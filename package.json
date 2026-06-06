@@ -1,0 +1,16 @@
+{
+  "name": "clinic-inbox-platform",
+  "version": "1.0.0",
+  "description": "マルチテナント版 クリニック問い合わせ受信トレイ（SaaS基盤）",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "imapflow": "^1.0.164",
+    "mailparser": "^3.7.1",
+    "nodemailer": "^6.9.13",
+    "pg": "^8.11.5",
+    "web-push": "^3.6.7"
+  }
+}
