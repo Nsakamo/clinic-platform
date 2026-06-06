@@ -233,26 +233,39 @@ async function pollAll() {
     client.on("error", (e) => console.error("imap event " + slug + ":", e && e.message));
     // 連携開始以降のメールだけ処理（過去の未読への一斉下書き/自動返信を防ぐ）
     if (!cfg.mailCutoff) { cfg.mailCutoff = Date.now(); try { await saveTenantConfig(t); } catch (_) {} }
+    const seenIds = new Set(Array.isArray(cfg.seenIds) ? cfg.seenIds : []);
     try {
       await client.connect(); const lock = await client.getMailboxLock("INBOX");
       try {
+        // 注意: fetchループ中に他のIMAPコマンド（既読化など）を実行してはいけない（無効になる）
+        const items = [];
         for await (const msg of client.fetch({ seen: false, since: new Date(Date.now() - 2*86400000) }, { source: true })) {
+          items.push({ uid: msg.uid, source: msg.source });
+        }
+        const markUids = [];
+        for (const it of items) {
           try {
-            const parsed = await simpleParser(msg.source);
+            const parsed = await simpleParser(it.source);
             const md = parsed.date ? new Date(parsed.date).getTime() : Date.now();
             if (md < +cfg.mailCutoff) continue; // 連携前のメールは未読のまま放置
+            const mid = String(parsed.messageId || "").trim();
+            markUids.push(it.uid);
+            if (mid && seenIds.has(mid)) continue; // 既に処理済み
+            if (mid) seenIds.add(mid);
             const fv = (parsed.from && parsed.from.value && parsed.from.value[0]) || {};
             const email = String(fv.address || "").toLowerCase();
-            await client.messageFlagsAdd(msg.seq, ["\\Seen"], {});
             if (!email || email === String(cfg.imapUser).toLowerCase()) continue;
             if (/no-?reply|mailer-daemon|postmaster/i.test(email)) continue;
             const text = String(parsed.text || parsed.subject || "").replace(/\r/g, "").slice(0, 8000);
             await handleInbound(t, { channel: "mail", uid: email, name: fv.name || email, text, subject: parsed.subject || "" });
           } catch (e) {}
         }
+        // フェッチ完了後にまとめて既読化（ループ中は効かないため）
+        if (markUids.length) { try { await client.messageFlagsAdd(markUids.join(","), ["\\Seen"], { uid: true }); } catch (e) { console.error("mail seen " + slug + ":", e.message); } }
       } finally { lock.release(); }
       await client.logout();
     } catch (e) { console.error("imap " + slug + ":", e.message); try { await client.logout(); } catch (_) {} }
+    try { cfg.seenIds = Array.from(seenIds).slice(-300); await saveTenantConfig(t); } catch (_) {}
   }
   polling = false;
 }
