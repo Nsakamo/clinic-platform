@@ -1,4 +1,7 @@
 process.env.TZ = "Asia/Tokyo";
+// 想定外エラーでサーバー全体が落ちないようにする（IMAP接続エラー等）
+process.on("uncaughtException", (e) => console.error("uncaught:", e && e.message));
+process.on("unhandledRejection", (e) => console.error("unhandled:", e && (e.message || e)));
 const express = require("express");
 const crypto = require("crypto");
 const app = express();
@@ -224,13 +227,20 @@ async function pollAll() {
   for (const slug of Object.keys(TEN)) {
     const t = TEN[slug]; const cfg = t.config;
     if (!cfg.imapUser || !cfg.imapPass) continue;
-    const client = new ImapFlow({ host: cfg.imapHost || "imap.gmail.com", port: +(cfg.imapPort || 993), secure: true, auth: { user: cfg.imapUser, pass: cfg.imapPass }, logger: false });
+    const ihost = cfg.imapHost || "imap.gmail.com";
+    // SNI(servername)必須: 明示しないとGmail等がダミー証明書を返し接続失敗する
+    const client = new ImapFlow({ host: ihost, servername: ihost, port: +(cfg.imapPort || 993), secure: true, auth: { user: cfg.imapUser, pass: cfg.imapPass }, logger: false, greetingTimeout: 20000, socketTimeout: 90000 });
+    client.on("error", (e) => console.error("imap event " + slug + ":", e && e.message));
+    // 連携開始以降のメールだけ処理（過去の未読への一斉下書き/自動返信を防ぐ）
+    if (!cfg.mailCutoff) { cfg.mailCutoff = Date.now(); try { await saveTenantConfig(t); } catch (_) {} }
     try {
       await client.connect(); const lock = await client.getMailboxLock("INBOX");
       try {
-        for await (const msg of client.fetch({ seen: false }, { source: true })) {
+        for await (const msg of client.fetch({ seen: false, since: new Date(Date.now() - 2*86400000) }, { source: true })) {
           try {
             const parsed = await simpleParser(msg.source);
+            const md = parsed.date ? new Date(parsed.date).getTime() : Date.now();
+            if (md < +cfg.mailCutoff) continue; // 連携前のメールは未読のまま放置
             const fv = (parsed.from && parsed.from.value && parsed.from.value[0]) || {};
             const email = String(fv.address || "").toLowerCase();
             await client.messageFlagsAdd(msg.seq, ["\\Seen"], {});
