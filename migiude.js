@@ -1087,6 +1087,42 @@ app.post("/api/partner/import", (req,res,next)=>{ if(partnerOk(req)) return next
   }catch(e){ res.status(500).json({ok:false,error:String(e.message||e).slice(0,80)}); }
 });
 
+// 自テナントへの引っ越し（ログイン中のテナント自身が、旧システムのエクスポートURLからデータを取り込む）
+app.post("/api/import-own", guard, async (req,res)=>{
+  const t = req.tenant;
+  const url = String(req.body.url||"");
+  if(!/^https:\/\//.test(url)) return res.status(400).json({ok:false,error:"bad_url"});
+  let b;
+  try{
+    const r = await fetch(url);
+    if(!r.ok) return res.status(502).json({ok:false,error:"fetch_"+r.status});
+    b = await r.json();
+  }catch(e){ return res.status(502).json({ok:false,error:"fetch_failed"}); }
+  if(!b || !Array.isArray(b.conversations)) return res.status(400).json({ok:false,error:"bad_backup"});
+  let convs = 0, rulesN = 0;
+  try{
+    for(const c of b.conversations.slice(0,2000)){
+      if(!c || !c.id) continue;
+      t.store[c.id] = c; dbSave(t, c); convs++;
+    }
+    const existingTitles = new Set(Object.values(t.rules||{}).map(r=>r.title));
+    for(const r of (Array.isArray(b.rules)?b.rules:[]).slice(0,500)){
+      if(!r || typeof r.content !== "string" || !r.content.trim()) continue;
+      if(existingTitles.has(String(r.title||"ルール").slice(0,100))) continue; // 二重実行しても重複しない
+      await ruleAdd(t, String(r.title||"ルール").slice(0,100), r.content.slice(0,2000)); rulesN++;
+    }
+    if(b.settings && typeof b.settings === "object"){
+      const s = t.config.settings;
+      if(typeof b.settings.autoReply === "boolean") s.autoReply = b.settings.autoReply;
+      if(b.settings.level === "high" || b.settings.level === "medium") s.level = b.settings.level;
+      if(typeof b.settings.tone === "string") s.tone = b.settings.tone.slice(0,1500);
+      if(["claude","gpt","gemini"].includes(b.settings.engine)) s.engine = b.settings.engine;
+      await saveTenantConfig(t);
+    }
+    res.json({ok:true, convs, rules:rulesN, ruleCount:Object.keys(t.rules).length, convoCount:Object.keys(t.store).length});
+  }catch(e){ res.status(500).json({ok:false,error:String(e.message||e).slice(0,80)}); }
+});
+
 // ---------- パートナーアプリ連携API（受付くん等。鍵: header x-partner-key = PLATFORM_SECRET） ----------
 function partnerOk(req){ return !!ADMIN_SECRET && String(req.headers["x-partner-key"]||"") === ADMIN_SECRET; }
 function pGuard(req,res,next){ if(partnerOk(req)) return next(); res.status(401).json({error:"auth"}); }
