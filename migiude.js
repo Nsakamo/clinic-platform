@@ -176,6 +176,17 @@ function rulesSearch(t, query, limit) {
   scored.sort((a, b) => b.n - a.n || b.r.id - a.r.id);
   return scored.slice(0, limit).map(x => x.r);
 }
+// ルールをAIに渡すブロックを作る。ルールは絶対に途中で切らない（万一物理上限に近づいたら関連性の低いルールを丸ごと外す）
+function rulesBlock(list, budget) {
+  budget = budget || 150000;
+  const out = []; let used = 0;
+  for (const r of list) {
+    const s = "・" + r.title + ": " + String(r.content || "");
+    if (used + s.length > budget) break;
+    out.push(s); used += s.length + 1;
+  }
+  return out.join("\n");
+}
 
 // ---------- helpers ----------
 function lastText(c) { const m = c.msgs[c.msgs.length - 1]; if (!m) return ""; if (m.media === "image") return "［画像］写真"; if (m.media === "video") return "［動画］動画"; if (m.media === "file") return "［ファイル］" + (m.fileName || ""); if (m.media === "audio") return "［音声］"; return m.text || ""; }
@@ -205,15 +216,51 @@ function seedTenant(t) {
 
 app.get("/health", (req, res) => res.json({ ok: true, tenants: Object.keys(TEN).length, db: !!pool }));
 
-// ===== AI brain: shared draft generator (used by LINE + email, in-app) =====
-const JP_QUALITY = "【日本語の品質（トーン指示よりも優先）】実際の日本人受付スタッフが書いたものと区別がつかない、自然で正しい日本語にすること。不自然な敬語・誤った敬語・二重敬語は絶対に使わない。禁止例:「大変良かったでございます」「拝見させていただきます」「ご確認していただけます」「お伺いさせていただきます」。正しい例:「安心いたしました」「拝見します」「ご確認いただけます」「伺います」。動詞の活用や助詞の誤りがないか、文のつながりが自然か、出力する前に全文を自己点検し、少しでも違和感のある文は書き直してから出力すること。";
-async function genDraft(t, c) {
+// ===== AIエンジン切り替え（返信文の生成のみ。みぎうで君等のシステム系はClaude固定） =====
+// t.config.settings.engine: "claude"(標準) | "gpt" | "gemini"。各エンジンのAPIキーは環境変数（OPENAI_KEY / GEMINI_KEY、全テナント共通）
+async function aiChat(t, system, messages, maxTokens){
+  const eng = (S(t).engine || "claude");
+  if(eng === "gpt" && process.env.OPENAI_KEY){
+    try{
+      const model = process.env.OPENAI_MODEL || "gpt-5.4";
+      const r = await fetch("https://api.openai.com/v1/chat/completions", { method:"POST",
+        headers: { "Content-Type":"application/json", "Authorization":"Bearer "+process.env.OPENAI_KEY },
+        body: JSON.stringify({ model, max_completion_tokens: maxTokens, messages: [{role:"system",content:system}].concat(messages) }) });
+      if(r.ok){ const d = await r.json(); const tx = d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content; if(tx) return tx; }
+      else console.error("openai:", r.status, (await r.text().catch(()=>"")).slice(0,200));
+    }catch(e){ console.error("openai:", e.message); }
+    // 失敗時はClaudeにフォールバック（下に続く）
+  }
+  if(eng === "gemini" && process.env.GEMINI_KEY){
+    try{
+      const model = process.env.GEMINI_MODEL || "gemini-3-flash";
+      const r = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", { method:"POST",
+        headers: { "Content-Type":"application/json", "Authorization":"Bearer "+process.env.GEMINI_KEY },
+        body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{role:"system",content:system}].concat(messages) }) });
+      if(r.ok){ const d = await r.json(); const tx = d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content; if(tx) return tx; }
+      else console.error("gemini:", r.status, (await r.text().catch(()=>"")).slice(0,200));
+    }catch(e){ console.error("gemini:", e.message); }
+  }
   const key = ANTHROPIC_KEY;
-  if (!key) return null;
+  if(!key) return null;
+  try{
+    const r = await fetch("https://api.anthropic.com/v1/messages", { method:"POST",
+      headers: { "Content-Type":"application/json", "x-api-key":key, "anthropic-version":"2023-06-01" },
+      body: JSON.stringify({ model:"claude-sonnet-4-6", max_tokens:maxTokens, system, messages }) });
+    if(!r.ok) return null;
+    const d = await r.json();
+    return (d.content && d.content[0] && d.content[0].text) || null;
+  }catch(e){ return null; }
+}
+
+// ===== AI brain: shared draft generator (used by LINE + email, in-app) =====
+const JP_QUALITY ="【日本語の品質（トーン指示よりも優先）】実際の日本人受付スタッフが書いたものと区別がつかない、自然で正しい日本語にすること。不自然な敬語・誤った敬語・二重敬語は絶対に使わない。禁止例:「大変良かったでございます」「拝見させていただきます」「ご確認していただけます」「お伺いさせていただきます」。正しい例:「安心いたしました」「拝見します」「ご確認いただけます」「伺います」。動詞の活用や助詞の誤りがないか、文のつながりが自然か、出力する前に全文を自己点検し、少しでも違和感のある文は書き直してから出力すること。";
+async function genDraft(t, c) {
   const channel = c.channel;
-  const lastQ = c.msgs.filter(m => m.from === "them").slice(-1).map(m => m.text || "").join("");
-  const rel = rulesSearch(t, lastQ.slice(0, 1000), 40);
-  const rulesTxt = rel.map(r => "・" + r.title + ": " + String(r.content || "").slice(0, 400)).join("\n").slice(0, 9000);
+  // 検索キーは直近3件のお客様メッセージ（最後の一言だけだと文脈語が拾えないため）
+  const lastQ = c.msgs.filter(m => m.from === "them").slice(-3).map(m => m.text || "").join(" ");
+  const rel = rulesSearch(t, lastQ.slice(0, 1500), 100);
+  const rulesTxt = rulesBlock(rel);
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = channel === "mail" ? "メールなので返信本文の最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
   const msgsArr = []; let cur = null;
@@ -238,10 +285,8 @@ async function genDraft(t, c) {
     + "\nneeds_human: 予約状況の確認・キャンセル例外判断・クレーム・支払いトラブル・偽物疑惑などスタッフ確認が必要ならtrue。"
     + "\nis_urgent: 痛み・出血・腫れ・強い不調など緊急性があればtrue。";
   try {
-    const resp = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" }, body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1500, system: sys, messages: msgsArr }) });
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    let raw = (data.content && data.content[0] && data.content[0].text) || "";
+    const raw = await aiChat(t, sys, msgsArr, 1500);
+    if (!raw) return null;
     let out = null; try { const m = raw.match(/\{[\s\S]*\}/); out = JSON.parse(m ? m[0] : raw); } catch (e) { out = { draft: raw, confidence: "low", is_urgent: false, needs_human: true, site_alert: "none", site_summary: "" }; }
     return out;
   } catch (e) { return null; }
@@ -571,14 +616,15 @@ app.post("/api/conn", guard, async (req, res) => {
   res.json({ ok: true, lineConfigured: !!C.lineToken(t) && !!C.lineSecret(t), mailConfigured: !!C.smtpUser(t) && !!C.smtpPass(t), emailInternal: !!emailOn(t) });
 });
 
-app.get("/api/settings", guard, (req, res) => res.json(S(req.tenant)));
+app.get("/api/settings", guard, (req, res) => res.json(Object.assign({}, S(req.tenant), { engines: { claude: !!ANTHROPIC_KEY, gpt: !!process.env.OPENAI_KEY, gemini: !!process.env.GEMINI_KEY } })));
 app.post("/api/settings", guard, async (req, res) => {
   const t = req.tenant;
   if (typeof req.body.autoReply === "boolean") S(t).autoReply = req.body.autoReply;
   if (req.body.level === "high" || req.body.level === "medium") S(t).level = req.body.level;
   if (typeof req.body.tone === "string") S(t).tone = req.body.tone.slice(0, 1500);
+  if (["claude", "gpt", "gemini"].includes(req.body.engine)) S(t).engine = req.body.engine;
   try { await saveTenantConfig(t); } catch (e) {}
-  res.json(S(t));
+  res.json(Object.assign({}, S(t), { engines: { claude: !!ANTHROPIC_KEY, gpt: !!process.env.OPENAI_KEY, gemini: !!process.env.GEMINI_KEY } }));
 });
 app.post("/api/done", guard, (req, res) => { const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" }); c.status = "done"; c.flag = false; dbSave(t, c); res.json({ ok: true }); });
 app.post("/api/tag", guard, (req, res) => { const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" }); c.flag = !c.flag; if (c.flag) { c.order = Math.max(0, ...Object.values(t.store).filter(x => x.flag).map(x => x.order || 0)) + 1; c.status = "todo"; } dbSave(t, c); res.json({ ok: true, flag: c.flag }); });
@@ -591,8 +637,8 @@ app.post("/api/ai-regen", guard, async (req, res) => {
   const c = t.store[req.body.id] || null;
   const channel = c ? c.channel : (req.body.channel || "line");
   const lastQ = c ? (c.msgs.filter(m => m.from === "them").slice(-1).map(m => m.text || "").join("")) : "";
-  const rel = rulesSearch(t, (lastQ + " " + idea).slice(0, 1000), 15);
-  const rulesTxt = rel.length ? rel.map(r => "・" + r.title + ": " + String(r.content || "").slice(0, 300)).join("\n").slice(0, 6000) : "";
+  const rel = rulesSearch(t, (lastQ + " " + idea).slice(0, 1000), 100);
+  const rulesTxt = rel.length ? rulesBlock(rel) : "";
   const sig = channel === "mail" ? "メールなので本文の最後に「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
   // build the real conversation as alternating turns (much better context understanding)
   const msgsArr = [];
@@ -635,8 +681,7 @@ app.post("/api/ai-regen", guard, async (req, res) => {
 // AIで作り直す（会話型）: 下書きをスタッフと会話しながら磨き上げる
 app.post("/api/draft-chat", guard, async (req, res) => {
   const t = req.tenant;
-  const key = ANTHROPIC_KEY;
-  if (!key) return res.json({ ok: false, error: "no_ai_key" });
+  if (!ANTHROPIC_KEY && !process.env.OPENAI_KEY && !process.env.GEMINI_KEY) return res.json({ ok: false, error: "no_ai_key" });
   const c = t.store[req.body.id] || null;
   if (!c) return res.json({ ok: false, error: "no_conv" });
   const edits = (Array.isArray(req.body.messages) ? req.body.messages : []).slice(-14)
@@ -651,8 +696,8 @@ app.post("/api/draft-chat", guard, async (req, res) => {
   const conv = c.msgs.slice(-20).map(m => (m.from === "them" ? "お客様" : "クリニック") + ": " + (m.text || (m.media ? "［" + m.media + "］" : ""))).join("\n").slice(0, 6000);
   const lastQ = c.msgs.filter(m => m.from === "them").slice(-1).map(m => m.text || "").join("");
   const editTxt = edits.map(e => e.content).join(" ");
-  const rel = rulesSearch(t, (lastQ + " " + editTxt).slice(0, 1000), 25);
-  const rulesTxt = rel.length ? rel.map(r => "・" + r.title + ": " + String(r.content || "").slice(0, 350)).join("\n").slice(0, 8000) : "";
+  const rel = rulesSearch(t, (lastQ + " " + editTxt).slice(0, 1500), 100);
+  const rulesTxt = rel.length ? rulesBlock(rel) : "";
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = c.channel === "mail" ? "メールなので下書きの最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
   const sys = "あなたは「" + (t.name || "クリニック") + "」の受付スタッフの返信作成アシスタントです。"
@@ -667,10 +712,8 @@ app.post("/api/draft-chat", guard, async (req, res) => {
     + "毎回、返信下書きの完成形の全文をdraftに入れる。replyにはスタッフへの短い一言（何をどう変えたか、1〜2文。敬語でなくてよい）。"
     + "出力は必ず次のJSONのみ: {\"reply\":\"スタッフへの一言\",\"draft\":\"お客様への返信下書き全文\"}";
   try {
-    const resp = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" }, body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1500, system: sys, messages: edits }) });
-    if (!resp.ok) return res.json({ ok: false, error: "ai_" + resp.status });
-    const data = await resp.json();
-    const raw = (data.content && data.content[0] && data.content[0].text) || "";
+    const raw = await aiChat(t, sys, edits, 1500);
+    if (!raw) return res.json({ ok: false, error: "ai_failed" });
     let out = { reply: "", draft: "" };
     try { const m = raw.match(/\{[\s\S]*\}/); out = JSON.parse(m ? m[0] : raw); } catch (e) { out = { reply: "", draft: raw.trim() }; }
     res.json({ ok: true, reply: String(out.reply || "").slice(0, 600), draft: String(out.draft || "").slice(0, 4000) });
@@ -887,8 +930,8 @@ app.post("/api/assistant", guard, async (req, res) => {
       + "\n【例外対応の検知（重要）】提案の前に、今回の対応が全患者向けの一般ルールか、この患者だけの例外対応（特別扱い・イレギュラー・クレーム対応のための特例・規定外の譲歩など）かを必ず判定すること。例外対応に見える場合はルール化を提案せず、『今回は例外対応に見えるため、ルール化はおすすめしません』と理由を添えて伝える。繰り返し起こり得る例外の場合のみ、既存の通常ルールを壊さない条件付きの形（例:『通常は◯◯と案内する。ただし△△の場合のみ□□とする』）で提案する。通常ルール自体を例外に合わせて書き換える提案は絶対にしない。";
   }
   const searchKey = msgs.map(m => m.content).join(" ") + (ctx ? " " + String(ctx.customer || "") + " " + String(ctx.finalText || "") : "");
-  const rel = rulesSearch(t, searchKey.slice(0, 2000), 30); // 会話に関連するルールのみ参照（30件まで）
-  const list = rel.map(r => "[" + r.id + "] " + r.title + ": " + String(r.content || "").slice(0, 400)).join("\n") || "（まだルールはありません）";
+  const rel = rulesSearch(t, searchKey.slice(0, 2000), 100); // 会話に関連するルール（途中で切らない）
+  const list = rel.map(r => "[" + r.id + "] " + r.title + ": " + String(r.content||"")).join("\n").slice(0, 100000) || "（まだルールはありません）";
   const totalRules = rulesList(t).length;
   const sys = "あなたは「みぎうで君」。クリニック問い合わせ返信システムの『返信ルールブック』編集専用アシスタントです。"
     + "できることはルールの追加・修正・削除の提案と、現在のルール内容の説明だけです。守ること:"
@@ -900,7 +943,7 @@ app.post("/api/assistant", guard, async (req, res) => {
     + "出力は必ず次のJSONのみで、他のテキストは出さない: {\"reply\":\"ユーザーへの返答\",\"proposals\":[],\"actions\":[]}"
     + " proposalsの形式: 追加={\"op\":\"add\",\"title\":\"短い見出し\",\"content\":\"ルール本文\"} 修正={\"op\":\"update\",\"id\":番号,\"title\":\"...\",\"content\":\"...\"} 削除={\"op\":\"delete\",\"id\":番号}"
     + (lead ? "\n\nあなたは会話の冒頭で既にこう発言済み（ユーザーはこれへの返事をしている）: " + lead.slice(0, 500) : "")
-    + "\n\n関連する既存ルール（全" + totalRules + "件中、この会話に関連するもののみ抽出。編集判断用、ユーザーにそのまま見せない）:\n" + list.slice(0, 14000) + ctxTxt;
+    + "\n\n関連する既存ルール（全" + totalRules + "件中、この会話に関連するもののみ抽出。編集判断用、ユーザーにそのまま見せない）:\n" + list + ctxTxt;
   try {
     const resp = await fetch("https://api.anthropic.com/v1/messages", { method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
@@ -1355,6 +1398,15 @@ const PAGE = `<!DOCTYPE html>
     <option value="medium">確信率「高」と「中」</option>
   </select>
   <div style="border-top:1px solid #e5e7eb;margin-top:14px;padding-top:10px;">
+    <div style="font-size:13px;margin-bottom:4px;">🧠 返信文を作るAIエンジン</div>
+    <select id="setEngine" style="width:100%;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:13px;">
+      <option value="claude">Claude（標準）</option>
+      <option value="gpt">ChatGPT（GPT）</option>
+      <option value="gemini">Gemini（最安）</option>
+    </select>
+    <div id="engineNote" style="font-size:11px;color:#6b7280;margin-top:2px;">AI下書き・自動返信・AIで作り直すの文章生成に使うAIです。キー未設定のエンジンを選ぶと自動的にClaudeで動きます。</div>
+  </div>
+  <div style="border-top:1px solid #e5e7eb;margin-top:14px;padding-top:10px;">
     <div style="font-size:13px;margin-bottom:4px;">🎨 回答全体のトーン・文体</div>
     <textarea id="setTone" placeholder="例：少し柔らかめで親しみやすい敬語にする。文章は短めに。「〜でございます」は使わない。" style="width:100%;box-sizing:border-box;min-height:70px;border:1px solid #d1d5db;border-radius:8px;padding:8px;font-size:13px;font-family:inherit;"></textarea>
     <div style="font-size:11px;color:#6b7280;margin-top:2px;">ここに書いた指示は、AI下書き・自動返信・AIで作り直す、すべてに最優先で反映されます。空欄なら標準のトーンです。</div>
@@ -1553,7 +1605,8 @@ async function sendAndLearn(){const c=DATA.find(x=>x.id===current);if(!c)return;
   await sendMsg();
   openAsst(ctx);}
 // ---- settings popup ----
-async function openSet(){try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";}catch(e){}
+async function openSet(){try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"claude";
+  if(s.engines){const n=document.getElementById("engineNote");const st=[];st.push("Claude:"+(s.engines.claude?"✓":"未"));st.push("GPT:"+(s.engines.gpt?"✓":"キー未設定"));st.push("Gemini:"+(s.engines.gemini?"✓":"キー未設定"));n.textContent="利用可能: "+st.join(" / ")+"。キー未設定のエンジンを選ぶと自動的にClaudeで動きます。";}}catch(e){}
   try{const cr=await fetch("/api/conn");const c=await cr.json();document.getElementById("connStat").textContent=(c.lineConfigured?"LINE✓ ":"LINE未 ")+(c.mailConfigured?"メール✓":"メール未");document.getElementById("cSmtpHost").value=c.smtpHost||"";document.getElementById("cSmtpPort").value=c.smtpPort||"";document.getElementById("cSmtpUser").value=c.smtpUser||"";document.getElementById("cImapHost").value=c.imapHost||"";document.getElementById("cImapPort").value=c.imapPort||"";document.getElementById("cImapUser").value=c.imapUser||"";document.getElementById("cEmailInternal").checked=!!c.emailInternal;renderAccts(c);}catch(e){}
   document.getElementById("setPop").style.display="flex";}
 function renderAccts(c){const el=document.getElementById("acctList");if(!el)return;let h="";
@@ -1583,7 +1636,7 @@ async function delAcct(kind,i){if(!confirm("この連携を削除しますか？
   try{await api("/api/conn-del",{kind,i});}catch(e){}openSet();}
 async function saveConn(){const g=id=>document.getElementById(id).value.trim();const body={lineSecret:g("cLineSecret"),lineToken:g("cLineToken"),smtpHost:g("cSmtpHost"),smtpPort:g("cSmtpPort"),smtpUser:g("cSmtpUser"),smtpPass:g("cSmtpPass"),imapHost:g("cImapHost"),imapPort:g("cImapPort"),imapUser:g("cImapUser"),imapPass:g("cImapPass"),emailInternal:document.getElementById("cEmailInternal").checked};try{const r=await api("/api/conn",body);const j=await r.json();if(j.ok){alert("連携設定を保存しました。\\nLINE: "+(j.lineConfigured?"設定済み":"未設定")+" / メール: "+(j.mailConfigured?"設定済み":"未設定")+" / メール直接監視: "+(j.emailInternal?"オン":"オフ"));["cLineSecret","cLineToken","cSmtpPass","cImapPass"].forEach(id=>document.getElementById(id).value="");}else alert("保存に失敗しました");}catch(e){alert("保存に失敗しました");}}
 function closeSet(){document.getElementById("setPop").style.display="none";}
-async function saveSet(){const autoReply=document.getElementById("setAuto").checked;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;try{await api("/api/settings",{autoReply,level,tone});alert("設定を保存しました");}catch(e){alert("保存に失敗しました");}closeSet();}
+async function saveSet(){const autoReply=document.getElementById("setAuto").checked;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;try{await api("/api/settings",{autoReply,level,tone,engine});alert("設定を保存しました");}catch(e){alert("保存に失敗しました");}closeSet();}
 async function changePass(){
   const cur=prompt("現在のパスワードを入力してください");if(cur===null)return;
   const np=prompt("新しいパスワード（8文字以上）を入力してください");if(np===null)return;
