@@ -1,10 +1,14 @@
 {
-  "name": "clinic-inbox-platform",
+  "name": "migiude-kun",
   "version": "1.0.0",
-  "description": "マルチテナント版 クリニック問い合わせ受信トレイ（SaaS基盤）",
-  "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=18" },
+  "description": "右腕くん（問い合わせ自動返答SaaS・マルチテナント）",
+  "main": "migiude.js",
+  "scripts": {
+    "start": "node migiude.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "express": "^4.19.2",
     "imapflow": "^1.0.164",
