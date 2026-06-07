@@ -1043,6 +1043,75 @@ app.post("/api/admin/delete", admGuard, async (req,res)=>{
 });
 app.get("/admin", (req,res)=>{ res.set("Content-Type","text/html; charset=utf-8"); res.set("Cache-Control","no-store"); res.send(adminOk(req) ? ADMIN_PAGE : ADMIN_LOGIN_PAGE); });
 
+// テナントデータの取り込み（移行用: hatobiyo-inboxの /api/backup 出力をそのまま受け取る）
+app.post("/api/admin/import", admGuard, async (req,res)=>{
+  const t = TEN[String(req.body.slug||"")]; if(!t) return res.status(404).json({ok:false,error:"no_tenant"});
+  const b = req.body.backup || {};
+  let convs = 0, rulesN = 0;
+  try{
+    for(const c of (Array.isArray(b.conversations)?b.conversations:[]).slice(0,2000)){
+      if(!c || !c.id) continue;
+      t.store[c.id] = c; dbSave(t, c); convs++;
+    }
+    for(const r of (Array.isArray(b.rules)?b.rules:[]).slice(0,500)){
+      if(!r || typeof r.content !== "string" || !r.content.trim()) continue;
+      await ruleAdd(t, String(r.title||"ルール").slice(0,100), r.content.slice(0,2000)); rulesN++;
+    }
+    if(b.settings && typeof b.settings === "object"){
+      const s = t.config.settings;
+      if(typeof b.settings.autoReply === "boolean") s.autoReply = b.settings.autoReply;
+      if(b.settings.level === "high" || b.settings.level === "medium") s.level = b.settings.level;
+      if(typeof b.settings.tone === "string") s.tone = b.settings.tone.slice(0,1500);
+      await saveTenantConfig(t);
+    }
+    res.json({ok:true, convs, rules:rulesN, ruleCount:Object.keys(t.rules).length});
+  }catch(e){ res.status(500).json({ok:false,error:String(e.message||e).slice(0,80)}); }
+});
+
+// ---------- パートナーアプリ連携API（受付くん等。鍵: header x-partner-key = PLATFORM_SECRET） ----------
+function partnerOk(req){ return !!ADMIN_SECRET && String(req.headers["x-partner-key"]||"") === ADMIN_SECRET; }
+function pGuard(req,res,next){ if(partnerOk(req)) return next(); res.status(401).json({error:"auth"}); }
+const SSO_TOKENS = {}; // token -> {slug, exp}
+app.get("/api/partner/tenants", pGuard, (req,res)=>{
+  res.json(Object.values(TEN).map(t=>({ slug:t.slug, name:t.name,
+    convos:Object.keys(t.store||{}).length, rules:Object.keys(t.rules||{}).length,
+    line: !!(t.config.conn&&t.config.conn.lineToken), mail: !!(t.config.conn&&t.config.conn.smtpUser),
+    suspended: !!t.config.suspended })));
+});
+app.get("/api/partner/conn", pGuard, (req,res)=>{
+  const t = TEN[String(req.query.slug||"")]; if(!t) return res.status(404).json({error:"no_tenant"});
+  const cn = t.config.conn || {};
+  res.json({ slug:t.slug, name:t.name,
+    lineConfigured: !!cn.lineToken, lineBotId: cn.lineBotId||"",
+    mailConfigured: !!cn.smtpUser, mailAddress: cn.smtpUser||"",
+    extraLines: (cn.lines||[]).map(a=>({name:a.name,botId:a.botId||""})),
+    extraMails: (cn.mails||[]).map(a=>({name:a.name,address:a.smtpUser})) });
+});
+app.post("/api/partner/suspend", pGuard, async (req,res)=>{
+  const t = TEN[String(req.body.slug||"")]; if(!t) return res.status(404).json({ok:false});
+  t.config.suspended = !!req.body.on;
+  try{ await saveTenantConfig(t); }catch(e){ return res.status(500).json({ok:false}); }
+  res.json({ok:true, suspended:t.config.suspended});
+});
+// SSO: 受付くん側から「右腕くんを開く」ボタン用のワンタイムURLを発行（5分有効・1回限り）
+app.post("/api/partner/sso", pGuard, (req,res)=>{
+  const t = TEN[String(req.body.slug||"")]; if(!t || t.config.suspended) return res.status(404).json({ok:false});
+  const tok = crypto.randomBytes(24).toString("hex");
+  SSO_TOKENS[tok] = { slug: t.slug, exp: Date.now() + 5*60000 };
+  res.json({ ok:true, url: "https://" + (req.headers.host||"") + "/sso?t=" + tok });
+});
+app.get("/sso", (req,res)=>{
+  const tok = String(req.query.t||"");
+  const e = SSO_TOKENS[tok];
+  if(e) delete SSO_TOKENS[tok];
+  if(!e || Date.now() > e.exp) return res.status(401).send("リンクの有効期限が切れています。もう一度お試しください。");
+  const t = TEN[e.slug];
+  if(!t || t.config.suspended) return res.status(404).send("not found");
+  setSess(res, t);
+  res.redirect("/");
+});
+setInterval(()=>{ const now=Date.now(); for(const k of Object.keys(SSO_TOKENS)) if(SSO_TOKENS[k].exp < now) delete SSO_TOKENS[k]; }, 60000);
+
 app.get("/", (req, res) => { res.set("Content-Type", "text/html; charset=utf-8"); res.set("Cache-Control", "no-store"); res.send(tenantFromReq(req) ? PAGE : LOGIN_PAGE); });
 app.get("/signup", (req, res) => { res.set("Content-Type", "text/html; charset=utf-8"); res.set("Cache-Control", "no-store"); res.send(SIGNUP_PAGE); });
 app.get("/board", (req, res) => { res.set("Content-Type", "text/html; charset=utf-8"); res.set("Cache-Control", "no-store"); res.send(tenantFromReq(req) ? BOARD_PAGE : LOGIN_PAGE); });
