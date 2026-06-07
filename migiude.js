@@ -168,6 +168,15 @@ async function ruleDelete(t, id) {
 }
 // relevance search (character-bigram overlap; works for Japanese, no tokenizer needed)
 function bigrams(s) { s = String(s || "").replace(/\s+/g, ""); const set = new Set(); for (let i = 0; i < s.length - 1; i++) set.add(s.slice(i, i + 2)); return set; }
+// 全ルールを関連度順で返す（件数制限なし。物理枠を超えた場合のみrulesBlockが関連性の低いものを丸ごと外す）
+function rulesRanked(t, query) {
+  const list = rulesList(t);
+  if (!query) return list;
+  const qb = bigrams(query);
+  const scored = list.map(r => { const tb = bigrams(r.title + " " + r.content); let n = 0; qb.forEach(b => { if (tb.has(b)) n++; }); return { r, n }; });
+  scored.sort((a, b) => b.n - a.n || b.r.id - a.r.id);
+  return scored.map(x => x.r);
+}
 function rulesSearch(t, query, limit) {
   const list = rulesList(t);
   if (!query || list.length <= limit) return list;
@@ -177,6 +186,10 @@ function rulesSearch(t, query, limit) {
   return scored.slice(0, limit).map(x => x.r);
 }
 // ルールをAIに渡すブロックを作る。ルールは絶対に途中で切らない（万一物理上限に近づいたら関連性の低いルールを丸ごと外す）
+function ruleBudget(t) {
+  const eng = (S(t).engine || "claude");
+  return eng === "gemini" ? 600000 : eng === "gpt" ? 300000 : 150000; // 各AIの物理枠いっぱいまで使う
+}
 function rulesBlock(list, budget) {
   budget = budget || 150000;
   const out = []; let used = 0;
@@ -259,8 +272,8 @@ async function genDraft(t, c) {
   const channel = c.channel;
   // 検索キーは直近3件のお客様メッセージ（最後の一言だけだと文脈語が拾えないため）
   const lastQ = c.msgs.filter(m => m.from === "them").slice(-3).map(m => m.text || "").join(" ");
-  const rel = rulesSearch(t, lastQ.slice(0, 1500), 100);
-  const rulesTxt = rulesBlock(rel);
+  const rel = rulesRanked(t, lastQ.slice(0, 1500));
+  const rulesTxt = rulesBlock(rel, ruleBudget(t));
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = channel === "mail" ? "メールなので返信本文の最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
   const msgsArr = []; let cur = null;
@@ -637,8 +650,8 @@ app.post("/api/ai-regen", guard, async (req, res) => {
   const c = t.store[req.body.id] || null;
   const channel = c ? c.channel : (req.body.channel || "line");
   const lastQ = c ? (c.msgs.filter(m => m.from === "them").slice(-1).map(m => m.text || "").join("")) : "";
-  const rel = rulesSearch(t, (lastQ + " " + idea).slice(0, 1000), 100);
-  const rulesTxt = rel.length ? rulesBlock(rel) : "";
+  const rel = rulesRanked(t, (lastQ + " " + idea).slice(0, 1000));
+  const rulesTxt = rel.length ? rulesBlock(rel, ruleBudget(t)) : "";
   const sig = channel === "mail" ? "メールなので本文の最後に「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
   // build the real conversation as alternating turns (much better context understanding)
   const msgsArr = [];
@@ -696,8 +709,8 @@ app.post("/api/draft-chat", guard, async (req, res) => {
   const conv = c.msgs.slice(-20).map(m => (m.from === "them" ? "お客様" : "クリニック") + ": " + (m.text || (m.media ? "［" + m.media + "］" : ""))).join("\n").slice(0, 6000);
   const lastQ = c.msgs.filter(m => m.from === "them").slice(-1).map(m => m.text || "").join("");
   const editTxt = edits.map(e => e.content).join(" ");
-  const rel = rulesSearch(t, (lastQ + " " + editTxt).slice(0, 1500), 100);
-  const rulesTxt = rel.length ? rulesBlock(rel) : "";
+  const rel = rulesRanked(t, (lastQ + " " + editTxt).slice(0, 1500));
+  const rulesTxt = rel.length ? rulesBlock(rel, ruleBudget(t)) : "";
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = c.channel === "mail" ? "メールなので下書きの最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
   const sys = "あなたは「" + (t.name || "クリニック") + "」の受付スタッフの返信作成アシスタントです。"
@@ -930,7 +943,7 @@ app.post("/api/assistant", guard, async (req, res) => {
       + "\n【例外対応の検知（重要）】提案の前に、今回の対応が全患者向けの一般ルールか、この患者だけの例外対応（特別扱い・イレギュラー・クレーム対応のための特例・規定外の譲歩など）かを必ず判定すること。例外対応に見える場合はルール化を提案せず、『今回は例外対応に見えるため、ルール化はおすすめしません』と理由を添えて伝える。繰り返し起こり得る例外の場合のみ、既存の通常ルールを壊さない条件付きの形（例:『通常は◯◯と案内する。ただし△△の場合のみ□□とする』）で提案する。通常ルール自体を例外に合わせて書き換える提案は絶対にしない。";
   }
   const searchKey = msgs.map(m => m.content).join(" ") + (ctx ? " " + String(ctx.customer || "") + " " + String(ctx.finalText || "") : "");
-  const rel = rulesSearch(t, searchKey.slice(0, 2000), 100); // 会話に関連するルール（途中で切らない）
+  const rel = rulesRanked(t, searchKey.slice(0, 2000)); // 全ルール・関連度順（途中で切らない）
   const list = rel.map(r => "[" + r.id + "] " + r.title + ": " + String(r.content||"")).join("\n").slice(0, 100000) || "（まだルールはありません）";
   const totalRules = rulesList(t).length;
   const sys = "あなたは「みぎうで君」。クリニック問い合わせ返信システムの『返信ルールブック』編集専用アシスタントです。"
@@ -1334,6 +1347,8 @@ const PAGE = `<!DOCTYPE html>
   .amcard .c{white-space:pre-wrap;word-break:break-word;color:#374151;max-height:140px;overflow-y:auto;line-height:1.5;}
   .amcard button{margin-top:8px;border:none;background:#7c3aed;color:#fff;border-radius:8px;padding:7px 12px;font-size:12.5px;cursor:pointer;font-weight:600;}
   .amcard button:disabled{background:#d1d5db;cursor:default;}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid #ddd6fe;border-top-color:#7c3aed;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:7px;}
+  @keyframes spin{to{transform:rotate(360deg);}}
   #dpanel{position:fixed;inset:0;background:rgba(0,0,0,.25);z-index:72;display:none;}
   #dCard{position:absolute;right:0;top:0;bottom:0;width:min(96vw,430px);background:#fff;display:flex;flex-direction:column;overflow:hidden;box-shadow:-4px 0 24px rgba(0,0,0,.15);animation:slideinX .28s cubic-bezier(.22,.9,.36,1);}
   #dMsgs{flex:1;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:8px;background:#f8fafc;}
@@ -1532,7 +1547,7 @@ function closeDraftChat(){slideClose("dpanel","dCard");}
 function dChip(t){const x=document.getElementById("dText");x.value=t;dSend();}
 async function dSend(){const x=document.getElementById("dText");const txt=x.value.trim();if(!txt)return;x.value="";
   dAdd("user",txt);dHist.push({role:"user",content:txt});
-  const ph=dRender("ai","書き直し中…");
+  const ph=spinAdd(dMsgsEl,"書き直し中…");
   try{
     const r=await api("/api/draft-chat",{id:current,messages:dHist});
     const j=await r.json();ph.remove();
@@ -1545,6 +1560,7 @@ async function dSend(){const x=document.getElementById("dText");const txt=x.valu
 // ---- みぎうで君 (rulebook editing chat) ----
 let asstHist=[],asstCtx=null;
 const asstEl=document.getElementById("asst"),asstMsgsEl=document.getElementById("asstMsgs");
+function spinAdd(el,label){const d=document.createElement("div");d.className="am ai";const sp=document.createElement("span");sp.className="spin";d.appendChild(sp);d.appendChild(document.createTextNode(label));el.appendChild(d);el.scrollTop=el.scrollHeight;return d;}
 function amAdd(role,text){const d=document.createElement("div");d.className="am "+role;d.textContent=text;asstMsgsEl.appendChild(d);asstMsgsEl.scrollTop=asstMsgsEl.scrollHeight;return d;}
 function amCardAdd(p){const card=document.createElement("div");card.className="amcard";
   const head=p.op==="delete"?"🗑 削除案: ":(p.op==="update"?"✏️ 修正案: ":"➕ 追加案: ");
@@ -1559,7 +1575,7 @@ function amCardAdd(p){const card=document.createElement("div");card.className="a
 function openAsst(ctx){asstHist=[];asstCtx=ctx||null;asstMsgsEl.innerHTML="";asstEl.style.display="block";
   if(ctx){
     asstHist.push({role:"user",content:"（スタッフが返信を送信しました。会話と返信内容から学習すべき点を読み取って、ルール案を提案してください）"});
-    const ph=amAdd("ai","送った返信を確認しています…");asstCall(ph);
+    const ph=spinAdd(asstMsgsEl,"送った返信を確認しています…");asstCall(ph);
   }else{
     const greet="ルールブックの編集をお手伝いします。回答をどう変えたいか教えてください。\\n📎ボタンで価格表などの資料（画像・PDF・CSV）を読み込ませて一括学習もできます。「今の料金ルールどうなってる？」のように現状を聞くこともできます。";
     amAdd("ai",greet);asstHist.push({role:"assistant",content:greet});
@@ -1573,11 +1589,11 @@ async function asstCall(ph){
   }catch(e){if(ph)ph.remove();amAdd("sysn","通信エラーが発生しました");}}
 async function asstSend(){const t=document.getElementById("asstText");const txt=t.value.trim();if(!txt)return;t.value="";
   amAdd("user",txt);asstHist.push({role:"user",content:txt});
-  const ph=amAdd("ai","考え中…");asstCall(ph);}
+  const ph=spinAdd(asstMsgsEl,"考え中…");asstCall(ph);}
 function asstAttach(){const inp=document.createElement("input");inp.type="file";inp.accept="image/*,.pdf,.csv,.txt";
   inp.onchange=async()=>{const f=inp.files[0];if(!f)return;
     if(f.size>8*1024*1024){alert("8MB以下のファイルにしてください");return;}
-    amAdd("user","📎 "+f.name);const ph=amAdd("ai","資料を読み込んでいます…（少し時間がかかります）");
+    amAdd("user","📎 "+f.name);const ph=spinAdd(asstMsgsEl,"資料を読み込んでいます…（少し時間がかかります）");
     try{
       const b64=await new Promise((res2,rej)=>{const rd=new FileReader();rd.onload=()=>res2(String(rd.result).split(",")[1]);rd.onerror=rej;rd.readAsDataURL(f);});
       const r=await api("/api/assistant-file",{name:f.name,mime:f.type||"",data:b64});const j=await r.json();ph.remove();
