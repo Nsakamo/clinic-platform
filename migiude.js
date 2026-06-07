@@ -1001,50 +1001,13 @@ app.get("/api/backup", guard, (req, res) => {
   res.send(JSON.stringify(data, null, 1));
 });
 
-// ---------- 運営側管理画面（テナント管理。鍵=PLATFORM_SECRET） ----------
+// ---------- 運営管理は受付くん（SmileMedi Cloud）に統合済み。旧/adminは410 ----------
+// PLATFORM_SECRET はパートナーAPIの共有キーとして引き続き使用（変更・削除しないこと）
 const ADMIN_SECRET = process.env.PLATFORM_SECRET || "";
-function adminOk(req){ return !!ADMIN_SECRET && cookies(req).adm === sha("adm|" + ADMIN_SECRET); }
-function admGuard(req,res,next){ if(adminOk(req)) return next(); res.status(401).json({error:"auth"}); }
-app.post("/api/admin/login", (req,res)=>{
-  if(!ADMIN_SECRET || String(req.body.key||"") !== ADMIN_SECRET) return res.status(401).json({ok:false});
-  res.set("Set-Cookie","adm="+sha("adm|"+ADMIN_SECRET)+"; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800");
-  res.json({ok:true});
-});
-app.get("/api/admin/tenants", admGuard, (req,res)=>{
-  const list = Object.values(TEN).map(t=>{
-    const convs = Object.values(t.store||{});
-    return { slug:t.slug, name:t.name, convos:convs.length, rules:Object.keys(t.rules||{}).length,
-      lastTs: convs.reduce((m,c)=>Math.max(m,c.ts||0),0),
-      line: !!(t.config.conn&&t.config.conn.lineToken), mail: !!(t.config.conn&&t.config.conn.smtpUser),
-      suspended: !!t.config.suspended };
-  }).sort((a,b)=>b.lastTs-a.lastTs);
-  res.json(list);
-});
-app.post("/api/admin/suspend", admGuard, async (req,res)=>{
-  const t = TEN[String(req.body.slug||"")]; if(!t) return res.status(404).json({ok:false});
-  t.config.suspended = !!req.body.on;
-  try{ await saveTenantConfig(t); }catch(e){ return res.status(500).json({ok:false}); }
-  res.json({ok:true, suspended:t.config.suspended});
-});
-app.post("/api/admin/delete", admGuard, async (req,res)=>{
-  const slug = String(req.body.slug||""); const t = TEN[slug]; if(!t) return res.status(404).json({ok:false});
-  try{
-    if(pool){
-      await pool.query("DELETE FROM convos WHERE tenant=$1",[slug]);
-      await pool.query("DELETE FROM rules WHERE tenant=$1",[slug]);
-      await pool.query("DELETE FROM alerts WHERE tenant=$1",[slug]);
-      await pool.query("DELETE FROM files WHERE tenant=$1",[slug]);
-      await pool.query("DELETE FROM push_subs WHERE tenant=$1",[slug]);
-      await pool.query("DELETE FROM tenants WHERE slug=$1",[slug]);
-    }
-    delete TEN[slug];
-    res.json({ok:true});
-  }catch(e){ res.status(500).json({ok:false,error:String(e.message||e).slice(0,80)}); }
-});
-app.get("/admin", (req,res)=>{ res.set("Content-Type","text/html; charset=utf-8"); res.set("Cache-Control","no-store"); res.send(adminOk(req) ? ADMIN_PAGE : ADMIN_LOGIN_PAGE); });
+app.get("/admin", (req,res)=>{ res.status(410).send("運営管理は受付くん（SmileMedi Cloud）の管理画面に統合されました。"); });
 
 // テナントデータの取り込み（移行用: hatobiyo-inboxの /api/backup 出力をそのまま受け取る）
-app.post("/api/admin/import", admGuard, async (req,res)=>{
+app.post("/api/partner/import", (req,res,next)=>{ if(partnerOk(req)) return next(); res.status(401).json({error:"auth"}); }, async (req,res)=>{
   const t = TEN[String(req.body.slug||"")]; if(!t) return res.status(404).json({ok:false,error:"no_tenant"});
   const b = req.body.backup || {};
   let convs = 0, rulesN = 0;
@@ -1085,7 +1048,77 @@ app.get("/api/partner/conn", pGuard, (req,res)=>{
     lineConfigured: !!cn.lineToken, lineBotId: cn.lineBotId||"",
     mailConfigured: !!cn.smtpUser, mailAddress: cn.smtpUser||"",
     extraLines: (cn.lines||[]).map(a=>({name:a.name,botId:a.botId||""})),
-    extraMails: (cn.mails||[]).map(a=>({name:a.name,address:a.smtpUser})) });
+    extraMails: (cn.mails||[]).map(a=>({name:a.name,address:a.smtpUser})),
+    rules: Object.values(t.rules||{}).map(r=>({id:r.id,title:r.title})).slice(0,200) });
+});
+// テナント新規作成（受付くん運営画面から。空テナント: LINE/メール未設定・ルール0件・デモなし）
+app.post("/api/partner/tenants", pGuard, async (req,res)=>{
+  const name = String(req.body.name||"").trim().slice(0,80);
+  if(!name) return res.status(400).json({ok:false,error:"name"});
+  let slug = String(req.body.slug||"").trim().toLowerCase().replace(/[^a-z0-9-]/g,"").slice(0,30);
+  if(slug && TEN[slug]) return res.status(409).json({ok:false,error:"slug_exists"});
+  if(!slug){ slug = slugify(name); if(TEN[slug]) return res.status(409).json({ok:false,error:"slug_exists"}); }
+  // パスワード未指定ならランダム生成（顧客はSSO経由で入る。後からパスワード設定も可能）
+  const pass = String(req.body.password||"") || crypto.randomBytes(12).toString("hex");
+  const config = { passHash: sha(pass), conn: {}, settings: { autoReply: false, level: "high", tone: "" } };
+  const t = TEN[slug] = newTenant(slug, name, config);
+  if(pool){ try{ await pool.query("INSERT INTO tenants (slug,name,config) VALUES ($1,$2,$3)", [slug, name, t.config]); }catch(e){ delete TEN[slug]; return res.status(500).json({ok:false,error:"db"}); } }
+  res.status(201).json({ slug, name });
+});
+// テナント完全削除（解約時）
+app.delete("/api/partner/tenants/:slug", pGuard, async (req,res)=>{
+  const slug = String(req.params.slug||""); const t = TEN[slug]; if(!t) return res.status(404).json({ok:false});
+  try{
+    if(pool){
+      await pool.query("DELETE FROM convos WHERE tenant=$1",[slug]);
+      await pool.query("DELETE FROM rules WHERE tenant=$1",[slug]);
+      await pool.query("DELETE FROM alerts WHERE tenant=$1",[slug]);
+      await pool.query("DELETE FROM files WHERE tenant=$1",[slug]);
+      await pool.query("DELETE FROM push_subs WHERE tenant=$1",[slug]);
+      await pool.query("DELETE FROM tenants WHERE slug=$1",[slug]);
+    }
+    delete TEN[slug];
+    res.json({ok:true});
+  }catch(e){ res.status(500).json({ok:false,error:String(e.message||e).slice(0,80)}); }
+});
+// LINE設定（受付くん運営画面から。トークン検証＋botId自動取得）
+app.put("/api/partner/line-config", pGuard, async (req,res)=>{
+  const t = TEN[String(req.body.slug||"")]; if(!t) return res.status(404).json({ok:false,error:"no_tenant"});
+  const conn = t.config.conn = t.config.conn || {};
+  if(req.body.clear === true){
+    delete conn.lineToken; delete conn.lineSecret; delete conn.lineBotId; delete conn.lineChannelId;
+  }else{
+    const token = String(req.body.channel_access_token||"").trim();
+    const secret = String(req.body.channel_secret||"").trim();
+    if(!token || !secret) return res.status(400).json({ok:false,error:"missing"});
+    try{
+      const r = await fetch("https://api.line.me/v2/bot/info", { headers: { "Authorization": "Bearer " + token } });
+      if(!r.ok) return res.status(400).json({ok:false,error:"bad_token"});
+      const j = await r.json(); conn.lineBotId = j.userId || "";
+    }catch(e){ return res.status(502).json({ok:false,error:"line_api"}); }
+    conn.lineToken = token.slice(0,300); conn.lineSecret = secret.slice(0,300);
+    if(req.body.channel_id) conn.lineChannelId = String(req.body.channel_id).slice(0,40);
+  }
+  try{ await saveTenantConfig(t); }catch(e){ return res.status(500).json({ok:false}); }
+  res.json({ ok:true, webhook_url: "https://" + (req.headers.host||"") + "/webhook/line" });
+});
+// メール設定（受付くん運営画面から。設定完了で受信監視も自動オン）
+app.put("/api/partner/mail-config", pGuard, async (req,res)=>{
+  const t = TEN[String(req.body.slug||"")]; if(!t) return res.status(404).json({ok:false,error:"no_tenant"});
+  const conn = t.config.conn = t.config.conn || {};
+  if(req.body.clear === true){
+    ["smtpHost","smtpPort","smtpUser","smtpPass","imapHost","imapPort","imapUser","imapPass"].forEach(k=>{ delete conn[k]; });
+    conn.emailInternal = false;
+  }else{
+    const b = req.body;
+    ["smtpHost","smtpUser","smtpPass","imapHost","imapUser","imapPass"].forEach(k=>{ if(typeof b[k]==="string" && b[k].trim()) conn[k] = b[k].trim().slice(0,300); });
+    if(b.smtpPort) conn.smtpPort = +b.smtpPort;
+    if(b.imapPort) conn.imapPort = +b.imapPort;
+    if(typeof b.emailInternal === "boolean") conn.emailInternal = b.emailInternal;
+    else if(conn.smtpUser && conn.smtpPass) conn.emailInternal = true;
+  }
+  try{ await saveTenantConfig(t); }catch(e){ return res.status(500).json({ok:false}); }
+  res.json({ ok:true, mail_address: conn.smtpUser || "" });
 });
 app.post("/api/partner/suspend", pGuard, async (req,res)=>{
   const t = TEN[String(req.body.slug||"")]; if(!t) return res.status(404).json({ok:false});
@@ -1122,45 +1155,6 @@ app.get("/board", (req, res) => { res.set("Content-Type", "text/html; charset=ut
   setTimeout(() => { Object.values(TEN).forEach(t => ensureLineBotId(t).catch(() => {})); }, 3000);
   app.listen(PORT, () => console.log("clinic-inbox platform listening on " + PORT));
 })();
-
-const ADMIN_LOGIN_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>運営ログイン</title></head>
-<body style="font-family:-apple-system,'Hiragino Kaku Gothic ProN',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#111827;">
-<div style="background:#fff;padding:28px 24px;border-radius:14px;width:min(90vw,320px);">
-<div style="font-size:17px;font-weight:600;margin-bottom:14px;">🛠 運営管理</div>
-<input id="k" type="password" placeholder="運営キー" autofocus style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;" onkeydown="if(event.key==='Enter'&&!event.isComposing&&event.keyCode!==229)go()">
-<button onclick="go()" style="width:100%;padding:11px;border:none;border-radius:8px;background:#111827;color:#fff;font-size:15px;font-weight:600;cursor:pointer;">ログイン</button>
-<div id="e" style="color:#dc2626;font-size:12px;margin-top:8px;min-height:14px;"></div></div>
-<script>async function go(){const r=await fetch("/api/admin/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key:document.getElementById("k").value})});if(r.ok)location.reload();else document.getElementById("e").textContent="キーが違います";}</script>
-</body></html>`;
-
-const ADMIN_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>運営管理</title>
-<style>
-body{font-family:-apple-system,'Hiragino Kaku Gothic ProN',sans-serif;margin:0;background:#f3f4f6;color:#111827;}
-header{background:#111827;color:#fff;padding:14px 18px;font-weight:600;display:flex;justify-content:space-between;align-items:center;}
-main{padding:16px;max-width:880px;margin:0 auto;}
-table{width:100%;border-collapse:collapse;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 1px 6px rgba(0,0,0,.06);}
-th,td{padding:10px 12px;text-align:left;font-size:13px;border-bottom:1px solid #f1f5f9;}
-th{background:#f8fafc;color:#6b7280;font-size:11px;}
-.b{border:1px solid #d1d5db;background:#fff;border-radius:7px;padding:5px 10px;font-size:12px;cursor:pointer;margin-right:4px;}
-.b.danger{border-color:#fecaca;color:#dc2626;}
-.tag{font-size:10px;padding:1px 6px;border-radius:6px;}
-.on{background:#ecfdf5;color:#047857;}.off{background:#f3f4f6;color:#9ca3af;}.sus{background:#fef2f2;color:#dc2626;}
-</style></head><body>
-<header><span>🛠 みぎうで君 運営管理</span><span id="cnt" style="font-size:12px;font-weight:400;"></span></header>
-<main><table><thead><tr><th>会社名</th><th>ID</th><th>会話数</th><th>ルール数</th><th>連携</th><th>状態</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
-<div style="font-size:11px;color:#6b7280;margin-top:10px;">停止＝そのテナントのログイン・受信・自動返信がすべて止まります（データは残る）。削除＝データごと完全に消えます。</div></main>
-<script>
-function esc(s){return (s||"").replace(/[<>&]/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]));}
-async function load(){
-  const r=await fetch("/api/admin/tenants");if(!r.ok){location.reload();return;}
-  const a=await r.json();
-  document.getElementById("cnt").textContent="テナント "+a.length+"社";
-  document.getElementById("rows").innerHTML=a.map(t=>'<tr><td><b>'+esc(t.name)+'</b></td><td style="color:#9ca3af;">'+esc(t.slug)+'</td><td>'+t.convos+'</td><td>'+t.rules+'</td><td>'+(t.line?'<span class="tag on">LINE</span> ':'<span class="tag off">LINE</span> ')+(t.mail?'<span class="tag on">メール</span>':'<span class="tag off">メール</span>')+'</td><td>'+(t.suspended?'<span class="tag sus">停止中</span>':'<span class="tag on">稼働中</span>')+'</td><td><button class="b" onclick="susp(\\''+t.slug+'\\','+(t.suspended?'false':'true')+')">'+(t.suspended?"再開":"停止")+'</button><button class="b danger" onclick="del(\\''+t.slug+'\\',\\''+esc(t.name)+'\\')">削除</button></td></tr>').join("");
-}
-async function susp(slug,on){await fetch("/api/admin/suspend",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({slug,on:on==="true"||on===true})});load();}
-async function del(slug,name){if(prompt('「'+name+'」を完全削除します。会話・ルールも消えます。確認のため会社IDを入力してください')!==slug)return;await fetch("/api/admin/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({slug})});load();}
-load();setInterval(load,30000);
-</script></body></html>`;
 
 const LOGIN_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>ログイン</title></head>
 <body style="font-family:-apple-system,'Hiragino Kaku Gothic ProN',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f3f4f6;">
