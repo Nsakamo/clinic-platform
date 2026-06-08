@@ -1405,6 +1405,26 @@ app.post("/api/partner/sso", pGuard, (req,res)=>{
   SSO_TOKENS[tok] = { slug: t.slug, exp: Date.now() + 5*60000 };
   res.json({ ok:true, url: "https://" + (req.headers.host||"") + "/sso?t=" + tok });
 });
+// 受付くん管理画面用: ログイン再発行（現パスワード不要）。partner key 必須・新パスワードを平文で1回だけ返す
+app.post("/api/partner/reset-login", pGuard, async (req,res)=>{
+  const t = TEN[String(req.body.slug||"")];
+  if(!t) return res.status(404).json({ ok:false });
+  const prevHash = t.config.passHash, prevId = t.config.loginId; // DB保存失敗時のロールバック用
+  // 紛らわしい文字(0/O/1/l/I)を除いた12桁の安全な新パスワードを自動生成
+  const ab = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const rb = crypto.randomBytes(12); let pw = "";
+  for(let i=0;i<12;i++) pw += ab[rb[i] % ab.length];
+  t.config.passHash = sha(pw);
+  let loginId = t.config.loginId || t.slug;
+  if(req.body.resetId === true){
+    let cand; do { cand = slugify(t.name || t.slug); } while(loginIdTaken(cand, t.slug));
+    t.config.loginId = cand; loginId = cand;
+  }
+  try { await saveTenantConfig(t); }
+  catch(e){ t.config.passHash = prevHash; t.config.loginId = prevId; return res.status(500).json({ ok:false, error:"db" }); }
+  console.log("partner reset-login:", t.slug, "resetId=" + (req.body.resetId === true)); // 操作ログ（パスワードは記録しない）
+  res.json({ ok:true, loginId, password: pw });
+});
 app.get("/sso", (req,res)=>{
   const tok = String(req.query.t||"");
   const e = SSO_TOKENS[tok];
