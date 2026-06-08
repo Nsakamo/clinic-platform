@@ -1456,7 +1456,7 @@ const PAGE = `<!DOCTYPE html>
   </div>
   <div style="display:flex;gap:8px;padding:10px;border-top:1px solid var(--line);align-items:flex-end;"><textarea id="dText" placeholder="どう変えたいか入力…（例：予約確定メールに記載の院に来てと案内して）" onkeydown="if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing&&event.keyCode!==229){event.preventDefault();dSend();}"></textarea><button class="cbtn send" onclick="dSend()">送信</button></div>
 </div></div>
-<div id="setPop" style="position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:65;display:none;align-items:center;justify-content:center;"><div style="background:#fff;border-radius:14px;padding:18px;width:min(92vw,360px);">
+<div id="setPop" style="position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:65;display:none;align-items:center;justify-content:center;"><div style="background:#fff;border-radius:14px;padding:18px;width:min(92vw,360px);max-height:86vh;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;">
   <h3 style="margin:0 0 12px;font-size:15px;">⚙ 設定</h3>
   <label style="display:flex;align-items:center;gap:10px;font-size:14px;padding:8px 0;cursor:pointer;"><input type="checkbox" id="setAuto" style="width:18px;height:18px;"> 自動返信を有効にする</label>
   <div style="font-size:12px;color:#6b7280;margin:2px 0 10px;">AIの確信率が高い問い合わせに、スタッフを待たずAIが自動で返信します。緊急・要対応と判定されたものは自動返信されません。</div>
