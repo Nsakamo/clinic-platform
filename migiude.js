@@ -1427,6 +1427,48 @@ app.post("/api/partner/reset-login", pGuard, async (req,res)=>{
   console.log("partner reset-login:", t.slug, "resetId=" + (req.body.resetId === true)); // 操作ログ（パスワードは記録しない）
   res.json({ ok:true, loginId, password: pw });
 });
+// 受付くんのAIアシスタント用: 患者へLINE送信（partner key必須）。line_uid優先、無ければphone/emailで既存LINE会話を解決
+app.post("/api/partner/send-line", pGuard, async (req,res)=>{
+  const t = TEN[String(req.body.slug||"")];
+  if(!t) return res.json({ ok:false, error:"no_tenant" }); // 実装済みルートなのでslug不正は200で返す（404=未実装と混同させない）
+  const p = (req.body && typeof req.body.patient === "object" && req.body.patient) || {};
+  const text = String(req.body.text||"").trim();
+  if(!text) return res.json({ ok:false, error:"empty_text" });
+  // 宛先(LINEユーザーID)の解決
+  let uid = String(p.line_uid||"").trim();
+  let acctKey = null;
+  if(uid){
+    const c = t.store["line:" + uid];
+    if(c && c.acct && c.acct.type === "line") acctKey = c.acct.key;
+  } else {
+    // line_uidが無い場合、保存済みのLINE会話から phone/email 一致を探す（該当が無ければ解決不可）
+    const email = String(p.email||"").trim().toLowerCase();
+    const phone = String(p.phone||"").replace(/[^0-9]/g, "");
+    const conv = Object.values(t.store).find(c => c.channel === "line" && (
+      (email && String(c.email||"").toLowerCase() === email) ||
+      (phone && String(c.phone||"").replace(/[^0-9]/g, "") === phone)
+    ));
+    if(conv){ uid = conv.userId; acctKey = (conv.acct && conv.acct.type === "line") ? conv.acct.key : null; }
+  }
+  if(!uid) return res.json({ ok:false, error:"no_line_target" });
+  // 送信元LINEチャネル: 会話が紐づくチャネル優先、無ければメイン
+  const accts = lineAccounts(t);
+  const a = (acctKey ? accts.find(x => (x.botId||"main") === acctKey) : null) || accts[0];
+  if(!a || !a.token) return res.json({ ok:false, error:"no_line_config" });
+  try{
+    const resp = await fetch("https://api.line.me/v2/bot/message/push", { method:"POST",
+      headers:{ "Content-Type":"application/json", "Authorization":"Bearer " + a.token },
+      body: JSON.stringify({ to: uid, messages:[{ type:"text", text }] }) });
+    if(!resp.ok) return res.json({ ok:false, error:"line_" + resp.status });
+  }catch(e){ return res.json({ ok:false, error:String(e.message||e).slice(0,80) }); }
+  // 会話履歴にも残す（既存会話があれば）
+  try{
+    const c = t.store["line:" + uid];
+    if(c){ c.msgs.push({ from:"us", text, time: nowt(), via:"partner" }); c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c); }
+  }catch(e){}
+  console.log("partner send-line:", t.slug, "uid=" + uid.slice(0,8) + "…");
+  res.json({ ok:true });
+});
 app.get("/sso", (req,res)=>{
   const tok = String(req.query.t||"");
   const e = SSO_TOKENS[tok];
