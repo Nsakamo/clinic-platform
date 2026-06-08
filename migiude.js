@@ -208,7 +208,11 @@ function rulesSearch(t, query, limit) {
   return scored.slice(0, limit).map(x => x.r);
 }
 // ルールをAIに渡すブロックを作る。ルールは絶対に途中で切らない（万一物理上限に近づいたら関連性の低いルールを丸ごと外す）
-const RULE_BUDGETS = { claude: 150000, gpt: 300000, gemini: 600000 }; // 各AIの物理枠（文字数）。ここを超えると関連性の低いルールが除外される
+// ===== 読み込み上限の中央管理 =====
+// Gemini 3 Flash は約105万トークン(1,048,576)の文脈。会話履歴・出力(最大64k)・トークン換算の余白を確保した安全上限。
+// 「読み込み量」を増減したい時はこの1か所だけ変えればOK（ルール枠・編集チャット参照・資料テキストすべてに反映）。
+const GEMINI_MAX_CHARS = 800000;
+const RULE_BUDGETS = { claude: 150000, gpt: 300000, gemini: GEMINI_MAX_CHARS }; // 各AIの物理枠（文字数）。ここを超えると関連性の低いルールが除外される
 function ruleBudget(t) {
   const eng = (S(t).engine || "gemini");
   return RULE_BUDGETS[eng] || RULE_BUDGETS.gemini;
@@ -1112,7 +1116,7 @@ app.post("/api/assistant", guard, async (req, res) => {
   }
   const searchKey = msgs.map(m => m.content).join(" ") + (ctx ? " " + String(ctx.customer || "") + " " + String(ctx.finalText || "") : "");
   const rel = rulesRanked(t, searchKey.slice(0, 2000)); // 全ルール・関連度順（途中で切らない）
-  const list = rel.map(r => "[" + r.id + "] " + r.title + ": " + String(r.content||"")).join("\n").slice(0, 400000) || "（まだルールはありません）";
+  const list = rel.map(r => "[" + r.id + "] " + r.title + ": " + String(r.content||"")).join("\n").slice(0, GEMINI_MAX_CHARS) || "（まだルールはありません）";
   const totalRules = rulesList(t).length;
   const sys = "あなたは「みぎうで君」。クリニック問い合わせ返信システムの『返信ルールブック』編集専用アシスタントです。"
     + "できることはルールの追加・修正・削除の提案と、現在のルール内容の説明だけです。守ること:"
@@ -1170,7 +1174,7 @@ app.post("/api/assistant-file", guard, async (req, res) => {
   const note = String(req.body.note || "").slice(0, 500);
   let buf; try { buf = Buffer.from(String(req.body.data || ""), "base64"); } catch (e) { return res.status(400).json({ error: "bad data" }); }
   if (!buf || !buf.length) return res.json({ ok: false, error: "empty" });
-  if (buf.length > 8 * 1024 * 1024) return res.json({ ok: false, error: "too_large" });
+  if (buf.length > 14 * 1024 * 1024) return res.json({ ok: false, error: "too_large" }); // Geminiのinlineリクエスト上限(20MB)に収まる範囲で最大化
   const content = [];      // Claude（フォールバック）用ペイロード
   const geminiParts = [];  // Gemini（優先）用ペイロード
   if (/^image\/(jpeg|png|gif|webp)$/.test(mime)) {
@@ -1182,7 +1186,7 @@ app.post("/api/assistant-file", guard, async (req, res) => {
     content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } });
     geminiParts.push({ inlineData: { mimeType: "application/pdf", data: b64 } });
   } else {
-    const txt = buf.toString("utf8").slice(0, 200000); // テキスト/CSVの読み込み上限（Gemini大容量に合わせ拡大）
+    const txt = buf.toString("utf8").slice(0, GEMINI_MAX_CHARS); // テキスト/CSVの読み込み上限（Geminiの文脈に収まる最大）
     if (!txt.trim()) return res.json({ ok: false, error: "unsupported" });
     const blk = "【アップロードされた資料（" + name + "）】\n" + txt;
     content.push({ type: "text", text: blk });
@@ -1191,7 +1195,7 @@ app.post("/api/assistant-file", guard, async (req, res) => {
   const instr = "この資料の内容を、クリニック問い合わせ返信AIのルールブックに登録できる形に整理してください。" + (note ? "\nスタッフからの補足: " + note : "");
   content.push({ type: "text", text: instr });
   geminiParts.push({ text: instr });
-  const existing = rulesList(t).map(r => "[" + r.id + "] " + r.title).join("\n").slice(0, 20000);
+  const existing = rulesList(t).map(r => "[" + r.id + "] " + r.title).join("\n").slice(0, 100000);
   const fsys = "あなたは「みぎうで君」。クリニック返信ルールブックの編集アシスタントです。渡された資料（価格表・案内文・FAQ・CSVなど）を読み取り、回答AIがそのまま使える簡潔で具体的な日本語ルールに変換します。"
     + "料金表はカテゴリごとに数件のルールにまとめる。数字・金額・条件は資料から正確に転記し、読み取れない部分は省いて勝手に補完しない。"
     + "\n既存ルールの見出し一覧（同じテーマの資料なら新規追加ではなくその番号へのupdateにする）:\n" + (existing || "（まだルールはありません）")
@@ -1814,7 +1818,7 @@ async function asstSend(){const t=document.getElementById("asstText");const txt=
   const ph=spinAdd(asstMsgsEl,"考え中…");asstCall(ph);}
 function asstAttach(){const inp=document.createElement("input");inp.type="file";inp.accept="image/*,.pdf,.csv,.txt";
   inp.onchange=async()=>{const f=inp.files[0];if(!f)return;
-    if(f.size>8*1024*1024){alert("8MB以下のファイルにしてください");return;}
+    if(f.size>14*1024*1024){alert("14MB以下のファイルにしてください");return;}
     amAdd("user","📎 "+f.name);const ph=spinAdd(asstMsgsEl,"資料を読み込んでいます…（少し時間がかかります）");
     try{
       const b64=await new Promise((res2,rej)=>{const rd=new FileReader();rd.onload=()=>res2(String(rd.result).split(",")[1]);rd.onerror=rej;rd.readAsDataURL(f);});
