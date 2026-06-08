@@ -35,7 +35,8 @@ const TEN = {};
 function newTenant(slug, name, config) {
   config = config || {};
   if (!config.conn || typeof config.conn !== "object") config.conn = {};
-  if (!config.settings || typeof config.settings !== "object") config.settings = { autoReply: false, level: "high", tone: "", autoDelayMin: 0 };
+  if (!config.settings || typeof config.settings !== "object") config.settings = { autoReply: false, level: "high", tone: "", autoDelayMin: 0, engine: "gemini" };
+  if (!["claude", "gpt", "gemini"].includes(config.settings.engine)) config.settings.engine = "gemini"; // 文章作成の既定はGemini
   if (typeof config.settings.autoReply !== "boolean") config.settings.autoReply = false;
   if (config.settings.level !== "high" && config.settings.level !== "medium") config.settings.level = "high";
   if (typeof config.settings.tone !== "string") config.settings.tone = "";
@@ -207,9 +208,16 @@ function rulesSearch(t, query, limit) {
   return scored.slice(0, limit).map(x => x.r);
 }
 // ルールをAIに渡すブロックを作る。ルールは絶対に途中で切らない（万一物理上限に近づいたら関連性の低いルールを丸ごと外す）
+const RULE_BUDGETS = { claude: 150000, gpt: 300000, gemini: 600000 }; // 各AIの物理枠（文字数）。ここを超えると関連性の低いルールが除外される
 function ruleBudget(t) {
-  const eng = (S(t).engine || "claude");
-  return eng === "gemini" ? 600000 : eng === "gpt" ? 300000 : 150000; // 各AIの物理枠いっぱいまで使う
+  const eng = (S(t).engine || "gemini");
+  return RULE_BUDGETS[eng] || RULE_BUDGETS.gemini;
+}
+// ルールブックの合計文字数（rulesBlockと同じ換算: 「・タイトル: 本文」＋改行1）
+function rulesCharTotal(t) {
+  let n = 0;
+  for (const r of rulesList(t)) { n += ("・" + r.title + ": " + String(r.content || "")).length + 1; }
+  return n;
 }
 function rulesBlock(list, budget) {
   budget = budget || 150000;
@@ -253,7 +261,7 @@ app.get("/health", (req, res) => res.json({ ok: true, tenants: Object.keys(TEN).
 // ===== AIエンジン切り替え（返信文の生成のみ。みぎうで君等のシステム系はClaude固定） =====
 // t.config.settings.engine: "claude"(標準) | "gpt" | "gemini"。各エンジンのAPIキーは環境変数（OPENAI_KEY / GEMINI_KEY、全テナント共通）
 async function aiChat(t, system, messages, maxTokens){
-  const eng = (S(t).engine || "claude");
+  const eng = (S(t).engine || "gemini"); // 既定はGemini（文章作成）。Gemini失敗時のみ下のClaudeに保険でフォールバック
   if(eng === "gpt" && process.env.OPENAI_KEY){
     try{
       const model = process.env.OPENAI_MODEL || "gpt-5.4";
@@ -285,6 +293,29 @@ async function aiChat(t, system, messages, maxTokens){
     const d = await r.json();
     return (d.content && d.content[0] && d.content[0].text) || null;
   }catch(e){ return null; }
+}
+
+// Gemini ネイティブ generateContent（PDF・画像・大容量テキストの資料読み込み用。OpenAI互換のaiChatは添付不可のためこちらを使う）
+async function geminiGenerate(systemText, userParts, maxTokens) {
+  if (!process.env.GEMINI_KEY) return null;
+  const model = process.env.GEMINI_MODEL || "gemini-3-flash";
+  try {
+    const parts = (userParts || []).map(p => (p && p.inlineData)
+      ? { inlineData: { mimeType: p.inlineData.mimeType, data: p.inlineData.data } }
+      : { text: String((p && p.text) || "") });
+    const body = {
+      systemInstruction: { parts: [{ text: String(systemText || "") }] },
+      contents: [{ role: "user", parts }],
+      generationConfig: { maxOutputTokens: maxTokens || 2000 }
+    };
+    const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + encodeURIComponent(process.env.GEMINI_KEY), {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!r.ok) { console.error("gemini-gen:", r.status, (await r.text().catch(() => "")).slice(0, 200)); return null; }
+    const d = await r.json();
+    const cand = d.candidates && d.candidates[0];
+    const txt = cand && cand.content && cand.content.parts && cand.content.parts.map(p => p.text || "").join("");
+    return txt || null;
+  } catch (e) { console.error("gemini-gen:", e.message); return null; }
 }
 
 // ===== AI brain: shared draft generator (used by LINE + email, in-app) =====
@@ -768,7 +799,7 @@ app.post("/api/conn", guard, async (req, res) => {
   res.json({ ok: true, lineConfigured: !!C.lineToken(t) && !!C.lineSecret(t), mailConfigured: !!C.smtpUser(t) && !!C.smtpPass(t), emailInternal: !!emailOn(t) });
 });
 
-app.get("/api/settings", guard, (req, res) => res.json(Object.assign({}, S(req.tenant), { engines: { claude: !!ANTHROPIC_KEY, gpt: !!process.env.OPENAI_KEY, gemini: !!process.env.GEMINI_KEY } })));
+app.get("/api/settings", guard, (req, res) => res.json(Object.assign({}, S(req.tenant), { engines: { claude: !!ANTHROPIC_KEY, gpt: !!process.env.OPENAI_KEY, gemini: !!process.env.GEMINI_KEY }, rules: { chars: rulesCharTotal(req.tenant), count: rulesList(req.tenant).length, budget: ruleBudget(req.tenant), budgets: RULE_BUDGETS } })));
 app.post("/api/settings", guard, async (req, res) => {
   const t = req.tenant;
   if (typeof req.body.autoReply === "boolean") S(t).autoReply = req.body.autoReply;
@@ -784,8 +815,8 @@ app.post("/api/tag", guard, (req, res) => { const t = req.tenant; const c = t.st
 
 app.post("/api/ai-regen", guard, async (req, res) => {
   const t = req.tenant;
-  const key = ANTHROPIC_KEY; const idea = (req.body.idea || "").trim();
-  if (!key) return res.json({ ok: false, error: "no_ai_key" });
+  const idea = (req.body.idea || "").trim();
+  if (!ANTHROPIC_KEY && !process.env.OPENAI_KEY && !process.env.GEMINI_KEY) return res.json({ ok: false, error: "no_ai_key" });
   if (!idea) return res.json({ ok: false, error: "empty" });
   const c = t.store[req.body.id] || null;
   const channel = c ? c.channel : (req.body.channel || "line");
@@ -818,10 +849,8 @@ app.post("/api/ai-regen", guard, async (req, res) => {
     + "\n" + JP_QUALITY
     + "\n出力はそのままお客様に送信される。だからお客様に送る返信文だけを出力すること。【】付きの見出し、状況の説明、会話の引用、区切り線(---)、前置き、かぎ括弧は一切含めてはいけない。1文字目から返信本文で始めること。";
   try {
-    const resp = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" }, body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1000, system: sys, messages: msgsArr }) });
-    if (!resp.ok) { return res.json({ ok: false, error: "ai_" + resp.status }); }
-    const data = await resp.json();
-    let text = (data.content && data.content[0] && data.content[0].text) || "";
+    let text = await aiChat(t, sys, msgsArr, 1000); // 選択中エンジン（既定Gemini）で生成
+    if (!text) { return res.json({ ok: false, error: "ai_error" }); }
     // safety: strip any echoed meta sections (headers / separators) the model might add
     if (/\n-{3,}\n?/.test(text)) text = text.split(/\n-{3,}\n?/).pop();
     const lines = text.split("\n");
@@ -1065,8 +1094,7 @@ app.get("/api/rules-for-ai", (req, res) => {
 // みぎうで君: rulebook-editing chat. Server only allows rule add/update/delete — nothing else.
 app.post("/api/assistant", guard, async (req, res) => {
   const t = req.tenant;
-  const key = ANTHROPIC_KEY;
-  if (!key) return res.json({ ok: false, error: "no_ai_key" });
+  if (!process.env.GEMINI_KEY && !ANTHROPIC_KEY && !process.env.OPENAI_KEY) return res.json({ ok: false, error: "no_ai_key" });
   const msgs = (Array.isArray(req.body.messages) ? req.body.messages : []).slice(-12)
     .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
     .map(m => ({ role: m.role, content: m.content.slice(0, 4000) }));
@@ -1084,7 +1112,7 @@ app.post("/api/assistant", guard, async (req, res) => {
   }
   const searchKey = msgs.map(m => m.content).join(" ") + (ctx ? " " + String(ctx.customer || "") + " " + String(ctx.finalText || "") : "");
   const rel = rulesRanked(t, searchKey.slice(0, 2000)); // 全ルール・関連度順（途中で切らない）
-  const list = rel.map(r => "[" + r.id + "] " + r.title + ": " + String(r.content||"")).join("\n").slice(0, 100000) || "（まだルールはありません）";
+  const list = rel.map(r => "[" + r.id + "] " + r.title + ": " + String(r.content||"")).join("\n").slice(0, 400000) || "（まだルールはありません）";
   const totalRules = rulesList(t).length;
   const sys = "あなたは「みぎうで君」。クリニック問い合わせ返信システムの『返信ルールブック』編集専用アシスタントです。"
     + "できることはルールの追加・修正・削除の提案と、現在のルール内容の説明だけです。守ること:"
@@ -1098,12 +1126,8 @@ app.post("/api/assistant", guard, async (req, res) => {
     + (lead ? "\n\nあなたは会話の冒頭で既にこう発言済み（ユーザーはこれへの返事をしている）: " + lead.slice(0, 500) : "")
     + "\n\n関連する既存ルール（全" + totalRules + "件中、この会話に関連するもののみ抽出。編集判断用、ユーザーにそのまま見せない）:\n" + list + ctxTxt;
   try {
-    const resp = await fetch("https://api.anthropic.com/v1/messages", { method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1500, system: sys, messages: msgs }) });
-    if (!resp.ok) return res.json({ ok: false, error: "ai_" + resp.status });
-    const data = await resp.json();
-    const raw = (data.content && data.content[0] && data.content[0].text) || "";
+    const raw = await aiChat(t, sys, msgs, 1500) || ""; // 既定Gemini（失敗時はaiChat内でClaude保険）
+    if (!raw) return res.json({ ok: false, error: "ai_error" });
     let out = { reply: "", proposals: [], actions: [] };
     try { const m = raw.match(/\{[\s\S]*\}/); out = JSON.parse(m ? m[0] : raw); } catch (e) { out = { reply: raw.slice(0, 1200), proposals: [], actions: [] }; }
     const proposals = (Array.isArray(out.proposals) ? out.proposals : []).filter(a => a && typeof a === "object" && (a.op === "delete" ? t.rules[a.id] : (typeof a.content === "string" && a.content.trim()))).slice(0, 20)
@@ -1140,37 +1164,47 @@ app.post("/api/rules-apply", guard, async (req, res) => {
 // みぎうで君への資料アップロード（画像・PDF・CSV/テキスト）→ ルール案に一括変換
 app.post("/api/assistant-file", guard, async (req, res) => {
   const t = req.tenant;
-  const key = ANTHROPIC_KEY;
-  if (!key) return res.json({ ok: false, error: "no_ai_key" });
+  if (!process.env.GEMINI_KEY && !ANTHROPIC_KEY) return res.json({ ok: false, error: "no_ai_key" });
   const name = String(req.body.name || "file").slice(0, 200);
   const mime = String(req.body.mime || "").toLowerCase();
   const note = String(req.body.note || "").slice(0, 500);
   let buf; try { buf = Buffer.from(String(req.body.data || ""), "base64"); } catch (e) { return res.status(400).json({ error: "bad data" }); }
   if (!buf || !buf.length) return res.json({ ok: false, error: "empty" });
   if (buf.length > 8 * 1024 * 1024) return res.json({ ok: false, error: "too_large" });
-  const content = [];
+  const content = [];      // Claude（フォールバック）用ペイロード
+  const geminiParts = [];  // Gemini（優先）用ペイロード
   if (/^image\/(jpeg|png|gif|webp)$/.test(mime)) {
-    content.push({ type: "image", source: { type: "base64", media_type: mime, data: buf.toString("base64") } });
+    const b64 = buf.toString("base64");
+    content.push({ type: "image", source: { type: "base64", media_type: mime, data: b64 } });
+    geminiParts.push({ inlineData: { mimeType: mime, data: b64 } });
   } else if (mime === "application/pdf" || /\.pdf$/i.test(name)) {
-    content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: buf.toString("base64") } });
+    const b64 = buf.toString("base64");
+    content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } });
+    geminiParts.push({ inlineData: { mimeType: "application/pdf", data: b64 } });
   } else {
-    const txt = buf.toString("utf8").slice(0, 30000);
+    const txt = buf.toString("utf8").slice(0, 200000); // テキスト/CSVの読み込み上限（Gemini大容量に合わせ拡大）
     if (!txt.trim()) return res.json({ ok: false, error: "unsupported" });
-    content.push({ type: "text", text: "【アップロードされた資料（" + name + "）】\n" + txt });
+    const blk = "【アップロードされた資料（" + name + "）】\n" + txt;
+    content.push({ type: "text", text: blk });
+    geminiParts.push({ text: blk });
   }
-  content.push({ type: "text", text: "この資料の内容を、クリニック問い合わせ返信AIのルールブックに登録できる形に整理してください。" + (note ? "\nスタッフからの補足: " + note : "") });
-  const existing = rulesList(t).map(r => "[" + r.id + "] " + r.title).join("\n").slice(0, 4000);
+  const instr = "この資料の内容を、クリニック問い合わせ返信AIのルールブックに登録できる形に整理してください。" + (note ? "\nスタッフからの補足: " + note : "");
+  content.push({ type: "text", text: instr });
+  geminiParts.push({ text: instr });
+  const existing = rulesList(t).map(r => "[" + r.id + "] " + r.title).join("\n").slice(0, 20000);
   const fsys = "あなたは「みぎうで君」。クリニック返信ルールブックの編集アシスタントです。渡された資料（価格表・案内文・FAQ・CSVなど）を読み取り、回答AIがそのまま使える簡潔で具体的な日本語ルールに変換します。"
     + "料金表はカテゴリごとに数件のルールにまとめる。数字・金額・条件は資料から正確に転記し、読み取れない部分は省いて勝手に補完しない。"
     + "\n既存ルールの見出し一覧（同じテーマの資料なら新規追加ではなくその番号へのupdateにする）:\n" + (existing || "（まだルールはありません）")
     + "\n出力は必ず次のJSONのみ: {\"reply\":\"資料から読み取った内容の短い要約説明（ユーザー向け）\",\"items\":[{\"op\":\"add\",\"title\":\"見出し\",\"content\":\"ルール本文\"} または {\"op\":\"update\",\"id\":番号,\"title\":\"...\",\"content\":\"...\"}]}";
   try {
-    const resp = await fetch("https://api.anthropic.com/v1/messages", { method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 3500, system: fsys, messages: [{ role: "user", content }] }) });
-    if (!resp.ok) return res.json({ ok: false, error: "ai_" + resp.status });
-    const data = await resp.json();
-    const raw = (data.content && data.content[0] && data.content[0].text) || "";
+    let raw = await geminiGenerate(fsys, geminiParts, 3500) || ""; // 資料読み込みはGemini優先（大容量・低コスト）
+    if (!raw && ANTHROPIC_KEY) { // Gemini失敗時のみClaudeにフォールバック
+      const resp = await fetch("https://api.anthropic.com/v1/messages", { method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 3500, system: fsys, messages: [{ role: "user", content }] }) });
+      if (resp.ok) { const data = await resp.json(); raw = (data.content && data.content[0] && data.content[0].text) || ""; }
+    }
+    if (!raw) return res.json({ ok: false, error: "ai_error" });
     let out = { reply: "", items: [] };
     try { const m = raw.match(/\{[\s\S]*\}/); out = JSON.parse(m ? m[0] : raw); } catch (e) { out = { reply: raw.slice(0, 800), items: [] }; }
     const proposals = (Array.isArray(out.items) ? out.items : []).filter(a => a && typeof a === "object" && typeof a.content === "string" && a.content.trim()).slice(0, 60)
@@ -1597,12 +1631,16 @@ const PAGE = `<!DOCTYPE html>
   <div style="font-size:11px;color:#6b7280;margin-top:2px;">例：5 と入れると、メッセージ受信から5分後に自動返信します。0 なら即時。返信文の生成に設定時間以上かかった場合は、できあがり次第すぐ送信します。</div>
   <div style="border-top:1px solid #e5e7eb;margin-top:14px;padding-top:10px;">
     <div style="font-size:13px;margin-bottom:4px;">🧠 返信文を作るAIエンジン</div>
-    <select id="setEngine" style="width:100%;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:13px;">
-      <option value="claude">Claude（標準）</option>
-      <option value="gpt">ChatGPT（GPT）</option>
-      <option value="gemini">Gemini（最安）</option>
+    <select id="setEngine" onchange="renderRuleGauge()" style="width:100%;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:13px;">
+      <option value="gemini">Gemini（gemini-3-flash・標準）</option>
     </select>
-    <div id="engineNote" style="font-size:11px;color:#6b7280;margin-top:2px;">AI下書き・自動返信・AIで作り直すの文章生成に使うAIです。キー未設定のエンジンを選ぶと自動的にClaudeで動きます。</div>
+    <div id="engineNote" style="font-size:11px;color:#6b7280;margin-top:2px;">文章作成（AI下書き・自動返信・AIで作り直す）はGeminiで統一しています。みぎうで君チャットと資料読み込みは引き続きClaudeを使用します。</div>
+  </div>
+  <div style="border-top:1px solid #e5e7eb;margin-top:14px;padding-top:10px;">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;"><span style="font-size:13px;">📚 ルールブックの使用量</span><span id="ruleGaugePct" style="font-size:12px;font-weight:600;color:#6b7280;">—</span></div>
+    <div style="background:#e5e7eb;border-radius:999px;height:10px;overflow:hidden;"><div id="ruleGaugeBar" style="height:100%;width:0%;background:#16a34a;transition:width .25s,background .25s;"></div></div>
+    <div id="ruleGaugeText" style="font-size:11px;color:#6b7280;margin-top:4px;">読み込み中…</div>
+    <div id="ruleGaugeWarn" style="font-size:11px;color:#dc2626;margin-top:2px;display:none;"></div>
   </div>
   <div style="border-top:1px solid #e5e7eb;margin-top:14px;padding-top:10px;">
     <div style="font-size:13px;margin-bottom:4px;">🎨 回答全体のトーン・文体</div>
@@ -1805,8 +1843,28 @@ async function sendAndLearn(){const c=DATA.find(x=>x.id===current);if(!c)return;
   await sendMsg();
   openAsst(ctx);}
 // ---- settings popup ----
-async function openSet(){try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"claude";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);
-  if(s.engines){const n=document.getElementById("engineNote");const st=[];st.push("Claude:"+(s.engines.claude?"✓":"未"));st.push("GPT:"+(s.engines.gpt?"✓":"キー未設定"));st.push("Gemini:"+(s.engines.gemini?"✓":"キー未設定"));n.textContent="利用可能: "+st.join(" / ")+"。キー未設定のエンジンを選ぶと自動的にClaudeで動きます。";}}catch(e){}
+function renderRuleGauge(){
+  const info=window.__rules; const bar=document.getElementById("ruleGaugeBar"); if(!bar) return;
+  const pctEl=document.getElementById("ruleGaugePct"), txt=document.getElementById("ruleGaugeText"), warn=document.getElementById("ruleGaugeWarn");
+  if(!info){ if(txt) txt.textContent="—"; return; }
+  const eng=(document.getElementById("setEngine").value)||"claude";
+  const budget=(info.budgets&&info.budgets[eng])||info.budget||150000;
+  const used=info.chars||0;
+  const ratio=budget>0?used/budget:0;
+  bar.style.width=Math.min(100,Math.round(ratio*100))+"%";
+  let color="#16a34a"; if(ratio>=0.9) color="#dc2626"; else if(ratio>=0.7) color="#f59e0b";
+  bar.style.background=color;
+  if(pctEl){ pctEl.textContent=Math.round(ratio*100)+"%"; pctEl.style.color=color; }
+  const eName=({claude:"Claude",gpt:"GPT",gemini:"Gemini"})[eng]||eng;
+  if(txt) txt.textContent="ルール"+(info.count||0)+"件 ・ "+used.toLocaleString()+"文字 / 枠"+budget.toLocaleString()+"文字（"+eName+"）";
+  if(warn){
+    if(ratio>=1){ warn.style.display="block"; warn.style.color="#dc2626"; warn.textContent="⚠ 枠を超えています。各返信では質問に関連度の高いルールから枠まで読み込み、入りきらないルールは除外されます。"; }
+    else if(ratio>=0.9){ warn.style.display="block"; warn.style.color="#f59e0b"; warn.textContent="残りわずかです。これ以上増やすと一部ルールが読み込まれない場合があります。"; }
+    else { warn.style.display="none"; }
+  }
+}
+async function openSet(){try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value="gemini";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);window.__rules=s.rules||null;renderRuleGauge();
+  if(s.engines){const n=document.getElementById("engineNote");n.textContent="文章作成はGeminiで統一"+(s.engines.gemini?"（Geminiキー✓）":"（⚠Geminiキー未設定＝保険でClaude動作）")+"。みぎうで君チャット・資料読み込みはClaude"+(s.engines.claude?"✓":"⚠キー未設定")+"。";}}catch(e){}
   try{const cr=await fetch("/api/conn");const c=await cr.json();document.getElementById("connStat").textContent=(c.lineConfigured?"LINE✓ ":"LINE未 ")+(c.mailConfigured?"メール✓":"メール未");document.getElementById("cSmtpHost").value=c.smtpHost||"";document.getElementById("cSmtpPort").value=c.smtpPort||"";document.getElementById("cSmtpUser").value=c.smtpUser||"";document.getElementById("cImapHost").value=c.imapHost||"";document.getElementById("cImapPort").value=c.imapPort||"";document.getElementById("cImapUser").value=c.imapUser||"";document.getElementById("cEmailInternal").checked=!!c.emailInternal;renderAccts(c);}catch(e){}
   document.getElementById("setPop").style.display="flex";}
 function renderAccts(c){const el=document.getElementById("acctList");if(!el)return;let h="";
