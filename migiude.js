@@ -114,6 +114,8 @@ function loginIdTaken(id, exceptSlug){
   return Object.values(TEN).some(x => x.slug !== exceptSlug && ((x.config.loginId || x.slug) === id));
 }
 app.post("/api/signup", async (req, res) => {
+  return res.status(403).json({ ok: false, error: "signup_closed" }); // 新規契約は運営（受付くん管理画面）経由のみ
+
   const name = String(req.body.company || req.body.name || "").trim().slice(0, 80);
   const pass = String(req.body.password || "");
   const loginId = String(req.body.loginId || "").trim();
@@ -1251,7 +1253,7 @@ app.get("/sso", (req,res)=>{
 setInterval(()=>{ const now=Date.now(); for(const k of Object.keys(SSO_TOKENS)) if(SSO_TOKENS[k].exp < now) delete SSO_TOKENS[k]; }, 60000);
 
 app.get("/", (req, res) => { res.set("Content-Type", "text/html; charset=utf-8"); res.set("Cache-Control", "no-store"); res.send(tenantFromReq(req) ? PAGE : LOGIN_PAGE); });
-app.get("/signup", (req, res) => { res.set("Content-Type", "text/html; charset=utf-8"); res.set("Cache-Control", "no-store"); res.send(SIGNUP_PAGE); });
+app.get("/signup", (req, res) => res.redirect("/")); // 申込みは営業契約後に運営が作成
 app.get("/board", (req, res) => { res.set("Content-Type", "text/html; charset=utf-8"); res.set("Cache-Control", "no-store"); res.send(tenantFromReq(req) ? BOARD_PAGE : LOGIN_PAGE); });
 (async () => {
   try { if (pool) await dbInit(); } catch (e) { console.error("dbInit failed:", e.message); }
@@ -1270,7 +1272,7 @@ const LOGIN_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><
 <input id="p" type="password" placeholder="パスワード" style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;" onkeydown="if(event.key==='Enter'&&!event.isComposing&&event.keyCode!==229)go()">
 <button onclick="go()" style="width:100%;padding:11px;border:none;border-radius:8px;background:#06c755;color:#fff;font-size:15px;font-weight:600;cursor:pointer;">ログイン</button>
 <div id="e" style="color:#dc2626;font-size:12px;margin-top:8px;min-height:14px;"></div>
-<div style="text-align:center;margin-top:6px;"><a href="/signup" style="font-size:12px;color:#2563eb;">新規お申し込みはこちら</a></div>
+<div style="text-align:center;margin-top:6px;font-size:11px;color:#9ca3af;">ご利用開始をご希望の方は運営までお問い合わせください</div>
 <div style="text-align:center;margin-top:8px;font-size:11px;color:#9ca3af;">ログインID・パスワードを忘れた場合は運営にお問い合わせください</div></div>
 <script>async function go(){const loginId=document.getElementById("lid").value.trim();const password=document.getElementById("p").value;if(!loginId){document.getElementById("e").textContent="ログインIDを入力してください";return;}const r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({loginId,password})});if(r.ok){location.reload();}else{document.getElementById("e").textContent="ログインIDかパスワードが違います";document.getElementById("p").value="";}}</script>
 </body></html>`;
