@@ -110,13 +110,19 @@ function tenantFromReq(req) {
 function guard(req, res, next) { const t = tenantFromReq(req); if (!t) return res.status(401).json({ error: "auth" }); req.tenant = t; next(); }
 function slugify(name) { const base = String(name || "clinic").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 20) || "clinic"; return base + "-" + crypto.randomBytes(2).toString("hex"); }
 
+function loginIdTaken(id, exceptSlug){
+  return Object.values(TEN).some(x => x.slug !== exceptSlug && ((x.config.loginId || x.slug) === id));
+}
 app.post("/api/signup", async (req, res) => {
   const name = String(req.body.company || req.body.name || "").trim().slice(0, 80);
   const pass = String(req.body.password || "");
+  const loginId = String(req.body.loginId || "").trim();
   if (!name) return res.status(400).json({ ok: false, error: "name" });
+  if (!/^[a-zA-Z0-9_-]{3,30}$/.test(loginId)) return res.status(400).json({ ok: false, error: "bad_id" });
   if (pass.length < 8) return res.status(400).json({ ok: false, error: "too_short" });
+  if (loginIdTaken(loginId)) return res.status(409).json({ ok: false, error: "id_taken" });
   const slug = slugify(name);
-  const config = { passHash: sha(pass), conn: {}, settings: { autoReply: false, level: "high", tone: "" } };
+  const config = { passHash: sha(pass), loginId, conn: {}, settings: { autoReply: false, level: "high", tone: "" } };
   const t = TEN[slug] = newTenant(slug, name, config);
   if (pool) { try { await pool.query("INSERT INTO tenants (slug,name,config) VALUES ($1,$2,$3)", [slug, name, t.config]); } catch (e) { delete TEN[slug]; return res.status(500).json({ ok: false, error: "db" }); } }
   seedTenant(t); // 本番と同様、新規テナントにはデモ会話を入れて空っぽにしない
@@ -124,16 +130,23 @@ app.post("/api/signup", async (req, res) => {
   res.json({ ok: true, slug });
 });
 app.post("/api/login", (req, res) => {
-  const company = String(req.body.company || "").trim();
+  const loginId = String(req.body.loginId || req.body.company || "").trim();
   const pass = String(req.body.password || "");
-  // 会社名でマッチ（同名がいる場合はパスワードが一致するテナント）。slug直指定もログイン可
-  const cand = Object.values(TEN).filter(x => x.name === company);
-  if (TEN[company]) cand.push(TEN[company]);
-  const t = cand.find(x => x.config.passHash && sha(pass) === x.config.passHash);
+  // ログインIDでマッチ（未設定テナントはslugがID代わり）
+  const t = Object.values(TEN).find(x => (x.config.loginId || x.slug) === loginId && x.config.passHash && sha(pass) === x.config.passHash);
   if (!t) return res.status(401).json({ ok: false });
   if (t.config.suspended) return res.status(403).json({ ok: false, error: "suspended" });
   setSess(res, t);
   res.json({ ok: true, slug: t.slug });
+});
+app.post("/api/change-loginid", guard, async (req, res) => {
+  const t = req.tenant;
+  const next = String(req.body.next || "").trim();
+  if (!/^[a-zA-Z0-9_-]{3,30}$/.test(next)) return res.status(400).json({ ok: false, error: "bad_id" });
+  if (loginIdTaken(next, t.slug)) return res.status(409).json({ ok: false, error: "id_taken" });
+  t.config.loginId = next;
+  try { await saveTenantConfig(t); } catch (e) { return res.status(500).json({ ok: false, error: "save" }); }
+  res.json({ ok: true, loginId: next });
 });
 app.post("/api/logout", (req, res) => { res.set("Set-Cookie", "sess=; Path=/; HttpOnly; Max-Age=0"); res.json({ ok: true }); });
 app.post("/api/change-pass", guard, async (req, res) => {
@@ -1253,13 +1266,13 @@ const LOGIN_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><
 <div style="background:#fff;padding:28px 24px;border-radius:14px;width:min(90vw,320px);box-shadow:0 2px 14px rgba(0,0,0,.08);">
 <div style="font-size:18px;font-weight:600;margin-bottom:4px;">📥 受信トレイ</div>
 <div style="font-size:13px;color:#6b7280;margin-bottom:18px;">ログイン</div>
-<input id="company" placeholder="会社名（登録した名前）" autocapitalize="off" autofocus style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;">
+<input id="lid" placeholder="ログインID" autocapitalize="off" autofocus style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;">
 <input id="p" type="password" placeholder="パスワード" style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;" onkeydown="if(event.key==='Enter'&&!event.isComposing&&event.keyCode!==229)go()">
 <button onclick="go()" style="width:100%;padding:11px;border:none;border-radius:8px;background:#06c755;color:#fff;font-size:15px;font-weight:600;cursor:pointer;">ログイン</button>
 <div id="e" style="color:#dc2626;font-size:12px;margin-top:8px;min-height:14px;"></div>
 <div style="text-align:center;margin-top:6px;"><a href="/signup" style="font-size:12px;color:#2563eb;">新規お申し込みはこちら</a></div>
-<div style="text-align:center;margin-top:8px;font-size:11px;color:#9ca3af;">パスワードを忘れた場合は運営にお問い合わせください</div></div>
-<script>async function go(){const company=document.getElementById("company").value.trim();const password=document.getElementById("p").value;if(!company){document.getElementById("e").textContent="会社名を入力してください";return;}const r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({company,password})});if(r.ok){location.reload();}else{document.getElementById("e").textContent="会社名かパスワードが違います";document.getElementById("p").value="";}}</script>
+<div style="text-align:center;margin-top:8px;font-size:11px;color:#9ca3af;">ログインID・パスワードを忘れた場合は運営にお問い合わせください</div></div>
+<script>async function go(){const loginId=document.getElementById("lid").value.trim();const password=document.getElementById("p").value;if(!loginId){document.getElementById("e").textContent="ログインIDを入力してください";return;}const r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({loginId,password})});if(r.ok){location.reload();}else{document.getElementById("e").textContent="ログインIDかパスワードが違います";document.getElementById("p").value="";}}</script>
 </body></html>`;
 
 const SIGNUP_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>新規お申し込み</title></head>
@@ -1269,12 +1282,14 @@ const SIGNUP_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
 <div style="font-size:13px;color:#6b7280;margin-bottom:18px;">新規お申し込み</div>
 <label style="font-size:12px;color:#374151;display:block;margin:0 0 3px;">会社名（クリニック・店舗名）</label>
 <input id="company" placeholder="例：歯と美容のクリニック" autofocus style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;">
+<label style="font-size:12px;color:#374151;display:block;margin:0 0 3px;">ログインID（半角英数字。スタッフ全員がログインに使います）</label>
+<input id="lid" autocapitalize="off" placeholder="例：hbclinic" style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;">
 <label style="font-size:12px;color:#374151;display:block;margin:0 0 3px;">ログインパスワード（8文字以上）</label>
 <input id="p" type="password" style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;" onkeydown="if(event.key==='Enter'&&!event.isComposing&&event.keyCode!==229)go()">
 <button onclick="go()" style="width:100%;padding:11px;border:none;border-radius:8px;background:#06c755;color:#fff;font-size:15px;font-weight:600;cursor:pointer;">アカウントを作成</button>
 <div id="e" style="color:#dc2626;font-size:12px;margin-top:8px;min-height:14px;"></div>
 <div style="text-align:center;margin-top:6px;"><a href="/" style="font-size:12px;color:#6b7280;">既にアカウントをお持ちの方はこちら</a></div></div>
-<script>async function go(){const company=document.getElementById("company").value.trim();const password=document.getElementById("p").value;const e=document.getElementById("e");if(!company){e.textContent="会社名を入力してください";return;}if(password.length<8){e.textContent="パスワードは8文字以上にしてください";return;}const r=await fetch("/api/signup",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({company,password})});let j={};try{j=await r.json();}catch(err){}if(j.ok){location.href="/";}else{e.textContent=j.error==="too_short"?"パスワードは8文字以上にしてください":"作成に失敗しました";}}</script>
+<script>async function go(){const company=document.getElementById("company").value.trim();const loginId=document.getElementById("lid").value.trim();const password=document.getElementById("p").value;const e=document.getElementById("e");if(!company){e.textContent="会社名を入力してください";return;}if(!/^[a-zA-Z0-9_-]{3,30}$/.test(loginId)){e.textContent="ログインIDは半角英数字3〜30文字にしてください";return;}if(password.length<8){e.textContent="パスワードは8文字以上にしてください";return;}const r=await fetch("/api/signup",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({company,loginId,password})});let j={};try{j=await r.json();}catch(err){}if(j.ok){location.href="/";}else{e.textContent=j.error==="too_short"?"パスワードは8文字以上にしてください":j.error==="id_taken"?"このログインIDは既に使われています":j.error==="bad_id"?"ログインIDは半角英数字3〜30文字にしてください":"作成に失敗しました";}}</script>
 </body></html>`;
 
 const BOARD_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>現場ボード</title>
@@ -1490,6 +1505,7 @@ const PAGE = `<!DOCTYPE html>
     </div>
   </div>
   <div style="border-top:1px solid #e5e7eb;margin-top:12px;padding-top:10px;display:flex;flex-direction:column;gap:8px;">
+    <button class="cbtn" style="width:100%;" onclick="changeLoginId()">🪪 ログインIDを変更</button>
     <button class="cbtn" style="width:100%;" onclick="changePass()">🔑 ログインパスワードを変更</button>
     <button class="cbtn" style="width:100%;" onclick="location.href='/api/backup'">💾 バックアップをダウンロード（会話・ルール・設定）</button>
     <button class="cbtn" style="width:100%;" onclick="doLogout()">↩ ログアウト</button>
@@ -1689,6 +1705,12 @@ async function delAcct(kind,i){if(!confirm("この連携を削除しますか？
 async function saveConn(){const g=id=>document.getElementById(id).value.trim();const body={lineSecret:g("cLineSecret"),lineToken:g("cLineToken"),smtpHost:g("cSmtpHost"),smtpPort:g("cSmtpPort"),smtpUser:g("cSmtpUser"),smtpPass:g("cSmtpPass"),imapHost:g("cImapHost"),imapPort:g("cImapPort"),imapUser:g("cImapUser"),imapPass:g("cImapPass"),emailInternal:document.getElementById("cEmailInternal").checked};try{const r=await api("/api/conn",body);const j=await r.json();if(j.ok){alert("連携設定を保存しました。\\nLINE: "+(j.lineConfigured?"設定済み":"未設定")+" / メール: "+(j.mailConfigured?"設定済み":"未設定")+" / メール直接監視: "+(j.emailInternal?"オン":"オフ"));["cLineSecret","cLineToken","cSmtpPass","cImapPass"].forEach(id=>document.getElementById(id).value="");}else alert("保存に失敗しました");}catch(e){alert("保存に失敗しました");}}
 function closeSet(){document.getElementById("setPop").style.display="none";}
 async function saveSet(){const autoReply=document.getElementById("setAuto").checked;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;try{await api("/api/settings",{autoReply,level,tone,engine});alert("設定を保存しました");}catch(e){alert("保存に失敗しました");}closeSet();}
+async function changeLoginId(){
+  const next=prompt("新しいログインID（半角英数字3〜30文字。スタッフ全員のログインに使います）");if(!next)return;
+  try{const r=await api("/api/change-loginid",{next:next.trim()});const j=await r.json();
+    if(j.ok)alert("ログインIDを「"+j.loginId+"」に変更しました。スタッフに共有してください");
+    else alert(j.error==="id_taken"?"このIDは既に使われています":j.error==="bad_id"?"半角英数字3〜30文字にしてください":"変更に失敗しました");
+  }catch(e){alert("変更に失敗しました");}}
 async function changePass(){
   const cur=prompt("現在のパスワードを入力してください");if(cur===null)return;
   const np=prompt("新しいパスワード（8文字以上）を入力してください");if(np===null)return;
