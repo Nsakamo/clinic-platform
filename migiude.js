@@ -1307,6 +1307,8 @@ app.post("/api/import-own", guard, async (req,res)=>{
 function partnerOk(req){ return !!ADMIN_SECRET && String(req.headers["x-partner-key"]||"") === ADMIN_SECRET; }
 function pGuard(req,res,next){ if(partnerOk(req)) return next(); res.status(401).json({error:"auth"}); }
 const SSO_TOKENS = {}; // token -> {slug, exp}
+const RESET_TOKENS = {}; // パスワード再設定トークン token -> {slug, exp}
+const RESET_REQ_AT = {}; // email -> 最終リクエスト時刻(ms)。簡易レート制限
 app.get("/api/partner/tenants", pGuard, (req,res)=>{
   res.json(Object.values(TEN).map(t=>({ slug:t.slug, name:t.name,
     convos:Object.keys(t.store||{}).length, rules:Object.keys(t.rules||{}).length,
@@ -1435,7 +1437,74 @@ app.get("/sso", (req,res)=>{
   setSess(res, t);
   res.redirect("/");
 });
-setInterval(()=>{ const now=Date.now(); for(const k of Object.keys(SSO_TOKENS)) if(SSO_TOKENS[k].exp < now) delete SSO_TOKENS[k]; }, 60000);
+setInterval(()=>{ const now=Date.now(); for(const k of Object.keys(SSO_TOKENS)) if(SSO_TOKENS[k].exp < now) delete SSO_TOKENS[k]; for(const k of Object.keys(RESET_TOKENS)) if(RESET_TOKENS[k].exp < now) delete RESET_TOKENS[k]; }, 60000);
+
+// ===== パスワードを忘れた方（顧客の自己解決リセット。右腕くん単独で完結） =====
+function tenantByEmail(email){
+  const e = String(email||"").trim().toLowerCase();
+  if(!e || e.indexOf("@") < 0) return null;
+  for(const slug of Object.keys(TEN)){
+    const t = TEN[slug];
+    if(t.config && t.config.suspended) continue;
+    if(mailAccounts(t).some(a => String(a.smtpUser||"").toLowerCase() === e)) return t;
+  }
+  return null;
+}
+async function sendResetEmail(t, toEmail, link){
+  const a = mailAccounts(t).find(x => String(x.smtpUser||"").toLowerCase() === String(toEmail||"").toLowerCase()) || mailAccounts(t)[0];
+  if(!a) return false;
+  try{
+    const nodemailer = require("nodemailer");
+    const tp = nodemailer.createTransport({ host:a.smtpHost, port:a.smtpPort, secure:a.smtpPort===465, auth:{user:a.smtpUser, pass:a.smtpPass} });
+    await tp.sendMail({
+      from: (t.name || "受信トレイ") + " <" + a.smtpUser + ">",
+      to: toEmail,
+      subject: "【受信トレイ】パスワード再設定のご案内",
+      text: "受信トレイのパスワード再設定リクエストを受け付けました。\n下記リンクから新しいパスワードを設定してください（1時間有効・1回のみ）。\n\n" + link + "\n\nお心当たりが無い場合はこのメールを破棄してください。"
+    });
+    return true;
+  }catch(e){ console.error("reset-mail:", e.message); return false; }
+}
+app.get("/forgot", (req,res)=>{ res.set("Content-Type","text/html; charset=utf-8"); res.set("Cache-Control","no-store"); res.send(FORGOT_PAGE); });
+app.post("/api/forgot", async (req,res)=>{
+  const email = String(req.body.email||"").trim().toLowerCase();
+  try{
+    const now = Date.now();
+    if(email && email.indexOf("@")>0 && !(RESET_REQ_AT[email] && now - RESET_REQ_AT[email] < 60000)){
+      RESET_REQ_AT[email] = now;
+      const t = tenantByEmail(email);
+      if(t){
+        const tok = crypto.randomBytes(24).toString("hex");
+        RESET_TOKENS[tok] = { slug: t.slug, exp: now + 60*60000 }; // 1時間有効
+        const link = "https://" + (req.headers.host||"") + "/reset?token=" + tok;
+        await sendResetEmail(t, email, link);
+      }
+    }
+  }catch(e){ console.error("forgot:", e.message); }
+  res.json({ ok:true }); // 列挙対策: 登録有無に関わらず常に成功扱い
+});
+app.get("/reset", (req,res)=>{
+  res.set("Content-Type","text/html; charset=utf-8"); res.set("Cache-Control","no-store");
+  const e = RESET_TOKENS[String(req.query.token||"")];
+  if(!e || Date.now() > e.exp) return res.send(RESET_INVALID_PAGE);
+  res.send(RESET_PAGE(String(req.query.token||"")));
+});
+app.post("/api/reset", async (req,res)=>{
+  const tok = String(req.body.token||"");
+  const password = String(req.body.password||"");
+  const e = RESET_TOKENS[tok];
+  if(!e || Date.now() > e.exp){ if(e) delete RESET_TOKENS[tok]; return res.status(400).json({ ok:false, error:"expired" }); }
+  if(password.length < 8) return res.status(400).json({ ok:false, error:"too_short" });
+  const t = TEN[e.slug];
+  if(!t){ delete RESET_TOKENS[tok]; return res.status(404).json({ ok:false }); }
+  const prev = t.config.passHash;
+  t.config.passHash = sha(password);
+  try{ await saveTenantConfig(t); }
+  catch(err){ t.config.passHash = prev; return res.status(500).json({ ok:false, error:"db" }); }
+  delete RESET_TOKENS[tok]; // 1回限り
+  console.log("self password reset:", t.slug);
+  res.json({ ok:true });
+});
 
 app.get("/", (req, res) => { res.set("Content-Type", "text/html; charset=utf-8"); res.set("Cache-Control", "no-store"); res.send(tenantFromReq(req) ? PAGE : LOGIN_PAGE); });
 app.get("/signup", (req, res) => res.redirect("/")); // 申込みは営業契約後に運営が作成
@@ -1458,9 +1527,40 @@ const LOGIN_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><
 <button onclick="go()" style="width:100%;padding:11px;border:none;border-radius:8px;background:#06c755;color:#fff;font-size:15px;font-weight:600;cursor:pointer;">ログイン</button>
 <div id="e" style="color:#dc2626;font-size:12px;margin-top:8px;min-height:14px;"></div>
 <div style="text-align:center;margin-top:6px;font-size:11px;color:#9ca3af;">ご利用開始をご希望の方は運営までお問い合わせください</div>
-<div style="text-align:center;margin-top:8px;font-size:11px;color:#9ca3af;">ログインID・パスワードを忘れた場合は運営にお問い合わせください</div></div>
+<div style="text-align:center;margin-top:10px;font-size:12px;"><a href="/forgot" style="color:#06c755;text-decoration:none;">パスワードを忘れた方</a></div>
+<div style="text-align:center;margin-top:6px;font-size:11px;color:#9ca3af;">ログインIDが不明な場合は運営にお問い合わせください</div></div>
 <script>async function go(){const loginId=document.getElementById("lid").value.trim();const password=document.getElementById("p").value;if(!loginId){document.getElementById("e").textContent="ログインIDを入力してください";return;}const r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({loginId,password})});if(r.ok){location.reload();}else{document.getElementById("e").textContent="ログインIDかパスワードが違います";document.getElementById("p").value="";}}</script>
 </body></html>`;
+
+const FORGOT_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>パスワード再設定</title></head>
+<body style="font-family:-apple-system,'Hiragino Kaku Gothic ProN',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f3f4f6;">
+<div style="background:#fff;padding:28px 24px;border-radius:14px;width:min(90vw,340px);box-shadow:0 2px 14px rgba(0,0,0,.08);">
+<div style="font-size:17px;font-weight:600;margin-bottom:4px;">🔑 パスワード再設定</div>
+<div style="font-size:13px;color:#6b7280;margin-bottom:16px;">登録メールアドレスに再設定リンクをお送りします。</div>
+<input id="em" type="email" placeholder="登録メールアドレス" autocapitalize="off" autofocus style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;" onkeydown="if(event.key==='Enter'&&!event.isComposing&&event.keyCode!==229)send()">
+<button onclick="send()" id="sb" style="width:100%;padding:11px;border:none;border-radius:8px;background:#06c755;color:#fff;font-size:15px;font-weight:600;cursor:pointer;">再設定リンクを送る</button>
+<div id="msg" style="font-size:12px;margin-top:10px;min-height:14px;color:#374151;"></div>
+<div style="text-align:center;margin-top:12px;font-size:12px;"><a href="/" style="color:#06c755;text-decoration:none;">ログインに戻る</a></div></div>
+<script>async function send(){const email=document.getElementById("em").value.trim();const b=document.getElementById("sb");b.disabled=true;try{await fetch("/api/forgot",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email})});}catch(e){}document.getElementById("msg").textContent="ご登録があれば、再設定リンクをメールでお送りしました。届かない場合は迷惑メールをご確認のうえ、運営にお問い合わせください。";b.disabled=false;}</script>
+</body></html>`;
+
+const RESET_INVALID_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>パスワード再設定</title></head>
+<body style="font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f3f4f6;">
+<div style="background:#fff;padding:28px 24px;border-radius:14px;width:min(90vw,340px);box-shadow:0 2px 14px rgba(0,0,0,.08);text-align:center;">
+<div style="font-size:15px;margin-bottom:12px;color:#374151;">リンクの有効期限が切れているか、無効です。</div>
+<a href="/forgot" style="color:#06c755;text-decoration:none;">もう一度再設定リンクを取得する</a></div>
+</body></html>`;
+
+function RESET_PAGE(tok){ return `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>新しいパスワード</title></head>
+<body style="font-family:-apple-system,'Hiragino Kaku Gothic ProN',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f3f4f6;">
+<div style="background:#fff;padding:28px 24px;border-radius:14px;width:min(90vw,340px);box-shadow:0 2px 14px rgba(0,0,0,.08);">
+<div style="font-size:17px;font-weight:600;margin-bottom:14px;">新しいパスワードを設定</div>
+<input id="p1" type="password" placeholder="新しいパスワード（8文字以上）" style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;">
+<input id="p2" type="password" placeholder="もう一度入力" style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;" onkeydown="if(event.key==='Enter'&&!event.isComposing&&event.keyCode!==229)go()">
+<button onclick="go()" id="sb" style="width:100%;padding:11px;border:none;border-radius:8px;background:#06c755;color:#fff;font-size:15px;font-weight:600;cursor:pointer;">設定する</button>
+<div id="e" style="color:#dc2626;font-size:12px;margin-top:8px;min-height:14px;"></div></div>
+<script>var TOK=${JSON.stringify(tok)};async function go(){var p1=document.getElementById("p1").value,p2=document.getElementById("p2").value,e=document.getElementById("e");if(p1.length<8){e.textContent="8文字以上で入力してください";return;}if(p1!==p2){e.textContent="パスワードが一致しません";return;}var b=document.getElementById("sb");b.disabled=true;try{var r=await fetch("/api/reset",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:TOK,password:p1})});var j=await r.json();if(j.ok){document.body.innerHTML='<div style=\\'font-family:sans-serif;text-align:center;margin-top:25vh;color:#374151;\\'>パスワードを変更しました。<br><br><a href=\\'/\\' style=\\'color:#06c755;\\'>ログインへ</a></div>';}else{e.textContent=(j.error==='too_short'?'8文字以上で入力してください':(j.error==='expired'?'リンクの有効期限が切れています':'設定に失敗しました'));b.disabled=false;}}catch(err){e.textContent="設定に失敗しました";b.disabled=false;}}</script>
+</body></html>`; }
 
 const SIGNUP_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>新規お申し込み</title></head>
 <body style="font-family:-apple-system,'Hiragino Kaku Gothic ProN',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f3f4f6;">
