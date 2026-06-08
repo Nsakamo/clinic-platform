@@ -14,6 +14,10 @@ app.use(express.json({ limit: "16mb", verify: (req, res, buf) => { req.rawBody =
 const PORT = process.env.PORT || 3000;
 const INGEST_KEY = process.env.INGEST_KEY || "clinic-secret";
 const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY || ""; // 全テナント共通（運営持ち）
+// ===== 受付くん（SmileMedi Cloud）連携 =====
+const PARTNER_KEY = process.env.PLATFORM_SECRET || ""; // パートナーAPI共有キー（x-partner-key）。未設定なら連携は無効
+const PARTNER_HOOK_URL = process.env.PARTNER_HOOK_URL || "https://smilemedi-cloud-web.vercel.app/api/hooks/migiude"; // 受信イベントの転送先
+const PARTNER_BOOKING_URL = process.env.PARTNER_BOOKING_URL || "https://smilemedi-cloud-web.vercel.app/api/partner/booking"; // AI下書き前の予約照会
 
 // ---------- Postgres ----------
 let pool = null;
@@ -31,10 +35,12 @@ const TEN = {};
 function newTenant(slug, name, config) {
   config = config || {};
   if (!config.conn || typeof config.conn !== "object") config.conn = {};
-  if (!config.settings || typeof config.settings !== "object") config.settings = { autoReply: false, level: "high", tone: "" };
+  if (!config.settings || typeof config.settings !== "object") config.settings = { autoReply: false, level: "high", tone: "", autoDelayMin: 0 };
   if (typeof config.settings.autoReply !== "boolean") config.settings.autoReply = false;
   if (config.settings.level !== "high" && config.settings.level !== "medium") config.settings.level = "high";
   if (typeof config.settings.tone !== "string") config.settings.tone = "";
+  if (typeof config.settings.autoDelayMin !== "number" || !isFinite(config.settings.autoDelayMin) || config.settings.autoDelayMin < 0) config.settings.autoDelayMin = 0;
+  config.settings.autoDelayMin = Math.min(60, Math.round(config.settings.autoDelayMin)); // 自動返信までの待ち時間（分）。0=即時, 上限60
   return { slug, name: name || slug, config, store: {}, rules: {}, ruleSeq: 1, alerts: [], alertSeq: 1, push: {} };
 }
 async function saveTenantConfig(t) {
@@ -283,6 +289,108 @@ async function aiChat(t, system, messages, maxTokens){
 
 // ===== AI brain: shared draft generator (used by LINE + email, in-app) =====
 const JP_QUALITY ="【日本語の品質（トーン指示よりも優先）】実際の日本人受付スタッフが書いたものと区別がつかない、自然で正しい日本語にすること。不自然な敬語・誤った敬語・二重敬語は絶対に使わない。禁止例:「大変良かったでございます」「拝見させていただきます」「ご確認していただけます」「お伺いさせていただきます」。正しい例:「安心いたしました」「拝見します」「ご確認いただけます」「伺います」。動詞の活用や助詞の誤りがないか、文のつながりが自然か、出力する前に全文を自己点検し、少しでも違和感のある文は書き直してから出力すること。";
+// ===== 受付くん連携: 受信イベント転送（fire-and-forget。失敗してもメイン処理は止めない） =====
+function forwardToPartner(t, c, extra) {
+  try {
+    if (!PARTNER_KEY || !PARTNER_HOOK_URL) return;
+    const payload = {
+      slug: t.slug,
+      convId: c.id,
+      channel: c.channel,
+      userId: c.userId,
+      name: c.name || "",
+      text: c.last || lastText(c) || "",
+      subject: c.subject || "",
+      acct: c.acct || null,
+      ts: c.ts || Date.now(),
+    };
+    if (extra && typeof extra === "object") Object.assign(payload, extra);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, 5000);
+    fetch(PARTNER_HOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-partner-key": PARTNER_KEY },
+      body: JSON.stringify(payload),
+      signal: ctrl.signal,
+    }).then(() => {}).catch(() => {}).finally(() => clearTimeout(timer));
+  } catch (e) {}
+}
+
+// ===== 受付くん連携: AI下書き前の予約照会 =====
+function bookingToText(data) {
+  try {
+    if (!data) return "";
+    if (typeof data === "string") return data.slice(0, 1200);
+    if (data.found === false || data.exists === false || data.ok === false) return "";
+    if (typeof data.text === "string" && data.text.trim()) return data.text.trim().slice(0, 1200);
+    let list = Array.isArray(data.bookings) ? data.bookings : (Array.isArray(data) ? data : null);
+    if (!list && data.booking && typeof data.booking === "object") list = [data.booking];
+    if (list && list.length) {
+      return list.slice(0, 5).map(b => {
+        if (typeof b === "string") return "・" + b;
+        const d = b.date || b.datetime || b.start || b.reservedAt || "";
+        const menu = b.menu || b.service || b.title || b.course || "";
+        const staff = b.staff || b.practitioner || b.doctor || "";
+        const st = b.status || "";
+        const cols = [d, menu, staff, st].filter(Boolean);
+        return cols.length ? "・" + cols.join(" / ") : "";
+      }).filter(Boolean).join("\n").slice(0, 1200);
+    }
+    return "";
+  } catch (e) { return ""; }
+}
+async function fetchBooking(t, c) {
+  try {
+    if (!PARTNER_KEY || !PARTNER_BOOKING_URL) return "";
+    const url = PARTNER_BOOKING_URL
+      + "?slug=" + encodeURIComponent(t.slug)
+      + "&channel=" + encodeURIComponent(c.channel || "")
+      + "&userId=" + encodeURIComponent(c.userId || "");
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, 4000);
+    let resp;
+    try { resp = await fetch(url, { headers: { "x-partner-key": PARTNER_KEY }, signal: ctrl.signal }); }
+    finally { clearTimeout(timer); }
+    if (!resp || !resp.ok) return ""; // 404（未実装）等は予約情報なしで通常生成
+    const data = await resp.json().catch(() => null);
+    return bookingToText(data);
+  } catch (e) { return ""; }
+}
+
+// ===== 自動返信の待ち時間スケジューラ（メモリ上。プロセス再起動で予約は消える＝短い遅延向け） =====
+const pendingAuto = new Map();
+function autoKey(t, id) { return t.slug + "::" + id; }
+function cancelAutoReply(t, id) {
+  const k = autoKey(t, id);
+  const h = pendingAuto.get(k);
+  if (h) { clearTimeout(h); pendingAuto.delete(k); }
+}
+function scheduleAutoReply(t, c, draftText, recvAt, delayMin) {
+  cancelAutoReply(t, c.id);
+  const k = autoKey(t, c.id);
+  const wait = Math.max(0, recvAt + delayMin * 60000 - Date.now()); // 生成に設定時間以上かかっていたら0=即時
+  const h = setTimeout(async () => {
+    pendingAuto.delete(k);
+    try {
+      const cur = t.store[c.id];
+      if (!cur) return;
+      if (!S(t).autoReply) return;                 // 待機中に自動返信OFFにされた
+      if (cur.status === "done" || cur.flag) return; // 既に対応済み/フラグ付き
+      if (!cur.draft || cur.draft.trim() !== draftText) return; // 下書きが変わった/消えた
+      const lastMsg = cur.msgs[cur.msgs.length - 1];
+      if (!lastMsg || lastMsg.from !== "them") return; // 待機中に誰かが返信した
+      const r = await deliverText(t, cur, draftText);
+      if (r.sent) {
+        cur.msgs.push({ from: "us", text: draftText, auto: true, time: nowt() });
+        cur.draft = ""; cur.draft0 = ""; cur.status = "done"; cur.lastAuto = true;
+        cur.time = nowt(); cur.ts = Date.now(); cur.last = lastText(cur); dbSave(t, cur);
+        try { notifyAll(t, "🤖 自動返信済み: " + (cur.name || ""), (cur.last || "").slice(0, 90)); } catch (e) {}
+      }
+    } catch (e) {}
+  }, wait);
+  pendingAuto.set(k, h);
+}
+
 async function genDraft(t, c) {
   const channel = c.channel;
   // 検索キーは直近3件のお客様メッセージ（最後の一言だけだと文脈語が拾えないため）
@@ -301,12 +409,15 @@ async function genDraft(t, c) {
   });
   while (msgsArr.length && msgsArr[0].role === "assistant") msgsArr.shift();
   if (!msgsArr.length || msgsArr[msgsArr.length - 1].role !== "user") return null;
+  let bookingTxt = "";
+  try { bookingTxt = await fetchBooking(t, c); } catch (e) { bookingTxt = ""; }
   const sys = "あなたはクリニック・店舗「" + (t.name || "クリニック") + "」の受付スタッフです。お客様とこの会話をしてきた本人として、最新のメッセージへの返信を書きます。一流ホテルのコンシェルジュのように上質で温かく、品のある丁寧な言葉遣いで対応する。"
     + "本日は" + today + "です。キャンセル料など日付が関わる案内は、本日と予約日の差から判断すること（予約日の前日にあたる連絡なら前日扱い、当日なら当日扱い、それより前なら通常キャンセル料は不要）。憶測で日付を決めない。"
     + "お客様が複数の質問・依頼をしている場合は、その全てにもれなく答えること。1つも取りこぼさない。会話で既に伝えた内容は繰り返さない。"
     + "医療判断・診断はしない。「絶対」「完治」など断定的表現は使わない。絵文字は使わない。" + sig
     + (rulesTxt ? "\n\n【店舗ルール（最優先で従う。料金・規定・対応可否はここに従い、推測で答えない）】\n" + rulesTxt : "")
     + (S(t).tone && S(t).tone.trim() ? "\n\n【トーン指示（最優先）】\n" + S(t).tone.trim().slice(0, 1200) : "")
+    + (bookingTxt ? "\n\n【この方の予約情報（予約システムからの照会結果。日付判断・キャンセル可否・来院案内の参考にする。ここに無い予約内容は推測しない）】\n" + bookingTxt : "")
     + "\n\n" + JP_QUALITY
     + "\n\n出力は必ず次のJSONのみ（前後に説明や```やかぎ括弧を付けない）: {\"draft\":\"お客様への返信文\",\"confidence\":\"high|medium|low\",\"is_urgent\":true|false,\"needs_human\":true|false,\"site_alert\":\"遅刻|当日キャンセル|緊急来院|none\",\"site_summary\":\"現場向け一行要約。site_alertがnoneなら空文字\"}"
     + "\nconfidence: ルールと会話から自信を持って答えられればhigh、判断に迷う/情報不足ならlow。"
@@ -325,6 +436,8 @@ async function handleInbound(t, opts) {
   const channel = opts.channel === "mail" ? "mail" : "line";
   const uid = String(opts.uid || "unknown");
   const id = channel + ":" + uid;
+  const recvAt = Date.now();   // 受信時刻（自動返信の待ち時間の起点）
+  cancelAutoReply(t, id);      // 新着が来たので、保留中の自動返信予約があれば取り消して作り直す
   let c = t.store[id];
   if (!c) { c = t.store[id] = { id, userId: uid, name: opts.name || (channel === "mail" ? uid : "LINEのお客様"), channel, color: colorFor(id), status: "todo", flag: false, msgs: [], draft: "" }; }
   c.userId = uid;
@@ -347,18 +460,28 @@ async function handleInbound(t, opts) {
 
   try { const sa = String(siteAlert || "").trim(); if (sa && sa !== "none") await alertAdd(t, sa, String(siteSummary || c.last || "").slice(0, 200), c.name || ""); } catch (e) {}
 
-  let autoSent = false;
+  let autoSent = false;     // この受信処理の中で即時送信したか
+  let autoScheduled = false; // 待ち時間後に送信する予約をしたか
   try {
     const conf = String(confidence || "").toLowerCase();
     const confOk = conf === "high" || (S(t).level === "medium" && conf === "medium");
     const safe = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med;
     if (S(t).autoReply && confOk && safe && c.draft && c.draft.trim()) {
-      const r = await deliverText(t, c, c.draft.trim());
-      if (r.sent) { c.msgs.push({ from: "us", text: c.draft.trim(), auto: true, time: nowt() }); c.draft = ""; c.draft0 = ""; c.status = "done"; c.lastAuto = true; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c); autoSent = true; }
+      const draftText = c.draft.trim();
+      const delayMin = Number(S(t).autoDelayMin || 0);
+      if (delayMin > 0 && (recvAt + delayMin * 60000 - Date.now()) > 0) {
+        // 受信からdelayMin分が経過していない → 残り時間だけ待ってから送信（生成が設定時間を超えていれば即時）
+        scheduleAutoReply(t, c, draftText, recvAt, delayMin);
+        autoScheduled = true;
+      } else {
+        const r = await deliverText(t, c, draftText);
+        if (r.sent) { c.msgs.push({ from: "us", text: draftText, auto: true, time: nowt() }); c.draft = ""; c.draft0 = ""; c.status = "done"; c.lastAuto = true; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c); autoSent = true; }
+      }
     }
   } catch (e) {}
   try { if (autoSent) notifyAll(t, "🤖 自動返信済み: " + (c.name || ""), (c.last || "").slice(0, 90)); else notifyAll(t, c.name || "新着メッセージ", (c.last || "新しいメッセージが届きました").slice(0, 90)); } catch (e) {}
-  return { id, autoSent };
+  try { forwardToPartner(t, c, { autoSent, autoScheduled }); } catch (e) {} // 受付くんへ受信イベントを転送
+  return { id, autoSent, autoScheduled };
 }
 
 // ===== 複数アカウント対応: メイン（conn直下）＋追加分（conn.lines / conn.mails） =====
@@ -570,6 +693,7 @@ async function deliverText(t, c, text) {
 app.post("/api/send", guard, async (req, res) => {
   const t = req.tenant;
   const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" });
+  cancelAutoReply(t, c.id); // スタッフが手動返信したので保留中の自動返信は取り消す
   const text = (req.body.text || "").trim(); if (!text) return res.status(400).json({ error: "empty" });
   const { sent, sendErr } = await deliverText(t, c, text);
   if (sent) { c.msgs.push({ from: "us", text, time: nowt() }); c.draft = ""; c.status = "done"; c.flag = false; c.lastAuto = false; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c); }
@@ -650,11 +774,12 @@ app.post("/api/settings", guard, async (req, res) => {
   if (typeof req.body.autoReply === "boolean") S(t).autoReply = req.body.autoReply;
   if (req.body.level === "high" || req.body.level === "medium") S(t).level = req.body.level;
   if (typeof req.body.tone === "string") S(t).tone = req.body.tone.slice(0, 1500);
+  if (req.body.autoDelayMin != null && isFinite(Number(req.body.autoDelayMin))) S(t).autoDelayMin = Math.min(60, Math.max(0, Math.round(Number(req.body.autoDelayMin))));
   if (["claude", "gpt", "gemini"].includes(req.body.engine)) S(t).engine = req.body.engine;
   try { await saveTenantConfig(t); } catch (e) {}
   res.json(Object.assign({}, S(t), { engines: { claude: !!ANTHROPIC_KEY, gpt: !!process.env.OPENAI_KEY, gemini: !!process.env.GEMINI_KEY } }));
 });
-app.post("/api/done", guard, (req, res) => { const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" }); c.status = "done"; c.flag = false; dbSave(t, c); res.json({ ok: true }); });
+app.post("/api/done", guard, (req, res) => { const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" }); cancelAutoReply(t, c.id); c.status = "done"; c.flag = false; dbSave(t, c); res.json({ ok: true }); });
 app.post("/api/tag", guard, (req, res) => { const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" }); c.flag = !c.flag; if (c.flag) { c.order = Math.max(0, ...Object.values(t.store).filter(x => x.flag).map(x => x.order || 0)) + 1; c.status = "todo"; } dbSave(t, c); res.json({ ok: true, flag: c.flag }); });
 
 app.post("/api/ai-regen", guard, async (req, res) => {
@@ -1096,6 +1221,7 @@ app.post("/api/partner/import", (req,res,next)=>{ if(partnerOk(req)) return next
       if(typeof b.settings.autoReply === "boolean") s.autoReply = b.settings.autoReply;
       if(b.settings.level === "high" || b.settings.level === "medium") s.level = b.settings.level;
       if(typeof b.settings.tone === "string") s.tone = b.settings.tone.slice(0,1500);
+      if(b.settings.autoDelayMin != null && isFinite(Number(b.settings.autoDelayMin))) s.autoDelayMin = Math.min(60, Math.max(0, Math.round(Number(b.settings.autoDelayMin))));
       await saveTenantConfig(t);
     }
     res.json({ok:true, convs, rules:rulesN, ruleCount:Object.keys(t.rules).length});
@@ -1131,6 +1257,7 @@ app.post("/api/import-own", guard, async (req,res)=>{
       if(typeof b.settings.autoReply === "boolean") s.autoReply = b.settings.autoReply;
       if(b.settings.level === "high" || b.settings.level === "medium") s.level = b.settings.level;
       if(typeof b.settings.tone === "string") s.tone = b.settings.tone.slice(0,1500);
+      if(b.settings.autoDelayMin != null && isFinite(Number(b.settings.autoDelayMin))) s.autoDelayMin = Math.min(60, Math.max(0, Math.round(Number(b.settings.autoDelayMin))));
       if(["claude","gpt","gemini"].includes(b.settings.engine)) s.engine = b.settings.engine;
       await saveTenantConfig(t);
     }
@@ -1465,6 +1592,9 @@ const PAGE = `<!DOCTYPE html>
     <option value="high">確信率「高」のみ（おすすめ）</option>
     <option value="medium">確信率「高」と「中」</option>
   </select>
+  <div style="font-size:13px;margin:12px 0 4px;">⏱ 自動返信までの待ち時間（分）</div>
+  <input type="number" id="setDelay" min="0" max="60" step="1" inputmode="numeric" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:13px;">
+  <div style="font-size:11px;color:#6b7280;margin-top:2px;">例：5 と入れると、メッセージ受信から5分後に自動返信します。0 なら即時。返信文の生成に設定時間以上かかった場合は、できあがり次第すぐ送信します。</div>
   <div style="border-top:1px solid #e5e7eb;margin-top:14px;padding-top:10px;">
     <div style="font-size:13px;margin-bottom:4px;">🧠 返信文を作るAIエンジン</div>
     <select id="setEngine" style="width:100%;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:13px;">
@@ -1675,7 +1805,7 @@ async function sendAndLearn(){const c=DATA.find(x=>x.id===current);if(!c)return;
   await sendMsg();
   openAsst(ctx);}
 // ---- settings popup ----
-async function openSet(){try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"claude";
+async function openSet(){try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"claude";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);
   if(s.engines){const n=document.getElementById("engineNote");const st=[];st.push("Claude:"+(s.engines.claude?"✓":"未"));st.push("GPT:"+(s.engines.gpt?"✓":"キー未設定"));st.push("Gemini:"+(s.engines.gemini?"✓":"キー未設定"));n.textContent="利用可能: "+st.join(" / ")+"。キー未設定のエンジンを選ぶと自動的にClaudeで動きます。";}}catch(e){}
   try{const cr=await fetch("/api/conn");const c=await cr.json();document.getElementById("connStat").textContent=(c.lineConfigured?"LINE✓ ":"LINE未 ")+(c.mailConfigured?"メール✓":"メール未");document.getElementById("cSmtpHost").value=c.smtpHost||"";document.getElementById("cSmtpPort").value=c.smtpPort||"";document.getElementById("cSmtpUser").value=c.smtpUser||"";document.getElementById("cImapHost").value=c.imapHost||"";document.getElementById("cImapPort").value=c.imapPort||"";document.getElementById("cImapUser").value=c.imapUser||"";document.getElementById("cEmailInternal").checked=!!c.emailInternal;renderAccts(c);}catch(e){}
   document.getElementById("setPop").style.display="flex";}
@@ -1706,7 +1836,7 @@ async function delAcct(kind,i){if(!confirm("この連携を削除しますか？
   try{await api("/api/conn-del",{kind,i});}catch(e){}openSet();}
 async function saveConn(){const g=id=>document.getElementById(id).value.trim();const body={lineSecret:g("cLineSecret"),lineToken:g("cLineToken"),smtpHost:g("cSmtpHost"),smtpPort:g("cSmtpPort"),smtpUser:g("cSmtpUser"),smtpPass:g("cSmtpPass"),imapHost:g("cImapHost"),imapPort:g("cImapPort"),imapUser:g("cImapUser"),imapPass:g("cImapPass"),emailInternal:document.getElementById("cEmailInternal").checked};try{const r=await api("/api/conn",body);const j=await r.json();if(j.ok){alert("連携設定を保存しました。\\nLINE: "+(j.lineConfigured?"設定済み":"未設定")+" / メール: "+(j.mailConfigured?"設定済み":"未設定")+" / メール直接監視: "+(j.emailInternal?"オン":"オフ"));["cLineSecret","cLineToken","cSmtpPass","cImapPass"].forEach(id=>document.getElementById(id).value="");}else alert("保存に失敗しました");}catch(e){alert("保存に失敗しました");}}
 function closeSet(){document.getElementById("setPop").style.display="none";}
-async function saveSet(){const autoReply=document.getElementById("setAuto").checked;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;try{await api("/api/settings",{autoReply,level,tone,engine});alert("設定を保存しました");}catch(e){alert("保存に失敗しました");}closeSet();}
+async function saveSet(){const autoReply=document.getElementById("setAuto").checked;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{await api("/api/settings",{autoReply,level,tone,engine,autoDelayMin});alert("設定を保存しました");}catch(e){alert("保存に失敗しました");}closeSet();}
 async function changeLoginId(){
   const next=prompt("新しいログインID（半角英数字3〜30文字。スタッフ全員のログインに使います）");if(!next)return;
   try{const r=await api("/api/change-loginid",{next:next.trim()});const j=await r.json();
