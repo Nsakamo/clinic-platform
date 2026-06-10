@@ -1556,7 +1556,11 @@ app.get("/board", (req, res) => { res.set("Content-Type", "text/html; charset=ut
   try { await pushInit(); } catch (e) { console.error("pushInit failed:", e.message); }
   setInterval(() => { pollAll().catch(() => {}); }, 60000); setTimeout(() => { pollAll().catch(() => {}); }, 8000);
   setTimeout(() => { Object.values(TEN).forEach(t => ensureLineBotId(t).catch(() => {})); }, 3000);
-  app.listen(PORT, () => console.log("clinic-inbox platform listening on " + PORT));
+  const server = app.listen(PORT, () => console.log("clinic-inbox platform listening on " + PORT));
+  // Railwayの前段プロキシよりNodeが先にkeep-alive接続を切ると、切断直後のPOST(LINE Webhook等)が
+  // 499/接続リセットで稀に失敗する。プロキシのアイドル時間より長くして競合をなくす。
+  server.keepAliveTimeout = 120000; // 120秒
+  server.headersTimeout = 125000;   // keepAliveTimeoutより長く必須
 })();
 
 const LOGIN_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>ログイン</title></head>
