@@ -324,6 +324,16 @@ async function geminiGenerate(systemText, userParts, maxTokens) {
 
 // ===== AI brain: shared draft generator (used by LINE + email, in-app) =====
 const JP_QUALITY ="【日本語の品質（トーン指示よりも優先）】実際の日本人受付スタッフが書いたものと区別がつかない、自然で正しい日本語にすること。不自然な敬語・誤った敬語・二重敬語は絶対に使わない。禁止例:「大変良かったでございます」「拝見させていただきます」「ご確認していただけます」「お伺いさせていただきます」。正しい例:「安心いたしました」「拝見します」「ご確認いただけます」「伺います」。動詞の活用や助詞の誤りがないか、文のつながりが自然か、出力する前に全文を自己点検し、少しでも違和感のある文は書き直してから出力すること。";
+// 出力が途中で切れる等でJSONがパースできない時、draft本文だけを救出する保険
+function salvageDraft(raw) {
+  const s = String(raw || "").trim();
+  const m = s.match(/"draft"\s*:\s*"((?:[^"\\]|\\.)*)/);
+  if (m) {
+    try { return JSON.parse('"' + m[1] + '"'); }
+    catch (e) { return m[1].replace(/\\n/g, "\n").replace(/\\"/g, '"'); }
+  }
+  return s;
+}
 // ===== 受付くん連携: 受信イベント転送（fire-and-forget。失敗してもメイン処理は止めない） =====
 function forwardToPartner(t, c, extra) {
   try {
@@ -459,9 +469,9 @@ async function genDraft(t, c) {
     + "\nneeds_human: 予約状況の確認・キャンセル例外判断・クレーム・支払いトラブル・偽物疑惑などスタッフ確認が必要ならtrue。"
     + "\nis_urgent: 痛み・出血・腫れ・強い不調など緊急性があればtrue。";
   try {
-    const raw = await aiChat(t, sys, msgsArr, 1500);
+    const raw = await aiChat(t, sys, msgsArr, 4000);
     if (!raw) return null;
-    let out = null; try { const m = raw.match(/\{[\s\S]*\}/); out = JSON.parse(m ? m[0] : raw); } catch (e) { out = { draft: raw, confidence: "low", is_urgent: false, needs_human: true, site_alert: "none", site_summary: "" }; }
+    let out = null; try { const m = raw.match(/\{[\s\S]*\}/); out = JSON.parse(m ? m[0] : raw); } catch (e) { out = { draft: salvageDraft(raw), confidence: "low", is_urgent: false, needs_human: true, site_alert: "none", site_summary: "" }; }
     return out;
   } catch (e) { return null; }
 }
@@ -853,7 +863,7 @@ app.post("/api/ai-regen", guard, async (req, res) => {
     + "\n" + JP_QUALITY
     + "\n出力はそのままお客様に送信される。だからお客様に送る返信文だけを出力すること。【】付きの見出し、状況の説明、会話の引用、区切り線(---)、前置き、かぎ括弧は一切含めてはいけない。1文字目から返信本文で始めること。";
   try {
-    let text = await aiChat(t, sys, msgsArr, 1000); // 選択中エンジン（既定Gemini）で生成
+    let text = await aiChat(t, sys, msgsArr, 3000); // 選択中エンジン（既定Gemini）で生成
     if (!text) { return res.json({ ok: false, error: "ai_error" }); }
     // safety: strip any echoed meta sections (headers / separators) the model might add
     if (/\n-{3,}\n?/.test(text)) text = text.split(/\n-{3,}\n?/).pop();
@@ -898,10 +908,10 @@ app.post("/api/draft-chat", guard, async (req, res) => {
     + "毎回、返信下書きの完成形の全文をdraftに入れる。replyにはスタッフへの短い一言（何をどう変えたか、1〜2文。敬語でなくてよい）。"
     + "出力は必ず次のJSONのみ: {\"reply\":\"スタッフへの一言\",\"draft\":\"お客様への返信下書き全文\"}";
   try {
-    const raw = await aiChat(t, sys, edits, 1500);
+    const raw = await aiChat(t, sys, edits, 4000);
     if (!raw) return res.json({ ok: false, error: "ai_failed" });
     let out = { reply: "", draft: "" };
-    try { const m = raw.match(/\{[\s\S]*\}/); out = JSON.parse(m ? m[0] : raw); } catch (e) { out = { reply: "", draft: raw.trim() }; }
+    try { const m = raw.match(/\{[\s\S]*\}/); out = JSON.parse(m ? m[0] : raw); } catch (e) { out = { reply: "", draft: salvageDraft(raw) }; }
     res.json({ ok: true, reply: String(out.reply || "").slice(0, 600), draft: String(out.draft || "").slice(0, 4000) });
   } catch (e) { res.json({ ok: false, error: String(e.message || e).slice(0, 80) }); }
 });
