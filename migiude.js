@@ -282,7 +282,7 @@ async function aiChat(t, system, messages, maxTokens){
       const model = process.env.GEMINI_MODEL || "gemini-3-flash";
       const r = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", { method:"POST",
         headers: { "Content-Type":"application/json", "Authorization":"Bearer "+process.env.GEMINI_KEY },
-        body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{role:"system",content:system}].concat(messages) }) });
+        body: JSON.stringify({ model, max_tokens: maxTokens, reasoning_effort: "low", messages: [{role:"system",content:system}].concat(messages) }) });  // reasoning_effort:lowで思考トークンを節約し、本文が途切れないようにする
       if(r.ok){ const d = await r.json(); const tx = d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content; if(tx) return tx; }
       else console.error("gemini:", r.status, (await r.text().catch(()=>"")).slice(0,200));
     }catch(e){ console.error("gemini:", e.message); }
