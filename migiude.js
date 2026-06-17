@@ -323,7 +323,7 @@ async function geminiGenerate(systemText, userParts, maxTokens) {
 }
 
 // ===== AI brain: shared draft generator (used by LINE + email, in-app) =====
-const JP_QUALITY ="【日本語の品質（トーン指示よりも優先）】実際の日本人受付スタッフが書いたものと区別がつかない、自然で正しい日本語にすること。不自然な敬語・誤った敬語・二重敬語は絶対に使わない。禁止例:「大変良かったでございます」「拝見させていただきます」「ご確認していただけます」「お伺いさせていただきます」。正しい例:「安心いたしました」「拝見します」「ご確認いただけます」「伺います」。動詞の活用や助詞の誤りがないか、文のつながりが自然か、出力する前に全文を自己点検し、少しでも違和感のある文は書き直してから出力すること。【AIっぽさの排除（同じく必須）】(1)同じ結論を言い換えて繰り返さない。結論は一度だけ述べる。(2)「原則として」「基本的には」「特に指示がない限り」等の保険表現は1通につき1回まで。(3)「〜についてご案内いたします」のような前置きの宣言は書かず、すぐ本題に入る。(4)1文ごとに空行で区切らない。関連する文は同じ段落にまとめる。(5)締めの定型句（ご安心くださいませ・どうぞよろしくお願いいたします等）は1文だけにする。";
+const JP_QUALITY ="【日本語の品質（トーン指示よりも優先）】実際の日本人受付スタッフが書いたものと区別がつかない、自然で正しい日本語にすること。不自然な敬語・誤った敬語・二重敬語は絶対に使わない。禁止例:「大変良かったでございます」「拝見させていただきます」「ご確認していただけます」「お伺いさせていただきます」。正しい例:「安心いたしました」「拝見します」「ご確認いただけます」「伺います」。動詞の活用や助詞の誤りがないか、文のつながりが自然か、出力する前に全文を自己点検し、少しでも違和感のある文は書き直してから出力すること。【AIっぽさの排除（同じく必須）】(1)同じ結論を言い換えて繰り返さない。結論は一度だけ述べる。(2)「原則として」「基本的には」「特に指示がない限り」等の保険表現は1通につき1回まで。(3)「〜についてご案内いたします」のような前置きの宣言は書かず、すぐ本題に入る。(4)1文ごとに空行で区切らない。関連する文は同じ段落にまとめる。(5)締めの定型句（ご安心くださいませ・どうぞよろしくお願いいたします等）は1文だけにする。(6)機械翻訳のような直訳調・カタコト・不要な主語（私たちは・当院では…）の多用をしない。日本語として自然な語順と省略にする。(7)「〜させていただきます」は実際に許可や恩恵がある時だけ使う。例:「確認させていただきます」→「確認します」、「ご案内させていただきます」→「ご案内します」。(8)「〜となります」「〜になります」は状態が変化する時だけ使う。例:「こちらが料金となります」→「こちらが料金です」。(9)同じ文末（です・ます・ございます）を3回以上連続させない。語尾に自然な変化をつける。(10)二重否定や回りくどい言い回しを避け、要点を先に短く述べる。出力する前に、声に出して読んで不自然なところがないか必ず一度見直す。";
 // 出力が途中で切れる等でJSONがパースできない時、draft本文だけを救出する保険
 function salvageDraft(raw) {
   const s = String(raw || "").trim();
@@ -825,6 +825,7 @@ app.post("/api/settings", guard, async (req, res) => {
   res.json(Object.assign({}, S(t), { engines: { claude: !!ANTHROPIC_KEY, gpt: !!process.env.OPENAI_KEY, gemini: !!process.env.GEMINI_KEY } }));
 });
 app.post("/api/done", guard, (req, res) => { const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" }); cancelAutoReply(t, c.id); c.status = "done"; c.flag = false; dbSave(t, c); res.json({ ok: true }); });
+app.post("/api/done-all", guard, (req, res) => { const t = req.tenant; let count = 0; Object.values(t.store).forEach(c => { if (c.status !== "done" || c.flag) { cancelAutoReply(t, c.id); c.status = "done"; c.flag = false; dbSave(t, c); count++; } }); res.json({ ok: true, count }); });
 app.post("/api/tag", guard, (req, res) => { const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" }); c.flag = !c.flag; if (c.flag) { c.order = Math.max(0, ...Object.values(t.store).filter(x => x.flag).map(x => x.order || 0)) + 1; c.status = "todo"; } dbSave(t, c); res.json({ ok: true, flag: c.flag }); });
 
 app.post("/api/ai-regen", guard, async (req, res) => {
@@ -1854,6 +1855,11 @@ const PAGE = `<!DOCTYPE html>
       </div>
     </div>
   </div>
+  <div style="border-top:1px solid #e5e7eb;margin-top:14px;padding-top:10px;">
+    <div style="font-size:13px;margin-bottom:6px;">✅ 一括操作</div>
+    <button class="cbtn" style="width:100%;" onclick="markAllDone()">すべてのチャットを対応済みにする</button>
+    <div style="font-size:11px;color:#6b7280;margin-top:4px;">未対応・要対応をまとめて「対応済み」にします。元に戻すときは各チャットを個別に開いて操作してください。</div>
+  </div>
   <div style="border-top:1px solid #e5e7eb;margin-top:12px;padding-top:10px;display:flex;flex-direction:column;gap:8px;">
     <button class="cbtn" style="width:100%;" onclick="changeLoginId()">🪪 ログインIDを変更</button>
     <button class="cbtn" style="width:100%;" onclick="changePass()">🔑 ログインパスワードを変更</button>
@@ -1875,6 +1881,17 @@ function api(path,body){ return fetch(path,{method:"POST",headers:{"Content-Type
 function filt(){ const q=(document.getElementById("search").value||"").trim(); return q?DATA.filter(r=>(r.name||"").includes(q)||(r.last||"").includes(q)):DATA; }
 function chIcon(ch){return ch==="line"?'<span class="ch line">L</span>':'<span class="ch mail">✉</span>';}
 function statIcon(r){ if(r.flag)return '<i class="flagicon">⚑</i>'; if(r.status==="done")return r.lastAuto?'<span title="自動返信済み" style="font-size:13px;">🤖</span>':''; return '<span class="dot"></span>'; }
+// 一覧の時刻表示：当日はHH:MM、昨日は「昨日」、それ以前は日付（年跨ぎはYYYY/M/D）。r.ts が無い古いデータは従来のr.timeにフォールバック。
+function tlabel(r){
+  if(!r.ts){ return r.time||""; }
+  const d=new Date(r.ts), n=new Date();
+  const sameDay=(a,b)=>a.getFullYear()===b.getFullYear()&&a.getMonth()===b.getMonth()&&a.getDate()===b.getDate();
+  if(sameDay(d,n)) return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");
+  const y=new Date(n); y.setDate(n.getDate()-1);
+  if(sameDay(d,y)) return "昨日";
+  if(d.getFullYear()===n.getFullYear()) return (d.getMonth()+1)+"/"+d.getDate();
+  return d.getFullYear()+"/"+(d.getMonth()+1)+"/"+d.getDate();
+}
 function av(r,sz){ const s=sz||40; const bg=r.pic?("background-image:url("+r.pic+");"):("background:"+(r.color||"#888")+";"); return '<div class="avatar" style="width:'+s+'px;height:'+s+'px;font-size:'+(s/3)+'px;'+bg+'">'+(r.pic?"":(r.name||"?").charAt(0))+chIcon(r.channel)+'</div>'; }
 function renderList(){
   document.getElementById("cnt").textContent="未対応 "+DATA.filter(r=>r.status!=="done").length+"件";
@@ -1882,7 +1899,7 @@ function renderList(){
   filt().forEach(r=>{ const d=document.createElement("div");
     d.className="room"+(current===r.id?" active":"")+(r.flag?" flag":"");
     const acctBadge=(r.acct&&r.acct.name&&r.acct.name!=="メイン")?' <span class="badge">'+esc(r.acct.name)+'</span>':'';
-    d.innerHTML=av(r)+'<div class="rmid"><div class="rtop"><span class="rname">'+esc(r.name)+acctBadge+'</span><span class="rtime">'+(r.time||"")+'</span></div><div class="rlast">'+esc(r.last||"")+'</div></div><div class="stat">'+statIcon(r)+'</div>';
+    d.innerHTML=av(r)+'<div class="rmid"><div class="rtop"><span class="rname">'+esc(r.name)+acctBadge+'</span><span class="rtime">'+tlabel(r)+'</span></div><div class="rlast">'+esc(r.last||"")+'</div></div><div class="stat">'+statIcon(r)+'</div>';
     d.onclick=()=>openChat(r.id);
     roomsEl.appendChild(d);
   });
@@ -1901,6 +1918,7 @@ function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)ret
 }
 function closeChat(){appEl.classList.remove("chatopen");current=null;renderList();}
 async function markDone(){const id=current;await api("/api/done",{id});await load();}
+async function markAllDone(){if(!confirm("すべてのチャットを「対応済み」に変更します。よろしいですか？"))return;try{const r=await api("/api/done-all",{});const j=await r.json();closeSet();if(current){closeChat();}await load();alert((j.count||0)+"件を対応済みにしました");}catch(e){alert("変更に失敗しました");}}
 async function sendMsg(){const id=current;const t=document.getElementById("draft").value.trim();if(!t)return;const r=await api("/api/send",{id,text:t});let j={};try{j=await r.json();}catch(e){}if(j.sent){const d0=document.getElementById("draft");if(d0)d0.value="";const cd=DATA.find(x=>x.id===id);if(cd)cd.draft="";await load();}else{const m={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です"}[j.sendErr]||("送信失敗: "+(j.sendErr||"不明"));alert(m+"\\n（下書きは消えていません）");}}
 function attach(){const inp=document.createElement("input");inp.type="file";inp.accept="image/*,video/*,application/pdf,.pdf,.doc,.docx,.xls,.xlsx";inp.onchange=async()=>{const f=inp.files[0];if(!f)return;if(f.size>10*1024*1024){alert("10MB以下のファイルにしてください");return;}const btn=document.getElementById("attach");if(btn){btn.disabled=true;btn.textContent="⏳";}try{const b64=await new Promise((res,rej)=>{const rd=new FileReader();rd.onload=()=>res(String(rd.result).split(",")[1]);rd.onerror=rej;rd.readAsDataURL(f);});const up=await api("/api/upload",{name:f.name,mime:f.type||"application/octet-stream",data:b64});const uj=await up.json();if(!uj.ok)throw new Error(uj.error||"upload");const sr=await api("/api/send-file",{id:current,fileId:uj.fileId});const sj=await sr.json();if(!sj.sent)alert("送信失敗: "+(sj.sendErr||"不明"));await load();}catch(e){alert("ファイル送信に失敗しました: "+e.message);}if(btn){btn.disabled=false;btn.textContent="📎";}};inp.click();}
 async function shareClinic(){const note=prompt("現場に伝える内容を入力してください（空欄のままOKを押すと、お客様の直近メッセージをそのまま共有します）","");if(note===null)return;try{const r=await api("/api/share",{id:current,note:note||""});const j=await r.json();if(j.ok)alert("現場ボードに共有しました");else alert("共有に失敗しました");}catch(e){alert("共有に失敗しました");}}
