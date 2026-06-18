@@ -271,7 +271,7 @@ async function aiChat(t, system, messages, maxTokens){
       const model = process.env.OPENAI_MODEL || "gpt-5.4";
       const r = await fetch("https://api.openai.com/v1/chat/completions", { method:"POST",
         headers: { "Content-Type":"application/json", "Authorization":"Bearer "+process.env.OPENAI_KEY },
-        body: JSON.stringify({ model, max_completion_tokens: maxTokens, messages: [{role:"system",content:system}].concat(messages) }) });
+        body: JSON.stringify({ model, max_completion_tokens: maxTokens, reasoning_effort: "low", messages: [{role:"system",content:system}].concat(messages) }) });  // GPT-5系は思考型。reasoning_effort:lowで思考トークンを抑え本文の途切れを防ぐ（非対応モデルでエラーが出る場合はこの1項目を外す）
       if(r.ok){ const d = await r.json(); const tx = d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content; if(tx) return tx; }
       else console.error("openai:", r.status, (await r.text().catch(()=>"")).slice(0,200));
     }catch(e){ console.error("openai:", e.message); }
@@ -813,6 +813,33 @@ app.post("/api/conn", guard, async (req, res) => {
   res.json({ ok: true, lineConfigured: !!C.lineToken(t) && !!C.lineSecret(t), mailConfigured: !!C.smtpUser(t) && !!C.smtpPass(t), emailInternal: !!emailOn(t) });
 });
 
+// 新モデル検知：OpenAIのモデル一覧から、現行(OPENAI_MODEL)より新しいフラッグシップGPTが出ているか判定。結果は1日キャッシュ（毎回APIを叩かない）。
+let MODEL_CHECK_CACHE = { ts: 0, current: "", latest: "", newer: false, error: null };
+async function checkNewerModel() {
+  const now = Date.now();
+  if (MODEL_CHECK_CACHE.ts && now - MODEL_CHECK_CACHE.ts < 24 * 60 * 60 * 1000) return MODEL_CHECK_CACHE;
+  const current = process.env.OPENAI_MODEL || "gpt-5.4";
+  let latest = current, newer = false, error = null;
+  try {
+    if (process.env.OPENAI_KEY) {
+      const r = await fetch("https://api.openai.com/v1/models", { headers: { "Authorization": "Bearer " + process.env.OPENAI_KEY } });
+      if (r.ok) {
+        const d = await r.json();
+        const ids = (d.data || []).map(m => m.id);
+        // フラッグシップの文章生成モデルだけを対象（gpt-5.5 / gpt-6 等）。mini・nano・pro・codex・audio・日付付きスナップショット等は誤検知防止のため除外。
+        const ver = id => { const m = /^gpt-(\d+(?:\.\d+)?)$/.exec(id); return m ? parseFloat(m[1]) : null; };
+        const curV = ver(current);
+        let bestId = current, bestV = (curV != null ? curV : -1);
+        ids.forEach(id => { const v = ver(id); if (v != null && v > bestV) { bestV = v; bestId = id; } });
+        latest = bestId;
+        newer = (curV != null && bestV > curV);
+      } else { error = "models_" + r.status; }
+    } else { error = "no_key"; }
+  } catch (e) { error = String(e.message || e).slice(0, 80); }
+  MODEL_CHECK_CACHE = { ts: now, current, latest, newer, error };
+  return MODEL_CHECK_CACHE;
+}
+app.get("/api/model-check", guard, async (req, res) => { res.json(await checkNewerModel()); });
 app.get("/api/settings", guard, (req, res) => res.json(Object.assign({}, S(req.tenant), { engines: { claude: !!ANTHROPIC_KEY, gpt: !!process.env.OPENAI_KEY, gemini: !!process.env.GEMINI_KEY }, rules: { chars: rulesCharTotal(req.tenant), count: rulesList(req.tenant).length, budget: ruleBudget(req.tenant), budgets: RULE_BUDGETS } })));
 app.post("/api/settings", guard, async (req, res) => {
   const t = req.tenant;
@@ -1780,7 +1807,7 @@ const PAGE = `<!DOCTYPE html>
       <button class="tbtn migi" onclick="openAsst(null)">🤝 みぎうで君</button>
       <button class="tbtn" onclick="window.open('/board','_blank')">🏥 現場ボード</button>
       <button class="tbtn" id="bellBtn" onclick="enablePush()">🔔 通知</button>
-      <button class="tbtn" onclick="openSet()">⚙ 設定</button>
+      <button class="tbtn" onclick="openSet()">⚙ 設定<span id="newModelDot" style="display:none;margin-left:3px;">🆕</span></button>
     </div>
     <input id="search" placeholder="検索" oninput="renderList()">
     <div id="rooms"></div>
@@ -1813,9 +1840,12 @@ const PAGE = `<!DOCTYPE html>
   <div style="border-top:1px solid #e5e7eb;margin-top:14px;padding-top:10px;">
     <div style="font-size:13px;margin-bottom:4px;">🧠 返信文を作るAIエンジン</div>
     <select id="setEngine" onchange="renderRuleGauge()" style="width:100%;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:13px;">
-      <option value="gemini">Gemini（gemini-3-flash・標準）</option>
+      <option value="gpt">GPT（OpenAI・gpt-5系）</option>
+      <option value="gemini">Gemini（gemini-3-flash）</option>
+      <option value="claude">Claude（保険・安定）</option>
     </select>
-    <div id="engineNote" style="font-size:11px;color:#6b7280;margin-top:2px;">文章作成（AI下書き・自動返信・AIで作り直す）はGeminiで統一しています。みぎうで君チャットと資料読み込みは引き続きClaudeを使用します。</div>
+    <div id="engineNote" style="font-size:11px;color:#6b7280;margin-top:2px;">文章作成（AI下書き・自動返信・AIで作り直す）に使うAIです。GPTを使うにはRailwayに OPENAI_KEY（必要なら OPENAI_MODEL）の設定が必要です。未設定のまま選ぶと安全のためClaudeで生成します。みぎうで君チャットと資料読み込みは引き続きClaude/Geminiを使用します。</div>
+    <div id="modelAlert" style="display:none;font-size:11px;background:#fef3c7;border:1px solid #fcd34d;color:#92400e;border-radius:8px;padding:8px;margin-top:6px;line-height:1.5;"></div>
   </div>
   <div style="border-top:1px solid #e5e7eb;margin-top:14px;padding-top:10px;">
     <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;"><span style="font-size:13px;">📚 ルールブックの使用量</span><span id="ruleGaugePct" style="font-size:12px;font-weight:600;color:#6b7280;">—</span></div>
@@ -2061,8 +2091,9 @@ function renderRuleGauge(){
     else { warn.style.display="none"; }
   }
 }
-async function openSet(){try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value="gemini";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);window.__rules=s.rules||null;renderRuleGauge();
-  if(s.engines){const n=document.getElementById("engineNote");n.textContent="文章作成はGeminiで統一"+(s.engines.gemini?"（Geminiキー✓）":"（⚠Geminiキー未設定＝保険でClaude動作）")+"。みぎうで君チャット・資料読み込みはClaude"+(s.engines.claude?"✓":"⚠キー未設定")+"。";}}catch(e){}
+async function openSet(){try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"gemini";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);window.__rules=s.rules||null;renderRuleGauge();
+  if(s.engines){const n=document.getElementById("engineNote");n.textContent="文章作成は選択中のAIで生成（GPT"+(s.engines.gpt?"✓":"⚠キー未設定")+"・Gemini"+(s.engines.gemini?"✓":"⚠")+"・Claude"+(s.engines.claude?"✓":"⚠")+"）。キー未設定のエンジンを選ぶと安全のためClaudeで生成します。";}}catch(e){}
+  refreshModelAlert();
   try{const cr=await fetch("/api/conn");const c=await cr.json();document.getElementById("connStat").textContent=(c.lineConfigured?"LINE✓ ":"LINE未 ")+(c.mailConfigured?"メール✓":"メール未");document.getElementById("cSmtpHost").value=c.smtpHost||"";document.getElementById("cSmtpPort").value=c.smtpPort||"";document.getElementById("cSmtpUser").value=c.smtpUser||"";document.getElementById("cImapHost").value=c.imapHost||"";document.getElementById("cImapPort").value=c.imapPort||"";document.getElementById("cImapUser").value=c.imapUser||"";document.getElementById("cEmailInternal").checked=!!c.emailInternal;renderAccts(c);}catch(e){}
   document.getElementById("setPop").style.display="flex";}
 function renderAccts(c){const el=document.getElementById("acctList");if(!el)return;let h="";
@@ -2127,7 +2158,17 @@ async function enablePush(){
     alert("通知をオンにしました。新しい問い合わせが届くとこの端末に通知されます。");
   }catch(e){alert("通知設定に失敗しました: "+e.message);}
 }
-load(); setInterval(load, 6000);
+async function refreshModelAlert(){
+  try{
+    const r=await fetch("/api/model-check"); const m=await r.json();
+    const dot=document.getElementById("newModelDot"); const box=document.getElementById("modelAlert");
+    if(m&&m.newer){
+      if(dot)dot.style.display="inline";
+      if(box){box.style.display="block";box.innerHTML="🆕 新しいAIモデル <b>"+esc(m.latest)+"</b> が出ています（現在: "+esc(m.current)+"）。<br>▶ 試す: RailwayのVariablesで OPENAI_MODEL を「"+esc(m.latest)+"」に変えてDeploy。<br>↩ 戻す: 使い勝手が悪ければ OPENAI_MODEL を「"+esc(m.current)+"」に戻すだけ。";}
+    }else{ if(dot)dot.style.display="none"; if(box)box.style.display="none"; }
+  }catch(e){}
+}
+load(); setInterval(load, 6000); refreshModelAlert();
 </script>
 </body>
 </html>`;
