@@ -436,7 +436,8 @@ function scheduleAutoReply(t, c, draftText, recvAt, delayMin) {
   pendingAuto.set(k, h);
 }
 
-async function genDraft(t, c) {
+async function genDraft(t, c, opts) {
+  opts = opts || {};
   const channel = c.channel;
   // 検索キーは直近3件のお客様メッセージ（最後の一言だけだと文脈語が拾えないため）
   const lastQ = c.msgs.filter(m => m.from === "them").slice(-3).map(m => m.text || "").join(" ");
@@ -458,16 +459,19 @@ async function genDraft(t, c) {
   try { bookingTxt = await fetchBooking(t, c); } catch (e) { bookingTxt = ""; }
   const sys = "あなたはクリニック・店舗「" + (t.name || "クリニック") + "」の受付スタッフです。お客様とこの会話をしてきた本人として、最新のメッセージへの返信を書きます。一流ホテルのコンシェルジュのように上質で温かく、品のある丁寧な言葉遣いで対応する。"
     + "本日は" + today + "です。キャンセル料など日付が関わる案内は、本日と予約日の差から判断すること（予約日の前日にあたる連絡なら前日扱い、当日なら当日扱い、それより前なら通常キャンセル料は不要）。憶測で日付を決めない。"
-    + "お客様が複数の質問・依頼をしている場合は、その全てにもれなく答えること。1つも取りこぼさない。会話で既に伝えた内容は繰り返さない。"
+    + (opts.only && opts.only.length
+        ? "お客様は複数の連絡をしているが、今回はスタッフが選んだ次の項目だけに答えること。選ばれていない項目には一切触れない: 「" + opts.only.map(s => String(s)).join("」「") + "」。会話で既に伝えた内容は繰り返さない。"
+        : "お客様が複数の質問・依頼をしている場合は、その全てにもれなく答えること。1つも取りこぼさない。会話で既に伝えた内容は繰り返さない。")
     + "医療判断・診断はしない。「絶対」「完治」など断定的表現は使わない。絵文字は使わない。" + sig
     + (rulesTxt ? "\n\n【店舗ルール（最優先で従う。料金・規定・対応可否はここに従い、推測で答えない）】\n" + rulesTxt : "")
     + (S(t).tone && S(t).tone.trim() ? "\n\n【トーン指示（最優先）】\n" + S(t).tone.trim().slice(0, 1200) : "")
     + (bookingTxt ? "\n\n【この方の予約情報（予約システムからの照会結果。日付判断・キャンセル可否・来院案内の参考にする。ここに無い予約内容は推測しない）】\n" + bookingTxt : "")
     + "\n\n" + JP_QUALITY
-    + "\n\n出力は必ず次のJSONのみ（前後に説明や```やかぎ括弧を付けない）: {\"draft\":\"お客様への返信文\",\"confidence\":\"high|medium|low\",\"is_urgent\":true|false,\"needs_human\":true|false,\"site_alert\":\"遅刻|当日キャンセル|緊急来院|none\",\"site_summary\":\"現場向け一行要約。site_alertがnoneなら空文字\"}"
+    + "\n\n出力は必ず次のJSONのみ（前後に説明や```やかぎ括弧を付けない）: {\"draft\":\"お客様への返信文\",\"confidence\":\"high|medium|low\",\"is_urgent\":true|false,\"needs_human\":true|false,\"site_alert\":\"遅刻|当日キャンセル|緊急来院|none\",\"site_summary\":\"現場向け一行要約。site_alertがnoneなら空文字\",\"topics\":[{\"q\":\"短い質問ラベル\",\"need\":true}]}"
     + "\nconfidence: ルールと会話から自信を持って答えられればhigh、判断に迷う/情報不足ならlow。"
     + "\nneeds_human: 予約状況の確認・キャンセル例外判断・クレーム・支払いトラブル・偽物疑惑などスタッフ確認が必要ならtrue。"
-    + "\nis_urgent: 痛み・出血・腫れ・強い不調など緊急性があればtrue。";
+    + "\nis_urgent: 痛み・出血・腫れ・強い不調など緊急性があればtrue。"
+    + "\ntopics: お客様の直近メッセージにある「返信すべき質問・依頼」を、それぞれ短い日本語ラベル(q)で列挙する（最大5件）。状況連絡・挨拶・お礼や、時間が経って既に解決済みと思われるもの（例: かなり前に届いた『遅れます』）は need:false。それ以外は need:true。質問が1つだけなら1件でよい。";
   try {
     const raw = await aiChat(t, sys, msgsArr, 4000);
     if (!raw) return null;
@@ -498,7 +502,7 @@ async function handleInbound(t, opts) {
   if (typeof opts.draft === "string") { c.draft = opts.draft; c.draft0 = opts.draft; }
   else if (!med) { // generate draft in-app for text messages
     const g = await genDraft(t, c);
-    if (g) { c.draft = String(g.draft || ""); c.draft0 = c.draft; confidence = g.confidence; needsHuman = g.needs_human; urgent = g.is_urgent; siteAlert = g.site_alert; siteSummary = g.site_summary; }
+    if (g) { c.draft = String(g.draft || ""); c.draft0 = c.draft; confidence = g.confidence; needsHuman = g.needs_human; urgent = g.is_urgent; siteAlert = g.site_alert; siteSummary = g.site_summary; c.topics = Array.isArray(g.topics) ? g.topics : []; }
   }
   if (confidence) c.confidence = confidence;
   dbSave(t, c);
@@ -855,6 +859,14 @@ app.post("/api/done", guard, (req, res) => { const t = req.tenant; const c = t.s
 app.post("/api/done-all", guard, (req, res) => { const t = req.tenant; let count = 0; Object.values(t.store).forEach(c => { if (c.status !== "done" || c.flag) { cancelAutoReply(t, c.id); c.status = "done"; c.flag = false; dbSave(t, c); count++; } }); res.json({ ok: true, count }); });
 app.post("/api/tag", guard, (req, res) => { const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" }); c.flag = !c.flag; if (c.flag) { c.order = Math.max(0, ...Object.values(t.store).filter(x => x.flag).map(x => x.order || 0)) + 1; c.status = "todo"; } dbSave(t, c); res.json({ ok: true, flag: c.flag }); });
 
+app.post("/api/redraft", guard, async (req, res) => {
+  const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" });
+  const sel = Array.isArray(req.body.selected) ? req.body.selected.map(String).slice(0, 20) : [];
+  const g = await genDraft(t, c, { only: sel });
+  if (!g) return res.json({ ok: false });
+  c.draft = String(g.draft || ""); c.draft0 = c.draft; if (Array.isArray(g.topics)) c.topics = g.topics; dbSave(t, c);
+  res.json({ ok: true, draft: c.draft, topics: c.topics || [] });
+});
 app.post("/api/ai-regen", guard, async (req, res) => {
   const t = req.tenant;
   const idea = (req.body.idea || "").trim();
@@ -1150,7 +1162,8 @@ app.post("/api/assistant", guard, async (req, res) => {
       + "\nAIの初回下書き: " + String(ctx.draft0 || "").slice(0, 1500)
       + "\nスタッフが実際に送った返信: " + String(ctx.finalText || "").slice(0, 1500)
       + "\n初回下書きとスタッフの最終返信の差分・会話の流れから「今後どう回答すべきか」を自分で読み取り、最初の返答で要点の短い説明と具体的なルール案（proposals）をすぐ提示すること。スタッフに『どんなルールにしたいか教えて』と聞き返さない。差分がなく学習すべき点が本当に無い場合だけ、その旨を短く伝える。"
-      + "\n【例外対応の検知（重要）】提案の前に、今回の対応が全患者向けの一般ルールか、この患者だけの例外対応（特別扱い・イレギュラー・クレーム対応のための特例・規定外の譲歩など）かを必ず判定すること。例外対応に見える場合はルール化を提案せず、『今回は例外対応に見えるため、ルール化はおすすめしません』と理由を添えて伝える。繰り返し起こり得る例外の場合のみ、既存の通常ルールを壊さない条件付きの形（例:『通常は◯◯と案内する。ただし△△の場合のみ□□とする』）で提案する。通常ルール自体を例外に合わせて書き換える提案は絶対にしない。";
+      + "\n【例外対応の検知（重要）】提案の前に、今回の対応が全患者向けの一般ルールか、この患者だけの例外対応（特別扱い・イレギュラー・クレーム対応のための特例・規定外の譲歩など）かを必ず判定すること。例外対応に見える場合はルール化を提案せず、『今回は例外対応に見えるため、ルール化はおすすめしません』と理由を添えて伝える。繰り返し起こり得る例外の場合のみ、既存の通常ルールを壊さない条件付きの形（例:『通常は◯◯と案内する。ただし△△の場合のみ□□とする』）で提案する。通常ルール自体を例外に合わせて書き換える提案は絶対にしない。"
+      + (ctx.confirmedGeneral ? "\n【スタッフの明示判断】スタッフはこの対応を『今後も標準にする』と選択済み。よって安易に例外却下せず、ルール化を前提に具体案を出すこと。ただし既存ルールと矛盾・重複する場合は新規追加ではなく該当ルールのupdate提案にし、どこがどう変わるかをreplyで必ず明示する（矛盾を黙って上書きしない）。内容が特定の患者にしか当てはまらず一般化が危険な場合のみ、既存ルールを壊さない条件付きの形で提案する。" : "");
   }
   const searchKey = msgs.map(m => m.content).join(" ") + (ctx ? " " + String(ctx.customer || "") + " " + String(ctx.finalText || "") : "");
   const rel = rulesRanked(t, searchKey.slice(0, 2000)); // 全ルール・関連度順（途中で切らない）
@@ -1903,6 +1916,15 @@ const PAGE = `<!DOCTYPE html>
   <div id="asstMsgs"></div>
   <div id="asstIn"><button class="cbtn" onclick="asstAttach()" title="価格表などの資料（画像・PDF・CSV）を読み込ませて一括学習">📎</button><textarea id="asstText" placeholder="例：発送質問には3営業日以内と答えて／今の料金ルールは？" onkeydown="if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing&&event.keyCode!==229){event.preventDefault();asstSend();}"></textarea><button class="cbtn send" onclick="asstSend()">送信</button></div>
 </div></div>
+<div id="learnPop" style="position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:70;display:none;align-items:center;justify-content:center;"><div style="background:#fff;border-radius:14px;padding:18px;width:min(92vw,340px);">
+  <h3 style="margin:0 0 6px;font-size:15px;">この返信を学習しますか？</h3>
+  <div style="font-size:12px;color:#6b7280;margin-bottom:14px;">「今後もこうする」を選ぶとルール化を検討します（既存ルールと矛盾する場合は、勝手に上書きせず確認のうえ更新提案）。特例は学習しません。どちらも返信は送信されます。</div>
+  <div style="display:flex;flex-direction:column;gap:8px;">
+    <button class="cbtn send" style="width:100%;" onclick="learnDecide('learn')">今後もこうする（ルール化を検討）</button>
+    <button class="cbtn" style="width:100%;" onclick="learnDecide('once')">今回だけの特例（学習しない）</button>
+    <button class="cbtn" style="width:100%;" onclick="closeLearnPop()">やめる</button>
+  </div>
+</div></div>
 <script>
 let DATA=[];let current=null;
 const roomsEl=document.getElementById("rooms"),chatEl=document.getElementById("chat"),appEl=document.getElementById("app");
@@ -1942,11 +1964,27 @@ function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)ret
   const bubbles=bubblesHtml(r);
   chatEl.innerHTML='<div id="chatHead"><button id="backBtn" onclick="closeChat()">‹</button>'+av(r,30)+'<span id="chatName">'+esc(r.name)+'　<span style="font-size:11px;color:#6b7280;">'+(r.channel==="line"?"LINE":"メール")+((r.acct&&r.acct.name&&r.acct.name!=="メイン")?"・"+esc(r.acct.name):"")+'</span></span><button class="hbtn" onclick="shareClinic()">🏥 クリニックへ共有</button></div>'+
     '<div id="msgs">'+bubbles+'</div>'+
-    '<div id="composer"><div id="aiLabel">✨ AI下書き（編集して送れます）</div><div id="draftRow"><button id="attach" onclick="attach()" title="写真・動画を添付">📎</button><textarea id="draft">'+esc(r.draft||"")+'</textarea></div>'+
+    '<div id="composer"><div id="aiLabel">✨ AI下書き（編集して送れます）</div><div id="topicChips" style="display:none;"></div><div id="draftRow"><button id="attach" onclick="attach()" title="写真・動画を添付">📎</button><textarea id="draft">'+esc(r.draft||"")+'</textarea></div>'+
     '<div id="cbtns"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ AIで作り直す</button><button class="cbtn done" onclick="markDone()">対応済み</button><button class="cbtn learn" onclick="sendAndLearn()">送信して学習</button><button class="cbtn send" onclick="sendMsg()">送信</button></div></div>';
-  const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.scrollTop=m.scrollHeight;} if(!keep)renderList();
+  const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r); if(!keep)renderList();
 }
 function closeChat(){appEl.classList.remove("chatopen");current=null;renderList();}
+// ===== 質問チップ：返信する内容を選んで下書きを作り直す =====
+let selTopics=null;
+function renderTopicChips(r){
+  const el=document.getElementById("topicChips"); if(!el)return;
+  const tp=(r&&Array.isArray(r.topics))?r.topics.filter(x=>x&&x.q):[];
+  if(tp.length<2){ el.style.display="none"; el.innerHTML=""; return; }
+  if(!selTopics){ selTopics=new Set(); tp.forEach(x=>{ if(x.need!==false) selTopics.add(x.q); }); }
+  el.style.display="block";
+  el.innerHTML='<div style="font-size:11px;color:#6b7280;margin:0 0 4px;">返信する内容を選択（タップでON/OFF）</div>'+
+    '<div style="display:flex;gap:6px;overflow-x:auto;padding-bottom:4px;">'+
+    tp.map((x,i)=>{const on=selTopics.has(x.q);return '<button type="button" onclick="toggleTopic('+i+')" style="flex:0 0 auto;font-size:12px;padding:5px 10px;border-radius:999px;border:1px solid '+(on?"#7c3aed":"#d1d5db")+';background:'+(on?"#ede9fe":"#fff")+';color:'+(on?"#5b21b6":"#9ca3af")+';white-space:nowrap;cursor:pointer;">'+(on?"✓ ":"")+esc(x.q)+'</button>';}).join("")+
+    '</div>'+
+    '<button type="button" id="redraftBtn" class="cbtn" style="margin:2px 0 6px;font-size:12px;padding:5px 10px;" onclick="redraftSelected()">選んだ内容で下書きを作成</button>';
+}
+function toggleTopic(i){ const r=DATA.find(x=>x.id===current); if(!r||!Array.isArray(r.topics))return; const tp=r.topics.filter(x=>x&&x.q); const q=tp[i]&&tp[i].q; if(q==null)return; if(!selTopics)selTopics=new Set(); if(selTopics.has(q))selTopics.delete(q); else selTopics.add(q); renderTopicChips(r); }
+async function redraftSelected(){ if(!current||!selTopics)return; const sel=[...selTopics]; if(!sel.length){alert("返信する内容を1つ以上選んでください");return;} const btn=document.getElementById("redraftBtn"); if(btn){btn.disabled=true;btn.textContent="作成中…";} try{ const rr=await api("/api/redraft",{id:current,selected:sel}); const j=await rr.json(); if(j&&j.ok&&typeof j.draft==="string"){ const d=document.getElementById("draft"); if(d)d.value=j.draft; const cd=DATA.find(x=>x.id===current); if(cd){cd.draft=j.draft; if(Array.isArray(j.topics))cd.topics=j.topics;} }else{ alert("作り直しに失敗しました"); } }catch(e){ alert("作り直しに失敗しました"); } if(btn){btn.disabled=false;btn.textContent="選んだ内容で下書きを作成";} }
 async function markDone(){const id=current;await api("/api/done",{id});await load();}
 async function markAllDone(){if(!confirm("すべてのチャットを「対応済み」に変更します。よろしいですか？"))return;try{const r=await api("/api/done-all",{});const j=await r.json();closeSet();if(current){closeChat();}await load();alert((j.count||0)+"件を対応済みにしました");}catch(e){alert("変更に失敗しました");}}
 async function sendMsg(){const id=current;const t=document.getElementById("draft").value.trim();if(!t)return;const r=await api("/api/send",{id,text:t});let j={};try{j=await r.json();}catch(e){}if(j.sent){const d0=document.getElementById("draft");if(d0)d0.value="";const cd=DATA.find(x=>x.id===id);if(cd)cd.draft="";await load();}else{const m={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です"}[j.sendErr]||("送信失敗: "+(j.sendErr||"不明"));alert(m+"\\n（下書きは消えていません）");}}
@@ -2064,12 +2102,19 @@ function asstAttach(){const inp=document.createElement("input");inp.type="file";
       }else amAdd("sysn","読み込み失敗: "+(j.error==="too_large"?"ファイルが大きすぎます":j.error==="unsupported"?"対応していない形式です（画像・PDF・CSV・テキストのみ）":(j.error||"不明")));
     }catch(e){ph.remove();amAdd("sysn","読み込みに失敗しました");}};
   inp.click();}
-async function sendAndLearn(){const c=DATA.find(x=>x.id===current);if(!c)return;
+function sendAndLearn(){const c=DATA.find(x=>x.id===current);if(!c)return;
+  const t=document.getElementById("draft").value.trim();if(!t){alert("送信する文章がありません");return;}
+  document.getElementById("learnPop").style.display="flex";}
+function closeLearnPop(){const p=document.getElementById("learnPop");if(p)p.style.display="none";}
+async function learnDecide(mode){
+  closeLearnPop();
+  const c=DATA.find(x=>x.id===current);if(!c)return;
   const t=document.getElementById("draft").value.trim();if(!t)return;
   const lastThem=c.msgs.filter(m=>m.from==="them").slice(-3).map(m=>m.text||(m.media?"["+m.media+"]":"")).join(" / ");
-  const ctx={customer:lastThem,draft0:c.draft0||c.draft||"",finalText:t};
+  const ctx={customer:lastThem,draft0:c.draft0||c.draft||"",finalText:t,confirmedGeneral:true}; // finalTextは送信前に確保（sendMsgがdraftを消すため）
   await sendMsg();
-  openAsst(ctx);}
+  if(mode==="learn"){ openAsst(ctx); } // 「今後もこうする」のみ学習。「今回だけの特例」は送信のみで学習しない
+}
 // ---- settings popup ----
 function renderRuleGauge(){
   const info=window.__rules; const bar=document.getElementById("ruleGaugeBar"); if(!bar) return;
