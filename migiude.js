@@ -42,7 +42,7 @@ function newTenant(slug, name, config) {
   if (typeof config.settings.tone !== "string") config.settings.tone = "";
   if (typeof config.settings.autoDelayMin !== "number" || !isFinite(config.settings.autoDelayMin) || config.settings.autoDelayMin < 0) config.settings.autoDelayMin = 0;
   config.settings.autoDelayMin = Math.min(60, Math.round(config.settings.autoDelayMin)); // 自動返信までの待ち時間（分）。0=即時, 上限60
-  return { slug, name: name || slug, config, store: {}, rules: {}, ruleSeq: 1, alerts: [], alertSeq: 1, push: {} };
+  return { slug, name: name || slug, config, store: {}, rules: {}, ruleSeq: 1, examples: {}, exampleSeq: 1, alerts: [], alertSeq: 1, push: {} };
 }
 async function saveTenantConfig(t) {
   if (pool) await pool.query("UPDATE tenants SET name=$2, config=$3 WHERE slug=$1", [t.slug, t.name, t.config]);
@@ -71,6 +71,7 @@ async function dbInit() {
   await pool.query("CREATE TABLE IF NOT EXISTS tenants (slug text primary key, name text, config jsonb)");
   await pool.query("CREATE TABLE IF NOT EXISTS convos (tenant text, id text, ts bigint, data jsonb, PRIMARY KEY(tenant,id))");
   await pool.query("CREATE TABLE IF NOT EXISTS rules (tenant text, id int, title text, content text, updated bigint, PRIMARY KEY(tenant,id))");
+  await pool.query("CREATE TABLE IF NOT EXISTS examples (tenant text, id int, q text, final text, draft0 text, instr text, ts bigint, PRIMARY KEY(tenant,id))");
   await pool.query("CREATE TABLE IF NOT EXISTS alerts (id serial primary key, tenant text, type text, summary text, name text, ts bigint, done boolean default false)");
   await pool.query("CREATE TABLE IF NOT EXISTS files (id text primary key, tenant text, name text, mime text, data bytea, ts bigint)");
   await pool.query("CREATE TABLE IF NOT EXISTS push_subs (tenant text, endpoint text primary key, sub jsonb)");
@@ -83,6 +84,8 @@ async function dbInit() {
     cv.rows.forEach(x => { const c = x.data; if (c && c.id) t.store[c.id] = c; });
     const ru = await pool.query("SELECT id,title,content FROM rules WHERE tenant=$1 ORDER BY id", [slug]);
     ru.rows.forEach(x => { t.rules[x.id] = { id: x.id, title: x.title, content: x.content }; if (x.id >= t.ruleSeq) t.ruleSeq = x.id + 1; });
+    const ex = await pool.query("SELECT id,q,final,draft0,instr,ts FROM examples WHERE tenant=$1 ORDER BY id DESC LIMIT 500", [slug]);
+    ex.rows.forEach(x => { t.examples[x.id] = { id: x.id, q: x.q, final: x.final, draft0: x.draft0, instr: x.instr, ts: Number(x.ts) }; if (x.id >= t.exampleSeq) t.exampleSeq = x.id + 1; });
     const al = await pool.query("SELECT id,type,summary,name,ts,done FROM alerts WHERE tenant=$1 ORDER BY ts DESC LIMIT 200", [slug]);
     t.alerts = al.rows.map(x => ({ id: x.id, type: x.type, summary: x.summary, name: x.name, ts: Number(x.ts), done: x.done }));
     t.alerts.forEach(a => { if (a.id >= t.alertSeq) t.alertSeq = a.id + 1; });
@@ -187,6 +190,29 @@ async function ruleDelete(t, id) {
   if (!t.rules[id]) return false; delete t.rules[id];
   if (pool) await pool.query("DELETE FROM rules WHERE tenant=$1 AND id=$2", [t.slug, id]);
   return true;
+}
+// ===== 自動メモリ（対応例）：スタッフの実際の返信を自動で貯め、次の下書きの“参考”にする。正式ルールではないので絶対視しない。=====
+const EXAMPLE_MAX = 500; // テナントあたりの保持上限（古いものから捨てる）
+async function exampleAdd(t, obj) {
+  const q = String(obj.q || "").slice(0, 600).trim();
+  const final = String(obj.final || "").slice(0, 1500).trim();
+  if (!q || !final) return null;
+  const id = t.exampleSeq++;
+  const ex = { id, q, final, draft0: String(obj.draft0 || "").slice(0, 1500), instr: String(obj.instr || "").slice(0, 800), ts: Date.now() };
+  t.examples[id] = ex;
+  if (pool) { try { await pool.query("INSERT INTO examples (tenant,id,q,final,draft0,instr,ts) VALUES ($1,$2,$3,$4,$5,$6,$7)", [t.slug, id, ex.q, ex.final, ex.draft0, ex.instr, ex.ts]); } catch (e) { console.error("exampleAdd:", e.message); } }
+  const ids = Object.keys(t.examples).map(Number).sort((a, b) => a - b);
+  while (ids.length > EXAMPLE_MAX) { const old = ids.shift(); delete t.examples[old]; if (pool) pool.query("DELETE FROM examples WHERE tenant=$1 AND id=$2", [t.slug, old]).catch(() => {}); }
+  return ex;
+}
+function examplesRanked(t, query, k) {
+  const list = Object.values(t.examples || {});
+  if (!list.length) return [];
+  if (!query) return list.slice(-(k || 4));
+  const qb = bigrams(query);
+  const scored = list.map(e => { const tb = bigrams(e.q + " " + e.final); let n = 0; qb.forEach(b => { if (tb.has(b)) n++; }); return { e, n }; });
+  scored.sort((a, b) => b.n - a.n || b.e.id - a.e.id);
+  return scored.filter(x => x.n > 0).slice(0, k || 4).map(x => x.e);
 }
 // relevance search (character-bigram overlap; works for Japanese, no tokenizer needed)
 function bigrams(s) { s = String(s || "").replace(/\s+/g, ""); const set = new Set(); for (let i = 0; i < s.length - 1; i++) set.add(s.slice(i, i + 2)); return set; }
@@ -443,6 +469,8 @@ async function genDraft(t, c, opts) {
   const lastQ = c.msgs.filter(m => m.from === "them").slice(-3).map(m => m.text || "").join(" ");
   const rel = rulesRanked(t, lastQ.slice(0, 1500));
   const rulesTxt = rulesBlock(rel, ruleBudget(t));
+  const exRel = examplesRanked(t, lastQ.slice(0, 1500), 4); // 自動メモリ：関連する過去の対応例
+  const examplesTxt = exRel.length ? exRel.map(e => "・お客様「" + String(e.q).slice(0, 160) + "」→ スタッフの返信「" + String(e.final).slice(0, 300) + "」").join("\n") : "";
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = channel === "mail" ? "メールなので返信本文の最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
   const msgsArr = []; let cur = null;
@@ -464,6 +492,7 @@ async function genDraft(t, c, opts) {
         : "お客様が複数の質問・依頼をしている場合は、その全てにもれなく答えること。1つも取りこぼさない。会話で既に伝えた内容は繰り返さない。")
     + "医療判断・診断はしない。「絶対」「完治」など断定的表現は使わない。絵文字は使わない。" + sig
     + (rulesTxt ? "\n\n【店舗ルール（最優先で従う。料金・規定・対応可否はここに従い、推測で答えない）】\n" + rulesTxt : "")
+    + (examplesTxt ? "\n\n【過去の対応例（スタッフが実際に送った返信。答え方・言い回し・上のルールに無い細かい対応の“参考”にしてよい。ただし料金・規定・対応可否は必ず上の店舗ルールが優先で、例がルールと食い違う場合はルールに従う。特定の人にだけ通じる特別対応は一般化しない）】\n" + examplesTxt : "")
     + (S(t).tone && S(t).tone.trim() ? "\n\n【トーン指示（最優先）】\n" + S(t).tone.trim().slice(0, 1200) : "")
     + (bookingTxt ? "\n\n【この方の予約情報（予約システムからの照会結果。日付判断・キャンセル可否・来院案内の参考にする。ここに無い予約内容は推測しない）】\n" + bookingTxt : "")
     + "\n\n" + JP_QUALITY
@@ -745,7 +774,15 @@ app.post("/api/send", guard, async (req, res) => {
   cancelAutoReply(t, c.id); // スタッフが手動返信したので保留中の自動返信は取り消す
   const text = (req.body.text || "").trim(); if (!text) return res.status(400).json({ error: "empty" });
   const { sent, sendErr } = await deliverText(t, c, text);
-  if (sent) { c.msgs.push({ from: "us", text, time: nowt() }); c.draft = ""; c.status = "done"; c.flag = false; c.lastAuto = false; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c); }
+  if (sent) {
+    const draft0 = String(c.draft0 || "").trim(); // 学習判定用に、消す前のAI初回下書きを確保
+    c.msgs.push({ from: "us", text, time: nowt() }); c.draft = ""; c.status = "done"; c.flag = false; c.lastAuto = false; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
+    // 自動メモリ：AIの下書きと違う返信（＝スタッフの貢献）だけを対応例として自動保存。送信したそのままは保存しない。
+    if (text !== draft0) {
+      const q0 = c.msgs.filter(m => m.from === "them").slice(-3).map(m => m.text || "").join(" ").trim();
+      if (q0) exampleAdd(t, { q: q0, final: text, draft0, instr: req.body.instr || "" });
+    }
+  }
   res.json({ ok: true, sent, sendErr });
 });
 
@@ -1161,6 +1198,7 @@ app.post("/api/assistant", guard, async (req, res) => {
     ctxTxt = "\n\n【今回の学習対象（スタッフが送信した返信）】\nお客様の直近メッセージ: " + String(ctx.customer || "").slice(0, 1000)
       + "\nAIの初回下書き: " + String(ctx.draft0 || "").slice(0, 1500)
       + "\nスタッフが実際に送った返信: " + String(ctx.finalText || "").slice(0, 1500)
+      + (ctx.instructions ? "\nスタッフが『AIで作り直す』で出した指示（最重要の手がかり。『今後こう答えてほしい』という方針そのもの。ルール案の核にすること）: " + String(ctx.instructions).slice(0, 1500) : "")
       + "\n初回下書きとスタッフの最終返信の差分・会話の流れから「今後どう回答すべきか」を自分で読み取り、最初の返答で要点の短い説明と具体的なルール案（proposals）をすぐ提示すること。スタッフに『どんなルールにしたいか教えて』と聞き返さない。差分がなく学習すべき点が本当に無い場合だけ、その旨を短く伝える。"
       + "\n【例外対応の検知（重要）】提案の前に、今回の対応が全患者向けの一般ルールか、この患者だけの例外対応（特別扱い・イレギュラー・クレーム対応のための特例・規定外の譲歩など）かを必ず判定すること。例外対応に見える場合はルール化を提案せず、『今回は例外対応に見えるため、ルール化はおすすめしません』と理由を添えて伝える。繰り返し起こり得る例外の場合のみ、既存の通常ルールを壊さない条件付きの形（例:『通常は◯◯と案内する。ただし△△の場合のみ□□とする』）で提案する。通常ルール自体を例外に合わせて書き換える提案は絶対にしない。"
       + (ctx.confirmedGeneral ? "\n【スタッフの明示判断】スタッフはこの対応を『今後も標準にする』と選択済み。よって安易に例外却下せず、ルール化を前提に具体案を出すこと。ただし既存ルールと矛盾・重複する場合は新規追加ではなく該当ルールのupdate提案にし、どこがどう変わるかをreplyで必ず明示する（矛盾を黙って上書きしない）。内容が特定の患者にしか当てはまらず一般化が危険な場合のみ、既存ルールを壊さない条件付きの形で提案する。" : "");
@@ -1916,15 +1954,7 @@ const PAGE = `<!DOCTYPE html>
   <div id="asstMsgs"></div>
   <div id="asstIn"><button class="cbtn" onclick="asstAttach()" title="価格表などの資料（画像・PDF・CSV）を読み込ませて一括学習">📎</button><textarea id="asstText" placeholder="例：発送質問には3営業日以内と答えて／今の料金ルールは？" onkeydown="if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing&&event.keyCode!==229){event.preventDefault();asstSend();}"></textarea><button class="cbtn send" onclick="asstSend()">送信</button></div>
 </div></div>
-<div id="learnPop" style="position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:70;display:none;align-items:center;justify-content:center;"><div style="background:#fff;border-radius:14px;padding:18px;width:min(92vw,340px);">
-  <h3 style="margin:0 0 6px;font-size:15px;">この返信を学習しますか？</h3>
-  <div style="font-size:12px;color:#6b7280;margin-bottom:14px;">「今後もこうする」を選ぶとルール化を検討します（既存ルールと矛盾する場合は、勝手に上書きせず確認のうえ更新提案）。特例は学習しません。どちらも返信は送信されます。</div>
-  <div style="display:flex;flex-direction:column;gap:8px;">
-    <button class="cbtn send" style="width:100%;" onclick="learnDecide('learn')">今後もこうする（ルール化を検討）</button>
-    <button class="cbtn" style="width:100%;" onclick="learnDecide('once')">今回だけの特例（学習しない）</button>
-    <button class="cbtn" style="width:100%;" onclick="closeLearnPop()">やめる</button>
-  </div>
-</div></div>
+<div id="learnToast" style="display:none;position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:75;background:#065f46;color:#fff;border-radius:10px;padding:8px 14px;font-size:12px;box-shadow:0 6px 20px rgba(0,0,0,.25);">✓ この対応を学習しました</div>
 <script>
 let DATA=[];let current=null;
 const roomsEl=document.getElementById("rooms"),chatEl=document.getElementById("chat"),appEl=document.getElementById("app");
@@ -1965,7 +1995,7 @@ function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)ret
   chatEl.innerHTML='<div id="chatHead"><button id="backBtn" onclick="closeChat()">‹</button>'+av(r,30)+'<span id="chatName">'+esc(r.name)+'　<span style="font-size:11px;color:#6b7280;">'+(r.channel==="line"?"LINE":"メール")+((r.acct&&r.acct.name&&r.acct.name!=="メイン")?"・"+esc(r.acct.name):"")+'</span></span><button class="hbtn" onclick="shareClinic()">🏥 クリニックへ共有</button></div>'+
     '<div id="msgs">'+bubbles+'</div>'+
     '<div id="composer"><div id="aiLabel">✨ AI下書き（編集して送れます）</div><div id="topicChips" style="display:none;"></div><div id="draftRow"><button id="attach" onclick="attach()" title="写真・動画を添付">📎</button><textarea id="draft">'+esc(r.draft||"")+'</textarea></div>'+
-    '<div id="cbtns"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ AIで作り直す</button><button class="cbtn done" onclick="markDone()">対応済み</button><button class="cbtn learn" onclick="sendAndLearn()">送信して学習</button><button class="cbtn send" onclick="sendMsg()">送信</button></div></div>';
+    '<div id="cbtns"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ AIで作り直す</button><button class="cbtn done" onclick="markDone()">対応済み</button><button class="cbtn send" onclick="sendMsg()">送信</button></div></div>';
   const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r); if(!keep)renderList();
 }
 function closeChat(){appEl.classList.remove("chatopen");current=null;renderList();}
@@ -1987,7 +2017,7 @@ function toggleTopic(i){ const r=DATA.find(x=>x.id===current); if(!r||!Array.isA
 async function redraftSelected(){ if(!current||!selTopics)return; const sel=[...selTopics]; if(!sel.length){alert("返信する内容を1つ以上選んでください");return;} const btn=document.getElementById("redraftBtn"); if(btn){btn.disabled=true;btn.textContent="作成中…";} try{ const rr=await api("/api/redraft",{id:current,selected:sel}); const j=await rr.json(); if(j&&j.ok&&typeof j.draft==="string"){ const d=document.getElementById("draft"); if(d)d.value=j.draft; const cd=DATA.find(x=>x.id===current); if(cd){cd.draft=j.draft; if(Array.isArray(j.topics))cd.topics=j.topics;} }else{ alert("作り直しに失敗しました"); } }catch(e){ alert("作り直しに失敗しました"); } if(btn){btn.disabled=false;btn.textContent="選んだ内容で下書きを作成";} }
 async function markDone(){const id=current;await api("/api/done",{id});await load();}
 async function markAllDone(){if(!confirm("すべてのチャットを「対応済み」に変更します。よろしいですか？"))return;try{const r=await api("/api/done-all",{});const j=await r.json();closeSet();if(current){closeChat();}await load();alert((j.count||0)+"件を対応済みにしました");}catch(e){alert("変更に失敗しました");}}
-async function sendMsg(){const id=current;const t=document.getElementById("draft").value.trim();if(!t)return;const r=await api("/api/send",{id,text:t});let j={};try{j=await r.json();}catch(e){}if(j.sent){const d0=document.getElementById("draft");if(d0)d0.value="";const cd=DATA.find(x=>x.id===id);if(cd)cd.draft="";await load();}else{const m={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です"}[j.sendErr]||("送信失敗: "+(j.sendErr||"不明"));alert(m+"\\n（下書きは消えていません）");}}
+async function sendMsg(){const id=current;const t=document.getElementById("draft").value.trim();if(!t)return;const cd0=DATA.find(x=>x.id===id);const orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim();const edited=(t!==orig);let instr="";try{if(dSessions&&dSessions[id]&&Array.isArray(dSessions[id].hist)){instr=dSessions[id].hist.filter(m=>m&&m.role==="user").map(m=>String(m.content||"")).join(" / ").slice(0,1500);}}catch(e){}const r=await api("/api/send",{id,text:t,instr:edited?instr:""});let j={};try{j=await r.json();}catch(e){}if(j.sent){const d0=document.getElementById("draft");if(d0)d0.value="";const cd=DATA.find(x=>x.id===id);if(cd)cd.draft="";if(edited&&orig.length>0){showLearnToast();}await load();}else{const m={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です"}[j.sendErr]||("送信失敗: "+(j.sendErr||"不明"));alert(m+"\\n（下書きは消えていません）");}}
 function attach(){const inp=document.createElement("input");inp.type="file";inp.accept="image/*,video/*,application/pdf,.pdf,.doc,.docx,.xls,.xlsx";inp.onchange=async()=>{const f=inp.files[0];if(!f)return;if(f.size>10*1024*1024){alert("10MB以下のファイルにしてください");return;}const btn=document.getElementById("attach");if(btn){btn.disabled=true;btn.textContent="⏳";}try{const b64=await new Promise((res,rej)=>{const rd=new FileReader();rd.onload=()=>res(String(rd.result).split(",")[1]);rd.onerror=rej;rd.readAsDataURL(f);});const up=await api("/api/upload",{name:f.name,mime:f.type||"application/octet-stream",data:b64});const uj=await up.json();if(!uj.ok)throw new Error(uj.error||"upload");const sr=await api("/api/send-file",{id:current,fileId:uj.fileId});const sj=await sr.json();if(!sj.sent)alert("送信失敗: "+(sj.sendErr||"不明"));await load();}catch(e){alert("ファイル送信に失敗しました: "+e.message);}if(btn){btn.disabled=false;btn.textContent="📎";}};inp.click();}
 async function shareClinic(){const note=prompt("現場に伝える内容を入力してください（空欄のままOKを押すと、お客様の直近メッセージをそのまま共有します）","");if(note===null)return;try{const r=await api("/api/share",{id:current,note:note||""});const j=await r.json();if(j.ok)alert("現場ボードに共有しました");else alert("共有に失敗しました");}catch(e){alert("共有に失敗しました");}}
 async function toggleFlag(){if(!current)return;try{const r=await api("/api/tag",{id:current});const j=await r.json();const b=document.getElementById("flagBtn");if(b)b.textContent=j.flag?"⚑ 要対応を外す":"⚑ 要対応";const cd=DATA.find(x=>x.id===current);if(cd)cd.flag=j.flag;renderList();}catch(e){}}
@@ -2102,19 +2132,9 @@ function asstAttach(){const inp=document.createElement("input");inp.type="file";
       }else amAdd("sysn","読み込み失敗: "+(j.error==="too_large"?"ファイルが大きすぎます":j.error==="unsupported"?"対応していない形式です（画像・PDF・CSV・テキストのみ）":(j.error||"不明")));
     }catch(e){ph.remove();amAdd("sysn","読み込みに失敗しました");}};
   inp.click();}
-function sendAndLearn(){const c=DATA.find(x=>x.id===current);if(!c)return;
-  const t=document.getElementById("draft").value.trim();if(!t){alert("送信する文章がありません");return;}
-  document.getElementById("learnPop").style.display="flex";}
-function closeLearnPop(){const p=document.getElementById("learnPop");if(p)p.style.display="none";}
-async function learnDecide(mode){
-  closeLearnPop();
-  const c=DATA.find(x=>x.id===current);if(!c)return;
-  const t=document.getElementById("draft").value.trim();if(!t)return;
-  const lastThem=c.msgs.filter(m=>m.from==="them").slice(-3).map(m=>m.text||(m.media?"["+m.media+"]":"")).join(" / ");
-  const ctx={customer:lastThem,draft0:c.draft0||c.draft||"",finalText:t,confirmedGeneral:true}; // finalTextは送信前に確保（sendMsgがdraftを消すため）
-  await sendMsg();
-  if(mode==="learn"){ openAsst(ctx); } // 「今後もこうする」のみ学習。「今回だけの特例」は送信のみで学習しない
-}
+// 学習トースト：下書きを修正して送った直後だけ「✓学習しました」と控えめに表示（操作不要・自動メモリへ保存済みの合図）。
+let learnToastTimer=null;
+function showLearnToast(){ const b=document.getElementById("learnToast"); if(!b)return; b.style.display="block"; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";},2500); }
 // ---- settings popup ----
 function renderRuleGauge(){
   const info=window.__rules; const bar=document.getElementById("ruleGaugeBar"); if(!bar) return;
