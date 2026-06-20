@@ -210,7 +210,7 @@ function examplesRanked(t, query, k) {
   if (!list.length) return [];
   if (!query) return list.slice(-(k || 4));
   const qb = bigrams(query);
-  const scored = list.map(e => { const tb = bigrams(e.q + " " + e.final); let n = 0; qb.forEach(b => { if (tb.has(b)) n++; }); return { e, n }; });
+  const scored = list.map(e => { const tb = bigrams(e.q + " " + e.final + " " + (e.instr || "")); let n = 0; qb.forEach(b => { if (tb.has(b)) n++; }); return { e, n }; });
   scored.sort((a, b) => b.n - a.n || b.e.id - a.e.id);
   return scored.filter(x => x.n > 0).slice(0, k || 4).map(x => x.e);
 }
@@ -470,7 +470,7 @@ async function genDraft(t, c, opts) {
   const rel = rulesRanked(t, lastQ.slice(0, 1500));
   const rulesTxt = rulesBlock(rel, ruleBudget(t));
   const exRel = examplesRanked(t, lastQ.slice(0, 1500), 4); // 自動メモリ：関連する過去の対応例
-  const examplesTxt = exRel.length ? exRel.map(e => "・お客様「" + String(e.q).slice(0, 160) + "」→ スタッフの返信「" + String(e.final).slice(0, 300) + "」").join("\n") : "";
+  const examplesTxt = exRel.length ? exRel.map(e => "・お客様「" + String(e.q).slice(0, 160) + "」→ スタッフの返信「" + String(e.final).slice(0, 300) + "」" + (e.instr ? "（スタッフが作り直しで出した方針: " + String(e.instr).slice(0, 160) + "）" : "")).join("\n") : "";
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = channel === "mail" ? "メールなので返信本文の最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
   const msgsArr = []; let cur = null;
@@ -774,16 +774,17 @@ app.post("/api/send", guard, async (req, res) => {
   cancelAutoReply(t, c.id); // スタッフが手動返信したので保留中の自動返信は取り消す
   const text = (req.body.text || "").trim(); if (!text) return res.status(400).json({ error: "empty" });
   const { sent, sendErr } = await deliverText(t, c, text);
+  let learnedId = null;
   if (sent) {
     const draft0 = String(c.draft0 || "").trim(); // 学習判定用に、消す前のAI初回下書きを確保
     c.msgs.push({ from: "us", text, time: nowt() }); c.draft = ""; c.status = "done"; c.flag = false; c.lastAuto = false; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
     // 自動メモリ：AIの下書きと違う返信（＝スタッフの貢献）だけを対応例として自動保存。送信したそのままは保存しない。
     if (text !== draft0) {
       const q0 = c.msgs.filter(m => m.from === "them").slice(-3).map(m => m.text || "").join(" ").trim();
-      if (q0) exampleAdd(t, { q: q0, final: text, draft0, instr: req.body.instr || "" });
+      if (q0) { const ex = await exampleAdd(t, { q: q0, final: text, draft0, instr: req.body.instr || "" }); if (ex) learnedId = ex.id; }
     }
   }
-  res.json({ ok: true, sent, sendErr });
+  res.json({ ok: true, sent, sendErr, learnedId });
 });
 
 // connection settings (secrets are write-only: never echoed back)
@@ -896,6 +897,7 @@ app.post("/api/done", guard, (req, res) => { const t = req.tenant; const c = t.s
 app.post("/api/done-all", guard, (req, res) => { const t = req.tenant; let count = 0; Object.values(t.store).forEach(c => { if (c.status !== "done" || c.flag) { cancelAutoReply(t, c.id); c.status = "done"; c.flag = false; dbSave(t, c); count++; } }); res.json({ ok: true, count }); });
 app.post("/api/tag", guard, (req, res) => { const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" }); c.flag = !c.flag; if (c.flag) { c.order = Math.max(0, ...Object.values(t.store).filter(x => x.flag).map(x => x.order || 0)) + 1; c.status = "todo"; } dbSave(t, c); res.json({ ok: true, flag: c.flag }); });
 
+app.post("/api/example-delete", guard, (req, res) => { const t = req.tenant; const id = Number(req.body.id); if (t.examples && t.examples[id]) { delete t.examples[id]; if (pool) pool.query("DELETE FROM examples WHERE tenant=$1 AND id=$2", [t.slug, id]).catch(() => {}); } res.json({ ok: true }); });
 app.post("/api/redraft", guard, async (req, res) => {
   const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" });
   const sel = Array.isArray(req.body.selected) ? req.body.selected.map(String).slice(0, 20) : [];
@@ -2017,7 +2019,7 @@ function toggleTopic(i){ const r=DATA.find(x=>x.id===current); if(!r||!Array.isA
 async function redraftSelected(){ if(!current||!selTopics)return; const sel=[...selTopics]; if(!sel.length){alert("返信する内容を1つ以上選んでください");return;} const btn=document.getElementById("redraftBtn"); if(btn){btn.disabled=true;btn.textContent="作成中…";} try{ const rr=await api("/api/redraft",{id:current,selected:sel}); const j=await rr.json(); if(j&&j.ok&&typeof j.draft==="string"){ const d=document.getElementById("draft"); if(d)d.value=j.draft; const cd=DATA.find(x=>x.id===current); if(cd){cd.draft=j.draft; if(Array.isArray(j.topics))cd.topics=j.topics;} }else{ alert("作り直しに失敗しました"); } }catch(e){ alert("作り直しに失敗しました"); } if(btn){btn.disabled=false;btn.textContent="選んだ内容で下書きを作成";} }
 async function markDone(){const id=current;await api("/api/done",{id});await load();}
 async function markAllDone(){if(!confirm("すべてのチャットを「対応済み」に変更します。よろしいですか？"))return;try{const r=await api("/api/done-all",{});const j=await r.json();closeSet();if(current){closeChat();}await load();alert((j.count||0)+"件を対応済みにしました");}catch(e){alert("変更に失敗しました");}}
-async function sendMsg(){const id=current;const t=document.getElementById("draft").value.trim();if(!t)return;const cd0=DATA.find(x=>x.id===id);const orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim();const edited=(t!==orig);let instr="";try{if(dSessions&&dSessions[id]&&Array.isArray(dSessions[id].hist)){instr=dSessions[id].hist.filter(m=>m&&m.role==="user").map(m=>String(m.content||"")).join(" / ").slice(0,1500);}}catch(e){}const r=await api("/api/send",{id,text:t,instr:edited?instr:""});let j={};try{j=await r.json();}catch(e){}if(j.sent){const d0=document.getElementById("draft");if(d0)d0.value="";const cd=DATA.find(x=>x.id===id);if(cd)cd.draft="";if(edited&&orig.length>0){showLearnToast();}await load();}else{const m={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です"}[j.sendErr]||("送信失敗: "+(j.sendErr||"不明"));alert(m+"\\n（下書きは消えていません）");}}
+async function sendMsg(){const id=current;const t=document.getElementById("draft").value.trim();if(!t)return;const cd0=DATA.find(x=>x.id===id);const orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim();const edited=(t!==orig);let instr="";try{if(dSessions&&dSessions[id]&&Array.isArray(dSessions[id].hist)){instr=dSessions[id].hist.filter(m=>m&&m.role==="user").map(m=>String(m.content||"")).join(" / ").slice(0,1500);}}catch(e){}const r=await api("/api/send",{id,text:t,instr:edited?instr:""});let j={};try{j=await r.json();}catch(e){}if(j.sent){const d0=document.getElementById("draft");if(d0)d0.value="";const cd=DATA.find(x=>x.id===id);if(cd)cd.draft="";if(edited&&orig.length>0){showLearnToast(j.learnedId);}await load();}else{const m={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です"}[j.sendErr]||("送信失敗: "+(j.sendErr||"不明"));alert(m+"\\n（下書きは消えていません）");}}
 function attach(){const inp=document.createElement("input");inp.type="file";inp.accept="image/*,video/*,application/pdf,.pdf,.doc,.docx,.xls,.xlsx";inp.onchange=async()=>{const f=inp.files[0];if(!f)return;if(f.size>10*1024*1024){alert("10MB以下のファイルにしてください");return;}const btn=document.getElementById("attach");if(btn){btn.disabled=true;btn.textContent="⏳";}try{const b64=await new Promise((res,rej)=>{const rd=new FileReader();rd.onload=()=>res(String(rd.result).split(",")[1]);rd.onerror=rej;rd.readAsDataURL(f);});const up=await api("/api/upload",{name:f.name,mime:f.type||"application/octet-stream",data:b64});const uj=await up.json();if(!uj.ok)throw new Error(uj.error||"upload");const sr=await api("/api/send-file",{id:current,fileId:uj.fileId});const sj=await sr.json();if(!sj.sent)alert("送信失敗: "+(sj.sendErr||"不明"));await load();}catch(e){alert("ファイル送信に失敗しました: "+e.message);}if(btn){btn.disabled=false;btn.textContent="📎";}};inp.click();}
 async function shareClinic(){const note=prompt("現場に伝える内容を入力してください（空欄のままOKを押すと、お客様の直近メッセージをそのまま共有します）","");if(note===null)return;try{const r=await api("/api/share",{id:current,note:note||""});const j=await r.json();if(j.ok)alert("現場ボードに共有しました");else alert("共有に失敗しました");}catch(e){alert("共有に失敗しました");}}
 async function toggleFlag(){if(!current)return;try{const r=await api("/api/tag",{id:current});const j=await r.json();const b=document.getElementById("flagBtn");if(b)b.textContent=j.flag?"⚑ 要対応を外す":"⚑ 要対応";const cd=DATA.find(x=>x.id===current);if(cd)cd.flag=j.flag;renderList();}catch(e){}}
@@ -2132,9 +2134,10 @@ function asstAttach(){const inp=document.createElement("input");inp.type="file";
       }else amAdd("sysn","読み込み失敗: "+(j.error==="too_large"?"ファイルが大きすぎます":j.error==="unsupported"?"対応していない形式です（画像・PDF・CSV・テキストのみ）":(j.error||"不明")));
     }catch(e){ph.remove();amAdd("sysn","読み込みに失敗しました");}};
   inp.click();}
-// 学習トースト：下書きを修正して送った直後だけ「✓学習しました」と控えめに表示（操作不要・自動メモリへ保存済みの合図）。
+// 学習トースト：下書きを修正して送った直後だけ「✓学習しました」と控えめに表示。特例だった場合は「学習しない」で今保存した例を取り消せる。
 let learnToastTimer=null;
-function showLearnToast(){ const b=document.getElementById("learnToast"); if(!b)return; b.style.display="block"; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";},2500); }
+function showLearnToast(id){ const b=document.getElementById("learnToast"); if(!b)return; b.innerHTML='✓ この対応を学習しました'+(id?' ・ <span style="text-decoration:underline;cursor:pointer;color:#a7f3d0;" onclick="undoLearn('+id+')">特例だった（学習しない）</span>':''); b.style.display="block"; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";}, id?6000:2500); }
+async function undoLearn(id){ try{ await api("/api/example-delete",{id}); }catch(e){} const b=document.getElementById("learnToast"); if(b){ b.innerHTML='↩ 学習を取り消しました（特例として記録しません）'; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";},2000); } }
 // ---- settings popup ----
 function renderRuleGauge(){
   const info=window.__rules; const bar=document.getElementById("ruleGaugeBar"); if(!bar) return;
