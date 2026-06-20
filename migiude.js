@@ -42,6 +42,7 @@ function newTenant(slug, name, config) {
   if (typeof config.settings.tone !== "string") config.settings.tone = "";
   if (typeof config.settings.autoDelayMin !== "number" || !isFinite(config.settings.autoDelayMin) || config.settings.autoDelayMin < 0) config.settings.autoDelayMin = 0;
   config.settings.autoDelayMin = Math.min(60, Math.round(config.settings.autoDelayMin)); // 自動返信までの待ち時間（分）。0=即時, 上限60
+  if (!Array.isArray(config.settings.prefs)) config.settings.prefs = []; // スタッフの記憶（全返信に効く恒久ルール）
   return { slug, name: name || slug, config, store: {}, rules: {}, ruleSeq: 1, examples: {}, exampleSeq: 1, alerts: [], alertSeq: 1, push: {} };
 }
 async function saveTenantConfig(t) {
@@ -204,6 +205,11 @@ async function exampleAdd(t, obj) {
   const ids = Object.keys(t.examples).map(Number).sort((a, b) => a - b);
   while (ids.length > EXAMPLE_MAX) { const old = ids.shift(); delete t.examples[old]; if (pool) pool.query("DELETE FROM examples WHERE tenant=$1 AND id=$2", [t.slug, old]).catch(() => {}); }
   return ex;
+}
+// スタッフの記憶（恒久ルール）を生成プロンプト用のテキストに整形
+function prefsBlock(t) {
+  const a = (S(t).prefs && Array.isArray(S(t).prefs)) ? S(t).prefs : [];
+  return a.map(p => (typeof p === "string" ? p : (p && p.text) || "")).filter(Boolean).map(s => "・" + s).join("\n");
 }
 function examplesRanked(t, query, k) {
   const list = Object.values(t.examples || {});
@@ -494,6 +500,7 @@ async function genDraft(t, c, opts) {
     + (rulesTxt ? "\n\n【店舗ルール（最優先で従う。料金・規定・対応可否はここに従い、推測で答えない）】\n" + rulesTxt : "")
     + (examplesTxt ? "\n\n【過去の対応例（スタッフが実際に送った返信。答え方・言い回し・上のルールに無い細かい対応の“参考”にしてよい。ただし料金・規定・対応可否は必ず上の店舗ルールが優先で、例がルールと食い違う場合はルールに従う。特定の人にだけ通じる特別対応は一般化しない）】\n" + examplesTxt : "")
     + (S(t).tone && S(t).tone.trim() ? "\n\n【トーン指示（最優先）】\n" + S(t).tone.trim().slice(0, 1200) : "")
+    + (prefsBlock(t) ? "\n\n【スタッフが記憶させた指示（全返信で必ず守る。トーン指示と同格で最優先）】\n" + prefsBlock(t) : "")
     + (bookingTxt ? "\n\n【この方の予約情報（予約システムからの照会結果。日付判断・キャンセル可否・来院案内の参考にする。ここに無い予約内容は推測しない）】\n" + bookingTxt : "")
     + "\n\n" + JP_QUALITY
     + "\n\n出力は必ず次のJSONのみ（前後に説明や```やかぎ括弧を付けない）: {\"draft\":\"お客様への返信文\",\"confidence\":\"high|medium|low\",\"is_urgent\":true|false,\"needs_human\":true|false,\"site_alert\":\"遅刻|当日キャンセル|緊急来院|none\",\"site_summary\":\"現場向け一行要約。site_alertがnoneなら空文字\",\"topics\":[{\"q\":\"短い質問ラベル\",\"need\":true}]}"
@@ -898,6 +905,8 @@ app.post("/api/done-all", guard, (req, res) => { const t = req.tenant; let count
 app.post("/api/tag", guard, (req, res) => { const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" }); c.flag = !c.flag; if (c.flag) { c.order = Math.max(0, ...Object.values(t.store).filter(x => x.flag).map(x => x.order || 0)) + 1; c.status = "todo"; } dbSave(t, c); res.json({ ok: true, flag: c.flag }); });
 
 app.post("/api/example-delete", guard, (req, res) => { const t = req.tenant; const id = Number(req.body.id); if (t.examples && t.examples[id]) { delete t.examples[id]; if (pool) pool.query("DELETE FROM examples WHERE tenant=$1 AND id=$2", [t.slug, id]).catch(() => {}); } res.json({ ok: true }); });
+app.post("/api/pref-add", guard, (req, res) => { const t = req.tenant; const text = String(req.body.text || "").trim().slice(0, 200); if (!text) return res.json({ ok: false }); const cur = (Array.isArray(S(t).prefs)) ? S(t).prefs : (S(t).prefs = []); if (!cur.some(p => (typeof p === "string" ? p : p.text) === text)) { cur.push({ id: Date.now(), text }); while (cur.length > 40) cur.shift(); saveTenantConfig(t).catch(() => {}); } res.json({ ok: true, prefs: S(t).prefs }); });
+app.post("/api/pref-delete", guard, (req, res) => { const t = req.tenant; const id = req.body.id; const cur = Array.isArray(S(t).prefs) ? S(t).prefs : []; S(t).prefs = cur.filter(p => String(p && p.id) !== String(id)); saveTenantConfig(t).catch(() => {}); res.json({ ok: true, prefs: S(t).prefs }); });
 app.post("/api/redraft", guard, async (req, res) => {
   const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" });
   const sel = Array.isArray(req.body.selected) ? req.body.selected.map(String).slice(0, 20) : [];
@@ -982,16 +991,27 @@ app.post("/api/draft-chat", guard, async (req, res) => {
     + "医療判断・診断はしない。断定的表現や絵文字は使わない。" + sig
     + (rulesTxt ? "\n\n【店舗ルール（料金・規定・対応可否はここに従い、推測で答えない）】\n" + rulesTxt : "")
     + (S(t).tone && S(t).tone.trim() ? "\n\n【トーン指示】\n" + S(t).tone.trim().slice(0, 1000) : "")
+    + (prefsBlock(t) ? "\n\n【スタッフが記憶させた指示（全返信で必ず守る）】\n" + prefsBlock(t) : "")
     + "\n\n" + JP_QUALITY
     + "\n\nスタッフの指示がどんなに短くても（「あってる」「もっと短く」「優しく」等）、お客様との会話の文脈に当てはめて意味を解釈すること。"
     + "毎回、返信下書きの完成形の全文をdraftに入れる。replyにはスタッフへの短い一言（何をどう変えたか、1〜2文。敬語でなくてよい）。"
-    + "出力は必ず次のJSONのみ: {\"reply\":\"スタッフへの一言\",\"draft\":\"お客様への返信下書き全文\"}";
+    + "出力は必ず次のJSONのみ: {\"reply\":\"スタッフへの一言\",\"draft\":\"お客様への返信下書き全文\",\"memory\":\"\"}"
+    + "\nmemory: スタッフの指示が『今後すべての返信に共通で適用すべき恒久的な好み・文体ルール』だと判断した時だけ、簡潔なルール文を入れる（例:「返信の冒頭に『様』を付けない」「常に短めにする」「絵文字を使わない」。『今後』『常に』『毎回』『これから』のような全体方針が手がかり）。その問い合わせ固有の内容（『この件は3営業日と答えて』等）は入れない。恒久ルールでなければ空文字。";
   try {
     const raw = await aiChat(t, sys, edits, 4000);
     if (!raw) return res.json({ ok: false, error: "ai_failed" });
     let out = { reply: "", draft: "" };
     try { const m = raw.match(/\{[\s\S]*\}/); out = JSON.parse(m ? m[0] : raw); } catch (e) { out = { reply: "", draft: salvageDraft(raw) }; }
-    res.json({ ok: true, reply: String(out.reply || "").slice(0, 600), draft: String(out.draft || "").slice(0, 4000) });
+    let savedMem = "";
+    const memTxt = String(out.memory || "").trim().slice(0, 200);
+    if (memTxt) {
+      const cur = (S(t).prefs && Array.isArray(S(t).prefs)) ? S(t).prefs : (S(t).prefs = []);
+      if (!cur.some(p => (typeof p === "string" ? p : p.text) === memTxt)) {
+        cur.push({ id: Date.now(), text: memTxt }); while (cur.length > 40) cur.shift();
+        saveTenantConfig(t).catch(() => {}); savedMem = memTxt;
+      }
+    }
+    res.json({ ok: true, reply: String(out.reply || "").slice(0, 600), draft: String(out.draft || "").slice(0, 4000), memory: savedMem });
   } catch (e) { res.json({ ok: false, error: String(e.message || e).slice(0, 80) }); }
 });
 
@@ -1912,6 +1932,15 @@ const PAGE = `<!DOCTYPE html>
     <div style="font-size:11px;color:#6b7280;margin-top:2px;">ここに書いた指示は、AI下書き・自動返信・AIで作り直す、すべてに最優先で反映されます。空欄なら標準のトーンです。</div>
   </div>
   <div style="border-top:1px solid #e5e7eb;margin-top:14px;padding-top:10px;">
+    <div style="font-size:13px;margin-bottom:4px;">🧠 スタッフの記憶（全返信に効く恒久ルール）</div>
+    <div id="prefList" style="font-size:12px;color:#374151;"></div>
+    <div style="display:flex;gap:6px;margin-top:6px;">
+      <input id="prefInput" placeholder="例：返信の冒頭に『様』を付けない" style="flex:1;box-sizing:border-box;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;">
+      <button class="cbtn" onclick="addPref()">＋追加</button>
+    </div>
+    <div style="font-size:11px;color:#6b7280;margin-top:4px;">「AIで作り直す」で『今後〜』『常に〜』のように指示すると自動でここに記憶され、以後の全返信に効きます。手動の追加・削除もここで。</div>
+  </div>
+  <div style="border-top:1px solid #e5e7eb;margin-top:14px;padding-top:10px;">
     <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;" onclick="document.getElementById('connBox').style.display=document.getElementById('connBox').style.display==='none'?'block':'none'"><span style="font-size:13px;font-weight:600;">🔗 連携設定（LINE・メール）</span><span id="connStat" style="font-size:11px;color:#16a34a;"></span></div>
     <div id="connBox" style="display:none;margin-top:8px;">
       <div style="font-size:12px;font-weight:600;margin:6px 0 2px;">LINE連携</div>
@@ -2075,6 +2104,7 @@ async function dSend(){const x=document.getElementById("dText");const txt=x.valu
       if(j.reply)dAdd("ai",j.reply);
       dNewCard(j.draft);
       dHist.push({role:"assistant",content:j.draft});
+      if(j.memory)dAdd("sysn","🧠 記憶しました：「"+j.memory+"」（今後の全返信に適用します。設定→スタッフの記憶 で確認・削除できます）");
     }else dAdd("sysn","エラー: "+(j.error||"不明"));
   }catch(e){ph.remove();dAdd("sysn","通信エラーが発生しました");}}
 // ---- みぎうで君 (rulebook editing chat) ----
@@ -2134,6 +2164,10 @@ function asstAttach(){const inp=document.createElement("input");inp.type="file";
       }else amAdd("sysn","読み込み失敗: "+(j.error==="too_large"?"ファイルが大きすぎます":j.error==="unsupported"?"対応していない形式です（画像・PDF・CSV・テキストのみ）":(j.error||"不明")));
     }catch(e){ph.remove();amAdd("sysn","読み込みに失敗しました");}};
   inp.click();}
+// スタッフの記憶（恒久ルール）の一覧描画・追加・削除
+function renderPrefs(prefs){const el=document.getElementById("prefList");if(!el)return;const a=Array.isArray(prefs)?prefs:[];if(!a.length){el.innerHTML='<span style="color:#9ca3af;">まだ記憶はありません。</span>';return;}el.innerHTML=a.map(p=>{const id=(p&&p.id!=null)?p.id:"";const tx=(typeof p==="string")?p:((p&&p.text)||"");return '<div style="display:flex;align-items:center;gap:6px;padding:3px 0;"><span style="flex:1;">・'+esc(tx)+'</span><button onclick="delPref('+JSON.stringify(id)+')" style="border:none;background:transparent;color:#dc2626;cursor:pointer;font-size:14px;">×</button></div>';}).join("");}
+async function addPref(){const inp=document.getElementById("prefInput");const text=(inp&&inp.value||"").trim();if(!text)return;try{const r=await api("/api/pref-add",{text});const j=await r.json();if(j.ok){if(inp)inp.value="";renderPrefs(j.prefs||[]);}}catch(e){alert("追加に失敗しました");}}
+async function delPref(id){try{const r=await api("/api/pref-delete",{id});const j=await r.json();if(j.ok)renderPrefs(j.prefs||[]);}catch(e){}}
 // 学習トースト：下書きを修正して送った直後だけ「✓学習しました」と控えめに表示。特例だった場合は「学習しない」で今保存した例を取り消せる。
 let learnToastTimer=null;
 function showLearnToast(id){ const b=document.getElementById("learnToast"); if(!b)return; b.innerHTML='✓ この対応を学習しました'+(id?' ・ <span style="text-decoration:underline;cursor:pointer;color:#a7f3d0;" onclick="undoLearn('+id+')">特例だった（学習しない）</span>':''); b.style.display="block"; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";}, id?6000:2500); }
@@ -2159,7 +2193,7 @@ function renderRuleGauge(){
     else { warn.style.display="none"; }
   }
 }
-async function openSet(){try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"gemini";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);window.__rules=s.rules||null;renderRuleGauge();
+async function openSet(){try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"gemini";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);window.__rules=s.rules||null;renderRuleGauge();renderPrefs(s.prefs||[]);
   if(s.engines){const n=document.getElementById("engineNote");n.textContent="文章作成は選択中のAIで生成（GPT"+(s.engines.gpt?"✓":"⚠キー未設定")+"・Gemini"+(s.engines.gemini?"✓":"⚠")+"・Claude"+(s.engines.claude?"✓":"⚠")+"）。キー未設定のエンジンを選ぶと安全のためClaudeで生成します。";}}catch(e){}
   refreshModelAlert();
   try{const cr=await fetch("/api/conn");const c=await cr.json();document.getElementById("connStat").textContent=(c.lineConfigured?"LINE✓ ":"LINE未 ")+(c.mailConfigured?"メール✓":"メール未");document.getElementById("cSmtpHost").value=c.smtpHost||"";document.getElementById("cSmtpPort").value=c.smtpPort||"";document.getElementById("cSmtpUser").value=c.smtpUser||"";document.getElementById("cImapHost").value=c.imapHost||"";document.getElementById("cImapPort").value=c.imapPort||"";document.getElementById("cImapUser").value=c.imapUser||"";document.getElementById("cEmailInternal").checked=!!c.emailInternal;renderAccts(c);}catch(e){}
