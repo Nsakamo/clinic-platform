@@ -2020,6 +2020,7 @@ const PAGE = `<!DOCTYPE html>
   <div style="display:flex;flex-direction:column;gap:8px;">
     <button class="cbtn send" style="width:100%;" onclick="resolveConflict('new')">今後は今回を基準にする（前の答えを消す）</button>
     <button class="cbtn" style="width:100%;" onclick="resolveConflict('exception')">今回は特例（前の答えを残す・今回は学習しない）</button>
+    <button class="cbtn" style="width:100%;" onclick="resolveConflict('chat')">どちらでもない（チャットで正しい答えを決める）</button>
   </div>
 </div></div>
 <script>
@@ -2211,7 +2212,9 @@ async function undoLearn(id){ try{ await api("/api/example-delete",{id}); }catch
 // 矛盾の確認：前の答えと今回の答えが食い違った時に出す。基準を選ぶと不要な方の対応例を削除。
 let conflictData=null;
 function showConflict(c){ conflictData=c; const o=document.getElementById("conflictOld"),n=document.getElementById("conflictNew"); if(o)o.textContent=c.oldFinal||""; if(n)n.textContent=c.newFinal||""; const p=document.getElementById("conflictPop"); if(p)p.style.display="flex"; }
-async function resolveConflict(mode){ const c=conflictData; conflictData=null; const p=document.getElementById("conflictPop"); if(p)p.style.display="none"; if(!c)return; try{ if(mode==="new"){ await api("/api/example-delete",{id:c.oldId}); } else { await api("/api/example-delete",{id:c.newId}); } }catch(e){} }
+async function resolveConflict(mode){ const c=conflictData; conflictData=null; const p=document.getElementById("conflictPop"); if(p)p.style.display="none"; if(!c)return; try{ if(mode==="new"){ await api("/api/example-delete",{id:c.oldId}); } else if(mode==="exception"){ await api("/api/example-delete",{id:c.newId}); } else if(mode==="chat"){ await api("/api/example-delete",{id:c.oldId}); await api("/api/example-delete",{id:c.newId}); openConflictChat(c); } }catch(e){} }
+// 「どちらでもない」→ みぎうで君を開き、食い違った2案を背景に、正しい案内をチャットで決めてルール化する
+function openConflictChat(c){ openAsst(null); try{ asstHist.push({role:"user",content:"（背景）似た質問で過去の回答が食い違っていました。前の回答:「"+(c.oldFinal||"")+"」／今回の回答:「"+(c.newFinal||"")+"」。どちらも正解ではありません。これからスタッフが正しい案内を教えるので、それを既存ルールと矛盾しない形でルール化する提案をしてください。"}); }catch(e){} amAdd("sysn","過去の回答が食い違っていました。正しい案内を教えてください——内容をルールにします。"); }
 // ---- settings popup ----
 function renderRuleGauge(){
   const info=window.__rules; const bar=document.getElementById("ruleGaugeBar"); if(!bar) return;
