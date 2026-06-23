@@ -318,7 +318,7 @@ async function aiChat(t, system, messages, maxTokens){
       const model = process.env.OPENAI_MODEL || "gpt-5.4";
       const r = await fetch("https://api.openai.com/v1/chat/completions", { method:"POST",
         headers: { "Content-Type":"application/json", "Authorization":"Bearer "+process.env.OPENAI_KEY },
-        body: JSON.stringify({ model, max_completion_tokens: maxTokens, reasoning_effort: "low", messages: [{role:"system",content:system}].concat(messages) }) });  // GPT-5系は思考型。reasoning_effort:lowで思考トークンを抑え本文の途切れを防ぐ（非対応モデルでエラーが出る場合はこの1項目を外す）
+        body: JSON.stringify({ model, max_completion_tokens: maxTokens, reasoning_effort: "medium", messages: [{role:"system",content:system}].concat(messages) }) });  // GPT-5系は思考型。mediumで文章の質を確保（出力枠4000で途切れも防げる）。非対応モデルでエラーが出る場合はこの1項目を外す
       if(r.ok){ const d = await r.json(); const tx = d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content; if(tx) return tx; }
       else console.error("openai:", r.status, (await r.text().catch(()=>"")).slice(0,200));
     }catch(e){ console.error("openai:", e.message); }
@@ -329,7 +329,7 @@ async function aiChat(t, system, messages, maxTokens){
       const model = process.env.GEMINI_MODEL || "gemini-3-flash";
       const r = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", { method:"POST",
         headers: { "Content-Type":"application/json", "Authorization":"Bearer "+process.env.GEMINI_KEY },
-        body: JSON.stringify({ model, max_tokens: maxTokens, reasoning_effort: "low", messages: [{role:"system",content:system}].concat(messages) }) });  // reasoning_effort:lowで思考トークンを節約し、本文が途切れないようにする
+        body: JSON.stringify({ model, max_tokens: maxTokens, reasoning_effort: "medium", messages: [{role:"system",content:system}].concat(messages) }) });  // mediumで文章の質を確保（出力枠4000で途切れも防げる）
       if(r.ok){ const d = await r.json(); const tx = d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content; if(tx) return tx; }
       else console.error("gemini:", r.status, (await r.text().catch(()=>"")).slice(0,200));
     }catch(e){ console.error("gemini:", e.message); }
