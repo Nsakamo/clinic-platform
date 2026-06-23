@@ -1016,6 +1016,7 @@ app.post("/api/draft-chat", guard, async (req, res) => {
     + (prefsBlock(t) ? "\n\n【スタッフが記憶させた指示（全返信で必ず守る）】\n" + prefsBlock(t) : "")
     + "\n\n" + JP_QUALITY
     + "\n\nスタッフの指示がどんなに短くても（「あってる」「もっと短く」「優しく」等）、お客様との会話の文脈に当てはめて意味を解釈すること。"
+    + "\n\n【書き方の最重要方針】優秀な受付スタッフが書くような、自然で読みやすく簡潔な返信にする。前の下書きの言い回しを無理に引き継がず、毎回“まっさらから一気に書き直す”つもりで、最も自然な完成形を作る（継ぎはぎ・冗長な説明の積み重ねを避ける）。お客様が聞いていないことや形式的な前置き・保険表現を詰め込みすぎず、要点に絞る（店舗ルールで必須の情報がある時だけ補う）。一息で読める自然な流れにする。"
     + "毎回、返信下書きの完成形の全文をdraftに入れる。replyにはスタッフへの短い一言（何をどう変えたか、1〜2文。敬語でなくてよい）。"
     + "出力は必ず次のJSONのみ: {\"reply\":\"スタッフへの一言\",\"draft\":\"お客様への返信下書き全文\",\"memory\":\"\"}"
     + "\nmemory: スタッフの指示の中に『他の返信でも再利用できる、書き方・対応の方針』が含まれていれば、簡潔なルール文にして入れる。『今後』『常に』と明示していなくても、再利用できる方針なら拾う（例:「冒頭に様を付けない」「短めにする」「絵文字を使わない」「結論から書く」「予約はWeb予約に誘導する」「謝罪を一言入れる」等）。"
@@ -1035,7 +1036,8 @@ app.post("/api/draft-chat", guard, async (req, res) => {
         saveTenantConfig(t).catch(() => {}); savedMem = memTxt;
       }
     }
-    res.json({ ok: true, reply: String(out.reply || "").slice(0, 600), draft: String(out.draft || "").slice(0, 4000), memory: savedMem });
+    const engLabel = (S(t).engine === "gpt" && process.env.OPENAI_KEY) ? "GPT" : (S(t).engine === "gemini" && process.env.GEMINI_KEY) ? "Gemini" : (ANTHROPIC_KEY ? "Claude(保険)" : "AI");
+    res.json({ ok: true, reply: String(out.reply || "").slice(0, 600) + " 〔" + engLabel + "で作成〕", draft: String(out.draft || "").slice(0, 4000), memory: savedMem });
   } catch (e) { res.json({ ok: false, error: String(e.message || e).slice(0, 80) }); }
 });
 
