@@ -346,6 +346,75 @@ async function aiChat(t, system, messages, maxTokens){
   }catch(e){ return null; }
 }
 
+// aiChatのストリーミング版。onDelta(text片)を呼びながら全文を返す。（編集チャットのGPT風リアルタイム表示用）
+// gpt/gemini はOpenAI互換SSE、Claude(保険)はAnthropic SSE。ストリーム不可ならnullを返し、呼び出し側がaiChatにフォールバックする。
+async function aiChatStream(t, system, messages, maxTokens, onDelta){
+  const eng = (S(t).engine || "gemini");
+  async function openaiCompat(url, key, model, extra){
+    const r = await fetch(url, { method:"POST",
+      headers: { "Content-Type":"application/json", "Authorization":"Bearer "+key },
+      body: JSON.stringify(Object.assign({ model, stream: true, messages: [{role:"system",content:system}].concat(messages) }, extra)) });
+    if(!r.ok || !r.body){ console.error("stream:", r.status, (await r.text().catch(()=>"")).slice(0,200)); return null; }
+    let full = "", buf = ""; const dec = new TextDecoder();
+    for await (const chunk of r.body){
+      buf += dec.decode(chunk, { stream: true });
+      let i;
+      while((i = buf.indexOf("\n")) >= 0){
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if(!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if(!data || data === "[DONE]") continue;
+        try{ const d = JSON.parse(data); const tx = d.choices && d.choices[0] && d.choices[0].delta && d.choices[0].delta.content; if(tx){ full += tx; onDelta(tx); } }catch(e){}
+      }
+    }
+    return full || null;
+  }
+  try{
+    if(eng === "gpt" && process.env.OPENAI_KEY){
+      const model = process.env.OPENAI_MODEL || "gpt-5.4";
+      const out = await openaiCompat("https://api.openai.com/v1/chat/completions", process.env.OPENAI_KEY, model, { max_completion_tokens: maxTokens, reasoning_effort: "medium" });
+      if(out) return out;
+    }
+    if(eng === "gemini" && process.env.GEMINI_KEY){
+      const model = process.env.GEMINI_MODEL || "gemini-3-flash";
+      const out = await openaiCompat("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", process.env.GEMINI_KEY, model, { max_tokens: maxTokens, reasoning_effort: "medium" });
+      if(out) return out;
+    }
+    if(ANTHROPIC_KEY){
+      const r = await fetch("https://api.anthropic.com/v1/messages", { method:"POST",
+        headers: { "Content-Type":"application/json", "x-api-key":ANTHROPIC_KEY, "anthropic-version":"2023-06-01" },
+        body: JSON.stringify({ model:"claude-sonnet-4-6", max_tokens:maxTokens, system, messages, stream: true }) });
+      if(!r.ok || !r.body) return null;
+      let full = "", buf = ""; const dec = new TextDecoder();
+      for await (const chunk of r.body){
+        buf += dec.decode(chunk, { stream: true });
+        let i;
+        while((i = buf.indexOf("\n")) >= 0){
+          const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+          if(!line.startsWith("data:")) continue;
+          try{ const d = JSON.parse(line.slice(5).trim()); const tx = d.type === "content_block_delta" && d.delta && d.delta.text; if(tx){ full += tx; onDelta(tx); } }catch(e){}
+        }
+      }
+      return full || null;
+    }
+  }catch(e){ console.error("aiChatStream:", e.message); }
+  return null;
+}
+
+// このお客様への対応でスタッフが出した指示のメモ（会話オブジェクトに保存 → 以後の自動生成にも反映）
+function noteAdd(c, txt){
+  txt = String(txt || "").trim().slice(0, 300);
+  if(!txt || txt.length < 4) return;
+  c.aiNotes = Array.isArray(c.aiNotes) ? c.aiNotes : [];
+  if(c.aiNotes.includes(txt)) return;
+  c.aiNotes.push(txt);
+  while(c.aiNotes.length > 12) c.aiNotes.shift();
+}
+function notesBlock(c){
+  const a = Array.isArray(c && c.aiNotes) ? c.aiNotes : [];
+  return a.length ? a.slice(-8).map(s => "・" + s).join("\n") : "";
+}
+
 // Gemini ネイティブ generateContent（PDF・画像・大容量テキストの資料読み込み用。OpenAI互換のaiChatは添付不可のためこちらを使う）
 async function geminiGenerate(systemText, userParts, maxTokens) {
   if (!process.env.GEMINI_KEY) return null;
@@ -516,6 +585,7 @@ async function genDraft(t, c, opts) {
     + (examplesTxt ? "\n\n【過去の対応例（スタッフが実際に送った返信。答え方・言い回し・上のルールに無い細かい対応の“参考”にしてよい。ただし料金・規定・対応可否は必ず上の店舗ルールが優先で、例がルールと食い違う場合はルールに従う。特定の人にだけ通じる特別対応は一般化しない）】\n" + examplesTxt : "")
     + (S(t).tone && S(t).tone.trim() ? "\n\n【トーン指示（最優先）】\n" + S(t).tone.trim().slice(0, 1200) : "")
     + (prefsBlock(t) ? "\n\n【スタッフが記憶させた指示（全返信で必ず守る。トーン指示と同格で最優先）】\n" + prefsBlock(t) : "")
+    + (notesBlock(c) ? "\n\n【このお客様への対応でスタッフが出した指示メモ（編集チャットでの指示。今回の返信でも引き続き従う。ただし明らかに“その時限り”の内容は無視してよい）】\n" + notesBlock(c) : "")
     + (bookingTxt ? "\n\n【この方の情報（受付るん＝予約システムからの照会結果。氏名・会員ランク・ポイント・予約・回数券・最終来院などの参考。日付判断・キャンセル可否・来院案内に使う。ここに無い内容は推測しない。カルテ・診療内容は含まれない）】\n" + bookingTxt : "")
     + "\n\n" + JP_QUALITY
     + "\n\n出力は必ず次のJSONのみ（前後に説明や```やかぎ括弧を付けない）: {\"draft\":\"お客様への返信文\",\"confidence\":\"high|medium|low\",\"is_urgent\":true|false,\"needs_human\":true|false,\"site_alert\":\"遅刻|当日キャンセル|緊急来院|none\",\"site_summary\":\"現場向け一行要約。site_alertがnoneなら空文字\",\"topics\":[{\"q\":\"短い質問ラベル\",\"need\":true}]}"
@@ -970,6 +1040,7 @@ app.post("/api/ai-regen", guard, async (req, res) => {
     + "お客様への敬意と心配りが自然に伝わる表現を選び、ご不便にはお詫びや労いの一言を添える。ただし慇懃無礼にならず、簡潔さと読みやすさも保つ。絵文字は使わない。断定や医療判断は避ける。" + sig
     + (rulesTxt ? "\n【店舗ルール（従うこと）】\n" + rulesTxt : "")
     + (S(t).tone && S(t).tone.trim() ? "\n【トーン指示（最優先）】" + S(t).tone.trim().slice(0, 1000) : "")
+    + (c && notesBlock(c) ? "\n【このお客様への対応でスタッフが以前出した指示メモ（引き続き守る）】\n" + notesBlock(c) : "")
     + "\n" + JP_QUALITY
     + "\n出力はそのままお客様に送信される。だからお客様に送る返信文だけを出力すること。【】付きの見出し、状況の説明、会話の引用、区切り線(---)、前置き、かぎ括弧は一切含めてはいけない。1文字目から返信本文で始めること。";
   try {
@@ -980,17 +1051,17 @@ app.post("/api/ai-regen", guard, async (req, res) => {
     const lines = text.split("\n");
     while (lines.length > 1 && (/^【.*】/.test(lines[0].trim()) || /^（.*）$/.test(lines[0].trim()) || lines[0].trim() === "")) lines.shift();
     text = lines.join("\n").trim();
+    if (c) { noteAdd(c, idea); dbSave(t, c); } // 方向性メモを次回以降の自動生成にも反映
     res.json({ ok: true, text });
   } catch (e) { res.json({ ok: false, error: String(e.message || e).slice(0, 80) }); }
 });
 
 // AIで作り直す（会話型）: 下書きをスタッフと会話しながら磨き上げる
-app.post("/api/draft-chat", guard, async (req, res) => {
-  const t = req.tenant;
-  if (!ANTHROPIC_KEY && !process.env.OPENAI_KEY && !process.env.GEMINI_KEY) return res.json({ ok: false, error: "no_ai_key" });
-  const c = t.store[req.body.id] || null;
-  if (!c) return res.json({ ok: false, error: "no_conv" });
-  const edits = (Array.isArray(req.body.messages) ? req.body.messages : []).slice(-14)
+// 共通部（会話文脈＋ルール＋方針）。出力形式だけ通常版(JSON)とストリーミング版(マーカー)で変える。
+function draftChatPrep(t, body) {
+  const c = t.store[body.id] || null;
+  if (!c) return { error: "no_conv" };
+  const edits = (Array.isArray(body.messages) ? body.messages : []).slice(-14)
     .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
     .map(m => ({ role: m.role, content: m.content.slice(0, 4000) }));
   while (edits.length && edits[0].role === "assistant") {
@@ -998,7 +1069,7 @@ app.post("/api/draft-chat", guard, async (req, res) => {
     if (edits[1] && edits[1].role === "user") { edits[0].content += "\n\n" + edits[1].content; edits.splice(1, 1); }
     break;
   }
-  if (!edits.length || edits[edits.length - 1].role !== "user") return res.json({ ok: false, error: "empty" });
+  if (!edits.length || edits[edits.length - 1].role !== "user") return { error: "empty" };
   const conv = c.msgs.slice(-20).map(m => (m.from === "them" ? "お客様" : "クリニック") + ": " + (m.text || (m.media ? "［" + m.media + "］" : ""))).join("\n").slice(0, 6000);
   const lastQ = c.msgs.filter(m => m.from === "them").slice(-1).map(m => m.text || "").join("");
   const editTxt = edits.map(e => e.content).join(" ");
@@ -1006,7 +1077,7 @@ app.post("/api/draft-chat", guard, async (req, res) => {
   const rulesTxt = rel.length ? rulesBlock(rel, ruleBudget(t)) : "";
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = c.channel === "mail" ? "メールなので下書きの最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
-  const sys = "あなたは「" + (t.name || "クリニック") + "」の受付スタッフの返信作成アシスタントです。"
+  const base = "あなたは「" + (t.name || "クリニック") + "」の受付スタッフの返信作成アシスタントです。"
     + "スタッフと会話しながら、お客様への返信下書きを一緒に磨き上げます。あなたと会話しているのはスタッフで、下書きを送る相手はお客様です。"
     + "\n\n【お客様との会話履歴（この最新メッセージへの返信を作っている。必ず全体を読み込み、文脈を正確に踏まえること）】\n" + conv
     + "\n\n本日は" + today + "です。キャンセル料など日付が関わる案内は、本日と予約日の差から判断する。憶測で日付を決めない。"
@@ -1014,31 +1085,89 @@ app.post("/api/draft-chat", guard, async (req, res) => {
     + (rulesTxt ? "\n\n【店舗ルール（料金・規定・対応可否はここに従い、推測で答えない）】\n" + rulesTxt : "")
     + (S(t).tone && S(t).tone.trim() ? "\n\n【トーン指示】\n" + S(t).tone.trim().slice(0, 1000) : "")
     + (prefsBlock(t) ? "\n\n【スタッフが記憶させた指示（全返信で必ず守る）】\n" + prefsBlock(t) : "")
+    + (notesBlock(c) ? "\n\n【このお客様への対応でスタッフが以前出した指示メモ（引き続き守る）】\n" + notesBlock(c) : "")
     + "\n\n" + JP_QUALITY
     + "\n\nスタッフの指示がどんなに短くても（「あってる」「もっと短く」「優しく」等）、お客様との会話の文脈に当てはめて意味を解釈すること。"
-    + "\n\n【書き方の最重要方針】優秀な受付スタッフが書くような、自然で読みやすく簡潔な返信にする。前の下書きの言い回しを無理に引き継がず、毎回“まっさらから一気に書き直す”つもりで、最も自然な完成形を作る（継ぎはぎ・冗長な説明の積み重ねを避ける）。お客様が聞いていないことや形式的な前置き・保険表現を詰め込みすぎず、要点に絞る（店舗ルールで必須の情報がある時だけ補う）。一息で読める自然な流れにする。"
-    + "毎回、返信下書きの完成形の全文をdraftに入れる。replyにはスタッフへの短い一言（何をどう変えたか、1〜2文。敬語でなくてよい）。"
-    + "出力は必ず次のJSONのみ: {\"reply\":\"スタッフへの一言\",\"draft\":\"お客様への返信下書き全文\",\"memory\":\"\"}"
-    + "\nmemory: スタッフの指示の中に『他の返信でも再利用できる、書き方・対応の方針』が含まれていれば、簡潔なルール文にして入れる。『今後』『常に』と明示していなくても、再利用できる方針なら拾う（例:「冒頭に様を付けない」「短めにする」「絵文字を使わない」「結論から書く」「予約はWeb予約に誘導する」「謝罪を一言入れる」等）。"
-    + "ただし次は絶対にmemoryに入れない（空文字にする）: (1)その問い合わせ固有の事実・数値・個別判断（例:「この件は3営業日」「今回はキャンセル無料」「この人には◯◯と伝える」）。 (2)『今は』『今回は』『一旦』『今だけ』『この返信は』『とりあえず』など“今回限り・一時的”を少しでも示す指示（例:「補償制度の件は今は書かなくていい」→ 今回だけの指示なので記憶しない）。スタッフが今回だけのつもりで言った可能性が少しでもあれば入れない。明確に毎回・恒久的に守るべき方針だと確信できる時だけ入れる。"
-    + "複数あれば最も方針性が高い1つだけ。再利用できる恒久方針が無ければ空文字。";
+    + "\n\n【会話の仕方】ChatGPTのような自然な会話相手として振る舞う。スタッフが指示ではなく質問・相談をしてきた場合（例:「キャンセル料っていくらだっけ？」「どっちの言い方がいいと思う？」）は、店舗ルールと会話文脈を踏まえて返事で普通に答え、下書きは変えなくてよい。指示が曖昧なら、解釈した上で作りつつ、返事で一言確認する。"
+    + "\n\n【書き方の最重要方針】(1)スタッフの指示は的確に反映する。(2)指示されていない部分の内容・構成・言い回しは、むやみに書き換えない（前の下書きを土台に、指示箇所だけ直す。つながりが不自然になる場合の最小限の調整は可）。勝手に情報を足したり削ったりしない。(3)全体は優秀な受付スタッフが書くような、自然で読みやすく簡潔な文にする。形式的な前置き・保険表現を詰め込まない（店舗ルールで必須の情報がある時だけ補う）。";
+  const engLabel = (S(t).engine === "gpt" && process.env.OPENAI_KEY) ? "GPT" : (S(t).engine === "gemini" && process.env.GEMINI_KEY) ? "Gemini" : (ANTHROPIC_KEY ? "Claude(保険)" : "AI");
+  return { c, edits, base, engLabel };
+}
+const DRAFTCHAT_MEMORY_RULE = "memory: スタッフの指示の中に『他の返信でも再利用できる、書き方・対応の方針』が含まれていれば、簡潔なルール文にして入れる。『今後』『常に』と明示していなくても、再利用できる方針なら拾う（例:「冒頭に様を付けない」「短めにする」「絵文字を使わない」「結論から書く」「予約はWeb予約に誘導する」「謝罪を一言入れる」等）。"
+  + "ただし次は絶対にmemoryに入れない（空にする）: (1)その問い合わせ固有の事実・数値・個別判断（例:「この件は3営業日」「今回はキャンセル無料」「この人には◯◯と伝える」）。 (2)『今は』『今回は』『一旦』『今だけ』『この返信は』『とりあえず』など“今回限り・一時的”を少しでも示す指示。スタッフが今回だけのつもりで言った可能性が少しでもあれば入れない。明確に毎回・恒久的に守るべき方針だと確信できる時だけ入れる。"
+  + "複数あれば最も方針性が高い1つだけ。再利用できる恒久方針が無ければ空にする。";
+// 恒久メモリ（スタッフの記憶）への保存
+function draftChatSaveMemory(t, memTxt) {
+  memTxt = String(memTxt || "").trim().slice(0, 200);
+  if (!memTxt) return "";
+  const cur = (S(t).prefs && Array.isArray(S(t).prefs)) ? S(t).prefs : (S(t).prefs = []);
+  if (cur.some(p => (typeof p === "string" ? p : p.text) === memTxt)) return "";
+  cur.push({ id: Date.now(), text: memTxt }); while (cur.length > 40) cur.shift();
+  saveTenantConfig(t).catch(() => {});
+  return memTxt;
+}
+// このお客様向けの指示メモを更新（次回以降の自動下書きにも反映される）
+function draftChatNote(t, c, edits) {
+  const lastUser = edits.slice().reverse().find(m => m.role === "user");
+  if (!lastUser) return;
+  const txt = String(lastUser.content || "").replace(/^【[^】]*】\n?/, "").trim();
+  if (!txt || /^(あってる|大丈夫|OK|ok|おけ|それでいい|いいね|良い)$/i.test(txt)) return;
+  noteAdd(c, txt);
+  dbSave(t, c);
+}
+
+app.post("/api/draft-chat", guard, async (req, res) => {
+  const t = req.tenant;
+  if (!ANTHROPIC_KEY && !process.env.OPENAI_KEY && !process.env.GEMINI_KEY) return res.json({ ok: false, error: "no_ai_key" });
+  const p = draftChatPrep(t, req.body);
+  if (p.error) return res.json({ ok: false, error: p.error });
+  const sys = p.base
+    + "\n毎回、返信下書きの完成形の全文をdraftに入れる（下書きを変えない時は前と同じ全文）。replyにはスタッフへの返事（何をどう変えたか、または質問への答え。1〜3文。敬語でなくてよい）。"
+    + "出力は必ず次のJSONのみ: {\"reply\":\"スタッフへの返事\",\"draft\":\"お客様への返信下書き全文\",\"memory\":\"\"}"
+    + "\n" + DRAFTCHAT_MEMORY_RULE;
   try {
-    const raw = await aiChat(t, sys, edits, 4000);
+    const raw = await aiChat(t, sys, p.edits, 4000);
     if (!raw) return res.json({ ok: false, error: "ai_failed" });
     let out = { reply: "", draft: "" };
     try { const m = raw.match(/\{[\s\S]*\}/); out = JSON.parse(m ? m[0] : raw); } catch (e) { out = { reply: "", draft: salvageDraft(raw) }; }
-    let savedMem = "";
-    const memTxt = String(out.memory || "").trim().slice(0, 200);
-    if (memTxt) {
-      const cur = (S(t).prefs && Array.isArray(S(t).prefs)) ? S(t).prefs : (S(t).prefs = []);
-      if (!cur.some(p => (typeof p === "string" ? p : p.text) === memTxt)) {
-        cur.push({ id: Date.now(), text: memTxt }); while (cur.length > 40) cur.shift();
-        saveTenantConfig(t).catch(() => {}); savedMem = memTxt;
-      }
-    }
-    const engLabel = (S(t).engine === "gpt" && process.env.OPENAI_KEY) ? "GPT" : (S(t).engine === "gemini" && process.env.GEMINI_KEY) ? "Gemini" : (ANTHROPIC_KEY ? "Claude(保険)" : "AI");
-    res.json({ ok: true, reply: String(out.reply || "").slice(0, 600) + " 〔" + engLabel + "で作成〕", draft: String(out.draft || "").slice(0, 4000), memory: savedMem });
+    const savedMem = draftChatSaveMemory(t, out.memory);
+    draftChatNote(t, p.c, p.edits);
+    res.json({ ok: true, reply: String(out.reply || "").slice(0, 600) + " 〔" + p.engLabel + "で作成〕", draft: String(out.draft || "").slice(0, 4000), memory: savedMem });
   } catch (e) { res.json({ ok: false, error: String(e.message || e).slice(0, 80) }); }
+});
+
+// ストリーミング版（GPT風にリアルタイムで文字が流れる）。@@REPLY@@/@@DRAFT@@/@@MEMORY@@ のマーカー区切りテキストを
+// chunked responseでそのまま流し、最後に @@META@@{json} を1行付ける。クライアントは逐次パースして表示する。
+app.post("/api/draft-chat-stream", guard, async (req, res) => {
+  const t = req.tenant;
+  if (!ANTHROPIC_KEY && !process.env.OPENAI_KEY && !process.env.GEMINI_KEY) { res.status(400).end("no_ai_key"); return; }
+  const p = draftChatPrep(t, req.body);
+  if (p.error) { res.status(400).end(p.error); return; }
+  const sys = p.base
+    + "\n\n【出力形式（厳守）】JSONではなく、次の3セクションをこの順で出力する。各マーカーは必ず行頭に単独で書く。"
+    + "\n@@REPLY@@\n（スタッフへの返事。何をどう変えたか、または質問への答え。1〜3文。敬語でなくてよい）"
+    + "\n@@DRAFT@@\n（お客様への返信下書きの完成形全文。下書きを変えない時は前と同じ全文。スタッフの質問に答えただけで下書き不要な時はこのセクションごと省略してよい）"
+    + "\n@@MEMORY@@\n（" + DRAFTCHAT_MEMORY_RULE + "無ければこの行のあとに何も書かない）";
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("X-Accel-Buffering", "no");
+  try {
+    let full = await aiChatStream(t, sys, p.edits, 4000, (d) => { try { res.write(d); } catch (e) {} });
+    if (!full) { // ストリーム不可時は非ストリームで生成して一括送信
+      full = await aiChat(t, sys, p.edits, 4000);
+      if (full) res.write(full);
+    }
+    let savedMem = "";
+    if (full) {
+      const mm = full.match(/@@MEMORY@@\s*([\s\S]*)$/);
+      savedMem = draftChatSaveMemory(t, mm ? mm[1].split(/@@/)[0] : "");
+      draftChatNote(t, p.c, p.edits);
+    }
+    res.write("\n@@META@@" + JSON.stringify({ ok: !!full, memory: savedMem, engine: p.engLabel }));
+  } catch (e) {
+    try { res.write("\n@@META@@" + JSON.stringify({ ok: false, error: String(e.message || e).slice(0, 80) })); } catch (e2) {}
+  }
+  res.end();
 });
 
 // ---- staff file uploads (PDF, images etc. to send to customers) ----
@@ -2133,19 +2262,55 @@ function slideClose(pid,cid){const p=document.getElementById(pid),c=document.get
   setTimeout(()=>{p.style.display="none";c.style.animation="";},220);}
 function closeDraftChat(){slideClose("dpanel","dCard");}
 function dChip(t){const x=document.getElementById("dText");x.value=t;dSend();}
+// GPT風ストリーミング送信。返事が文字単位で流れ、下書きカードもリアルタイムに埋まる。失敗時は従来API(JSON)へ自動フォールバック。
 async function dSend(){const x=document.getElementById("dText");const txt=x.value.trim();if(!txt)return;x.value="";
   dAdd("user",txt);dHist.push({role:"user",content:txt});
-  const ph=spinAdd(dMsgsEl,"書き直し中…");
+  const logEntry={type:"ai",text:""};dLog.push(logEntry);
+  const aiEl=dRender("ai","…");
+  let cardEntry=null;
+  const MK_D="@@DRAFT@@",MK_M="@@MEMORY@@",MK_T="@@META@@";
+  function applyAcc(acc){
+    const mi=acc.indexOf(MK_T);const body=(mi>=0?acc.slice(0,mi):acc).replace("@@REPLY@@","");
+    let reply=body,draft=null;
+    const di=body.indexOf(MK_D);
+    const mm=body.indexOf(MK_M);
+    if(di>=0){reply=body.slice(0,di);draft=body.slice(di+MK_D.length,mm>=0&&mm>di?mm:undefined);}
+    else if(mm>=0){reply=body.slice(0,mm);}
+    reply=reply.trim();
+    if(reply){aiEl.textContent=reply;logEntry.text=reply;}
+    if(draft!=null){const dtx=draft.trim();
+      if(dtx){
+        if(!cardEntry){cardEntry={type:"card",draft:dtx,applied:false};dLog.push(cardEntry);cardEntry._el=dDraftCard(cardEntry);}
+        else{cardEntry.draft=dtx;const cEl=cardEntry._el?cardEntry._el.querySelector(".c"):null;if(cEl)cEl.textContent=dtx;}
+      }}
+    dMsgsEl.scrollTop=dMsgsEl.scrollHeight;
+    return {reply,draft:(draft!=null?draft.trim():null),meta:(mi>=0?acc.slice(mi+MK_T.length):null)};
+  }
   try{
-    const r=await api("/api/draft-chat",{id:current,messages:dHist});
-    const j=await r.json();ph.remove();
-    if(j.ok&&j.draft){
-      if(j.reply)dAdd("ai",j.reply);
-      dNewCard(j.draft);
-      dHist.push({role:"assistant",content:j.draft});
-      if(j.memory)dAdd("sysn","🧠 記憶しました：「"+j.memory+"」（今後の全返信に適用します。設定→スタッフの記憶 で確認・削除できます）");
-    }else dAdd("sysn","エラー: "+(j.error||"不明"));
-  }catch(e){ph.remove();dAdd("sysn","通信エラーが発生しました");}}
+    const r=await fetch("/api/draft-chat-stream",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:current,messages:dHist})});
+    if(!r.ok||!r.body)throw new Error("stream_unavailable");
+    const reader=r.body.getReader();const dec=new TextDecoder();let acc="";
+    while(true){const s=await reader.read();if(s.done)break;acc+=dec.decode(s.value,{stream:true});applyAcc(acc);}
+    const fin=applyAcc(acc);
+    let meta={};try{meta=fin.meta?JSON.parse(fin.meta):{};}catch(e){}
+    if(meta.ok===false||(!fin.reply&&!fin.draft))throw new Error("stream_empty");
+    if(fin.reply&&meta.engine){aiEl.textContent=fin.reply+" 〔"+meta.engine+"で作成〕";logEntry.text=aiEl.textContent;}
+    dHist.push({role:"assistant",content:(fin.draft||fin.reply||"").slice(0,4000)});
+    if(meta.memory)dAdd("sysn","🧠 記憶しました：「"+meta.memory+"」（今後の全返信に適用します。設定→スタッフの記憶 で確認・削除できます）");
+  }catch(e){
+    // フォールバック: 従来のJSON API
+    aiEl.textContent="書き直し中…";
+    try{
+      const r2=await api("/api/draft-chat",{id:current,messages:dHist});
+      const j=await r2.json();
+      if(j.ok&&j.draft){
+        aiEl.textContent=j.reply||"できました";logEntry.text=aiEl.textContent;
+        if(!cardEntry)dNewCard(j.draft);else{cardEntry.draft=j.draft;const cEl=cardEntry._el?cardEntry._el.querySelector(".c"):null;if(cEl)cEl.textContent=j.draft;}
+        dHist.push({role:"assistant",content:j.draft});
+        if(j.memory)dAdd("sysn","🧠 記憶しました：「"+j.memory+"」（今後の全返信に適用します。設定→スタッフの記憶 で確認・削除できます）");
+      }else{aiEl.textContent="エラー: "+(j.error||"不明");logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";}
+    }catch(e2){aiEl.textContent="通信エラーが発生しました";logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";}
+  }}
 // ---- みぎうで君 (rulebook editing chat) ----
 let asstHist=[],asstCtx=null;
 const asstEl=document.getElementById("asst"),asstMsgsEl=document.getElementById("asstMsgs");
