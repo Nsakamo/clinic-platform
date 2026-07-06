@@ -12,7 +12,14 @@ const crypto = require("crypto");
 const app = express();
 app.use(express.json({ limit: "16mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 const PORT = process.env.PORT || 3000;
-const INGEST_KEY = process.env.INGEST_KEY || "clinic-secret";
+// 秘密鍵の定数時間比較（タイミング攻撃対策）。長さ不一致は即false（timingSafeEqualは同長が前提）。
+function safeEq(a, b) {
+  a = String(a || ""); b = String(b || "");
+  const ab = Buffer.from(a), bb = Buffer.from(b);
+  return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
+}
+// デフォルト鍵は廃止（未設定なら空＝下流のfail-closedで常に401）。シークレットは環境変数で必須。
+const INGEST_KEY = process.env.INGEST_KEY || "";
 const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY || ""; // 全テナント共通（運営持ち）
 // ===== 受付くん（SmileMedi Cloud）連携 =====
 const PARTNER_KEY = process.env.PLATFORM_SECRET || ""; // パートナーAPI共有キー（x-partner-key）。未設定なら連携は無効
@@ -691,7 +698,9 @@ async function lineProfile(uid, token) {
 app.post("/webhook/line", async (req, res) => {
   const dest = String((req.body && req.body.destination) || "");
   const sig = req.headers["x-line-signature"];
-  const sigOk = (a) => { if (!a.secret) return true; try { return sig === crypto.createHmac("sha256", a.secret).update(req.rawBody || Buffer.from("")).digest("base64"); } catch (e) { return false; } };
+  // fail-closed: チャネルシークレット未登録のアカウントは署名検証成功にしない（=Webhookは401）。
+  // 以前は secret 未設定で return true としていたため、未登録アカウント宛の偽装Webhookを受理する恐れがあった。
+  const sigOk = (a) => { if (!a.secret) return false; try { return safeEq(sig, crypto.createHmac("sha256", a.secret).update(req.rawBody || Buffer.from("")).digest("base64")); } catch (e) { return false; } };
   // 宛先botIdでテナント×アカウント特定 → 署名検証。特定できなければ署名が合うアカウントを全テナントから探す
   let t = null, acct = null;
   if (dest) {
@@ -804,7 +813,8 @@ async function pollAll() {
 
 // Make等の外部連携が新規問い合わせをPOSTする（server-to-server, secret key + tenant slug 必須）
 app.post("/api/ingest", async (req, res) => {
-  if ((req.headers["x-key"] || req.body.key) !== INGEST_KEY) return res.status(401).json({ error: "bad key" });
+  // fail-closed: INGEST_KEY未設定なら常に拒否。鍵はヘッダ x-key のみ受理（bodyのkey受理は廃止）。定数時間比較。
+  if (!INGEST_KEY || !safeEq(req.headers["x-key"], INGEST_KEY)) return res.status(401).json({ error: "bad key" });
   const t = TEN[String(req.body.tenant || "")];
   if (!t) return res.status(400).json({ error: "tenant" });
   const b = req.body || {};
@@ -1333,7 +1343,8 @@ app.get("/api/line-media/:id", guard, async (req, res) => {
 
 // bulk import of rules (資料取り込み: server-to-server, secret key + tenant slug 必須). Updates by same title, adds new.
 app.post("/api/rules-import", async (req, res) => {
-  if ((req.headers["x-key"] || req.body.key) !== INGEST_KEY) return res.status(401).json({ error: "bad key" });
+  // fail-closed: INGEST_KEY未設定なら常に拒否。鍵はヘッダ x-key のみ受理（bodyのkey受理は廃止）。定数時間比較。
+  if (!INGEST_KEY || !safeEq(req.headers["x-key"], INGEST_KEY)) return res.status(401).json({ error: "bad key" });
   const t = TEN[String(req.body.tenant || "")];
   if (!t) return res.status(400).json({ error: "tenant" });
   const items = Array.isArray(req.body.rules) ? req.body.rules.slice(0, 100) : [];
@@ -1350,7 +1361,8 @@ app.post("/api/rules-import", async (req, res) => {
 });
 
 app.get("/api/rules-for-ai", (req, res) => {
-  if ((req.headers["x-key"] || req.query.key) !== INGEST_KEY) return res.status(401).json({ error: "bad key" });
+  // fail-closed: INGEST_KEY未設定なら常に拒否。GETのためヘッダ x-key またはクエリ key を受理。定数時間比較。
+  if (!INGEST_KEY || !safeEq(req.headers["x-key"] || req.query.key, INGEST_KEY)) return res.status(401).json({ error: "bad key" });
   const t = TEN[String(req.query.tenant || "")];
   if (!t) return res.status(400).json({ error: "tenant" });
   const q = String(req.query.q || "").slice(0, 1000);
@@ -1581,7 +1593,7 @@ app.post("/api/import-own", guard, async (req,res)=>{
 });
 
 // ---------- パートナーアプリ連携API（受付くん等。鍵: header x-partner-key = PLATFORM_SECRET） ----------
-function partnerOk(req){ return !!ADMIN_SECRET && String(req.headers["x-partner-key"]||"") === ADMIN_SECRET; }
+function partnerOk(req){ return !!ADMIN_SECRET && safeEq(req.headers["x-partner-key"], ADMIN_SECRET); }
 function pGuard(req,res,next){ if(partnerOk(req)) return next(); res.status(401).json({error:"auth"}); }
 const SSO_TOKENS = {}; // token -> {slug, exp}
 const RESET_TOKENS = {}; // パスワード再設定トークン token -> {slug, exp}
