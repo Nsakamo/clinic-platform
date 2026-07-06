@@ -53,22 +53,25 @@ function newTenant(slug, name, config) {
   return { slug, name: name || slug, config, store: {}, rules: {}, ruleSeq: 1, examples: {}, exampleSeq: 1, alerts: [], alertSeq: 1, push: {} };
 }
 async function saveTenantConfig(t) {
+  try { encryptConnSecrets(t.config.conn); } catch (e) { console.error("encryptConnSecrets:", e.message); } // 保存直前にメール/LINE資格情報を暗号化（CRED_KEY未設定なら平文のまま）
   if (pool) await pool.query("UPDATE tenants SET name=$2, config=$3 WHERE slug=$1", [t.slug, t.name, t.config]);
 }
 
 // 接続設定アクセサ（テナントは全てUIで設定する。環境変数へのフォールバックは無し。ホスト/ポートのみGmail既定値）
 function cf(t, k) { const v = t.config.conn[k]; return v == null ? "" : String(v); }
+// 資格情報フィールドは decField 経由で読む（enc:v1: なら復号、平文ならそのまま）。ホスト/ユーザー/ポートは平文のまま。
+function cfSec(t, k) { return decField(cf(t, k)); }
 const C = {
-  lineToken: (t) => cf(t, "lineToken"),
-  lineSecret: (t) => cf(t, "lineSecret"),
+  lineToken: (t) => cfSec(t, "lineToken"),
+  lineSecret: (t) => cfSec(t, "lineSecret"),
   smtpHost: (t) => cf(t, "smtpHost") || "smtp.gmail.com",
   smtpPort: (t) => +(cf(t, "smtpPort") || 465),
   smtpUser: (t) => cf(t, "smtpUser"),
-  smtpPass: (t) => cf(t, "smtpPass"),
+  smtpPass: (t) => cfSec(t, "smtpPass"),
   imapHost: (t) => cf(t, "imapHost") || "imap.gmail.com",
   imapPort: (t) => +(cf(t, "imapPort") || 993),
   imapUser: (t) => cf(t, "imapUser") || cf(t, "smtpUser"),
-  imapPass: (t) => cf(t, "imapPass") || cf(t, "smtpPass"),
+  imapPass: (t) => cfSec(t, "imapPass") || cfSec(t, "smtpPass"),
 };
 function emailOn(t) { return !!t.config.conn.emailInternal; }
 function S(t) { return t.config.settings; }
@@ -108,11 +111,116 @@ function dbSave(t, c) {
     [t.slug, c.id, c.ts || 0, c]).catch(e => console.error("dbSave:", e.message));
 }
 
-// ---------- auth（旧platform方式: セッションcookie sess=base64(slug).sha("sess|slug|passHash")） ----------
+// ---------- 資格情報保護ヘルパー（後方互換最優先） ----------
+// bcrypt（純JS実装。ネイティブビルド不要）。存在しない環境でも起動は止めない（下でnullフォールバック）。
+let bcrypt = null;
+try { bcrypt = require("bcryptjs"); } catch (e) { console.warn("bcryptjs 未インストール: パスワードは従来のSHA-256のまま動作します（ログインは壊れません）"); }
+const BCRYPT_COST = 10;
+function isBcrypt(s) { return typeof s === "string" && /^\$2[aby]\$/.test(s); }
+function hashPassword(plain) { // 新規/変更時のハッシュ生成。bcryptが無ければ従来SHA-256にフォールバック
+  if (bcrypt) { try { return bcrypt.hashSync(String(plain), BCRYPT_COST); } catch (e) { console.error("bcrypt hash:", e.message); } }
+  return sha(String(plain));
+}
+// ログイン照合。bcrypt形式ならbcrypt.compare、そうでなければ従来 sha(input)===stored。
+// 従来ハッシュで一致した場合、呼び出し側が lazy migration できるよう { ok, legacy } を返す。
+function verifyPassword(input, stored) {
+  input = String(input == null ? "" : input);
+  stored = String(stored == null ? "" : stored);
+  if (!stored) return { ok: false, legacy: false };
+  if (isBcrypt(stored)) {
+    let ok = false; try { ok = bcrypt && bcrypt.compareSync(input, stored); } catch (e) { ok = false; }
+    return { ok: !!ok, legacy: false };
+  }
+  // 従来: 無塩SHA-256の定数時間比較
+  const ok = safeEq(sha(input), stored);
+  return { ok, legacy: ok }; // legacy=true のとき、成功していればbcryptへ再ハッシュして保存する（lazy migration）
+}
+// ===== メール/LINE資格情報の at-rest 暗号化（AES-256-GCM） =====
+// CRED_KEY（32バイト鍵。hex64桁 または base64）。未設定なら暗号化はスキップ＝平文動作（起動は止めない）。
+const CRED_KEY = (function () {
+  const raw = String(process.env.CRED_KEY || "").trim();
+  if (!raw) return null;
+  try {
+    let buf = null;
+    if (/^[0-9a-fA-F]{64}$/.test(raw)) buf = Buffer.from(raw, "hex");
+    else { const b = Buffer.from(raw, "base64"); if (b.length === 32) buf = b; }
+    if (buf && buf.length === 32) return buf;
+    console.warn("CRED_KEY が32バイト(hex64/base64)ではありません: メール/LINE資格情報の暗号化は無効（平文動作）");
+    return null;
+  } catch (e) { console.warn("CRED_KEY の解釈に失敗: 暗号化は無効（平文動作）"); return null; }
+})();
+const ENC_PREFIX = "enc:v1:";
+// 平文 -> "enc:v1:"+base64(iv(12)|tag(16)|ciphertext)。CRED_KEY未設定なら平文そのまま返す（後方互換）。
+function encField(plain) {
+  if (plain == null) return plain;
+  const s = String(plain);
+  if (!s) return s;                       // 空文字はそのまま
+  if (!CRED_KEY) return s;                // 鍵なし=平文動作
+  if (s.startsWith(ENC_PREFIX)) return s; // 既に暗号化済みは二重暗号化しない
+  try {
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv("aes-256-gcm", CRED_KEY, iv);
+    const ct = Buffer.concat([cipher.update(s, "utf8"), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    return ENC_PREFIX + Buffer.concat([iv, tag, ct]).toString("base64");
+  } catch (e) { console.error("encField:", e.message); return s; } // 失敗時は平文で保存（動作継続）
+}
+// "enc:v1:..." なら復号、無ければ平文とみなしそのまま返す（後方互換: 既存の平文値も読める）。
+function decField(stored) {
+  if (stored == null) return stored;
+  const s = String(stored);
+  if (!s.startsWith(ENC_PREFIX)) return s; // 平文フォールバック
+  if (!CRED_KEY) { console.error("decField: 暗号化された値があるがCRED_KEY未設定"); return ""; }
+  try {
+    const buf = Buffer.from(s.slice(ENC_PREFIX.length), "base64");
+    const iv = buf.subarray(0, 12), tag = buf.subarray(12, 28), ct = buf.subarray(28);
+    const decipher = crypto.createDecipheriv("aes-256-gcm", CRED_KEY, iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(ct), decipher.final()]).toString("utf8");
+  } catch (e) { console.error("decField:", e.message); return ""; }
+}
+// conn配下の資格情報フィールドを保存直前に暗号化する（メイン＋追加アカウント lines[]/mails[]）。冪等（enc:済みは再暗号化しない）。
+const ENC_CONN_KEYS = ["lineToken", "lineSecret", "smtpPass", "imapPass"];
+function encryptConnSecrets(conn) {
+  if (!conn || typeof conn !== "object" || !CRED_KEY) return; // 鍵なしなら平文のまま（後方互換）
+  ENC_CONN_KEYS.forEach(k => { if (typeof conn[k] === "string" && conn[k]) conn[k] = encField(conn[k]); });
+  if (Array.isArray(conn.lines)) conn.lines.forEach(a => { if (a) { if (a.token) a.token = encField(a.token); if (a.secret) a.secret = encField(a.secret); } });
+  if (Array.isArray(conn.mails)) conn.mails.forEach(a => { if (a) { if (a.smtpPass) a.smtpPass = encField(a.smtpPass); if (a.imapPass) a.imapPass = encField(a.imapPass); } });
+}
+
+// ---------- auth（旧platform方式: セッションcookie sess=base64(slug).token） ----------
 function sha(s) { return crypto.createHash("sha256").update(s).digest("hex"); }
 function cookies(req) { const o = {}; (req.headers.cookie || "").split(";").forEach(p => { const i = p.indexOf("="); if (i > 0) o[p.slice(0, i).trim()] = decodeURIComponent(p.slice(i + 1).trim()); }); return o; }
-function sessToken(slug, passHash) { return sha("sess|" + slug + "|" + passHash); }
-function setSess(res, t) { res.set("Set-Cookie", "sess=" + Buffer.from(t.slug).toString("base64") + "." + sessToken(t.slug, t.config.passHash) + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"); }
+// 旧: 決定的トークン（失効不可）。後方互換フォールバックのため照合ロジックだけ残す。
+// TODO: 次リリースで決定的トークンのフォールバック（legacySessToken / tenantFromReq内のlegacy判定）を削除する。
+function legacySessToken(slug, passHash) { return sha("sess|" + slug + "|" + passHash); }
+// ===== 新: ランダムなセッションID方式（失効可・有効期限あり）。jsonb config内に保持しスキーマ変更を回避 =====
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30日
+function sessions(t) { // t.config.sessions = { [tokenHash]: { created, exp, ua } }
+  if (!t.config.sessions || typeof t.config.sessions !== "object") t.config.sessions = {};
+  return t.config.sessions;
+}
+function pruneSessions(t) { // 期限切れを掃除。件数上限で古いものから破棄（暴走防止）
+  const s = sessions(t); const now = Date.now();
+  for (const h of Object.keys(s)) { const e = s[h]; if (!e || !e.exp || e.exp < now) delete s[h]; }
+  const keys = Object.keys(s);
+  if (keys.length > 50) { keys.sort((a, b) => (s[a].created || 0) - (s[b].created || 0)); while (Object.keys(s).length > 50) delete s[keys.shift()]; }
+}
+// 新規セッション発行: ランダム32バイト→cookieには生トークン、DBにはそのハッシュを保存。cookie文字列を返す。
+function issueSession(t, ua) {
+  const raw = crypto.randomBytes(32).toString("hex");
+  const h = sha(raw);
+  const s = sessions(t);
+  s[h] = { created: Date.now(), exp: Date.now() + SESSION_TTL_MS, ua: String(ua || "").slice(0, 200) };
+  pruneSessions(t);
+  saveTenantConfig(t).catch(() => {}); // セッション集合を永続化（fire-and-forget）
+  return raw;
+}
+function destroyAllSessions(t) { t.config.sessions = {}; saveTenantConfig(t).catch(() => {}); }
+function setSess(res, t) {
+  const raw = issueSession(t, res.req && res.req.headers && res.req.headers["user-agent"]);
+  res.set("Set-Cookie", "sess=" + Buffer.from(t.slug).toString("base64") + "." + raw + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000");
+}
 function tenantFromReq(req) {
   const sess = cookies(req).sess || "";
   const dot = sess.lastIndexOf(".");
@@ -121,9 +229,16 @@ function tenantFromReq(req) {
   const tok = sess.slice(dot + 1);
   const t = TEN[slug];
   if (!t || !t.config.passHash) return null;
-  if (tok !== sessToken(slug, t.config.passHash)) return null;
   if (t.config.suspended) return null; // 運営側で停止中
-  return t;
+  // 新方式: 送られたトークンのハッシュがテナントのセッション集合に存在し、かつ未失効か
+  const s = sessions(t); const h = sha(tok); const e = s[h];
+  if (e) {
+    if (e.exp && e.exp < Date.now()) { delete s[h]; saveTenantConfig(t).catch(() => {}); return null; } // 失効
+    return t;
+  }
+  // 後方互換フォールバック: 旧決定的トークン（本番の突然のログアウトを避けるため当面受理）。TODO: 次リリースで削除。
+  if (safeEq(tok, legacySessToken(slug, t.config.passHash))) return t;
+  return null;
 }
 function guard(req, res, next) { const t = tenantFromReq(req); if (!t) return res.status(401).json({ error: "auth" }); req.tenant = t; next(); }
 function slugify(name) { const base = String(name || "clinic").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 20) || "clinic"; return base + "-" + crypto.randomBytes(2).toString("hex"); }
@@ -142,20 +257,23 @@ app.post("/api/signup", async (req, res) => {
   if (pass.length < 8) return res.status(400).json({ ok: false, error: "too_short" });
   if (loginIdTaken(loginId)) return res.status(409).json({ ok: false, error: "id_taken" });
   const slug = slugify(name);
-  const config = { passHash: sha(pass), loginId, conn: {}, settings: { autoReply: false, level: "high", tone: "" } };
+  const config = { passHash: hashPassword(pass), loginId, conn: {}, settings: { autoReply: false, level: "high", tone: "" } };
   const t = TEN[slug] = newTenant(slug, name, config);
   if (pool) { try { await pool.query("INSERT INTO tenants (slug,name,config) VALUES ($1,$2,$3)", [slug, name, t.config]); } catch (e) { delete TEN[slug]; return res.status(500).json({ ok: false, error: "db" }); } }
   seedTenant(t); // 本番と同様、新規テナントにはデモ会話を入れて空っぽにしない
   setSess(res, t);
   res.json({ ok: true, slug });
 });
-app.post("/api/login", (req, res) => {
+app.post("/api/login", async (req, res) => {
   const loginId = String(req.body.loginId || req.body.company || "").trim();
   const pass = String(req.body.password || "");
-  // ログインIDでマッチ（未設定テナントはslugがID代わり）
-  const t = Object.values(TEN).find(x => (x.config.loginId || x.slug) === loginId && x.config.passHash && sha(pass) === x.config.passHash);
+  // ログインIDでマッチ（未設定テナントはslugがID代わり）。パスワード照合は bcrypt/legacy 両対応の verifyPassword。
+  const cand = Object.values(TEN).find(x => (x.config.loginId || x.slug) === loginId && x.config.passHash);
+  const vr = cand ? verifyPassword(pass, cand.config.passHash) : { ok: false, legacy: false };
+  const t = vr.ok ? cand : null;
   if (!t) return res.status(401).json({ ok: false });
   if (t.config.suspended) return res.status(403).json({ ok: false, error: "suspended" });
+  if (vr.legacy) { try { t.config.passHash = hashPassword(pass); await saveTenantConfig(t); } catch (e) { console.error("lazy-migrate:", e.message); } } // 従来SHA-256で成功→bcryptへ自動移行
   setSess(res, t);
   res.json({ ok: true, slug: t.slug });
 });
@@ -168,15 +286,23 @@ app.post("/api/change-loginid", guard, async (req, res) => {
   try { await saveTenantConfig(t); } catch (e) { return res.status(500).json({ ok: false, error: "save" }); }
   res.json({ ok: true, loginId: next });
 });
-app.post("/api/logout", (req, res) => { res.set("Set-Cookie", "sess=; Path=/; HttpOnly; Max-Age=0"); res.json({ ok: true }); });
+app.post("/api/logout", (req, res) => {
+  // このcookieのセッションだけをサーバ側集合から破棄（他端末のログインは維持）
+  try {
+    const sess = cookies(req).sess || ""; const dot = sess.lastIndexOf(".");
+    if (dot > 0) { const slug = Buffer.from(sess.slice(0, dot), "base64").toString("utf8"); const t = TEN[slug]; if (t) { const h = sha(sess.slice(dot + 1)); if (sessions(t)[h]) { delete sessions(t)[h]; saveTenantConfig(t).catch(() => {}); } } }
+  } catch (e) {}
+  res.set("Set-Cookie", "sess=; Path=/; HttpOnly; Max-Age=0"); res.json({ ok: true });
+});
 app.post("/api/change-pass", guard, async (req, res) => {
   const t = req.tenant;
   const cur = String(req.body.current || ""), next = String(req.body.next || "");
-  if (sha(cur) !== t.config.passHash) return res.status(401).json({ ok: false, error: "wrong_current" });
+  if (!verifyPassword(cur, t.config.passHash).ok) return res.status(401).json({ ok: false, error: "wrong_current" });
   if (next.length < 8) return res.status(400).json({ ok: false, error: "too_short" });
-  t.config.passHash = sha(next);
+  t.config.passHash = hashPassword(next);
+  destroyAllSessions(t); // パスワード変更で既存セッションを全破棄
   try { await saveTenantConfig(t); } catch (e) { return res.status(500).json({ ok: false, error: "save" }); }
-  setSess(res, t);
+  setSess(res, t); // 変更した本人には新しいセッションを発行し直す
   res.json({ ok: true });
 });
 
@@ -666,7 +792,7 @@ function lineAccounts(t) {
   const arr = [];
   const conn = t.config.conn;
   if (C.lineToken(t)) arr.push({ name: conn.lineName || "メイン", token: C.lineToken(t), secret: C.lineSecret(t), botId: conn.lineBotId || "", main: true });
-  (Array.isArray(conn.lines) ? conn.lines : []).forEach(a => { if (a && a.token) arr.push({ name: a.name || "LINE", token: a.token, secret: a.secret || "", botId: a.botId || "" }); });
+  (Array.isArray(conn.lines) ? conn.lines : []).forEach(a => { if (a && a.token) arr.push({ name: a.name || "LINE", token: decField(a.token), secret: a.secret ? decField(a.secret) : "", botId: a.botId || "" }); });
   return arr;
 }
 function mailAccounts(t) {
@@ -674,7 +800,7 @@ function mailAccounts(t) {
   const conn = t.config.conn;
   if (C.smtpUser(t) && C.smtpPass(t)) arr.push({ name: conn.mailName || "メイン", smtpHost: C.smtpHost(t), smtpPort: C.smtpPort(t), smtpUser: C.smtpUser(t), smtpPass: C.smtpPass(t), imapHost: C.imapHost(t), imapPort: C.imapPort(t), imapUser: C.imapUser(t), imapPass: C.imapPass(t), main: true });
   (Array.isArray(conn.mails) ? conn.mails : []).forEach(a => {
-    if (a && a.smtpUser && a.smtpPass) arr.push({ name: a.name || "メール", smtpHost: a.smtpHost || "smtp.gmail.com", smtpPort: +(a.smtpPort || 465), smtpUser: a.smtpUser, smtpPass: a.smtpPass, imapHost: a.imapHost || "imap.gmail.com", imapPort: +(a.imapPort || 993), imapUser: a.imapUser || a.smtpUser, imapPass: a.imapPass || a.smtpPass });
+    if (a && a.smtpUser && a.smtpPass) arr.push({ name: a.name || "メール", smtpHost: a.smtpHost || "smtp.gmail.com", smtpPort: +(a.smtpPort || 465), smtpUser: a.smtpUser, smtpPass: decField(a.smtpPass), imapHost: a.imapHost || "imap.gmail.com", imapPort: +(a.imapPort || 993), imapUser: a.imapUser || a.smtpUser, imapPass: a.imapPass ? decField(a.imapPass) : decField(a.smtpPass) });
   });
   return arr;
 }
@@ -724,7 +850,7 @@ app.post("/webhook/line", async (req, res) => {
   if (dest && !acct.botId) {
     const conn = t.config.conn;
     if (acct.main) { conn.lineBotId = dest; }
-    else { const raw = (conn.lines || []).find(x => x.token === acct.token); if (raw) raw.botId = dest; }
+    else { const raw = (conn.lines || []).find(x => decField(x.token) === acct.token); if (raw) raw.botId = dest; }
     acct.botId = dest; saveTenantConfig(t).catch(() => {});
   }
   res.status(200).end();
@@ -1623,7 +1749,7 @@ app.post("/api/partner/tenants", pGuard, async (req,res)=>{
   if(!slug){ slug = slugify(name); if(TEN[slug]) return res.status(409).json({ok:false,error:"slug_exists"}); }
   // パスワード未指定ならランダム生成（顧客はSSO経由で入る。後からパスワード設定も可能）
   const pass = String(req.body.password||"") || crypto.randomBytes(12).toString("hex");
-  const config = { passHash: sha(pass), conn: {}, settings: { autoReply: false, level: "high", tone: "" } };
+  const config = { passHash: hashPassword(pass), conn: {}, settings: { autoReply: false, level: "high", tone: "" } };
   const t = TEN[slug] = newTenant(slug, name, config);
   if(pool){ try{ await pool.query("INSERT INTO tenants (slug,name,config) VALUES ($1,$2,$3)", [slug, name, t.config]); }catch(e){ delete TEN[slug]; return res.status(500).json({ok:false,error:"db"}); } }
   res.status(201).json({ slug, name });
@@ -1705,7 +1831,8 @@ app.post("/api/partner/reset-login", pGuard, async (req,res)=>{
   const ab = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   const rb = crypto.randomBytes(12); let pw = "";
   for(let i=0;i<12;i++) pw += ab[rb[i] % ab.length];
-  t.config.passHash = sha(pw);
+  t.config.passHash = hashPassword(pw);
+  destroyAllSessions(t); // ログイン再発行で旧セッションを全破棄
   let loginId = t.config.loginId || t.slug;
   if(req.body.resetId === true){
     let cand; do { cand = slugify(t.name || t.slug); } while(loginIdTaken(cand, t.slug));
@@ -1829,7 +1956,8 @@ app.post("/api/reset", async (req,res)=>{
   const t = TEN[e.slug];
   if(!t){ delete RESET_TOKENS[tok]; return res.status(404).json({ ok:false }); }
   const prev = t.config.passHash;
-  t.config.passHash = sha(password);
+  t.config.passHash = hashPassword(password);
+  destroyAllSessions(t); // パスワード再設定で既存セッションを全破棄
   try{ await saveTenantConfig(t); }
   catch(err){ t.config.passHash = prev; return res.status(500).json({ ok:false, error:"db" }); }
   delete RESET_TOKENS[tok]; // 1回限り
@@ -1841,6 +1969,7 @@ app.get("/", (req, res) => { res.set("Content-Type", "text/html; charset=utf-8")
 app.get("/signup", (req, res) => res.redirect("/")); // 申込みは営業契約後に運営が作成
 app.get("/board", (req, res) => { res.set("Content-Type", "text/html; charset=utf-8"); res.set("Cache-Control", "no-store"); res.send(tenantFromReq(req) ? BOARD_PAGE : LOGIN_PAGE); });
 (async () => {
+  if (!CRED_KEY) console.warn("CRED_KEY 未設定: メール/LINE資格情報の at-rest 暗号化は無効です（平文で保存・動作）。設定すると次回保存時から自動的に暗号化されます。");
   try { if (pool) await dbInit(); } catch (e) { console.error("dbInit failed:", e.message); }
   try { await pushInit(); } catch (e) { console.error("pushInit failed:", e.message); }
   setInterval(() => { pollAll().catch(() => {}); }, 60000); setTimeout(() => { pollAll().catch(() => {}); }, 8000);

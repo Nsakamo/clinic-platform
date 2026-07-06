@@ -10,6 +10,7 @@
     "node": ">=18"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
     "express": "^4.19.2",
     "imapflow": "^1.0.164",
     "mailparser": "^3.7.1",
