@@ -191,6 +191,25 @@ function encryptConnSecrets(conn) {
 // ---------- auth（旧platform方式: セッションcookie sess=base64(slug).token） ----------
 function sha(s) { return crypto.createHash("sha256").update(s).digest("hex"); }
 function cookies(req) { const o = {}; (req.headers.cookie || "").split(";").forEach(p => { const i = p.indexOf("="); if (i > 0) o[p.slice(0, i).trim()] = decodeURIComponent(p.slice(i + 1).trim()); }); return o; }
+// ===== ログインのブルートフォース保護（単一プロセスのExpressなのでモジュール内Mapで確実に効く）=====
+// key = ip+"|"+loginId。直近15分で10回失敗したら15分ロック。
+const LOGIN_FAIL_WINDOW_MS = 15 * 60 * 1000, LOGIN_FAIL_MAX = 10;
+const loginFails = new Map(); // key -> { fails:number[], lockedUntil:number }
+function loginLocked(key) {
+  const e = loginFails.get(key);
+  if (!e) return false;
+  if (e.lockedUntil && Date.now() < e.lockedUntil) return true;
+  return false;
+}
+function loginFail(key) {
+  const now = Date.now();
+  const e = loginFails.get(key) || { fails: [], lockedUntil: 0 };
+  e.fails = e.fails.filter(t => now - t < LOGIN_FAIL_WINDOW_MS);
+  e.fails.push(now);
+  if (e.fails.length >= LOGIN_FAIL_MAX) e.lockedUntil = now + LOGIN_FAIL_WINDOW_MS;
+  loginFails.set(key, e);
+}
+function loginReset(key) { loginFails.delete(key); }
 // 旧: 決定的トークン（失効不可）。後方互換フォールバックのため照合ロジックだけ残す。
 // TODO: 次リリースで決定的トークンのフォールバック（legacySessToken / tenantFromReq内のlegacy判定）を削除する。
 function legacySessToken(slug, passHash) { return sha("sess|" + slug + "|" + passHash); }
@@ -267,11 +286,16 @@ app.post("/api/signup", async (req, res) => {
 app.post("/api/login", async (req, res) => {
   const loginId = String(req.body.loginId || req.body.company || "").trim();
   const pass = String(req.body.password || "");
+  // ブルートフォース保護: ip+loginId 単位で失敗を数え、直近15分で10回失敗したら15分ロック。
+  const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress || "unknown";
+  const flKey = ip + "|" + loginId;
+  if (loginLocked(flKey)) return res.status(429).json({ ok: false, error: "too_many" });
   // ログインIDでマッチ（未設定テナントはslugがID代わり）。パスワード照合は bcrypt/legacy 両対応の verifyPassword。
   const cand = Object.values(TEN).find(x => (x.config.loginId || x.slug) === loginId && x.config.passHash);
   const vr = cand ? verifyPassword(pass, cand.config.passHash) : { ok: false, legacy: false };
   const t = vr.ok ? cand : null;
-  if (!t) return res.status(401).json({ ok: false });
+  if (!t) { loginFail(flKey); return res.status(401).json({ ok: false }); }
+  loginReset(flKey);
   if (t.config.suspended) return res.status(403).json({ ok: false, error: "suspended" });
   if (vr.legacy) { try { t.config.passHash = hashPassword(pass); await saveTenantConfig(t); } catch (e) { console.error("lazy-migrate:", e.message); } } // 従来SHA-256で成功→bcryptへ自動移行
   setSess(res, t);
