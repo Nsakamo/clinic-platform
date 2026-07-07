@@ -2433,6 +2433,7 @@ async function loadCustomer(id){
     if(!j){ el.innerHTML=""; return; }
     if(j.found){ el.innerHTML=custFoundHtml(j); }
     else { el.innerHTML=custUnlinkedHtml(id); }
+    el.onclick=cpPanelClick; // data-cp ボタン（コピー/リンク/連携）をイベント委譲で処理
   }catch(e){ el.innerHTML=""; }
 }
 function custFoundHtml(j){
@@ -2458,7 +2459,7 @@ function custFoundHtml(j){
     var rows=qs.map(function(q){
       var label=esc((q.date||"")+" "+(q.menu||""));
       if(q.unansweredUrl){
-        return '<div class="cpRow">'+label+' <button class="cpBtn" onclick="cpCopy(this,\''+jsq(q.unansweredUrl)+'\')">未入力回答URLをコピー</button></div>';
+        return '<div class="cpRow">'+label+' <button class="cpBtn" data-cp="copy" data-val="'+encodeURIComponent(q.unansweredUrl)+'">未入力回答URLをコピー</button></div>';
       }
       return '<div class="cpRow">'+label+' <span class="cpMuted">問診: '+esc(q.ivStatus||"")+'</span></div>';
     }).join("");
@@ -2466,15 +2467,21 @@ function custFoundHtml(j){
   }
   var links=(j&&j.links)||{};
   var btns='<div class="cpBtnRow">';
-  if(links.karte) btns+='<button class="cpBtn" onclick="cpOpen(\''+jsq(links.karte)+'\')">🗂 カルテを開く</button>';
-  if(links.patient) btns+='<button class="cpBtn" onclick="cpOpen(\''+jsq(links.patient)+'\')">👤 顧客情報</button>';
-  if(links.patient) btns+='<button class="cpBtn" onclick="cpOpen(\''+jsq(links.patient)+'\')">↗ 受付るんで開く</button>';
+  if(links.karte) btns+='<button class="cpBtn" data-cp="open" data-val="'+encodeURIComponent(links.karte)+'">🗂 カルテを開く</button>';
+  if(links.patient) btns+='<button class="cpBtn" data-cp="open" data-val="'+encodeURIComponent(links.patient)+'">👤 顧客情報</button>';
+  if(links.patient) btns+='<button class="cpBtn" data-cp="open" data-val="'+encodeURIComponent(links.patient)+'">↗ 受付るんで開く</button>';
   btns+='</div>';
   h+=btns;
   return h;
 }
-function jsq(s){ return String(s||"").replace(/\\/g,"\\\\").replace(/'/g,"\\'"); }
 function cpOpen(url){ try{ window.open(url,"_blank"); }catch(e){} }
+function cpPanelClick(e){
+  var b=e.target&&e.target.closest?e.target.closest("[data-cp]"):null; if(!b)return;
+  var act=b.getAttribute("data-cp"); var val=decodeURIComponent(b.getAttribute("data-val")||"");
+  if(act==="copy") cpCopy(b,val);
+  else if(act==="open") cpOpen(val);
+  else if(act==="link") doLink(val);
+}
 function custUnlinkedHtml(id){
   return '<div class="cpRow"><span class="cpMuted">この顧客は受付るんと未連携です</span></div>'+
     '<input id="custSearch" class="cpInput" placeholder="氏名・電話で検索" oninput="custSearchDebounced()">'+
@@ -2496,7 +2503,7 @@ async function custSearchGo(){
         (p.nameKana?' <span class="cpMuted">'+esc(p.nameKana)+'</span>':'')+
         (p.phoneMasked?' <span class="cpMuted">'+esc(p.phoneMasked)+'</span>':'')+
         (p.lineLinked?' <span class="cpMuted">(LINE連携済)</span>':'')+
-        '</span><button class="cpLink" onclick="doLink(\''+jsq(p.id)+'\')">連携</button></div>';
+        '</span><button class="cpLink" data-cp="link" data-val="'+encodeURIComponent(p.id)+'">連携</button></div>';
     }).join("");
   }catch(e){ box.innerHTML=""; }
 }
