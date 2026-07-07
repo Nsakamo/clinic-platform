@@ -1208,6 +1208,42 @@ app.post("/api/customer-link", guard, async (req, res) => {
   if (!r.json) return res.json({ ok: false });
   res.json(r.json);
 });
+// GET/POST/PUT を1つで扱う汎用中継（partnerGet は GET専用、partnerPost は POST専用のため PUT用に追加）
+async function partnerReq(method, path, body) {
+  if (!PARTNER_KEY) return { ok: false, status: 0, json: null };
+  try {
+    const opt = { method, headers: { "x-partner-key": PARTNER_KEY }, signal: AbortSignal.timeout(8000) };
+    if (body != null) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+    const r = await fetch(PARTNER_BASE + path, opt);
+    return { ok: r.ok, status: r.status, json: await r.json().catch(() => null) };
+  } catch (e) { return { ok: false, status: 0, json: null }; }
+}
+app.get("/api/customer-karte", guard, async (req, res) => {
+  const t = req.tenant; const c = t.store[req.query.id];
+  if (!c) return res.json({ found: false });
+  const enc = encodeURIComponent;
+  const r = await partnerGet("/karte?slug=" + enc(t.slug) + "&channel=" + enc(c.channel || "") + "&userId=" + enc(c.userId || ""));
+  if (!r.ok || !r.json) return res.json({ found: false });
+  res.json(r.json);
+});
+app.post("/api/customer-karte", guard, async (req, res) => {
+  const t = req.tenant; const c = t.store[req.body.id];
+  if (!c) return res.json({ ok: false, error: "no" });
+  const action = req.body.action;
+  let r;
+  if (action === "add") r = await partnerPost("/karte", { slug: t.slug, patientId: req.body.patientId, body: req.body.body });
+  else if (action === "edit") r = await partnerReq("PUT", "/karte", { slug: t.slug, recordId: req.body.recordId, body: req.body.body });
+  else return res.json({ ok: false, error: "bad_action" });
+  if (!r.json) return res.json({ ok: false });
+  res.json(r.json);
+});
+app.post("/api/customer-appt-cancel", guard, async (req, res) => {
+  const t = req.tenant; const c = t.store[req.body.id];
+  if (!c) return res.json({ ok: false, error: "no" });
+  const r = await partnerPost("/appointment-cancel", { slug: t.slug, appointmentId: req.body.appointmentId, reason: req.body.reason });
+  if (!r.json) return res.json({ ok: false });
+  res.json(r.json);
+});
 app.post("/api/redraft", guard, async (req, res) => {
   const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" });
   const sel = Array.isArray(req.body.selected) ? req.body.selected.map(String).slice(0, 20) : [];
@@ -2173,7 +2209,7 @@ const PAGE = `<!DOCTYPE html>
   .rlast{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
   .stat{flex-shrink:0;width:20px;text-align:center;font-size:15px;}
   .dot{width:9px;height:9px;border-radius:50%;background:var(--info);display:inline-block;}.flagicon{color:var(--danger);}.doneicon{color:var(--done);}
-  #chat{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--chatbg);}
+  #chat{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--chatbg);position:relative;}
   #chatHead{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--panel);border-bottom:1px solid var(--line);}
   #backBtn{display:none;border:none;background:none;font-size:20px;cursor:pointer;color:var(--text);}
   #chatName{font-weight:600;flex:1;}
@@ -2186,6 +2222,20 @@ const PAGE = `<!DOCTYPE html>
   .cpCand{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:4px 0;border-top:1px solid var(--line);}
   .cpBtnRow{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;}
   .cpLink,.cpBtn{font-size:12px;padding:4px 8px;border:1px solid var(--line);background:#fff;border-radius:6px;cursor:pointer;white-space:nowrap;color:var(--text);}
+  .custPanel{transition:max-height .28s ease,opacity .2s ease;overflow:hidden;}
+  .cpGrip{display:flex;align-items:center;justify-content:center;gap:8px;padding:3px;border-top:1px solid #f3f4f6;cursor:pointer;}
+  .cpGripBar{width:34px;height:4px;border-radius:3px;background:#d1d5db;}
+  .custTab{display:flex;align-items:center;justify-content:center;gap:6px;background:#f0fdf4;border-bottom:1px solid #e5e7eb;padding:5px;font-size:11px;color:#15803d;cursor:pointer;}
+  .cpCancel{border-color:#f0999b;background:#fdecec;color:#b3261e;}
+  .cpKarte{border-color:#0f766e;background:#0f766e;color:#fff;}
+  #karteOv{position:absolute;left:0;right:0;top:0;bottom:0;background:rgba(0,0,0,.35);z-index:20;display:none;}
+  .karteCard{position:absolute;left:8px;right:8px;top:8px;bottom:8px;background:#fff;border-radius:14px;overflow:hidden;display:flex;flex-direction:column;}
+  .karteHd{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid #e5e7eb;font-weight:600;font-size:13px;}
+  .karteHd .kClose{margin-left:auto;border:none;background:none;font-size:18px;cursor:pointer;color:#6b7280;}
+  .karteBody{flex:1;overflow-y:auto;padding:8px 12px;}
+  .karteEntry{padding:8px 0;border-bottom:1px solid #f3f4f6;font-size:12px;line-height:1.5;}
+  .karteFoot{border-top:1px solid #e5e7eb;padding:8px 12px;}
+  .karteFoot textarea{width:100%;box-sizing:border-box;min-height:52px;padding:6px 8px;border:1px solid #e5e7eb;border-radius:8px;font-size:12px;}
   #msgs{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px;}
   .b{max-width:74%;padding:9px 12px;border-radius:14px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word;}
   .b.them{align-self:flex-start;background:#fff;border:1px solid var(--line);}.b.us{align-self:flex-end;background:var(--bubble-us);color:var(--bubble-us-text);}
@@ -2414,6 +2464,7 @@ function syncMsgs(c){const m=document.getElementById("msgs");if(!m)return;if(m.g
 function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)return; appEl.classList.add("chatopen");
   const bubbles=bubblesHtml(r);
   chatEl.innerHTML='<div id="chatHead"><button id="backBtn" onclick="closeChat()">‹</button>'+av(r,30)+'<span id="chatName">'+esc(r.name)+'　<span style="font-size:11px;color:#6b7280;">'+(r.channel==="line"?"LINE":"メール")+((r.acct&&r.acct.name&&r.acct.name!=="メイン")?"・"+esc(r.acct.name):"")+'</span></span><button class="hbtn" onclick="shareClinic()">🏥 クリニックへ共有</button></div>'+
+    '<div id="custTab" class="custTab" style="display:none;" onclick="cpExpand()">受付るん情報を表示 ⌄</div>'+
     '<div id="custPanel" class="custPanel">読み込み中…</div>'+
     '<div id="msgs">'+bubbles+'</div>'+
     '<div id="composer"><div id="aiLabel">✨ AI下書き（編集して送れます）</div><div id="topicChips" style="display:none;"></div><div id="draftRow"><button id="attach" onclick="attach()" title="写真・動画を添付">📎</button><textarea id="draft">'+esc(r.draft||"")+'</textarea></div>'+
@@ -2422,37 +2473,73 @@ function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)ret
 }
 function closeChat(){appEl.classList.remove("chatopen");current=null;renderList();}
 // ===== 受付るん 顧客情報パネル =====
+var custPid=null; var karteEntries={};
 function copyText(s){ try{ navigator.clipboard.writeText(s); }catch(e){} }
 function cpCopy(btn,url){ copyText(url); if(btn){ var o=btn.textContent; btn.textContent="コピーしました"; setTimeout(function(){ try{btn.textContent=o;}catch(e){} },1500); } }
+function cpGripHtml(){ return '<div data-cp="collapse" class="cpGrip"><span class="cpGripBar"></span><span class="cpMuted">▲ 隠す</span></div>'; }
 async function loadCustomer(id){
   var el=document.getElementById("custPanel"); if(!el)return;
+  cpExpand(); cpBindTouch();
   el.innerHTML='<span class="cpMuted">受付るん情報を読み込み中…</span>';
   try{
     var r=await fetch("/api/customer-context?id="+encodeURIComponent(id));
     var j=await r.json();
     if(!j){ el.innerHTML=""; return; }
-    if(j.found){ el.innerHTML=custFoundHtml(j); }
-    else { el.innerHTML=custUnlinkedHtml(id); }
-    el.onclick=cpPanelClick; // data-cp ボタン（コピー/リンク/連携）をイベント委譲で処理
+    if(j.found){ el.innerHTML=custFoundHtml(j); custPid=(j.patient&&j.patient.id!=null)?j.patient.id:null; el.setAttribute("data-pid", custPid!=null?encodeURIComponent(String(custPid)):""); }
+    else { el.innerHTML=custUnlinkedHtml(id); custPid=null; }
+    el.onclick=cpPanelClick; // data-cp ボタン（コピー/リンク/連携/キャンセル/カルテ/折りたたみ）をイベント委譲で処理
   }catch(e){ el.innerHTML=""; }
+}
+function cpCollapse(){
+  var el=document.getElementById("custPanel"); var tab=document.getElementById("custTab");
+  if(el){ el.style.maxHeight="0"; el.style.opacity="0"; el.style.paddingTop="0"; el.style.paddingBottom="0"; }
+  if(tab){ tab.style.display="flex"; }
+}
+function cpExpand(){
+  var el=document.getElementById("custPanel"); var tab=document.getElementById("custTab");
+  if(el){ el.style.maxHeight="600px"; el.style.opacity="1"; el.style.paddingTop=""; el.style.paddingBottom=""; }
+  if(tab){ tab.style.display="none"; }
+}
+function cpBindTouch(){
+  var el=document.getElementById("custPanel"); var tab=document.getElementById("custTab");
+  if(el&&!el.__cpb){ el.__cpb=1; var sy=0;
+    el.addEventListener("touchstart",function(e){ sy=e.touches[0].clientY; },{passive:true});
+    el.addEventListener("touchend",function(e){ var dy=sy-e.changedTouches[0].clientY; if(dy>24) cpCollapse(); });
+  }
+  if(tab&&!tab.__cpb){ tab.__cpb=1; var ty=0;
+    tab.addEventListener("touchstart",function(e){ ty=e.touches[0].clientY; },{passive:true});
+    tab.addEventListener("touchend",function(e){ var dy=e.changedTouches[0].clientY-ty; if(dy>16) cpExpand(); });
+  }
 }
 function custFoundHtml(j){
   var p=(j&&j.patient)||{};
+  var bk=(j&&j.bookings)||{};
+  var past=(bk.past)||[];
   var h='<div class="cpTitle">'+esc(p.name||"顧客")+
     (p.memberRank?'<span class="cpMuted"> ・'+esc(p.memberRank)+'</span>':'')+
     ((p.points!=null&&p.points!=="")?'<span class="cpMuted"> ・'+esc(String(p.points))+'pt</span>':'')+'</div>';
+  var vc=(p.visitCount!=null&&p.visitCount!=="")?String(p.visitCount):"";
+  var pv=past[0];
+  if(vc||pv){
+    var parts=[];
+    if(vc) parts.push("通算"+esc(vc)+"回");
+    if(pv) parts.push("前回 "+esc(((pv.date||"")+" "+(pv.menu||"")).trim()));
+    h+='<div class="cpRow"><span class="cpMuted">来院:</span> '+parts.join(" ／ ")+'</div>';
+  }
   if(p.tickets&&p.tickets.length){
     var tk=p.tickets.map(function(t){ return esc(t.name)+"×"+esc(String(t.remaining)); }).join("／");
     h+='<div class="cpRow"><span class="cpMuted">回数券:</span> '+tk+'</div>';
   }
-  var bk=(j&&j.bookings)||{};
   var up=(bk.upcoming)||[];
   if(up.length){
-    var shown=up.slice(0,3).map(function(b){ return esc((b.date||"")+" "+(b.menu||"")+"("+(b.status||"")+")"); }).join("／");
-    if(up.length>3) shown+="／他"+(up.length-3)+"件";
-    h+='<div class="cpRow"><span class="cpMuted">予約:</span> '+shown+'</div>';
+    h+='<div class="cpRow"><span class="cpMuted">予約:</span></div>';
+    h+=up.slice(0,6).map(function(b){
+      var lbl=esc((b.date||"")+" "+(b.menu||"")+"("+(b.status||"")+")");
+      var cbtn=b.apptId?'<button class="cpBtn cpCancel" data-cp="cancel" data-val="'+encodeURIComponent(String(b.apptId))+'">キャンセル</button>':'';
+      return '<div class="cpRow" style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span>'+lbl+'</span>'+cbtn+'</div>';
+    }).join("");
+    if(up.length>6) h+='<div class="cpRow"><span class="cpMuted">他'+(up.length-6)+'件</span></div>';
   }
-  var past=(bk.past)||[];
   if(past.length){ h+='<div class="cpRow"><span class="cpMuted">来院履歴 '+past.length+'件</span></div>'; }
   var qs=(j&&j.questionnaires)||[];
   if(qs.length){
@@ -2467,13 +2554,87 @@ function custFoundHtml(j){
   }
   var links=(j&&j.links)||{};
   var btns='<div class="cpBtnRow">';
+  btns+='<button class="cpBtn cpKarte" data-cp="karte">🗂 カルテクイック</button>';
   if(links.karte) btns+='<button class="cpBtn" data-cp="open" data-val="'+encodeURIComponent(links.karte)+'">🗂 カルテを開く</button>';
   if(links.patient) btns+='<button class="cpBtn" data-cp="open" data-val="'+encodeURIComponent(links.patient)+'">👤 顧客情報</button>';
   if(links.patient) btns+='<button class="cpBtn" data-cp="open" data-val="'+encodeURIComponent(links.patient)+'">↗ 受付るんで開く</button>';
   btns+='</div>';
   h+=btns;
+  h+=cpGripHtml();
   return h;
 }
+function openKarte(){
+  if(!current)return;
+  var chat=document.getElementById("chat"); if(!chat)return;
+  var ov=document.getElementById("karteOv");
+  if(!ov){ ov=document.createElement("div"); ov.id="karteOv"; chat.appendChild(ov);
+    ov.onclick=function(e){ if(e.target===ov){ closeKarte(); return; } cpPanelClick(e); }; }
+  ov.style.display="block";
+  ov.innerHTML='<div class="karteCard"><div class="karteHd">🗂 カルテクイック<button class="kClose" data-cp="karteclose">✕</button></div><div class="karteBody"><span class="cpMuted">読み込み中…</span></div></div>';
+  karteLoad(ov);
+}
+async function karteLoad(ov){
+  try{
+    var r=await fetch("/api/customer-karte?id="+encodeURIComponent(current));
+    var j=await r.json();
+    if(j&&j.patient&&j.patient.id!=null) custPid=j.patient.id;
+    ov.innerHTML=karteHtml(j);
+  }catch(e){ ov.innerHTML='<div class="karteCard"><div class="karteHd">🗂 カルテクイック<button class="kClose" data-cp="karteclose">✕</button></div><div class="karteBody"><span class="cpMuted">取得に失敗しました</span></div></div>'; }
+}
+function karteHtml(j){
+  j=j||{}; karteEntries={};
+  var pt=j.patient||{}; var name=esc(pt.name||"");
+  var entries=(j.entries)||[];
+  var body='';
+  if(!j.found){ body='<span class="cpMuted">カルテを取得できませんでした</span>'; }
+  else if(!entries.length){ body='<span class="cpMuted">記録がありません</span>'; }
+  else {
+    body=entries.map(function(en){
+      if(en.id!=null) karteEntries[String(en.id)]=en.text||"";
+      var editBtn=(en.kind==="note"&&en.editable&&en.id!=null)?' <button class="cpBtn" data-cp="karteedit" data-val="'+encodeURIComponent(String(en.id))+'">✎ 編集</button>':'';
+      var tag=(en.kind==="treatment")?' <span class="cpMuted">施術記録</span>':'';
+      return '<div class="karteEntry"><div class="cpMuted">'+esc(en.date||"")+tag+'</div><div>'+esc(en.text||"")+'</div>'+editBtn+'</div>';
+    }).join("");
+  }
+  return '<div class="karteCard"><div class="karteHd">🗂 カルテクイック — '+name+'<button class="kClose" data-cp="karteclose">✕</button></div>'+
+    '<div class="karteBody">'+body+'</div>'+
+    '<div class="karteFoot"><textarea id="karteAddText" placeholder="クイック追加（カルテにメモを追加）"></textarea><div class="cpBtnRow"><button class="cpBtn cpKarte" data-cp="karteadd">カルテに保存</button></div></div></div>';
+}
+function closeKarte(){ var ov=document.getElementById("karteOv"); if(ov) ov.style.display="none"; }
+async function karteAdd(){
+  var ta=document.getElementById("karteAddText"); if(!ta||!current)return;
+  var body=(ta.value||"").trim(); if(!body)return;
+  try{
+    var r=await api("/api/customer-karte",{id:current,action:"add",patientId:custPid,body:body});
+    var j=await r.json();
+    if(j&&j.ok){ openKarte(); }
+    else { alert("カルテの保存に失敗しました"); }
+  }catch(e){ alert("カルテの保存に失敗しました"); }
+}
+async function karteEdit(recordId){
+  if(!current||!recordId)return;
+  var cur=prompt("カルテ記録を編集します。新しい内容を入力してください：", karteEntries[String(recordId)]||"");
+  if(cur===null)return;
+  var body=cur.trim(); if(!body)return;
+  try{
+    var r=await api("/api/customer-karte",{id:current,action:"edit",recordId:recordId,body:body});
+    var j=await r.json();
+    if(j&&j.ok){ openKarte(); }
+    else { alert(j&&j.error==="not_editable"?"この記録は編集できません":"編集に失敗しました"); }
+  }catch(e){ alert("編集に失敗しました"); }
+}
+async function doApptCancel(apptId){
+  if(!current||!apptId)return;
+  var reason=prompt("この予約をキャンセルします。理由（任意・患者に送る自動連絡に使われる場合があります）:","クリニック都合");
+  if(reason===null)return;
+  try{
+    var r=await api("/api/customer-appt-cancel",{id:current,appointmentId:apptId,reason:reason});
+    var j=await r.json();
+    if(j&&j.ok){ loadCustomer(current); }
+    else { alert(j&&j.error==="not_cancellable"?"この予約はキャンセルできません(期限切れ/過去/処理済み)":"キャンセルに失敗しました"); }
+  }catch(e){ alert("キャンセルに失敗しました"); }
+}
+function linkToggle(){ var b=document.getElementById("custLinkBox"); if(!b)return; b.style.display=(!b.style.display||b.style.display==="none")?"block":"none"; }
 function cpOpen(url){ try{ window.open(url,"_blank"); }catch(e){} }
 function cpPanelClick(e){
   var b=e.target&&e.target.closest?e.target.closest("[data-cp]"):null; if(!b)return;
@@ -2481,11 +2642,19 @@ function cpPanelClick(e){
   if(act==="copy") cpCopy(b,val);
   else if(act==="open") cpOpen(val);
   else if(act==="link") doLink(val);
+  else if(act==="cancel") doApptCancel(val);
+  else if(act==="karte") openKarte();
+  else if(act==="karteadd") karteAdd();
+  else if(act==="karteedit") karteEdit(val);
+  else if(act==="karteclose") closeKarte();
+  else if(act==="collapse") cpCollapse();
+  else if(act==="linktoggle") linkToggle();
 }
 function custUnlinkedHtml(id){
   return '<div class="cpRow"><span class="cpMuted">この顧客は受付るんと未連携です</span></div>'+
-    '<input id="custSearch" class="cpInput" placeholder="氏名・電話で検索" oninput="custSearchDebounced()">'+
-    '<div id="custResults"></div>';
+    '<div class="cpBtnRow"><button class="cpBtn" data-cp="linktoggle">🔗 受付るんの顧客と連携</button></div>'+
+    '<div id="custLinkBox" style="display:none;"><input id="custSearch" class="cpInput" placeholder="氏名・電話で検索" oninput="custSearchDebounced()"><div id="custResults"></div></div>'+
+    cpGripHtml();
 }
 var custT;
 function custSearchDebounced(){ clearTimeout(custT); custT=setTimeout(custSearchGo,300); }
