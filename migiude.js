@@ -25,6 +25,7 @@ const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY || ""; // 全テナント共通�
 const PARTNER_KEY = process.env.PLATFORM_SECRET || ""; // パートナーAPI共有キー（x-partner-key）。未設定なら連携は無効
 const PARTNER_HOOK_URL = process.env.PARTNER_HOOK_URL || "https://smilemedi-cloud-web.vercel.app/api/hooks/migiude"; // 受信イベントの転送先
 const PARTNER_BOOKING_URL = process.env.PARTNER_BOOKING_URL || "https://smilemedi-cloud-web.vercel.app/api/partner/booking"; // AI下書き前の予約照会
+const PARTNER_BASE = PARTNER_BOOKING_URL.replace(/\/booking$/, ""); // 受付るんパートナーAPIのベース（/api/partner）
 
 // ---------- Postgres ----------
 let pool = null;
@@ -1170,6 +1171,43 @@ app.post("/api/tag", guard, (req, res) => { const t = req.tenant; const c = t.st
 app.post("/api/example-delete", guard, (req, res) => { const t = req.tenant; const id = Number(req.body.id); if (t.examples && t.examples[id]) { delete t.examples[id]; if (pool) pool.query("DELETE FROM examples WHERE tenant=$1 AND id=$2", [t.slug, id]).catch(() => {}); } res.json({ ok: true }); });
 app.post("/api/pref-add", guard, (req, res) => { const t = req.tenant; const text = String(req.body.text || "").trim().slice(0, 200); if (!text) return res.json({ ok: false }); const cur = (Array.isArray(S(t).prefs)) ? S(t).prefs : (S(t).prefs = []); if (!cur.some(p => (typeof p === "string" ? p : p.text) === text)) { cur.push({ id: Date.now(), text }); while (cur.length > 40) cur.shift(); saveTenantConfig(t).catch(() => {}); } res.json({ ok: true, prefs: S(t).prefs }); });
 app.post("/api/pref-delete", guard, (req, res) => { const t = req.tenant; const id = req.body.id; const cur = Array.isArray(S(t).prefs) ? S(t).prefs : []; S(t).prefs = cur.filter(p => String(p && p.id) !== String(id)); saveTenantConfig(t).catch(() => {}); res.json({ ok: true, prefs: S(t).prefs }); });
+
+// ---------- 受付るん 顧客情報パネル（中継: guard付き、パートナーAPIへ x-partner-key で転送） ----------
+async function partnerGet(path) {
+  if (!PARTNER_KEY) return { ok: false, status: 0, json: null };
+  try {
+    const r = await fetch(PARTNER_BASE + path, { headers: { "x-partner-key": PARTNER_KEY }, signal: AbortSignal.timeout(8000) });
+    return { ok: r.ok, status: r.status, json: await r.json().catch(() => null) };
+  } catch (e) { return { ok: false, status: 0, json: null }; }
+}
+async function partnerPost(path, body) {
+  if (!PARTNER_KEY) return { ok: false, status: 0, json: null };
+  try {
+    const r = await fetch(PARTNER_BASE + path, { method: "POST", headers: { "x-partner-key": PARTNER_KEY, "Content-Type": "application/json" }, body: JSON.stringify(body || {}), signal: AbortSignal.timeout(8000) });
+    return { ok: r.ok, status: r.status, json: await r.json().catch(() => null) };
+  } catch (e) { return { ok: false, status: 0, json: null }; }
+}
+app.get("/api/customer-context", guard, async (req, res) => {
+  const t = req.tenant; const c = t.store[req.query.id];
+  if (!c) return res.json({ found: false });
+  const enc = encodeURIComponent;
+  const r = await partnerGet("/customer-context?slug=" + enc(t.slug) + "&channel=" + enc(c.channel || "") + "&userId=" + enc(c.userId || ""));
+  if (!r.ok || !r.json) return res.json({ found: false });
+  res.json(r.json);
+});
+app.get("/api/customer-search", guard, async (req, res) => {
+  const t = req.tenant; const enc = encodeURIComponent;
+  const r = await partnerGet("/customer-search?slug=" + enc(t.slug) + "&q=" + enc(String(req.query.q || "")));
+  if (!r.ok || !r.json) return res.json({ candidates: [] });
+  res.json(r.json);
+});
+app.post("/api/customer-link", guard, async (req, res) => {
+  const t = req.tenant; const c = t.store[req.body.id];
+  if (!c || c.channel !== "line" || !c.userId) return res.json({ ok: false, error: "not_line" });
+  const r = await partnerPost("/customer-link", { slug: t.slug, patientId: req.body.patientId, lineUid: c.userId, action: req.body.action });
+  if (!r.json) return res.json({ ok: false });
+  res.json(r.json);
+});
 app.post("/api/redraft", guard, async (req, res) => {
   const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" });
   const sel = Array.isArray(req.body.selected) ? req.body.selected.map(String).slice(0, 20) : [];
@@ -2140,6 +2178,14 @@ const PAGE = `<!DOCTYPE html>
   #backBtn{display:none;border:none;background:none;font-size:20px;cursor:pointer;color:var(--text);}
   #chatName{font-weight:600;flex:1;}
   .hbtn{font-size:12px;padding:6px 10px;border:1px solid var(--line);background:#fff;border-radius:8px;cursor:pointer;white-space:nowrap;}
+  .custPanel{background:var(--panel);border-bottom:1px solid var(--line);padding:8px 12px;font-size:12px;color:var(--text);line-height:1.5;word-break:break-word;}
+  .custPanel .cpTitle{font-weight:600;}
+  .cpRow{padding:2px 0;}
+  .cpMuted{color:var(--muted);}
+  .cpInput{width:100%;box-sizing:border-box;margin-top:6px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:12px;}
+  .cpCand{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:4px 0;border-top:1px solid var(--line);}
+  .cpBtnRow{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;}
+  .cpLink,.cpBtn{font-size:12px;padding:4px 8px;border:1px solid var(--line);background:#fff;border-radius:6px;cursor:pointer;white-space:nowrap;color:var(--text);}
   #msgs{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px;}
   .b{max-width:74%;padding:9px 12px;border-radius:14px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word;}
   .b.them{align-self:flex-start;background:#fff;border:1px solid var(--line);}.b.us{align-self:flex-end;background:var(--bubble-us);color:var(--bubble-us-text);}
@@ -2368,12 +2414,102 @@ function syncMsgs(c){const m=document.getElementById("msgs");if(!m)return;if(m.g
 function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)return; appEl.classList.add("chatopen");
   const bubbles=bubblesHtml(r);
   chatEl.innerHTML='<div id="chatHead"><button id="backBtn" onclick="closeChat()">‹</button>'+av(r,30)+'<span id="chatName">'+esc(r.name)+'　<span style="font-size:11px;color:#6b7280;">'+(r.channel==="line"?"LINE":"メール")+((r.acct&&r.acct.name&&r.acct.name!=="メイン")?"・"+esc(r.acct.name):"")+'</span></span><button class="hbtn" onclick="shareClinic()">🏥 クリニックへ共有</button></div>'+
+    '<div id="custPanel" class="custPanel">読み込み中…</div>'+
     '<div id="msgs">'+bubbles+'</div>'+
     '<div id="composer"><div id="aiLabel">✨ AI下書き（編集して送れます）</div><div id="topicChips" style="display:none;"></div><div id="draftRow"><button id="attach" onclick="attach()" title="写真・動画を添付">📎</button><textarea id="draft">'+esc(r.draft||"")+'</textarea></div>'+
     '<div id="cbtns"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ AIで作り直す</button><button class="cbtn done" onclick="markDone()">対応済み</button><button class="cbtn send" onclick="sendMsg()">送信</button></div></div>';
-  const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r); if(!keep)renderList();
+  const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r); loadCustomer(id); if(!keep)renderList();
 }
 function closeChat(){appEl.classList.remove("chatopen");current=null;renderList();}
+// ===== 受付るん 顧客情報パネル =====
+function copyText(s){ try{ navigator.clipboard.writeText(s); }catch(e){} }
+function cpCopy(btn,url){ copyText(url); if(btn){ var o=btn.textContent; btn.textContent="コピーしました"; setTimeout(function(){ try{btn.textContent=o;}catch(e){} },1500); } }
+async function loadCustomer(id){
+  var el=document.getElementById("custPanel"); if(!el)return;
+  el.innerHTML='<span class="cpMuted">受付るん情報を読み込み中…</span>';
+  try{
+    var r=await fetch("/api/customer-context?id="+encodeURIComponent(id));
+    var j=await r.json();
+    if(!j){ el.innerHTML=""; return; }
+    if(j.found){ el.innerHTML=custFoundHtml(j); }
+    else { el.innerHTML=custUnlinkedHtml(id); }
+  }catch(e){ el.innerHTML=""; }
+}
+function custFoundHtml(j){
+  var p=(j&&j.patient)||{};
+  var h='<div class="cpTitle">'+esc(p.name||"顧客")+
+    (p.memberRank?'<span class="cpMuted"> ・'+esc(p.memberRank)+'</span>':'')+
+    ((p.points!=null&&p.points!=="")?'<span class="cpMuted"> ・'+esc(String(p.points))+'pt</span>':'')+'</div>';
+  if(p.tickets&&p.tickets.length){
+    var tk=p.tickets.map(function(t){ return esc(t.name)+"×"+esc(String(t.remaining)); }).join("／");
+    h+='<div class="cpRow"><span class="cpMuted">回数券:</span> '+tk+'</div>';
+  }
+  var bk=(j&&j.bookings)||{};
+  var up=(bk.upcoming)||[];
+  if(up.length){
+    var shown=up.slice(0,3).map(function(b){ return esc((b.date||"")+" "+(b.menu||"")+"("+(b.status||"")+")"); }).join("／");
+    if(up.length>3) shown+="／他"+(up.length-3)+"件";
+    h+='<div class="cpRow"><span class="cpMuted">予約:</span> '+shown+'</div>';
+  }
+  var past=(bk.past)||[];
+  if(past.length){ h+='<div class="cpRow"><span class="cpMuted">来院履歴 '+past.length+'件</span></div>'; }
+  var qs=(j&&j.questionnaires)||[];
+  if(qs.length){
+    var rows=qs.map(function(q){
+      var label=esc((q.date||"")+" "+(q.menu||""));
+      if(q.unansweredUrl){
+        return '<div class="cpRow">'+label+' <button class="cpBtn" onclick="cpCopy(this,\''+jsq(q.unansweredUrl)+'\')">未入力回答URLをコピー</button></div>';
+      }
+      return '<div class="cpRow">'+label+' <span class="cpMuted">問診: '+esc(q.ivStatus||"")+'</span></div>';
+    }).join("");
+    h+=rows;
+  }
+  var links=(j&&j.links)||{};
+  var btns='<div class="cpBtnRow">';
+  if(links.karte) btns+='<button class="cpBtn" onclick="cpOpen(\''+jsq(links.karte)+'\')">🗂 カルテを開く</button>';
+  if(links.patient) btns+='<button class="cpBtn" onclick="cpOpen(\''+jsq(links.patient)+'\')">👤 顧客情報</button>';
+  if(links.patient) btns+='<button class="cpBtn" onclick="cpOpen(\''+jsq(links.patient)+'\')">↗ 受付るんで開く</button>';
+  btns+='</div>';
+  h+=btns;
+  return h;
+}
+function jsq(s){ return String(s||"").replace(/\\/g,"\\\\").replace(/'/g,"\\'"); }
+function cpOpen(url){ try{ window.open(url,"_blank"); }catch(e){} }
+function custUnlinkedHtml(id){
+  return '<div class="cpRow"><span class="cpMuted">この顧客は受付るんと未連携です</span></div>'+
+    '<input id="custSearch" class="cpInput" placeholder="氏名・電話で検索" oninput="custSearchDebounced()">'+
+    '<div id="custResults"></div>';
+}
+var custT;
+function custSearchDebounced(){ clearTimeout(custT); custT=setTimeout(custSearchGo,300); }
+async function custSearchGo(){
+  var q=(document.getElementById("custSearch")||{}).value||"";
+  var box=document.getElementById("custResults"); if(!box)return;
+  if(q.trim().length<2){ box.innerHTML=""; return; }
+  try{
+    var r=await fetch("/api/customer-search?q="+encodeURIComponent(q));
+    var j=await r.json();
+    var arr=(j&&j.candidates)||[];
+    if(!arr.length){ box.innerHTML='<span class="cpMuted">該当なし</span>'; return; }
+    box.innerHTML=arr.map(function(p){
+      return '<div class="cpCand"><span>'+esc(p.name)+
+        (p.nameKana?' <span class="cpMuted">'+esc(p.nameKana)+'</span>':'')+
+        (p.phoneMasked?' <span class="cpMuted">'+esc(p.phoneMasked)+'</span>':'')+
+        (p.lineLinked?' <span class="cpMuted">(LINE連携済)</span>':'')+
+        '</span><button class="cpLink" onclick="doLink(\''+jsq(p.id)+'\')">連携</button></div>';
+    }).join("");
+  }catch(e){ box.innerHTML=""; }
+}
+async function doLink(pid){
+  if(!current)return;
+  if(!confirm("この顧客を現在のLINE会話に連携しますか？"))return;
+  try{
+    var r=await api("/api/customer-link",{id:current,patientId:pid,action:"link"});
+    var j=await r.json();
+    if(j&&j.ok){ loadCustomer(current); }
+    else { alert(j&&j.error==="already_linked_other"?"このLINEは別の顧客に連携済みです":(j&&j.error==="not_line"?"LINE会話のみ連携できます":"連携に失敗しました")); }
+  }catch(e){ alert("連携に失敗しました"); }
+}
 // ===== 質問チップ：返信する内容を選んで下書きを作り直す =====
 let selTopics=null;
 function renderTopicChips(r){
