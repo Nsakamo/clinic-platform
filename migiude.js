@@ -1222,8 +1222,19 @@ app.get("/api/customer-karte", guard, async (req, res) => {
   const t = req.tenant; const c = t.store[req.query.id];
   if (!c) return res.json({ found: false });
   const enc = encodeURIComponent;
-  const r = await partnerGet("/karte?slug=" + enc(t.slug) + "&channel=" + enc(c.channel || "") + "&userId=" + enc(c.userId || ""));
+  const pid = req.query.patientId;
+  const path = pid ? ("/karte?slug=" + enc(t.slug) + "&patientId=" + enc(pid)) : ("/karte?slug=" + enc(t.slug) + "&channel=" + enc(c.channel || "") + "&userId=" + enc(c.userId || ""));
+  const r = await partnerGet(path);
   if (!r.ok || !r.json) return res.json({ found: false });
+  res.json(r.json);
+});
+// 未入力回答URLは押下時に1件だけ生成（customer-context の遅延化に対応）
+app.get("/api/customer-unanswered", guard, async (req, res) => {
+  const t = req.tenant; const conv = t.store[req.query.id];
+  if (!conv) return res.json({ ok: false });
+  const enc = encodeURIComponent;
+  const r = await partnerGet("/unanswered-url?slug=" + enc(t.slug) + "&appointmentId=" + enc(String(req.query.apptId || "")));
+  if (!r.ok || !r.json) return res.json({ ok: false });
   res.json(r.json);
 });
 app.post("/api/customer-karte", guard, async (req, res) => {
@@ -2236,6 +2247,12 @@ const PAGE = `<!DOCTYPE html>
   .karteEntry{padding:8px 0;border-bottom:1px solid #f3f4f6;font-size:12px;line-height:1.5;}
   .karteFoot{border-top:1px solid #e5e7eb;padding:8px 12px;}
   .karteFoot textarea{width:100%;box-sizing:border-box;min-height:52px;padding:6px 8px;border:1px solid #e5e7eb;border-radius:8px;font-size:12px;}
+  .keHd{margin-bottom:2px;}
+  .keToggle{cursor:pointer;}
+  .kePreview{white-space:pre-wrap;word-break:break-word;color:#374151;}
+  .keText{white-space:pre-wrap;word-break:break-word;color:#111827;}
+  .keEdit{width:100%;box-sizing:border-box;min-height:60px;margin-top:4px;padding:6px 8px;border:1px solid #e5e7eb;border-radius:8px;font-size:12px;line-height:1.5;}
+  @media(min-width:900px){ .karteCard{left:50%;right:auto;transform:translateX(-50%);width:700px;max-width:92%;} }
   #msgs{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px;}
   .b{max-width:74%;padding:9px 12px;border-radius:14px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word;}
   .b.them{align-self:flex-start;background:#fff;border:1px solid var(--line);}.b.us{align-self:flex-end;background:var(--bubble-us);color:var(--bubble-us-text);}
@@ -2474,21 +2491,42 @@ function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)ret
 function closeChat(){appEl.classList.remove("chatopen");current=null;renderList();}
 // ===== 受付るん 顧客情報パネル =====
 var custPid=null; var karteEntries={};
+var custCache={}; var karteCache={}; // 会話ごとのコンテキスト/カルテのメモリキャッシュ（体感1秒以下）
+function kIsPC(){ return window.matchMedia("(min-width: 900px)").matches; }
 function copyText(s){ try{ navigator.clipboard.writeText(s); }catch(e){} }
 function cpCopy(btn,url){ copyText(url); if(btn){ var o=btn.textContent; btn.textContent="コピーしました"; setTimeout(function(){ try{btn.textContent=o;}catch(e){} },1500); } }
+// 未入力回答URLは押下時に1件だけ生成して取得（apptId → サーバー中継）
+async function copyUnans(btn,apptId){
+  if(!current||!apptId)return;
+  var o=btn?btn.textContent:"";
+  if(btn) btn.textContent="取得中…";
+  try{
+    var r=await fetch("/api/customer-unanswered?id="+encodeURIComponent(current)+"&apptId="+encodeURIComponent(apptId));
+    var j=await r.json();
+    if(j&&j.ok&&j.url){ copyText(j.url); if(btn){ btn.textContent="コピーしました"; setTimeout(function(){ try{btn.textContent=o;}catch(e){} },1500); } }
+    else { if(btn) btn.textContent=o; alert("URLを取得できませんでした"); }
+  }catch(e){ if(btn) btn.textContent=o; alert("URLを取得できませんでした"); }
+}
 function cpGripHtml(){ return '<div data-cp="collapse" class="cpGrip"><span class="cpGripBar"></span><span class="cpMuted">▲ 隠す</span></div>'; }
-async function loadCustomer(id){
+function renderCustomer(id,j){
+  if(current!==id)return; // 会話を切り替えていたら古い結果で描画しない
+  var el=document.getElementById("custPanel"); if(!el)return;
+  if(!j){ el.innerHTML=""; return; }
+  if(j.found){ el.innerHTML=custFoundHtml(j); custPid=(j.patient&&j.patient.id!=null)?j.patient.id:null; el.setAttribute("data-pid", custPid!=null?encodeURIComponent(String(custPid)):""); }
+  else { el.innerHTML=custUnlinkedHtml(id); custPid=null; }
+  el.onclick=cpPanelClick; // data-cp ボタンをイベント委譲で処理
+}
+function loadCustomer(id){
   var el=document.getElementById("custPanel"); if(!el)return;
   cpExpand(); cpBindTouch();
-  el.innerHTML='<span class="cpMuted">受付るん情報を読み込み中…</span>';
-  try{
-    var r=await fetch("/api/customer-context?id="+encodeURIComponent(id));
-    var j=await r.json();
-    if(!j){ el.innerHTML=""; return; }
-    if(j.found){ el.innerHTML=custFoundHtml(j); custPid=(j.patient&&j.patient.id!=null)?j.patient.id:null; el.setAttribute("data-pid", custPid!=null?encodeURIComponent(String(custPid)):""); }
-    else { el.innerHTML=custUnlinkedHtml(id); custPid=null; }
-    el.onclick=cpPanelClick; // data-cp ボタン（コピー/リンク/連携/キャンセル/カルテ/折りたたみ）をイベント委譲で処理
-  }catch(e){ el.innerHTML=""; }
+  var cached=custCache[id];
+  if(cached){ renderCustomer(id,cached); } // キャッシュあり=体感ゼロ待ちで即描画
+  else { el.innerHTML='<span class="cpMuted">受付るん情報を読み込み中…</span>'; }
+  fetch("/api/customer-context?id="+encodeURIComponent(id)).then(function(r){ return r.json(); }).then(function(j){
+    if(!j)return;
+    custCache[id]=j;
+    renderCustomer(id,j); // current!==id なら renderCustomer 内で破棄
+  }).catch(function(e){ if(!cached && current===id){ var el2=document.getElementById("custPanel"); if(el2) el2.innerHTML=""; } });
 }
 function cpCollapse(){
   var el=document.getElementById("custPanel"); var tab=document.getElementById("custTab");
@@ -2545,10 +2583,10 @@ function custFoundHtml(j){
   if(qs.length){
     var rows=qs.map(function(q){
       var label=esc((q.date||"")+" "+(q.menu||""));
-      if(q.unansweredUrl){
-        return '<div class="cpRow">'+label+' <button class="cpBtn" data-cp="copy" data-val="'+encodeURIComponent(q.unansweredUrl)+'">未入力回答URLをコピー</button></div>';
-      }
-      return '<div class="cpRow">'+label+' <span class="cpMuted">問診: '+esc(q.ivStatus||"")+'</span></div>';
+      var st=q.ivStatus?(' <span class="cpMuted">問診: '+esc(q.ivStatus||"")+'</span>'):'';
+      // customer-context は unansweredUrl を返さなくなったため、押下時に1件だけ生成する
+      var btn=q.apptId?(' <button class="cpBtn" data-cp="copyunans" data-val="'+encodeURIComponent(String(q.apptId))+'">未入力回答URLをコピー</button>'):'';
+      return '<div class="cpRow">'+label+st+btn+'</div>';
     }).join("");
     h+=rows;
   }
@@ -2563,25 +2601,39 @@ function custFoundHtml(j){
   h+=cpGripHtml();
   return h;
 }
+function karteLoadingCard(msg){
+  return '<div class="karteCard"><div class="karteHd">🗂 カルテクイック<button class="kClose" data-cp="karteclose">✕</button></div><div class="karteBody"><span class="cpMuted">'+esc(msg)+'</span></div></div>';
+}
 function openKarte(){
   if(!current)return;
   var chat=document.getElementById("chat"); if(!chat)return;
   var ov=document.getElementById("karteOv");
   if(!ov){ ov=document.createElement("div"); ov.id="karteOv"; chat.appendChild(ov);
-    ov.onclick=function(e){ if(e.target===ov){ closeKarte(); return; } cpPanelClick(e); }; }
+    // カルテオーバーレイ専用のクリックハンドラ（cpPanelClick と分離）
+    ov.onclick=function(e){ if(e.target===ov){ closeKarte(); return; } karteClick(e); }; }
   ov.style.display="block";
-  ov.innerHTML='<div class="karteCard"><div class="karteHd">🗂 カルテクイック<button class="kClose" data-cp="karteclose">✕</button></div><div class="karteBody"><span class="cpMuted">読み込み中…</span></div></div>';
-  karteLoad(ov);
+  var convId=current;
+  var cached=karteCache[convId];
+  if(cached){ ov.innerHTML=karteHtml(cached,kIsPC()); } // キャッシュあり=即描画
+  else { ov.innerHTML=karteLoadingCard("読み込み中…"); }
+  karteLoad(ov,convId);
 }
-async function karteLoad(ov){
+function reloadKarte(){ var ov=document.getElementById("karteOv"); if(!ov||!current)return; karteLoad(ov,current); }
+async function karteLoad(ov,convId){
+  var hadCache=!!karteCache[convId];
   try{
-    var r=await fetch("/api/customer-karte?id="+encodeURIComponent(current));
+    // patientId を付けて高速化（無ければサーバー側で line_uid 再解決にフォールバック）
+    var url="/api/customer-karte?id="+encodeURIComponent(convId)+(custPid!=null?("&patientId="+encodeURIComponent(String(custPid))):"");
+    var r=await fetch(url);
     var j=await r.json();
+    if(current!==convId)return; // 会話を切り替えていたら破棄
     if(j&&j.patient&&j.patient.id!=null) custPid=j.patient.id;
-    ov.innerHTML=karteHtml(j);
-  }catch(e){ ov.innerHTML='<div class="karteCard"><div class="karteHd">🗂 カルテクイック<button class="kClose" data-cp="karteclose">✕</button></div><div class="karteBody"><span class="cpMuted">取得に失敗しました</span></div></div>'; }
+    karteCache[convId]=j;
+    var ov2=document.getElementById("karteOv");
+    if(ov2&&ov2.style.display!=="none") ov2.innerHTML=karteHtml(j,kIsPC());
+  }catch(e){ if(!hadCache){ var ovx=document.getElementById("karteOv"); if(ovx&&current===convId) ovx.innerHTML=karteLoadingCard("取得に失敗しました"); } }
 }
-function karteHtml(j){
+function karteHtml(j,isPC){
   j=j||{}; karteEntries={};
   var pt=j.patient||{}; var name=esc(pt.name||"");
   var entries=(j.entries)||[];
@@ -2589,16 +2641,65 @@ function karteHtml(j){
   if(!j.found){ body='<span class="cpMuted">カルテを取得できませんでした</span>'; }
   else if(!entries.length){ body='<span class="cpMuted">記録がありません</span>'; }
   else {
-    body=entries.map(function(en){
+    body=entries.map(function(en,i){
       if(en.id!=null) karteEntries[String(en.id)]=en.text||"";
-      var editBtn=(en.kind==="note"&&en.editable&&en.id!=null)?' <button class="cpBtn" data-cp="karteedit" data-val="'+encodeURIComponent(String(en.id))+'">✎ 編集</button>':'';
-      var tag=(en.kind==="treatment")?' <span class="cpMuted">施術記録</span>':'';
-      return '<div class="karteEntry"><div class="cpMuted">'+esc(en.date||"")+tag+'</div><div>'+esc(en.text||"")+'</div>'+editBtn+'</div>';
+      var isNote=(en.kind==="note");
+      var editable=(isNote&&en.editable&&en.id!=null);
+      var tag=(en.kind==="treatment")?' <span class="cpMuted">施術記録・閲覧のみ</span>':(isNote?' <span class="cpMuted">メモ</span>':'');
+      var head='<div class="cpMuted keHd">'+esc(en.date||"")+tag+'</div>';
+      var fullText=String(en.text||"");
+      if(isPC){
+        // PC: 全文を表示。編集可能なnoteはインラインtextarea+保存ボタンでその場編集
+        if(editable){
+          var editUI='<textarea class="keEdit" id="kEdit_'+i+'">'+esc(fullText)+'</textarea>'+
+            '<div class="cpBtnRow"><button class="cpBtn cpKarte" data-cp="karteeditinline" data-val="'+encodeURIComponent(String(en.id))+'" data-i="'+i+'">保存</button></div>';
+          return '<div class="karteEntry">'+head+editUI+'</div>';
+        }
+        return '<div class="karteEntry">'+head+'<div class="keText">'+esc(fullText)+'</div></div>';
+      }
+      // スマホ: 折りたたみ（日付+先頭1行程度）。タップで展開して全文、noteはそこで編集
+      var preview=fullText.split(String.fromCharCode(10)).join(" ").slice(0,44);
+      var fullInner;
+      if(editable){
+        fullInner='<textarea class="keEdit" id="kEdit_'+i+'">'+esc(fullText)+'</textarea>'+
+          '<div class="cpBtnRow"><button class="cpBtn cpKarte" data-cp="karteeditinline" data-val="'+encodeURIComponent(String(en.id))+'" data-i="'+i+'">保存</button></div>';
+      } else {
+        fullInner='<div class="keText">'+esc(fullText)+'</div>';
+      }
+      return '<div class="karteEntry">'+
+        '<div class="keToggle" data-cp="karteexpand" data-val="'+i+'">'+head+'<div class="kePreview" id="kePrev_'+i+'">'+esc(preview)+'</div></div>'+
+        '<div class="keFull" id="keFull_'+i+'" style="display:none;">'+fullInner+'</div>'+
+      '</div>';
     }).join("");
   }
   return '<div class="karteCard"><div class="karteHd">🗂 カルテクイック — '+name+'<button class="kClose" data-cp="karteclose">✕</button></div>'+
     '<div class="karteBody">'+body+'</div>'+
     '<div class="karteFoot"><textarea id="karteAddText" placeholder="クイック追加（カルテにメモを追加）"></textarea><div class="cpBtnRow"><button class="cpBtn cpKarte" data-cp="karteadd">カルテに保存</button></div></div></div>';
+}
+function karteExpand(i){
+  var f=document.getElementById("keFull_"+i); if(!f)return;
+  var open=(f.style.display!=="none");
+  f.style.display=open?"none":"block";
+  var p=document.getElementById("kePrev_"+i); if(p) p.style.display=open?"block":"none";
+}
+async function karteEditInline(recordId,i){
+  if(!current||!recordId)return;
+  var ta=document.getElementById("kEdit_"+i); if(!ta)return;
+  var body=(ta.value||"").trim(); if(!body)return;
+  try{
+    var r=await api("/api/customer-karte",{id:current,action:"edit",recordId:recordId,body:body});
+    var j=await r.json();
+    if(j&&j.ok){ delete karteCache[current]; reloadKarte(); }
+    else { alert(j&&j.error==="not_editable"?"この記録は編集できません":"編集に失敗しました"); }
+  }catch(e){ alert("編集に失敗しました"); }
+}
+function karteClick(e){
+  var b=e.target&&e.target.closest?e.target.closest("[data-cp]"):null; if(!b)return;
+  var act=b.getAttribute("data-cp"); var val=decodeURIComponent(b.getAttribute("data-val")||"");
+  if(act==="karteclose") closeKarte();
+  else if(act==="karteadd") karteAdd();
+  else if(act==="karteexpand") karteExpand(val);
+  else if(act==="karteeditinline") karteEditInline(val,b.getAttribute("data-i"));
 }
 function closeKarte(){ var ov=document.getElementById("karteOv"); if(ov) ov.style.display="none"; }
 async function karteAdd(){
@@ -2607,7 +2708,7 @@ async function karteAdd(){
   try{
     var r=await api("/api/customer-karte",{id:current,action:"add",patientId:custPid,body:body});
     var j=await r.json();
-    if(j&&j.ok){ openKarte(); }
+    if(j&&j.ok){ delete karteCache[current]; reloadKarte(); } // 保存成功→キャッシュ無効化→再取得
     else { alert("カルテの保存に失敗しました"); }
   }catch(e){ alert("カルテの保存に失敗しました"); }
 }
@@ -2640,6 +2741,7 @@ function cpPanelClick(e){
   var b=e.target&&e.target.closest?e.target.closest("[data-cp]"):null; if(!b)return;
   var act=b.getAttribute("data-cp"); var val=decodeURIComponent(b.getAttribute("data-val")||"");
   if(act==="copy") cpCopy(b,val);
+  else if(act==="copyunans") copyUnans(b,val);
   else if(act==="open") cpOpen(val);
   else if(act==="link") doLink(val);
   else if(act==="cancel") doApptCancel(val);
