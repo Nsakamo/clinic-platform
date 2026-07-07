@@ -2252,6 +2252,21 @@ const PAGE = `<!DOCTYPE html>
   .kePreview{white-space:pre-wrap;word-break:break-word;color:#374151;}
   .keText{white-space:pre-wrap;word-break:break-word;color:#111827;}
   .keEdit{width:100%;box-sizing:border-box;min-height:60px;margin-top:4px;padding:6px 8px;border:1px solid #e5e7eb;border-radius:8px;font-size:12px;line-height:1.5;}
+  .kCard{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:10px 12px;margin-bottom:10px;font-size:12px;line-height:1.55;}
+  .kCard.kh-red{border-color:#fca5a5;background:#fef2f2;}
+  .kCard.kh-amber{border-color:#fcd34d;background:#fffbeb;}
+  .kCard.kh-green{border-color:#86efac;background:#f0fdf4;}
+  .kCard.kh-blue{border-color:#93c5fd;background:#eff6ff;}
+  .kTop{display:flex;align-items:center;gap:8px;margin-bottom:6px;}
+  .kBadge{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:600;}
+  .kbNote{background:#f5f0fb;color:#6b21a8;}
+  .kbTreat{background:#e6f5f1;color:#0f766e;}
+  .kDate{color:#6b7280;font-size:11px;}
+  .kBody{white-space:pre-wrap;word-break:break-word;color:#111827;}
+  .kEditArea{margin-top:4px;}
+  .snipRow{display:flex;gap:6px;overflow-x:auto;padding:2px 0 6px;-webkit-overflow-scrolling:touch;}
+  .snipChip{flex:0 0 auto;white-space:nowrap;border:1px solid #d1d5db;background:#f9fafb;color:#374151;border-radius:999px;padding:3px 10px;font-size:11px;cursor:pointer;}
+  .snipChip:hover{background:#f3f4f6;}
   @media(min-width:900px){ .karteCard{left:50%;right:auto;transform:translateX(-50%);width:700px;max-width:92%;} }
   #msgs{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px;}
   .b{max-width:74%;padding:9px 12px;border-radius:14px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word;}
@@ -2633,10 +2648,26 @@ async function karteLoad(ov,convId){
     if(ov2&&ov2.style.display!=="none") ov2.innerHTML=karteHtml(j,kIsPC());
   }catch(e){ if(!hadCache){ var ovx=document.getElementById("karteOv"); if(ovx&&current===convId) ovx.innerHTML=karteLoadingCard("取得に失敗しました"); } }
 }
+function snipRowHtml(snips,tgt){
+  if(!snips||!snips.length) return "";
+  var chips=snips.map(function(s){
+    var title=(s&&s.title)?String(s.title):"";
+    var bodyStr=(s&&s.body)?String(s.body):"";
+    var label=title?title:(bodyStr.slice(0,16)+"…");
+    return '<button class="snipChip" data-cp="snipins" data-val="'+encodeURIComponent(bodyStr)+'" data-tgt="'+encodeURIComponent(tgt)+'">'+esc(label)+'</button>';
+  }).join("");
+  return '<div class="snipRow">'+chips+'</div>';
+}
+function karteEditBtnRow(i,recordId){
+  var idAttr=encodeURIComponent(String(recordId));
+  return '<div class="cpBtnRow"><button class="cpBtn" data-cp="karteeditstart" data-i="'+i+'" data-val="'+idAttr+'">✎ 編集</button></div>';
+}
 function karteHtml(j,isPC){
   j=j||{}; karteEntries={};
   var pt=j.patient||{}; var name=esc(pt.name||"");
   var entries=(j.entries)||[];
+  var snips=(j.snippets)||[];
+  window.karteSnips=snips;
   var body='';
   if(!j.found){ body='<span class="cpMuted">カルテを取得できませんでした</span>'; }
   else if(!entries.length){ body='<span class="cpMuted">記録がありません</span>'; }
@@ -2644,37 +2675,46 @@ function karteHtml(j,isPC){
     body=entries.map(function(en,i){
       if(en.id!=null) karteEntries[String(en.id)]=en.text||"";
       var isNote=(en.kind==="note");
+      var isTreat=(en.kind==="treatment");
       var editable=(isNote&&en.editable&&en.id!=null);
-      var tag=(en.kind==="treatment")?' <span class="cpMuted">施術記録・閲覧のみ</span>':(isNote?' <span class="cpMuted">メモ</span>':'');
-      var head='<div class="cpMuted keHd">'+esc(en.date||"")+tag+'</div>';
+      var hl=en.highlight; var hlClass="";
+      if(hl==="red"||hl==="amber"||hl==="green"||hl==="blue") hlClass=" kh-"+hl;
+      var badge=isTreat?'<span class="kBadge kbTreat">施術記録</span>':'<span class="kBadge kbNote">顧客備考</span>';
+      var top='<div class="kTop">'+badge+'<span class="kDate">'+esc(en.date||"")+'</span></div>';
       var fullText=String(en.text||"");
-      if(isPC){
-        // PC: 全文を表示。編集可能なnoteはインラインtextarea+保存ボタンでその場編集
-        if(editable){
-          var editUI='<textarea class="keEdit" id="kEdit_'+i+'">'+esc(fullText)+'</textarea>'+
-            '<div class="cpBtnRow"><button class="cpBtn cpKarte" data-cp="karteeditinline" data-val="'+encodeURIComponent(String(en.id))+'" data-i="'+i+'">保存</button></div>';
-          return '<div class="karteEntry">'+head+editUI+'</div>';
-        }
-        return '<div class="karteEntry">'+head+'<div class="keText">'+esc(fullText)+'</div></div>';
-      }
-      // スマホ: 折りたたみ（日付+先頭1行程度）。タップで展開して全文、noteはそこで編集
-      var preview=fullText.split(String.fromCharCode(10)).join(" ").slice(0,44);
-      var fullInner;
-      if(editable){
-        fullInner='<textarea class="keEdit" id="kEdit_'+i+'">'+esc(fullText)+'</textarea>'+
-          '<div class="cpBtnRow"><button class="cpBtn cpKarte" data-cp="karteeditinline" data-val="'+encodeURIComponent(String(en.id))+'" data-i="'+i+'">保存</button></div>';
-      } else {
-        fullInner='<div class="keText">'+esc(fullText)+'</div>';
-      }
-      return '<div class="karteEntry">'+
-        '<div class="keToggle" data-cp="karteexpand" data-val="'+i+'">'+head+'<div class="kePreview" id="kePrev_'+i+'">'+esc(preview)+'</div></div>'+
-        '<div class="keFull" id="keFull_'+i+'" style="display:none;">'+fullInner+'</div>'+
-      '</div>';
+      var inner='<div class="kBody">'+esc(fullText)+'</div>';
+      if(editable){ inner='<div class="kBody">'+esc(fullText)+'</div>'+karteEditBtnRow(i,en.id); }
+      return '<div class="kCard'+hlClass+'" id="kCard_'+i+'">'+top+'<div class="kInner" id="kInner_'+i+'">'+inner+'</div></div>';
     }).join("");
   }
   return '<div class="karteCard"><div class="karteHd">🗂 カルテクイック — '+name+'<button class="kClose" data-cp="karteclose">✕</button></div>'+
     '<div class="karteBody">'+body+'</div>'+
-    '<div class="karteFoot"><textarea id="karteAddText" placeholder="クイック追加（カルテにメモを追加）"></textarea><div class="cpBtnRow"><button class="cpBtn cpKarte" data-cp="karteadd">カルテに保存</button></div></div></div>';
+    '<div class="karteFoot">'+snipRowHtml(snips,"add")+'<textarea id="karteAddText" placeholder="クイック追加（カルテにメモを追加）"></textarea><div class="cpBtnRow"><button class="cpBtn cpKarte" data-cp="karteadd">カルテに保存</button></div></div></div>';
+}
+function karteEditStart(i,recordId){
+  var inner=document.getElementById("kInner_"+i); if(!inner)return;
+  var snips=window.karteSnips||[];
+  inner.innerHTML='<div class="kEditArea">'+snipRowHtml(snips,"edit_"+recordId)+
+    '<textarea class="keEdit" id="kEdit_'+i+'"></textarea>'+
+    '<div class="cpBtnRow"><button class="cpBtn cpKarte" data-cp="karteeditinline" data-val="'+encodeURIComponent(String(recordId))+'" data-i="'+i+'">保存</button>'+
+    '<button class="cpBtn" data-cp="karteeditcancel" data-i="'+i+'" data-val="'+encodeURIComponent(String(recordId))+'">取消</button></div></div>';
+  var ta=document.getElementById("kEdit_"+i);
+  if(ta){ ta.value=karteEntries[String(recordId)]||""; ta.focus(); }
+}
+function karteEditCancel(i,recordId){
+  var inner=document.getElementById("kInner_"+i); if(!inner)return;
+  inner.innerHTML='<div class="kBody" id="kBody_'+i+'"></div>'+karteEditBtnRow(i,recordId);
+  var bd=document.getElementById("kBody_"+i);
+  if(bd) bd.textContent=karteEntries[String(recordId)]||"";
+}
+function snipInsert(bodyStr,tgt,btn){
+  var ta=null;
+  if(tgt==="add"){ ta=document.getElementById("karteAddText"); }
+  else { var host=(btn&&btn.closest)?btn.closest(".kInner"):null; ta=host?host.querySelector("textarea"):null; }
+  if(!ta)return;
+  var cur=ta.value||"";
+  if(cur&&cur.charAt(cur.length-1)!==String.fromCharCode(10)) cur=cur+String.fromCharCode(10);
+  ta.value=cur+bodyStr; ta.focus();
 }
 function karteExpand(i){
   var f=document.getElementById("keFull_"+i); if(!f)return;
@@ -2700,6 +2740,9 @@ function karteClick(e){
   else if(act==="karteadd") karteAdd();
   else if(act==="karteexpand") karteExpand(val);
   else if(act==="karteeditinline") karteEditInline(val,b.getAttribute("data-i"));
+  else if(act==="karteeditstart") karteEditStart(b.getAttribute("data-i"),val);
+  else if(act==="karteeditcancel") karteEditCancel(b.getAttribute("data-i"),val);
+  else if(act==="snipins") snipInsert(val,decodeURIComponent(b.getAttribute("data-tgt")||""),b);
 }
 function closeKarte(){ var ov=document.getElementById("karteOv"); if(ov) ov.style.display="none"; }
 async function karteAdd(){
