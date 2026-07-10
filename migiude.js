@@ -690,7 +690,9 @@ async function baCall(t, c, action, extra, timeoutMs) {
     const body = Object.assign({ action, slug: t.slug, channel: c.channel === "mail" ? "mail" : "line", userId: c.userId }, extra || {});
     if (body.phone == null && c.ba && c.ba.phone) body.phone = c.ba.phone; // メールの本人確認済み電話番号を常に添付
     const ctrl = new AbortController();
-    const timer = setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, timeoutMs || 6000);
+    // 既定20秒: 受付るん（Vercel）のコールドスタートは数秒〜十数秒かかることがある。
+    // Webhookは受信時に200を返却済み（処理は非同期）なので、ここで待っても再送・重複は起きない。
+    const timer = setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, timeoutMs || 20000);
     let r;
     try { r = await fetch(BA_URL, { method: "POST", headers: { "Content-Type": "application/json", "x-partner-key": PARTNER_KEY }, body: JSON.stringify(body), signal: ctrl.signal }); }
     finally { clearTimeout(timer); }
@@ -885,7 +887,8 @@ async function baAction(t, c, act, baCtx) {
   }
 
   if (type === "cancel") {
-    const r = await baCall(t, c, "propose", { kind: "cancel", appointmentId: apptId });
+    let r = await baCall(t, c, "propose", { kind: "cancel", appointmentId: apptId });
+    if (!r) r = await baCall(t, c, "propose", { kind: "cancel", appointmentId: apptId }); // 一時失敗（コールドスタート等）は一度だけ再試行（proposeは再実行しても安全）
     if (r && r.ok && r.requestId) {
       c.ba.pending = { requestId: r.requestId, confirmText: r.confirmText, expiresAt: r.expiresAt };
       dbSave(t, c);
@@ -902,7 +905,8 @@ async function baAction(t, c, act, baCtx) {
     if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(ndt)) return false;
     const dt = new Date(ndt.slice(0, 16) + ":00+09:00");
     if (isNaN(dt.getTime()) || dt.getTime() < Date.now()) return false;
-    const r = await baCall(t, c, "propose", { kind: "reschedule", appointmentId: apptId, newStartsAt: dt.toISOString() });
+    let r = await baCall(t, c, "propose", { kind: "reschedule", appointmentId: apptId, newStartsAt: dt.toISOString() });
+    if (!r) r = await baCall(t, c, "propose", { kind: "reschedule", appointmentId: apptId, newStartsAt: dt.toISOString() }); // 一時失敗は一度だけ再試行（proposeは再実行しても安全）
     if (r && r.ok && r.requestId) {
       c.ba.pending = { requestId: r.requestId, confirmText: r.confirmText, expiresAt: r.expiresAt };
       dbSave(t, c);
@@ -1058,6 +1062,15 @@ async function handleInbound(t, opts) {
     if (g && baEnabled(t) && PARTNER_KEY && g.action && typeof g.action === "object" && g.action.type && g.action.type !== "none") {
       try { baDone = await baAction(t, c, g.action, g.baCtx); } catch (e) { console.error("ba action:", e && e.message); }
       if (baDone) { c.draft = ""; c.draft0 = ""; }
+      else if (String(needsHuman) !== "true" && String(urgent) !== "true") {
+        // 予約操作の会話で「沈黙」「数分の待ち時間」を作らない：
+        // actionを処理できなかったら、AIの繋ぎ下書きを待ち時間なしで即送信（下書きも無ければ定型の案内）。
+        // 通常フローに落とすと繋ぎ文が自動返信の待ち時間キューに入り、患者には無反応に見えるため。
+        const fallback = (c.draft && c.draft.trim())
+          ? c.draft.trim()
+          : "恐れ入ります、ただいまお手続きの処理に少しお時間がかかっております。お手数ですが、もう一度ご希望（例: 「7月18日 14時に変更」）をお送りくださいませ。";
+        try { baDone = await baDeliverOrEscalate(t, c, fallback); } catch (e) { console.error("ba fallback:", e && e.message); }
+      }
     }
   }
   if (confidence) c.confidence = confidence;
