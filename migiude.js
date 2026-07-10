@@ -782,10 +782,22 @@ async function baHandlePending(t, c) {
   if (!text) return false;
   const cls = await classifyApproval(t, ba.pending.confirmText, text);
   if (cls !== "yes" && cls !== "no") return false; // 曖昧 → 実行せず通常の下書きへ（確認は期限まで有効）
-  const r = await baCall(t, c, "confirm", { requestId: ba.pending.requestId, approve: cls === "yes" }, 15000);
+  const requestId = ba.pending.requestId;
+  // 受付るん側はコールドスタート＋通知送信で時間がかかることがある。30秒待つ（confirmは排他制御済みで二重実行しない）。
+  let r = await baCall(t, c, "confirm", { requestId, approve: cls === "yes" }, 30000);
   ba.pending = null; dbSave(t, c);
   if (!r) {
-    // 通信断で実行されたか不明。誤った「失敗しました」案内をせず、要対応フラグでスタッフへ引き継ぐ。
+    // タイムアウト＝実行されたか不明。少し待って「結果照会（読み取りのみ）」で実際どうなったかを確かめる。
+    for (let i = 0; i < 3 && !r; i++) {
+      await new Promise(res => setTimeout(res, 4000));
+      const chk = await baCall(t, c, "result", { requestId }, 10000);
+      if (chk && chk.ok && chk.status === "executed" && chk.text) { r = { ok: true, done: true, text: chk.text }; break; }
+      if (chk && chk.ok && chk.status === "declined") { r = { ok: true, done: false, text: "かしこまりました。変更は行っておりませんので、ご安心ください。" }; break; }
+      if (chk && chk.ok && chk.status === "failed") break; // 実行失敗が確定 → 下の不明時案内ではなく失敗案内にしたいが詳細不明のためスタッフへ
+    }
+  }
+  if (!r) {
+    // 結果照会でも確定できない。誤った「失敗しました」案内をせず、要対応フラグでスタッフへ引き継ぐ。
     try { notifyAll(t, "⚠️ 予約自動受付: 実行結果不明（要確認）: " + (c.name || ""), "confirm応答が取れませんでした。予約状況を確認してください。"); } catch (e) {}
     await baDeliver(t, c, "恐れ入ります、お手続きの確認にお時間をいただいております。念のため担当者が確認し、必要に応じてご連絡いたします。");
     c.status = "todo"; c.flag = true; dbSave(t, c);
