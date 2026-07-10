@@ -707,9 +707,9 @@ function baPromptBlock(ctx) {
     s += "本人確認: 済み（" + ((ctx.patient && ctx.patient.name) || "") + " 様 / 診察券番号 " + ((ctx.patient && ctx.patient.patientNo) || "") + "）\n";
     const list = Array.isArray(ctx.appointments) ? ctx.appointments : [];
     s += list.length
-      ? "直近のご予約:\n" + list.map(a => "・[ID:" + a.id + "] " + a.label + "〜 " + a.menu + "（" + a.statusJa + (a.changeable ? "・変更/キャンセル可" : "・受付期限外につき変更不可") + "）").join("\n") + "\n"
+      ? "直近のご予約:\n" + list.map(a => "・[ID:" + a.id + "] " + a.label + "〜 " + a.menu + (a.location ? "＠" + a.location : "") + "（" + a.statusJa + (a.changeable ? "・変更/キャンセル可" : "・受付期限外につき変更不可") + "）" + (a.feeNote ? "※" + a.feeNote : "")).join("\n") + "\n"
       : "直近のご予約はありません。\n";
-    s += "予約内容の案内はこの情報の範囲で答えてよい。キャンセル・日時変更は自分で完了を宣言せず、必ず action を出す（正式な確認文はシステムが送る）。\n";
+    s += "予約内容の案内はこの情報の範囲で答えてよい。「どこの医院・店舗か」を聞かれたら＠以降の拠点名で答える（拠点名が無い予約は本院・単一拠点の扱い）。キャンセル・日時変更は自分で完了を宣言せず、必ず action を出す（正式な確認文はシステムが送る）。\n";
   } else if (ctx.reason === "unavailable") {
     s += "本人確認: 不可（自動受付をご利用いただけないお客様）。予約に関する個人情報は一切伝えず、actionも一切出さない（typeは常にnone）。ご用件はクリニックへ直接お電話いただくよう丁寧に案内する。理由の説明はしない。\n";
   } else if (ctx.reason === "not_linked") {
@@ -720,7 +720,7 @@ function baPromptBlock(ctx) {
     s += "予約の確認・変更・キャンセルを希望されたら、ご本人確認のためご登録の電話番号を尋ねる。番号が会話に出たら action {type:\"verify\", phone} を出す。\n";
   }
   s += "新規予約はここでは受け付けず、予約サイト " + (ctx.bookingUrl || "") + " を必ず案内する。\n";
-  if (ctx.cancelFeePolicy) s += "クリニックの規定 → " + ctx.cancelFeePolicy + "。キャンセル・日時変更の話題でこの規定に該当し得る場合は必ず言及する。ここに無い金額・条件は推測せず「クリニックへお問い合わせください」と案内する。\n";
+  if (ctx.cancelFeePolicy) s += "クリニックの規定 → " + ctx.cancelFeePolicy + "。キャンセル・日時変更の話題でこの規定に該当し得る場合は必ず言及する。ここに無い金額・条件は推測せず「クリニックへお問い合わせください」と案内する。免除・除外やお支払い以外の対応（チケット消化等）は「そういう対応が可能な場合がある」ことの案内までに留め、適用をあなたが約束・確定しない（最終判断はスタッフ。needs_humanをtrueにしてスタッフから折り返す旨を伝える）。キャンセル料の支払いリンクはキャンセル確定時にシステムが自動送付するので、あなたはURLを書かない。\n";
   s += "actionの出し方（出力JSONの \"action\"。操作が不要なら {\"type\":\"none\"}）:\n"
     + "・キャンセル希望が明確 → {\"type\":\"cancel\",\"appointmentId\":\"上の[ID:…]\"}（対象が複数あり特定できなければ draft で質問し type:none）\n"
     + "・変更希望で日付＋時刻が具体的 → {\"type\":\"reschedule\",\"appointmentId\":\"ID\",\"newDateTime\":\"YYYY-MM-DDTHH:MM\"}（日本時間。「明日」「来週金曜」は本日から計算。過去日時は出さない）\n"
