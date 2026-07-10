@@ -720,6 +720,7 @@ function baPromptBlock(ctx) {
     s += "予約の確認・変更・キャンセルを希望されたら、ご本人確認のためご登録の電話番号を尋ねる。番号が会話に出たら action {type:\"verify\", phone} を出す。\n";
   }
   s += "新規予約はここでは受け付けず、予約サイト " + (ctx.bookingUrl || "") + " を必ず案内する。\n";
+  if (ctx.cancelFeePolicy) s += "クリニックの規定 → " + ctx.cancelFeePolicy + "。キャンセル・日時変更の話題でこの規定に該当し得る場合は必ず言及する。ここに無い金額・条件は推測せず「クリニックへお問い合わせください」と案内する。\n";
   s += "actionの出し方（出力JSONの \"action\"。操作が不要なら {\"type\":\"none\"}）:\n"
     + "・キャンセル希望が明確 → {\"type\":\"cancel\",\"appointmentId\":\"上の[ID:…]\"}（対象が複数あり特定できなければ draft で質問し type:none）\n"
     + "・変更希望で日付＋時刻が具体的 → {\"type\":\"reschedule\",\"appointmentId\":\"ID\",\"newDateTime\":\"YYYY-MM-DDTHH:MM\"}（日本時間。「明日」「来週金曜」は本日から計算。過去日時は出さない）\n"
