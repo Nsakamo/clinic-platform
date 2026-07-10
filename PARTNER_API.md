@@ -24,5 +24,8 @@ API を変える／足すときは、まず正本を更新し、右腕くん（`
 - `POST /api/hooks/migiude` … 受信イベント転送＋AI使用量（`usage`）
 - `GET  /api/partner/booking?slug=&channel=&userId=` … AI下書き用の患者コンテキスト。
   返却 `text`（整形済み）を `bookingToText` が最優先で下書きに差し込む。
+- `POST /api/partner/appointment-actions` … 予約自動受付（context/slots/propose/confirm）。
+  テナント設定 `settings.bookingActions`（既定OFF）が有効なときのみ呼ぶ。本人確認と
+  患者の「はい」承認（二段階）は受付るん側が強制する。詳細は正本 docs/19 の B-2。
 
 詳細な各リクエスト/レスポンス形は正本（受付るん `docs/19`）を参照。

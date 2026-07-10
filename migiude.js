@@ -51,6 +51,7 @@ function newTenant(slug, name, config) {
   if (typeof config.settings.autoDelayMin !== "number" || !isFinite(config.settings.autoDelayMin) || config.settings.autoDelayMin < 0) config.settings.autoDelayMin = 0;
   config.settings.autoDelayMin = Math.min(60, Math.round(config.settings.autoDelayMin)); // 自動返信までの待ち時間（分）。0=即時, 上限60
   if (!Array.isArray(config.settings.prefs)) config.settings.prefs = []; // スタッフの記憶（全返信に効く恒久ルール）
+  if (typeof config.settings.bookingActions !== "boolean") config.settings.bookingActions = false; // 予約自動受付（受付るん連携でのキャンセル・変更・LINE連携）。既定OFF
   return { slug, name: name || slug, config, store: {}, rules: {}, ruleSeq: 1, examples: {}, exampleSeq: 1, alerts: [], alertSeq: 1, push: {} };
 }
 async function saveTenantConfig(t) {
@@ -676,6 +677,219 @@ async function fetchBooking(t, c) {
   } catch (e) { return ""; }
 }
 
+// ===== 予約自動受付（受付るん連携）: 本人確認＋二段階承認つきで予約の確認・キャンセル・変更・LINE連携を自動処理 =====
+// 設計: 受付るん側 POST /api/partner/appointment-actions が本人確認・確認待ち依頼(30分期限)・実行時再検証まで持つ。
+// 右腕くん側は (1) 会話から操作意図をAIが抽出(action) → propose → 確認文を送る、
+//              (2) 次の患者返信が明確な「はい/いいえ」のときだけ confirm → 結果文を送る、の2段階のみ。
+// 曖昧な返信では絶対に実行しない。確認文・結果文は受付るん生成の定型文をそのまま送る（AIが改変しない）。
+const BA_URL = PARTNER_BASE + "/appointment-actions";
+function baEnabled(t) { return !!S(t).bookingActions; }
+async function baCall(t, c, action, extra, timeoutMs) {
+  try {
+    if (!PARTNER_KEY) return null;
+    const body = Object.assign({ action, slug: t.slug, channel: c.channel === "mail" ? "mail" : "line", userId: c.userId }, extra || {});
+    if (body.phone == null && c.ba && c.ba.phone) body.phone = c.ba.phone; // メールの本人確認済み電話番号を常に添付
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, timeoutMs || 6000);
+    let r;
+    try { r = await fetch(BA_URL, { method: "POST", headers: { "Content-Type": "application/json", "x-partner-key": PARTNER_KEY }, body: JSON.stringify(body), signal: ctrl.signal }); }
+    finally { clearTimeout(timer); }
+    if (!r) return null;
+    return await r.json().catch(() => null);
+  } catch (e) { return null; }
+}
+
+// AI用のシステムプロンプト断片（本人確認の状態・予約一覧・actionの出し方）
+function baPromptBlock(ctx) {
+  if (!ctx || ctx.ok === false) return "";
+  let s = "\n\n【予約自動受付（受付るん連携・最優先で従う）】\n";
+  if (ctx.verified) {
+    s += "本人確認: 済み（" + ((ctx.patient && ctx.patient.name) || "") + " 様 / 診察券番号 " + ((ctx.patient && ctx.patient.patientNo) || "") + "）\n";
+    const list = Array.isArray(ctx.appointments) ? ctx.appointments : [];
+    s += list.length
+      ? "直近のご予約:\n" + list.map(a => "・[ID:" + a.id + "] " + a.label + "〜 " + a.menu + "（" + a.statusJa + (a.changeable ? "・変更/キャンセル可" : "・受付期限外につき変更不可") + "）").join("\n") + "\n"
+      : "直近のご予約はありません。\n";
+    s += "予約内容の案内はこの情報の範囲で答えてよい。キャンセル・日時変更は自分で完了を宣言せず、必ず action を出す（正式な確認文はシステムが送る）。\n";
+  } else if (ctx.reason === "unavailable") {
+    s += "本人確認: 不可（自動受付をご利用いただけないお客様）。予約に関する個人情報は一切伝えず、actionも一切出さない（typeは常にnone）。ご用件はクリニックへ直接お電話いただくよう丁寧に案内する。理由の説明はしない。\n";
+  } else if (ctx.reason === "not_linked") {
+    s += "本人確認: 未（このLINEアカウントは患者台帳と未連携）。予約に関する個人情報（予約の有無・日時・氏名等）は一切伝えない。\n";
+    s += "予約の確認・変更・キャンセルを希望されたら、ご本人確認のためご登録の電話番号とメールアドレスの2点を尋ねる。両方が会話に出そろったら action {type:\"link\", phone, email} を出す（連携の確認文はシステムが送る）。\n";
+  } else {
+    s += "本人確認: 未（メールアドレスだけでは確認できない）。予約に関する個人情報は一切伝えない。\n";
+    s += "予約の確認・変更・キャンセルを希望されたら、ご本人確認のためご登録の電話番号を尋ねる。番号が会話に出たら action {type:\"verify\", phone} を出す。\n";
+  }
+  s += "新規予約はここでは受け付けず、予約サイト " + (ctx.bookingUrl || "") + " を必ず案内する。\n";
+  s += "actionの出し方（出力JSONの \"action\"。操作が不要なら {\"type\":\"none\"}）:\n"
+    + "・キャンセル希望が明確 → {\"type\":\"cancel\",\"appointmentId\":\"上の[ID:…]\"}（対象が複数あり特定できなければ draft で質問し type:none）\n"
+    + "・変更希望で日付＋時刻が具体的 → {\"type\":\"reschedule\",\"appointmentId\":\"ID\",\"newDateTime\":\"YYYY-MM-DDTHH:MM\"}（日本時間。「明日」「来週金曜」は本日から計算。過去日時は出さない）\n"
+    + "・空き時間の質問、または日付だけ決まった変更希望 → {\"type\":\"slots\",\"appointmentId\":\"ID\",\"date\":\"YYYY-MM-DD\"}\n"
+    + "・LINE連携（電話・メール2点がそろったら） → {\"type\":\"link\",\"phone\":\"…\",\"email\":\"…\"}\n"
+    + "・メールの本人確認（電話番号が出たら） → {\"type\":\"verify\",\"phone\":\"…\"}\n"
+    + "actionを出すとき、draftは短い繋ぎ文でよい（システムが正式な確認文・結果文を患者に送る）。";
+  return s;
+}
+
+// 患者の返信が確認への明確な承認/拒否かを判定。まず厳格な定型一致、だめならAIで分類。曖昧は other（実行しない）。
+async function classifyApproval(t, confirmText, text) {
+  const s = String(text || "").trim().replace(/[\s　。．、，！!？?〜～ー・…]+/g, "");
+  if (s && s.length <= 12) {
+    if (/^(はい|ハイ|はーい|ok|ｏｋ|オッケー|オッケ|おけ|おねがいします|お願いします|それでおねがいします|それでお願いします|承認します|同意します|はいお願いします|はいおねがいします)$/i.test(s)) return "yes";
+    if (/^(いいえ|いえ|いや|やめます|やめる|やめときます|やめておきます|しないでください|しないで|取り消さないでください|不要です|なしで|キャンセルしません)$/i.test(s)) return "no";
+  }
+  try {
+    const sys = "あなたは分類器。患者に次の確認メッセージを送った直後の返信を分類する。確認メッセージ:「" + String(confirmText || "").slice(0, 300) + "」。返信がこの確認への明確な同意（実行してよい）なら yes、明確な拒否なら no、別の話題・条件の変更・曖昧・判断に迷う場合は other。必ず yes / no / other のうち1語だけを出力する。";
+    const raw = await aiChat(t, sys, [{ role: "user", content: String(text || "").slice(0, 500) }], 10);
+    const a = String(raw || "").toLowerCase();
+    if (/\byes\b/.test(a)) return "yes";
+    if (/\bno\b/.test(a)) return "no";
+  } catch (e) {}
+  return "other"; // 判定不能は実行しない側に倒す
+}
+
+// 定型文をそのまま患者へ送る（自動送信扱い）。送れたら会話を更新して true。
+async function baDeliver(t, c, text) {
+  const r = await deliverText(t, c, text);
+  if (r && r.sent) {
+    c.msgs.push({ from: "us", text, auto: true, time: nowt() });
+    c.draft = ""; c.draft0 = ""; c.status = "done"; c.lastAuto = true;
+    c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
+    try { notifyAll(t, "🤖 予約自動受付: " + (c.name || ""), String(text).slice(0, 90)); } catch (e) {}
+    return true;
+  }
+  return false;
+}
+
+// 定型文を送り、送信に失敗したら「下書きに残す＋要対応(todo)＋スタッフ通知」でエスカレーション。
+// 予約操作は既に実行/受付済みのことがあるため、送信失敗でも AI下書きで上書きせず必ずスタッフへ引き継ぐ。
+async function baDeliverOrEscalate(t, c, text, opts) {
+  const sent = await baDeliver(t, c, text);
+  if (sent) return true;
+  if (opts && opts.clearPendingOnFail && c.ba) c.ba.pending = null; // 患者が見ていない確認への「はい」を防ぐ（サーバー側の依頼は30分で自然失効）
+  c.draft = text; c.draft0 = text; c.status = "todo"; c.time = nowt(); c.ts = Date.now(); dbSave(t, c);
+  try { notifyAll(t, "⚠️ 予約自動受付: 自動送信に失敗（要対応）: " + (c.name || ""), String(text).slice(0, 90)); } catch (e) {}
+  return true;
+}
+
+// 確認待ち（c.ba.pending）がある会話への返信を処理。明確な yes/no のときだけ confirm を呼ぶ。
+async function baHandlePending(t, c) {
+  const ba = c.ba;
+  if (!ba || !ba.pending) return false;
+  if (!ba.pending.expiresAt || Date.parse(ba.pending.expiresAt) < Date.now()) { ba.pending = null; dbSave(t, c); return false; }
+  const lastMsg = c.msgs[c.msgs.length - 1];
+  const text = String((lastMsg && lastMsg.text) || "").trim();
+  if (!text) return false;
+  const cls = await classifyApproval(t, ba.pending.confirmText, text);
+  if (cls !== "yes" && cls !== "no") return false; // 曖昧 → 実行せず通常の下書きへ（確認は期限まで有効）
+  const r = await baCall(t, c, "confirm", { requestId: ba.pending.requestId, approve: cls === "yes" }, 15000);
+  ba.pending = null; dbSave(t, c);
+  if (!r) {
+    // 通信断で実行されたか不明。誤った「失敗しました」案内をせず、要対応フラグでスタッフへ引き継ぐ。
+    try { notifyAll(t, "⚠️ 予約自動受付: 実行結果不明（要確認）: " + (c.name || ""), "confirm応答が取れませんでした。予約状況を確認してください。"); } catch (e) {}
+    await baDeliver(t, c, "恐れ入ります、お手続きの確認にお時間をいただいております。念のため担当者が確認し、必要に応じてご連絡いたします。");
+    c.status = "todo"; c.flag = true; dbSave(t, c);
+    return true;
+  }
+  let reply = r.text ? String(r.text) : null;
+  if (!reply) {
+    if (r.ok) reply = cls === "yes" ? "お手続きが完了しました。" : "かしこまりました。変更は行っておりませんので、ご安心ください。";
+    else reply = "申し訳ありません、お手続きを完了できませんでした。お手数ですが、クリニックまで直接ご連絡ください。";
+  }
+  if (r.ok === false && Array.isArray(r.alternatives) && r.alternatives.length) {
+    reply += "\n空いているお時間: " + r.alternatives.map(x => x.label).join(" / ");
+  }
+  return await baDeliverOrEscalate(t, c, reply);
+}
+
+// AIが出した action を実行（propose→確認文送信 / verify / slots）。処理して返信まで送れたら true。
+async function baAction(t, c, act, baCtx) {
+  const type = String((act && act.type) || "none");
+  if (type === "none") return false;
+  c.ba = c.ba || {};
+  const changeable = (baCtx && Array.isArray(baCtx.appointments)) ? baCtx.appointments.filter(a => a.changeable) : [];
+  const apptId = String(act.appointmentId || "") || (changeable.length === 1 ? changeable[0].id : "");
+
+  if (type === "verify") { // メール経路: 電話番号でメール＋電話の両方一致を確認
+    const phone = String(act.phone || "").trim();
+    if (!phone || phone.replace(/\D/g, "").length < 8) return false;
+    const r = await baCall(t, c, "context", { phone });
+    if (r && r.ok && r.verified) {
+      c.ba.phone = phone; dbSave(t, c);
+      const list = Array.isArray(r.appointments) ? r.appointments : [];
+      const lines = list.length ? "直近のご予約:\n" + list.map(a => "・" + a.label + "〜 " + a.menu + "（" + a.statusJa + "）").join("\n") : "現在、直近のご予約はございません。";
+      return await baDeliverOrEscalate(t, c, "ご本人様の確認がとれました。\n" + lines + "\nご予約の変更・キャンセルをご希望の場合は、ご希望の内容をお送りください。");
+    }
+    return await baDeliverOrEscalate(t, c, "申し訳ありません、ご登録の情報との一致を確認できませんでした。お手数ですが、クリニックまで直接お電話でお問い合わせください。");
+  }
+
+  if (type === "link") { // LINE未連携: 電話＋メール両方一致で特定できたら連携の確認を送る
+    const phone = String(act.phone || "").trim();
+    const email = String(act.email || "").trim();
+    if (!phone || !email || !email.includes("@")) return false;
+    const r = await baCall(t, c, "propose", { kind: "line_link", linkPhone: phone, linkEmail: email });
+    if (r && r.ok && r.requestId) {
+      c.ba.phone = phone; c.ba.email = email;
+      c.ba.pending = { requestId: r.requestId, confirmText: r.confirmText, expiresAt: r.expiresAt };
+      dbSave(t, c);
+      return await baDeliverOrEscalate(t, c, r.confirmText, { clearPendingOnFail: true });
+    }
+    if (r && (r.error === "line_bound_other" || r.error === "patient_has_line")) {
+      return await baDeliverOrEscalate(t, c, "申し訳ありません、このLINEアカウントの連携手続きはこちらでは行えませんでした。お手数ですが、クリニックまで直接お問い合わせください。");
+    }
+    return await baDeliverOrEscalate(t, c, "申し訳ありません、ご登録の情報との一致を確認できませんでした。お電話番号とメールアドレスをもう一度お確かめのうえお送りいただくか、クリニックまで直接お問い合わせください。");
+  }
+
+  if (!apptId) return false; // 対象の予約を特定できない → AIの下書き（どの予約か質問）に任せる
+
+  if (type === "slots") {
+    const date = String(act.date || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
+    const r = await baCall(t, c, "slots", { appointmentId: apptId, date });
+    if (!r || !r.ok) return false;
+    const d = new Date(date + "T00:00:00+09:00");
+    const lbl = (d.getMonth() + 1) + "月" + d.getDate() + "日";
+    if (!Array.isArray(r.slots) || !r.slots.length) {
+      return await baDeliverOrEscalate(t, c, lbl + "は空きがございませんでした。別の日でよろしければ、ご希望の日をお知らせください。");
+    }
+    return await baDeliverOrEscalate(t, c, lbl + "の空き時間はこちらです:\n" + r.slots.map(x => x.label).join(" / ") + "\nご希望のお時間をお知らせください。");
+  }
+
+  if (type === "cancel") {
+    const r = await baCall(t, c, "propose", { kind: "cancel", appointmentId: apptId });
+    if (r && r.ok && r.requestId) {
+      c.ba.pending = { requestId: r.requestId, confirmText: r.confirmText, expiresAt: r.expiresAt };
+      dbSave(t, c);
+      return await baDeliverOrEscalate(t, c, r.confirmText, { clearPendingOnFail: true });
+    }
+    if (r && r.error === "not_changeable") {
+      return await baDeliverOrEscalate(t, c, "申し訳ありません、このご予約はキャンセルの受付期限を過ぎているため、こちらでは承れません。お手数ですが、クリニックまで直接ご連絡ください。");
+    }
+    return false;
+  }
+
+  if (type === "reschedule") {
+    const ndt = String(act.newDateTime || "");
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(ndt)) return false;
+    const dt = new Date(ndt.slice(0, 16) + ":00+09:00");
+    if (isNaN(dt.getTime()) || dt.getTime() < Date.now()) return false;
+    const r = await baCall(t, c, "propose", { kind: "reschedule", appointmentId: apptId, newStartsAt: dt.toISOString() });
+    if (r && r.ok && r.requestId) {
+      c.ba.pending = { requestId: r.requestId, confirmText: r.confirmText, expiresAt: r.expiresAt };
+      dbSave(t, c);
+      return await baDeliverOrEscalate(t, c, r.confirmText, { clearPendingOnFail: true });
+    }
+    if (r && r.error === "slot_taken") {
+      const alts = Array.isArray(r.alternatives) ? r.alternatives.map(x => x.label).join(" / ") : "";
+      return await baDeliverOrEscalate(t, c, "申し訳ありません、ご希望のお時間は埋まっております。" + (alts ? "\n同じ日の空き時間はこちらです:\n" + alts + "\nご希望のお時間をお知らせください。" : "別の日時のご希望をお知らせください。"));
+    }
+    if (r && r.error === "not_changeable") {
+      return await baDeliverOrEscalate(t, c, "申し訳ありません、このご予約は変更の受付期限を過ぎているため、こちらでは承れません。お手数ですが、クリニックまで直接ご連絡ください。");
+    }
+    return false;
+  }
+  return false;
+}
+
 // ===== 自動返信の待ち時間スケジューラ（メモリ上。プロセス再起動で予約は消える＝短い遅延向け） =====
 const pendingAuto = new Map();
 function autoKey(t, id) { return t.slug + "::" + id; }
@@ -733,6 +947,17 @@ async function genDraft(t, c, opts) {
   if (!msgsArr.length || msgsArr[msgsArr.length - 1].role !== "user") return null;
   let bookingTxt = "";
   try { bookingTxt = await fetchBooking(t, c); } catch (e) { bookingTxt = ""; }
+  // 予約自動受付: 本人確認つきコンテキスト。未確認の相手には既存の照会テキストも渡さない（個人情報を出させない）。
+  let baCtx = null, baTxt = "";
+  if (baEnabled(t) && PARTNER_KEY) {
+    try { baCtx = await baCall(t, c, "context", { email: (c.ba && c.ba.email) || undefined }); } catch (e) { baCtx = null; }
+    baTxt = baPromptBlock(baCtx);
+    // 本人確認が取れていない相手（照会失敗も含む）には既存の照会テキストも渡さない（個人情報を出させない）
+    if (!(baCtx && baCtx.ok && baCtx.verified)) bookingTxt = "";
+    if (c.ba && c.ba.pending && c.ba.pending.expiresAt && Date.parse(c.ba.pending.expiresAt) > Date.now()) {
+      baTxt += "\n現在、次の確認への返信待ち:「" + String(c.ba.pending.confirmText || "").slice(0, 120) + "」。患者が別の話をしていればそれに答えつつ、手続きを続ける場合は「はい」と返信いただくよう最後に一言添える。";
+    }
+  }
   const sys = "あなたはクリニック・店舗「" + (t.name || "クリニック") + "」の受付スタッフです。お客様とこの会話をしてきた本人として、最新のメッセージへの返信を書きます。一流ホテルのコンシェルジュのように上質で温かく、品のある丁寧な言葉遣いで対応する。"
     + "本日は" + today + "です。キャンセル料など日付が関わる案内は、本日と予約日の差から判断すること（予約日の前日にあたる連絡なら前日扱い、当日なら当日扱い、それより前なら通常キャンセル料は不要）。憶測で日付を決めない。"
     + (opts.only && opts.only.length
@@ -745,16 +970,22 @@ async function genDraft(t, c, opts) {
     + (prefsBlock(t) ? "\n\n【スタッフが記憶させた指示（全返信で必ず守る。トーン指示と同格で最優先）】\n" + prefsBlock(t) : "")
     + (notesBlock(c) ? "\n\n【このお客様への対応でスタッフが出した指示メモ（編集チャットでの指示。今回の返信でも引き続き従う。ただし明らかに“その時限り”の内容は無視してよい）】\n" + notesBlock(c) : "")
     + (bookingTxt ? "\n\n【この方の情報（受付るん＝予約システムからの照会結果。氏名・会員ランク・ポイント・予約・回数券・最終来院などの参考。日付判断・キャンセル可否・来院案内に使う。ここに無い内容は推測しない。カルテ・診療内容は含まれない）】\n" + bookingTxt : "")
+    + baTxt
     + "\n\n" + JP_QUALITY
-    + "\n\n出力は必ず次のJSONのみ（前後に説明や```やかぎ括弧を付けない）: {\"draft\":\"お客様への返信文\",\"confidence\":\"high|medium|low\",\"is_urgent\":true|false,\"needs_human\":true|false,\"site_alert\":\"遅刻|当日キャンセル|緊急来院|none\",\"site_summary\":\"現場向け一行要約。site_alertがnoneなら空文字\",\"topics\":[{\"q\":\"短い質問ラベル\",\"need\":true}]}"
+    + "\n\n出力は必ず次のJSONのみ（前後に説明や```やかぎ括弧を付けない）: {\"draft\":\"お客様への返信文\",\"confidence\":\"high|medium|low\",\"is_urgent\":true|false,\"needs_human\":true|false,\"site_alert\":\"遅刻|当日キャンセル|緊急来院|none\",\"site_summary\":\"現場向け一行要約。site_alertがnoneなら空文字\",\"topics\":[{\"q\":\"短い質問ラベル\",\"need\":true}]"
+    + (baTxt ? ",\"action\":{\"type\":\"none|cancel|reschedule|slots|link|verify\",\"appointmentId\":\"\",\"newDateTime\":\"\",\"date\":\"\",\"phone\":\"\",\"email\":\"\"}" : "")
+    + "}"
     + "\nconfidence: ルールと会話から自信を持って答えられればhigh、判断に迷う/情報不足ならlow。"
-    + "\nneeds_human: 予約状況の確認・キャンセル例外判断・クレーム・支払いトラブル・偽物疑惑などスタッフ確認が必要ならtrue。"
+    + (baTxt
+        ? "\nneeds_human: クレーム・支払いトラブル・偽物疑惑・キャンセル料の例外判断などスタッフの人間判断が必要ならtrue。予約の確認・キャンセル・日時変更は上の【予約自動受付】のactionで処理できるため、それだけならfalseでよい。"
+        : "\nneeds_human: 予約状況の確認・キャンセル例外判断・クレーム・支払いトラブル・偽物疑惑などスタッフ確認が必要ならtrue。")
     + "\nis_urgent: 痛み・出血・腫れ・強い不調など緊急性があればtrue。"
     + "\ntopics: お客様の直近メッセージにある「返信すべき質問・依頼」を、それぞれ短い日本語ラベル(q)で列挙する（最大5件）。状況連絡・挨拶・お礼や、時間が経って既に解決済みと思われるもの（例: かなり前に届いた『遅れます』）は need:false。それ以外は need:true。質問が1つだけなら1件でよい。";
   try {
     const raw = await aiChat(t, sys, msgsArr, 4000);
     if (!raw) return null;
     let out = null; try { const m = raw.match(/\{[\s\S]*\}/); out = JSON.parse(m ? m[0] : raw); } catch (e) { out = { draft: salvageDraft(raw), confidence: "low", is_urgent: false, needs_human: true, site_alert: "none", site_summary: "" }; }
+    if (out && typeof out === "object") out.baCtx = baCtx; // 予約自動受付: actionの対象特定に使う
     return out;
   } catch (e) { return null; }
 }
@@ -778,10 +1009,22 @@ async function handleInbound(t, opts) {
   c.status = "todo"; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
 
   let confidence = opts.confidence, needsHuman = opts.needsHuman, urgent = opts.urgent, siteAlert = opts.siteAlert, siteSummary = opts.siteSummary;
+
+  // ===== 予約自動受付: 確認待ちへの「はい/いいえ」を最優先で処理（明確な返答のときだけ実行） =====
+  let baDone = false;
+  if (!med && typeof opts.draft !== "string" && baEnabled(t) && PARTNER_KEY) {
+    try { baDone = await baHandlePending(t, c); } catch (e) { console.error("ba pending:", e && e.message); }
+  }
+
   if (typeof opts.draft === "string") { c.draft = opts.draft; c.draft0 = opts.draft; }
-  else if (!med) { // generate draft in-app for text messages
+  else if (!med && !baDone) { // generate draft in-app for text messages
     const g = await genDraft(t, c);
     if (g) { c.draft = String(g.draft || ""); c.draft0 = c.draft; confidence = g.confidence; needsHuman = g.needs_human; urgent = g.is_urgent; siteAlert = g.site_alert; siteSummary = g.site_summary; c.topics = Array.isArray(g.topics) ? g.topics : []; }
+    // ===== 予約自動受付: AIが操作依頼(action)を出したら、確認文の送信までを自動処理 =====
+    if (g && baEnabled(t) && PARTNER_KEY && g.action && typeof g.action === "object" && g.action.type && g.action.type !== "none") {
+      try { baDone = await baAction(t, c, g.action, g.baCtx); } catch (e) { console.error("ba action:", e && e.message); }
+      if (baDone) { c.draft = ""; c.draft0 = ""; }
+    }
   }
   if (confidence) c.confidence = confidence;
   dbSave(t, c);
@@ -794,7 +1037,7 @@ async function handleInbound(t, opts) {
     const conf = String(confidence || "").toLowerCase();
     const confOk = conf === "high" || (S(t).level === "medium" && conf === "medium");
     const safe = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med;
-    if (S(t).autoReply && confOk && safe && c.draft && c.draft.trim()) {
+    if (!baDone && S(t).autoReply && confOk && safe && c.draft && c.draft.trim()) {
       const draftText = c.draft.trim();
       const delayMin = Number(S(t).autoDelayMin || 0);
       if (delayMin > 0 && (recvAt + delayMin * 60000 - Date.now()) > 0) {
@@ -807,9 +1050,9 @@ async function handleInbound(t, opts) {
       }
     }
   } catch (e) {}
-  try { if (autoSent) notifyAll(t, "🤖 自動返信済み: " + (c.name || ""), (c.last || "").slice(0, 90)); else notifyAll(t, c.name || "新着メッセージ", (c.last || "新しいメッセージが届きました").slice(0, 90)); } catch (e) {}
-  try { forwardToPartner(t, c, { autoSent, autoScheduled }); } catch (e) {} // 受付くんへ受信イベントを転送
-  return { id, autoSent, autoScheduled };
+  try { if (autoSent) notifyAll(t, "🤖 自動返信済み: " + (c.name || ""), (c.last || "").slice(0, 90)); else if (!baDone) notifyAll(t, c.name || "新着メッセージ", (c.last || "新しいメッセージが届きました").slice(0, 90)); } catch (e) {}
+  try { forwardToPartner(t, c, { autoSent: autoSent || baDone, autoScheduled }); } catch (e) {} // 受付くんへ受信イベントを転送
+  return { id, autoSent: autoSent || baDone, autoScheduled };
 }
 
 // ===== 複数アカウント対応: メイン（conn直下）＋追加分（conn.lines / conn.mails） =====
@@ -1157,6 +1400,7 @@ app.get("/api/settings", guard, (req, res) => res.json(Object.assign({}, S(req.t
 app.post("/api/settings", guard, async (req, res) => {
   const t = req.tenant;
   if (typeof req.body.autoReply === "boolean") S(t).autoReply = req.body.autoReply;
+  if (typeof req.body.bookingActions === "boolean") S(t).bookingActions = req.body.bookingActions;
   if (req.body.level === "high" || req.body.level === "medium") S(t).level = req.body.level;
   if (typeof req.body.tone === "string") S(t).tone = req.body.tone.slice(0, 1500);
   if (req.body.autoDelayMin != null && isFinite(Number(req.body.autoDelayMin))) S(t).autoDelayMin = Math.min(60, Math.max(0, Math.round(Number(req.body.autoDelayMin))));
@@ -2360,6 +2604,8 @@ const PAGE = `<!DOCTYPE html>
 <div id="setPop" style="position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:65;display:none;align-items:center;justify-content:center;"><div style="background:#fff;border-radius:14px;padding:18px;width:min(92vw,360px);max-height:86vh;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;">
   <h3 style="margin:0 0 12px;font-size:15px;">⚙ 設定</h3>
   <label style="display:flex;align-items:center;gap:10px;font-size:14px;padding:8px 0;cursor:pointer;"><input type="checkbox" id="setAuto" style="width:18px;height:18px;"> 自動返信を有効にする</label>
+  <label style="display:flex;align-items:center;gap:10px;font-size:14px;padding:8px 0;cursor:pointer;"><input type="checkbox" id="setBookingActions" style="width:18px;height:18px;"> 予約の自動受付（確認・変更・キャンセル）</label>
+  <div style="font-size:11px;color:#888;margin:-6px 0 6px 28px;">予約システム（受付るん）連携。本人確認と、患者様の「はい」承認をはさんだうえで、予約のキャンセル・日時変更・LINE連携まで自動で行います。</div>
   <div style="font-size:12px;color:#6b7280;margin:2px 0 10px;">AIの確信率が高い問い合わせに、スタッフを待たずAIが自動で返信します。緊急・要対応と判定されたものは自動返信されません。</div>
   <div style="font-size:13px;margin-bottom:4px;">自動返信の対象</div>
   <select id="setLevel" style="width:100%;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:13px;">
@@ -3036,7 +3282,7 @@ function renderRuleGauge(){
     else { warn.style.display="none"; }
   }
 }
-async function openSet(){try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"gemini";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);window.__rules=s.rules||null;renderRuleGauge();renderPrefs(s.prefs||[]);
+async function openSet(){try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setBookingActions").checked=!!s.bookingActions;document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"gemini";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);window.__rules=s.rules||null;renderRuleGauge();renderPrefs(s.prefs||[]);
   if(s.engines){const n=document.getElementById("engineNote");n.textContent="文章作成は選択中のAIで生成（GPT"+(s.engines.gpt?"✓":"⚠キー未設定")+"・Gemini"+(s.engines.gemini?"✓":"⚠")+"・Claude"+(s.engines.claude?"✓":"⚠")+"）。キー未設定のエンジンを選ぶと安全のためClaudeで生成します。";}}catch(e){}
   refreshModelAlert();
   try{const cr=await fetch("/api/conn");const c=await cr.json();document.getElementById("connStat").textContent=(c.lineConfigured?"LINE✓ ":"LINE未 ")+(c.mailConfigured?"メール✓":"メール未");document.getElementById("cSmtpHost").value=c.smtpHost||"";document.getElementById("cSmtpPort").value=c.smtpPort||"";document.getElementById("cSmtpUser").value=c.smtpUser||"";document.getElementById("cImapHost").value=c.imapHost||"";document.getElementById("cImapPort").value=c.imapPort||"";document.getElementById("cImapUser").value=c.imapUser||"";document.getElementById("cEmailInternal").checked=!!c.emailInternal;renderAccts(c);}catch(e){}
@@ -3068,7 +3314,7 @@ async function delAcct(kind,i){if(!confirm("この連携を削除しますか？
   try{await api("/api/conn-del",{kind,i});}catch(e){}openSet();}
 async function saveConn(){const g=id=>document.getElementById(id).value.trim();const body={lineSecret:g("cLineSecret"),lineToken:g("cLineToken"),smtpHost:g("cSmtpHost"),smtpPort:g("cSmtpPort"),smtpUser:g("cSmtpUser"),smtpPass:g("cSmtpPass"),imapHost:g("cImapHost"),imapPort:g("cImapPort"),imapUser:g("cImapUser"),imapPass:g("cImapPass"),emailInternal:document.getElementById("cEmailInternal").checked};try{const r=await api("/api/conn",body);const j=await r.json();if(j.ok){alert("連携設定を保存しました。\\nLINE: "+(j.lineConfigured?"設定済み":"未設定")+" / メール: "+(j.mailConfigured?"設定済み":"未設定")+" / メール直接監視: "+(j.emailInternal?"オン":"オフ"));["cLineSecret","cLineToken","cSmtpPass","cImapPass"].forEach(id=>document.getElementById(id).value="");}else alert("保存に失敗しました");}catch(e){alert("保存に失敗しました");}}
 function closeSet(){document.getElementById("setPop").style.display="none";}
-async function saveSet(){const autoReply=document.getElementById("setAuto").checked;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{await api("/api/settings",{autoReply,level,tone,engine,autoDelayMin});alert("設定を保存しました");}catch(e){alert("保存に失敗しました");}closeSet();}
+async function saveSet(){const autoReply=document.getElementById("setAuto").checked;const bookingActions=document.getElementById("setBookingActions").checked;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{await api("/api/settings",{autoReply,bookingActions,level,tone,engine,autoDelayMin});alert("設定を保存しました");}catch(e){alert("保存に失敗しました");}closeSet();}
 async function changeLoginId(){
   const next=prompt("新しいログインID（半角英数字3〜30文字。スタッフ全員のログインに使います）");if(!next)return;
   try{const r=await api("/api/change-loginid",{next:next.trim()});const j=await r.json();
