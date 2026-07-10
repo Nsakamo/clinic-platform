@@ -723,7 +723,7 @@ function baPromptBlock(ctx) {
   s += "actionの出し方（出力JSONの \"action\"。操作が不要なら {\"type\":\"none\"}）:\n"
     + "・キャンセル希望が明確 → {\"type\":\"cancel\",\"appointmentId\":\"上の[ID:…]\"}（対象が複数あり特定できなければ draft で質問し type:none）\n"
     + "・変更希望で日付＋時刻が具体的 → {\"type\":\"reschedule\",\"appointmentId\":\"ID\",\"newDateTime\":\"YYYY-MM-DDTHH:MM\"}（日本時間。「明日」「来週金曜」は本日から計算。過去日時は出さない）\n"
-    + "・空き時間の質問、または日付だけ決まった変更希望 → {\"type\":\"slots\",\"appointmentId\":\"ID\",\"date\":\"YYYY-MM-DD\"}\n"
+    + "・空き時間の質問・日付だけ決まった変更希望・条件付きの空き照会（「一番遅い時間」「18時以降で」「直近の土日」など） → {\"type\":\"slots\",\"appointmentId\":\"ID\",\"dates\":[\"YYYY-MM-DD\"]}（条件に合いそうな日付を本日基準・近い順に最大7つ。単日の質問なら1つ。結果はシステムが取得し、あなたが次の生成で条件に沿って答える）\n"
     + "・LINE連携（電話・メール2点がそろったら） → {\"type\":\"link\",\"phone\":\"…\",\"email\":\"…\"}\n"
     + "・メールの本人確認（電話番号が出たら） → {\"type\":\"verify\",\"phone\":\"…\"}\n"
     + "actionを出すとき、draftは短い繋ぎ文でよい（システムが正式な確認文・結果文を患者に送る）。";
@@ -842,16 +842,33 @@ async function baAction(t, c, act, baCtx) {
   if (!apptId) return false; // 対象の予約を特定できない → AIの下書き（どの予約か質問）に任せる
 
   if (type === "slots") {
-    const date = String(act.date || "");
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
-    const r = await baCall(t, c, "slots", { appointmentId: apptId, date });
-    if (!r || !r.ok) return false;
-    const d = new Date(date + "T00:00:00+09:00");
-    const lbl = (d.getMonth() + 1) + "月" + d.getDate() + "日";
-    if (!Array.isArray(r.slots) || !r.slots.length) {
-      return await baDeliverOrEscalate(t, c, lbl + "は空きがございませんでした。別の日でよろしければ、ご希望の日をお知らせください。");
+    let dates = Array.isArray(act.dates) ? act.dates.map(String) : [];
+    if (act.date) dates.push(String(act.date)); // 旧形式との互換
+    dates = Array.from(new Set(dates.filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d)))).slice(0, 7);
+    if (!dates.length) return false;
+    const fmtD = (ds) => { const d = new Date(ds + "T00:00:00+09:00"); return (d.getMonth() + 1) + "月" + d.getDate() + "日(" + "日月火水木金土"[d.getDay()] + ")"; };
+    const results = [];
+    for (const ds of dates) {
+      const r = await baCall(t, c, "slots", { appointmentId: apptId, date: ds });
+      if (r && r.ok) results.push({ date: ds, slots: Array.isArray(r.slots) ? r.slots : [] });
     }
-    return await baDeliverOrEscalate(t, c, lbl + "の空き時間はこちらです:\n" + r.slots.map(x => x.label).join(" / ") + "\nご希望のお時間をお知らせください。");
+    if (!results.length) return false;
+    const slotsTxt = results.map(x => fmtD(x.date) + ": " + (x.slots.length ? x.slots.map(s => s.label).join(" ") : "空きなし")).join("\n");
+    // 2パス目: 照会結果をAIに渡し、患者の条件（一番遅い・◯時以降・土日など）に沿った回答を作らせる
+    try {
+      const g2 = await genDraft(t, c, { baSlotsTxt: slotsTxt });
+      if (g2 && g2.action && typeof g2.action === "object" && ["cancel", "reschedule"].includes(String(g2.action.type))) {
+        // 条件から具体的な変更確定まで進んだ場合は通常の操作経路へ（確認文が送られる）
+        const done2 = await baAction(t, c, g2.action, g2.baCtx);
+        if (done2) return true;
+      }
+      if (g2 && g2.draft && String(g2.draft).trim() && String(g2.needs_human) !== "true") {
+        return await baDeliverOrEscalate(t, c, String(g2.draft).trim());
+      }
+    } catch (e) { console.error("ba slots 2nd pass:", e && e.message); }
+    // フォールバック: 定型の一覧（AI生成が使えないときも空き情報は届ける）
+    const lines = results.map(x => fmtD(x.date) + ": " + (x.slots.length ? x.slots.slice(0, 12).map(s => s.label).join(" / ") : "空きなし"));
+    return await baDeliverOrEscalate(t, c, "空き状況はこちらです:\n" + lines.join("\n") + "\nご希望のお時間をお知らせください。");
   }
 
   if (type === "cancel") {
@@ -957,6 +974,10 @@ async function genDraft(t, c, opts) {
     if (c.ba && c.ba.pending && c.ba.pending.expiresAt && Date.parse(c.ba.pending.expiresAt) > Date.now()) {
       baTxt += "\n現在、次の確認への返信待ち:「" + String(c.ba.pending.confirmText || "").slice(0, 120) + "」。患者が別の話をしていればそれに答えつつ、手続きを続ける場合は「はい」と返信いただくよう最後に一言添える。";
     }
+    if (opts.baSlotsTxt) {
+      baTxt += "\n\n【空き枠の照会結果（システムが今取得した実データ。この範囲だけを根拠に答える）】\n" + opts.baSlotsTxt
+        + "\n患者の質問・条件（一番遅い/早い・◯時以降・土日など）に沿って、この結果から計算して端的に答える。全枠の羅列はせず、条件に合う候補を最大6件まで。条件に合う枠が無ければ正直に無いと伝え、近い代替を提案する。回答の最後に、ご希望が決まればこのまま日時変更できる旨を一言添える。追加の空き照会（type:slots）はもう出さない。";
+    }
   }
   const sys = "あなたはクリニック・店舗「" + (t.name || "クリニック") + "」の受付スタッフです。お客様とこの会話をしてきた本人として、最新のメッセージへの返信を書きます。一流ホテルのコンシェルジュのように上質で温かく、品のある丁寧な言葉遣いで対応する。"
     + "本日は" + today + "です。キャンセル料など日付が関わる案内は、本日と予約日の差から判断すること（予約日の前日にあたる連絡なら前日扱い、当日なら当日扱い、それより前なら通常キャンセル料は不要）。憶測で日付を決めない。"
@@ -973,7 +994,7 @@ async function genDraft(t, c, opts) {
     + baTxt
     + "\n\n" + JP_QUALITY
     + "\n\n出力は必ず次のJSONのみ（前後に説明や```やかぎ括弧を付けない）: {\"draft\":\"お客様への返信文\",\"confidence\":\"high|medium|low\",\"is_urgent\":true|false,\"needs_human\":true|false,\"site_alert\":\"遅刻|当日キャンセル|緊急来院|none\",\"site_summary\":\"現場向け一行要約。site_alertがnoneなら空文字\",\"topics\":[{\"q\":\"短い質問ラベル\",\"need\":true}]"
-    + (baTxt ? ",\"action\":{\"type\":\"none|cancel|reschedule|slots|link|verify\",\"appointmentId\":\"\",\"newDateTime\":\"\",\"date\":\"\",\"phone\":\"\",\"email\":\"\"}" : "")
+    + (baTxt ? ",\"action\":{\"type\":\"none|cancel|reschedule|slots|link|verify\",\"appointmentId\":\"\",\"newDateTime\":\"\",\"dates\":[\"YYYY-MM-DD\"],\"phone\":\"\",\"email\":\"\"}" : "")
     + "}"
     + "\nconfidence: ルールと会話から自信を持って答えられればhigh、判断に迷う/情報不足ならlow。"
     + (baTxt
