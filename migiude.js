@@ -2712,8 +2712,13 @@ const PAGE = `<!DOCTYPE html>
   .amcard button:disabled{background:#d1d5db;cursor:default;}
   .spin{display:inline-block;width:13px;height:13px;border:2px solid #ddd6fe;border-top-color:#7c3aed;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:7px;}
   @keyframes spin{to{transform:rotate(360deg);}}
-  #dpanel{position:fixed;inset:0;background:rgba(0,0,0,.25);z-index:72;display:none;}
-  #dCard{position:absolute;right:0;top:0;bottom:0;width:min(96vw,430px);background:#fff;display:flex;flex-direction:column;overflow:hidden;box-shadow:-4px 0 24px rgba(0,0,0,.15);animation:slideinX .28s cubic-bezier(.22,.9,.36,1);}
+  /* 編集チャットはモーダルではなく「横並びドロワー」：開いていても左の患者とのやり取りは見える・スクロールできる */
+  #dpanel{position:fixed;inset:0;background:transparent;z-index:72;display:none;pointer-events:none;}
+  #dCard{position:absolute;right:0;top:0;bottom:0;width:min(96vw,430px);background:#fff;display:flex;flex-direction:column;overflow:hidden;box-shadow:-4px 0 24px rgba(0,0,0,.15);animation:slideinX .28s cubic-bezier(.22,.9,.36,1);pointer-events:auto;border-left:1px solid var(--line);}
+  @media(min-width:761px){
+    #chat{transition:margin-right .28s cubic-bezier(.22,.9,.36,1);}
+    #app.dopen #chat{margin-right:430px;} /* ドロワー分だけ会話エリアを詰めて、隠れる部分をなくす */
+  }
   #dMsgs{flex:1;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:8px;background:#f8fafc;}
   #dChips{padding:6px 10px 0;display:flex;gap:6px;flex-wrap:wrap;}
   #dText{flex:1;border:1px solid #d1d5db;border-radius:10px;padding:10px 12px;font-size:14px;font-family:inherit;min-height:110px;max-height:240px;resize:vertical;}
@@ -3299,12 +3304,13 @@ function openDraftChat(){if(!current)return;const c=DATA.find(x=>x.id===current)
     }
   }
   document.getElementById("dpanel").style.display="block";
+  const app=document.getElementById("app");if(app)app.classList.add("dopen"); // 会話エリアをドロワー分だけ詰める（横並び表示）
   setTimeout(()=>{const t=document.getElementById("dText");if(t)t.focus();},50);}
 function slideClose(pid,cid){const p=document.getElementById(pid),c=document.getElementById(cid);if(!p||!c)return;
   const mob=window.matchMedia("(max-width:760px)").matches;
   c.style.animation=(mob?"slideoutY":"slideoutX")+" .22s ease forwards";
   setTimeout(()=>{p.style.display="none";c.style.animation="";},220);}
-function closeDraftChat(){slideClose("dpanel","dCard");}
+function closeDraftChat(){const app=document.getElementById("app");if(app)app.classList.remove("dopen");slideClose("dpanel","dCard");}
 function dChip(t){const x=document.getElementById("dText");x.value=t;dSend();}
 // GPT風ストリーミング送信。返事が文字単位で流れ、下書きカードもリアルタイムに埋まる。失敗時は従来API(JSON)へ自動フォールバック。
 async function dSend(){if(window.__dBusy)return;const x=document.getElementById("dText");const txt=x.value.trim();if(!txt)return;window.__dBusy=true;x.value="";
