@@ -713,10 +713,11 @@ function baPromptBlock(ctx) {
       : "直近のご予約はありません。\n";
     s += "予約内容の案内はこの情報の範囲で答えてよい。「どこの医院・店舗か」を聞かれたら＠以降の拠点名で答える。拠点名の無い予約では「指定がない」等の言及はせず、拠点に触れずに答える（単一院の扱い）。キャンセル・日時変更は自分で完了を宣言せず、必ず action を出す（正式な確認文はシステムが送る）。\n";
   } else if (ctx.reason === "unavailable") {
-    s += "本人確認: 不可（自動受付をご利用いただけないお客様）。予約に関する個人情報は一切伝えず、actionも一切出さない（typeは常にnone）。ご用件はクリニックへ直接お電話いただくよう丁寧に案内する。理由の説明はしない。\n";
+    s += "本人確認: 不可（自動受付をご利用いただけないお客様）。予約に関する個人情報は一切伝えず、actionも一切出さない（typeは常にnone）。ご用件はクリニックへ直接お問い合わせいただくよう丁寧に案内する。理由の説明はしない。\n";
   } else if (ctx.reason === "not_linked") {
     s += "本人確認: 未（このLINEアカウントは患者台帳と未連携）。予約に関する個人情報（予約の有無・日時・氏名等）は一切伝えない。\n";
     s += "予約の確認・変更・キャンセルを希望されたら、ご本人確認のためご登録の電話番号とメールアドレスの2点を尋ねる。両方が会話に出そろったら action {type:\"link\", phone, email} を出す（連携の確認文はシステムが送る）。\n";
+    s += "ただし、一度 link を試して一致しなかった電話番号・メールアドレスの組み合わせでは、再び link を出さない（同じ結果になるだけ）。患者が新しい番号・メールを出したときだけ再度 link を出す。クーポンサイト（キレイパス・くまポン等）経由のご予約は台帳に登録が無いことがあるため、その話が出たら link は出さず、ご予約のお名前と日時を伺って needs_human を true にする（スタッフが確認して対応する旨を伝える）。\n";
   } else {
     s += "本人確認: 未（メールアドレスだけでは確認できない）。予約に関する個人情報は一切伝えない。\n";
     s += "予約の確認・変更・キャンセルを希望されたら、ご本人確認のためご登録の電話番号を尋ねる。番号が会話に出たら action {type:\"verify\", phone} を出す。\n";
@@ -763,9 +764,28 @@ async function baDeliver(t, c, text) {
   return false;
 }
 
+// 「スタッフが対応します」と患者へ案内したうえで、実際に要対応（フラグ付き）としてスタッフへ引き継ぐ。
+// 案内だけして誰も見ない、を防ぐ（自動受付の行き止まりは必ずここを通す）。
+async function baHandoff(t, c, text) {
+  const lastUs = (c.msgs || []).slice().reverse().find(m => m && m.from === "us");
+  const already = lastUs && lastUs.auto && String(lastUs.text || "").trim() === String(text || "").trim();
+  if (!already) {
+    const ok = await baDeliver(t, c, text);
+    if (!ok) { c.draft = text; c.draft0 = text; }
+  }
+  c.status = "todo"; c.flag = true; c.time = nowt(); c.ts = Date.now(); dbSave(t, c);
+  try { notifyAll(t, "🙋 予約自動受付: スタッフ対応に切替: " + (c.name || ""), (lastText(c) || "").slice(0, 90)); } catch (e) {}
+  return true;
+}
+
 // 定型文を送り、送信に失敗したら「下書きに残す＋要対応(todo)＋スタッフ通知」でエスカレーション。
 // 予約操作は既に実行/受付済みのことがあるため、送信失敗でも AI下書きで上書きせず必ずスタッフへ引き継ぐ。
 async function baDeliverOrEscalate(t, c, text, opts) {
+  // 同じ自動返信を2回続けて送らない（定型文ループ防止）。2回目からは自動対応を打ち切り、スタッフ引き継ぎに切り替える。
+  const lastUs0 = (c.msgs || []).slice().reverse().find(m => m && m.from === "us");
+  if (lastUs0 && lastUs0.auto && String(lastUs0.text || "").trim() === String(text || "").trim()) {
+    return await baHandoff(t, c, "たびたび恐れ入ります。こちらの件は担当スタッフが確認のうえ、こちらからあらためてご連絡いたします。お手数をおかけしますが、このままお待ちくださいませ。");
+  }
   const sent = await baDeliver(t, c, text);
   if (sent) return true;
   if (opts && opts.clearPendingOnFail && c.ba) c.ba.pending = null; // 患者が見ていない確認への「はい」を防ぐ（サーバー側の依頼は30分で自然失効）
@@ -808,10 +828,14 @@ async function baHandlePending(t, c) {
   let reply = r.text ? String(r.text) : null;
   if (!reply) {
     if (r.ok) reply = cls === "yes" ? "お手続きが完了しました。" : "かしこまりました。変更は行っておりませんので、ご安心ください。";
-    else reply = "申し訳ありません、お手続きを完了できませんでした。お手数ですが、クリニックまで直接ご連絡ください。";
+    else reply = "申し訳ありません、お手続きを完了できませんでした。担当スタッフが確認してご対応いたしますので、お手数ですがこのままお待ちくださいませ。";
   }
   if (r.ok === false && Array.isArray(r.alternatives) && r.alternatives.length) {
     reply += "\n空いているお時間: " + r.alternatives.map(x => x.label).join(" / ");
+    return await baDeliverOrEscalate(t, c, reply); // 代替枠あり＝会話を続けられるのでスタッフ引き継ぎ不要
+  }
+  if (r.ok === false && ["not_found", "not_changeable", "line_bound_other", "bad_request"].includes(String(r.error || ""))) {
+    return await baHandoff(t, c, reply); // 自動では進められない失敗＝案内したうえで実際にスタッフへ引き継ぐ
   }
   return await baDeliverOrEscalate(t, c, reply);
 }
@@ -834,7 +858,7 @@ async function baAction(t, c, act, baCtx) {
       const lines = list.length ? "直近のご予約:\n" + list.map(a => "・" + a.label + "〜 " + a.menu + "（" + a.statusJa + "）").join("\n") : "現在、直近のご予約はございません。";
       return await baDeliverOrEscalate(t, c, "ご本人様の確認がとれました。\n" + lines + "\nご予約の変更・キャンセルをご希望の場合は、ご希望の内容をお送りください。");
     }
-    return await baDeliverOrEscalate(t, c, "申し訳ありません、ご登録の情報との一致を確認できませんでした。お手数ですが、クリニックまで直接お電話でお問い合わせください。");
+    return await baDeliverOrEscalate(t, c, "申し訳ありません、ご登録の情報との一致を確認できませんでした。お手数ですが、ご登録のお電話番号をもう一度お確かめのうえお送りくださいませ。");
   }
 
   if (type === "link") { // LINE未連携: 電話＋メール両方一致で特定できたら連携の確認を送る
@@ -849,9 +873,9 @@ async function baAction(t, c, act, baCtx) {
       return await baDeliverOrEscalate(t, c, r.confirmText, { clearPendingOnFail: true });
     }
     if (r && (r.error === "line_bound_other" || r.error === "patient_has_line")) {
-      return await baDeliverOrEscalate(t, c, "申し訳ありません、このLINEアカウントの連携手続きはこちらでは行えませんでした。お手数ですが、クリニックまで直接お問い合わせください。");
+      return await baHandoff(t, c, "申し訳ありません、このLINEアカウントの連携はこちらでの確認が必要です。担当スタッフが確認してご対応いたしますので、お手数ですがこのままお待ちくださいませ。");
     }
-    return await baDeliverOrEscalate(t, c, "申し訳ありません、ご登録の情報との一致を確認できませんでした。お電話番号とメールアドレスをもう一度お確かめのうえお送りいただくか、クリニックまで直接お問い合わせください。");
+    return await baDeliverOrEscalate(t, c, "申し訳ありません、頂戴したお電話番号・メールアドレスに一致するご登録が見つかりませんでした。お手数ですが、もう一度お確かめのうえお送りくださいませ。\nなお、クーポンサイト（キレイパス・くまポン等）経由でご予約の場合は、こちらにご登録が無いことがございます。その場合は担当スタッフがご対応いたしますので、ご予約のお名前とご予約日時をこのままお知らせください。");
   }
 
   if (!apptId) return false; // 対象の予約を特定できない → AIの下書き（どの予約か質問）に任せる
@@ -895,7 +919,7 @@ async function baAction(t, c, act, baCtx) {
       return await baDeliverOrEscalate(t, c, r.confirmText, { clearPendingOnFail: true });
     }
     if (r && r.error === "not_changeable") {
-      return await baDeliverOrEscalate(t, c, "申し訳ありません、このご予約はキャンセルの受付期限を過ぎているため、こちらでは承れません。お手数ですが、クリニックまで直接ご連絡ください。");
+      return await baHandoff(t, c, "申し訳ありません、このご予約は自動受付でのキャンセル期限を過ぎております。担当スタッフが確認してご対応いたしますので、お手数ですがこのままお待ちくださいませ。");
     }
     return false;
   }
@@ -917,7 +941,7 @@ async function baAction(t, c, act, baCtx) {
       return await baDeliverOrEscalate(t, c, "申し訳ありません、ご希望のお時間は埋まっております。" + (alts ? "\n同じ日の空き時間はこちらです:\n" + alts + "\nご希望のお時間をお知らせください。" : "別の日時のご希望をお知らせください。"));
     }
     if (r && r.error === "not_changeable") {
-      return await baDeliverOrEscalate(t, c, "申し訳ありません、このご予約は変更の受付期限を過ぎているため、こちらでは承れません。お手数ですが、クリニックまで直接ご連絡ください。");
+      return await baHandoff(t, c, "申し訳ありません、このご予約は自動受付での変更期限を過ぎております。担当スタッフが確認してご対応いたしますので、お手数ですがこのままお待ちくださいませ。");
     }
     return false;
   }
