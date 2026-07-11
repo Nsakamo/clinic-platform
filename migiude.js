@@ -59,6 +59,20 @@ async function saveTenantConfig(t) {
   if (pool) await pool.query("UPDATE tenants SET name=$2, config=$3 WHERE slug=$1", [t.slug, t.name, t.config]);
 }
 
+// ===== 自動化ダッシュボード用の日次カウンタ（受信トレイ上部の帯に使う） =====
+// in=患者からの受信数 / auto=AIが自動送信した返信数 / staff=スタッフが送信した返信数 / rules=学習・更新した店舗ルール数
+function statBump(t, key, n) {
+  try {
+    const day = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Tokyo" });
+    const all = (t.config.statsDaily = t.config.statsDaily || {});
+    const d = (all[day] = all[day] || {});
+    d[key] = (d[key] || 0) + (n || 1);
+    const keys = Object.keys(all).sort();
+    while (keys.length > 60) delete all[keys.shift()]; // 直近60日だけ保持
+    saveTenantConfig(t).catch(() => {});
+  } catch (e) {}
+}
+
 // 接続設定アクセサ（テナントは全てUIで設定する。環境変数へのフォールバックは無し。ホスト/ポートのみGmail既定値）
 function cf(t, k) { const v = t.config.conn[k]; return v == null ? "" : String(v); }
 // 資格情報フィールドは decField 経由で読む（enc:v1: なら復号、平文ならそのまま）。ホスト/ユーザー/ポートは平文のまま。
@@ -440,6 +454,7 @@ async function distillRules(t, c, opts) {
         if (r) applied.push({ action: "add", id: r.id, title });
       }
     }
+    if (applied.length) statBump(t, "rules", applied.length);
     return applied;
   } catch (e) { console.error("distillRules:", e && e.message); return []; }
 }
@@ -812,6 +827,7 @@ async function classifyApproval(t, confirmText, text) {
 async function baDeliver(t, c, text) {
   const r = await deliverText(t, c, text);
   if (r && r.sent) {
+    statBump(t, "auto");
     c.msgs.push({ from: "us", text, auto: true, time: nowt() });
     c.draft = ""; c.draft0 = ""; c.status = "done"; c.lastAuto = true;
     c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
@@ -1029,6 +1045,7 @@ function scheduleAutoReply(t, c, draftText, recvAt, delayMin) {
       if (!lastMsg || lastMsg.from !== "them") return; // 待機中に誰かが返信した
       const r = await deliverText(t, cur, draftText);
       if (r.sent) {
+        statBump(t, "auto");
         cur.msgs.push({ from: "us", text: draftText, auto: true, time: nowt() });
         cur.draft = ""; cur.draft0 = ""; cur.status = "done"; cur.lastAuto = true;
         cur.time = nowt(); cur.ts = Date.now(); cur.last = lastText(cur); dbSave(t, cur);
@@ -1124,6 +1141,7 @@ async function handleInbound(t, opts) {
   if (opts.acct) c.acct = opts.acct; // どの連携アカウント（LINEチャネル/メールアドレス）経由か
   const med = ["image", "video", "file", "audio"].includes(opts.media) ? opts.media : null;
   c.msgs.push({ from: "them", text: opts.text || "", media: med, mediaId: med ? (opts.mediaId || null) : null, fileName: med === "file" ? (opts.fileName || "ファイル") : undefined, time: nowt() });
+  statBump(t, "in");
   if (opts.subject) c.subject = String(opts.subject).slice(0, 300);
   c.status = "todo"; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
 
@@ -1174,7 +1192,7 @@ async function handleInbound(t, opts) {
         autoScheduled = true;
       } else {
         const r = await deliverText(t, c, draftText);
-        if (r.sent) { c.msgs.push({ from: "us", text: draftText, auto: true, time: nowt() }); c.draft = ""; c.draft0 = ""; c.status = "done"; c.lastAuto = true; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c); autoSent = true; }
+        if (r.sent) { statBump(t, "auto"); c.msgs.push({ from: "us", text: draftText, auto: true, time: nowt() }); c.draft = ""; c.draft0 = ""; c.status = "done"; c.lastAuto = true; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c); autoSent = true; }
       }
     }
   } catch (e) {}
@@ -1351,6 +1369,20 @@ app.post("/api/ingest", async (req, res) => {
   res.json({ ok: true, ...r });
 });
 
+// 自動化ダッシュボード：直近7日（日本時間）の集計を返す
+app.get("/api/stats", guard, (req, res) => {
+  const t = req.tenant;
+  const all = (t.config && t.config.statsDaily) || {};
+  const sum = { in: 0, auto: 0, staff: 0, rules: 0 };
+  for (let i = 0; i < 7; i++) {
+    const dk = new Date(Date.now() - i * 86400000).toLocaleDateString("sv-SE", { timeZone: "Asia/Tokyo" });
+    const d = all[dk] || {};
+    sum.in += d.in || 0; sum.auto += d.auto || 0; sum.staff += d.staff || 0; sum.rules += d.rules || 0;
+  }
+  const replies = sum.auto + sum.staff;
+  res.json({ ok: true, week: { in: sum.in, auto: sum.auto, staff: sum.staff, rules: sum.rules, autoRate: replies ? Math.round(sum.auto * 100 / replies) : null } });
+});
+
 app.get("/api/conversations", guard, (req, res) => {
   const arr = Object.values(req.tenant.store).sort((a, b) => {
     if (a.flag && !b.flag) return -1; if (!a.flag && b.flag) return 1;
@@ -1413,6 +1445,7 @@ app.post("/api/send", guard, async (req, res) => {
   if (sent) {
     const draft0 = String(c.draft0 || "").trim(); // 学習判定用に、消す前のAI初回下書きを確保
     c.msgs.push({ from: "us", text, time: nowt() }); c.draft = ""; c.status = "done"; c.flag = false; c.lastAuto = false; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
+    statBump(t, "staff");
     const q0 = c.msgs.filter(m => m.from === "them").slice(-3).map(m => m.text || "").join(" ").trim();
     // ルール蒸留：スタッフの返信＋編集チャットの指示から、再利用できる事実・規定を店舗ルールへ自動登録。
     // （対応例の保存・矛盾チェックと並列で回して送信応答を遅くしない）
@@ -1749,6 +1782,7 @@ async function draftChatSaveRule(t, ruleObj) {
     const dup = rulesSearch(t, title + " " + content, 1)[0];
     if (dup && similarEnough(dup.title + dup.content, title + content)) return null;
     const r = await ruleAdd(t, title, content);
+    if (r) statBump(t, "rules");
     return r ? { id: r.id, title: r.title } : null;
   } catch (e) { return null; }
 }
@@ -2749,6 +2783,7 @@ const PAGE = `<!DOCTYPE html>
 <div id="app">
   <div id="list">
     <div id="listHead"><span>📥 受信トレイ</span><span class="badge" id="cnt"></span></div>
+    <div id="statsBar" style="display:none;padding:6px 12px;font-size:11px;color:#6b7280;background:#f8fafc;border-bottom:1px solid var(--line);line-height:1.7;"></div>
     <div id="tools">
       <button class="tbtn migi" onclick="openAsst(null)">🤝 みぎうで君</button>
       <button class="tbtn" onclick="window.open('/board','_blank')">🏥 現場ボード</button>
@@ -3537,7 +3572,9 @@ async function refreshModelAlert(){
     }else{ if(dot)dot.style.display="none"; if(box)box.style.display="none"; }
   }catch(e){}
 }
-load(); setInterval(load, 6000); refreshModelAlert();
+// 自動化ダッシュボード帯（直近7日の自動対応状況）。起動時＋5分ごとに更新。
+async function loadStats(){try{const r=await fetch("/api/stats");const j=await r.json();if(!j||!j.ok)return;const w=j.week||{};const el=document.getElementById("statsBar");if(!el)return;const rate=(w.autoRate==null)?"—":(w.autoRate+"%");el.innerHTML="📊 直近7日：問い合わせ <b>"+(w.in||0)+"</b> 件 ・ AI自動返信率 <b>"+rate+"</b>（"+(w.auto||0)+"件）・ スタッフ返信 <b>"+(w.staff||0)+"</b> 件 ・ 学習ルール <b>+"+(w.rules||0)+"</b> 件";el.style.display="block";}catch(e){}}
+load(); setInterval(load, 6000); refreshModelAlert(); loadStats(); setInterval(loadStats, 300000);
 </script>
 </body>
 </html>`;
