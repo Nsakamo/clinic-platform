@@ -2948,6 +2948,34 @@ let DATA=[];let current=null;
 const roomsEl=document.getElementById("rooms"),chatEl=document.getElementById("chat"),appEl=document.getElementById("app");
 async function load(){ try{ const r=await fetch("/api/conversations"); DATA=await r.json(); }catch(e){} renderList(); if(current){ const c=DATA.find(x=>x.id===current); if(c) syncMsgs(c); } }
 function api(path,body){ return fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); }
+/* ネイティブalert/confirm/promptの置き換え（ブラウザのイベントループを止めない自前モーダル。自動テスト・拡張機能対応） */
+function uiDlg(msg,kind,def){
+ return new Promise(function(res){
+  var ov=document.createElement("div");
+  ov.style.cssText="position:fixed;inset:0;z-index:2147483000;background:rgba(15,23,42,.45);display:flex;align-items:center;justify-content:center;padding:16px;";
+  var card=document.createElement("div");
+  card.style.cssText="background:#fff;border-radius:14px;box-shadow:0 20px 50px rgba(2,6,23,.25);max-width:26rem;width:100%;padding:18px;font-size:14px;line-height:1.7;color:#111827;";
+  var m=document.createElement("div"); m.style.cssText="white-space:pre-wrap;word-break:break-word;"; m.textContent=(msg==null?"":String(msg)); card.appendChild(m);
+  var input=null;
+  if(kind==="prompt"){ input=document.createElement("input"); input.type="text"; input.value=(def==null?"":String(def)); input.style.cssText="display:block;width:100%;margin-top:12px;border:1px solid #d1d5db;border-radius:8px;padding:8px 10px;font-size:14px;box-sizing:border-box;"; card.appendChild(input); }
+  var row=document.createElement("div"); row.style.cssText="display:flex;justify-content:flex-end;gap:8px;margin-top:14px;";
+  function mkBtn(label,primary){ var b=document.createElement("button"); b.type="button"; b.textContent=label; b.style.cssText="border-radius:8px;padding:8px 18px;font-size:13px;font-weight:600;cursor:pointer;"+(primary?"background:#06c755;border:1px solid #06c755;color:#fff;":"background:#fff;border:1px solid #d1d5db;color:#374151;"); return b; }
+  function fin(v){ document.removeEventListener("keydown",onKey,true); ov.remove(); res(v); }
+  function okVal(){ return kind==="prompt"?(input?input.value:""):(kind==="confirm"?true:undefined); }
+  function ngVal(){ return kind==="prompt"?null:(kind==="confirm"?false:undefined); }
+  function onKey(e){ if(e.key==="Escape"){ e.preventDefault(); e.stopPropagation(); fin(ngVal()); } else if(e.key==="Enter"){ e.preventDefault(); e.stopPropagation(); fin(okVal()); } }
+  if(kind!=="alert"){ var c=mkBtn("キャンセル",false); c.addEventListener("click",function(){ fin(ngVal()); }); row.appendChild(c); }
+  var ok=mkBtn("OK",true); ok.addEventListener("click",function(){ fin(okVal()); }); row.appendChild(ok);
+  card.appendChild(row); ov.appendChild(card);
+  ov.addEventListener("mousedown",function(e){ if(e.target===ov) fin(ngVal()); });
+  document.addEventListener("keydown",onKey,true);
+  document.body.appendChild(ov);
+  if(input){ input.focus(); input.select(); } else { ok.focus(); }
+ });
+}
+function uiAlert(m){ return uiDlg(m,"alert"); }
+function uiConfirm(m){ return uiDlg(m,"confirm"); }
+function uiPrompt(m,d){ return uiDlg(m,"prompt",d); }
 function filt(){ const q=(document.getElementById("search").value||"").trim(); return q?DATA.filter(r=>(r.name||"").includes(q)||(r.last||"").includes(q)):DATA; }
 function chIcon(ch){return ch==="line"?'<span class="ch line">L</span>':'<span class="ch mail">✉</span>';}
 function statIcon(r){ if(r.flag)return '<i class="flagicon">⚑</i>'; if(r.status==="done")return r.lastAuto?'<span title="自動返信済み" style="font-size:13px;">🤖</span>':''; return '<span class="dot"></span>'; }
@@ -3004,8 +3032,8 @@ async function copyUnans(btn,apptId){
     var r=await fetch("/api/customer-unanswered?id="+encodeURIComponent(current)+"&apptId="+encodeURIComponent(apptId));
     var j=await r.json();
     if(j&&j.ok&&j.url){ copyText(j.url); if(btn){ btn.textContent="コピーしました"; setTimeout(function(){ try{btn.textContent=o;}catch(e){} },1500); } }
-    else { if(btn) btn.textContent=o; alert("URLを取得できませんでした"); }
-  }catch(e){ if(btn) btn.textContent=o; alert("URLを取得できませんでした"); }
+    else { if(btn) btn.textContent=o; uiAlert("URLを取得できませんでした"); }
+  }catch(e){ if(btn) btn.textContent=o; uiAlert("URLを取得できませんでした"); }
 }
 function cpGripHtml(){ return '<div data-cp="collapse" class="cpGrip"><span class="cpGripBar"></span><span class="cpMuted">▲ 隠す</span></div>'; }
 function renderCustomer(id,j){
@@ -3292,8 +3320,8 @@ async function karteEditInline(recordId,i){
     var r=await api("/api/customer-karte",{id:current,action:"edit",recordId:recordId,body:body});
     var j=await r.json();
     if(j&&j.ok){ delete karteCache[current]; reloadKarte(); }
-    else { alert(j&&j.error==="not_editable"?"この記録は編集できません":"編集に失敗しました"); }
-  }catch(e){ alert("編集に失敗しました"); }
+    else { uiAlert(j&&j.error==="not_editable"?"この記録は編集できません":"編集に失敗しました"); }
+  }catch(e){ uiAlert("編集に失敗しました"); }
 }
 function karteClick(e){
   var b=e.target&&e.target.closest?e.target.closest("[data-cp]"):null; if(!b)return;
@@ -3314,31 +3342,31 @@ async function karteAdd(){
     var r=await api("/api/customer-karte",{id:current,action:"add",patientId:custPid,body:body});
     var j=await r.json();
     if(j&&j.ok){ delete karteCache[current]; reloadKarte(); } // 保存成功→キャッシュ無効化→再取得
-    else { alert("カルテの保存に失敗しました"); }
-  }catch(e){ alert("カルテの保存に失敗しました"); }
+    else { uiAlert("カルテの保存に失敗しました"); }
+  }catch(e){ uiAlert("カルテの保存に失敗しました"); }
 }
 async function karteEdit(recordId){
   if(!current||!recordId)return;
-  var cur=prompt("カルテ記録を編集します。新しい内容を入力してください：", karteEntries[String(recordId)]||"");
+  var cur=await uiPrompt("カルテ記録を編集します。新しい内容を入力してください：", karteEntries[String(recordId)]||"");
   if(cur===null)return;
   var body=cur.trim(); if(!body)return;
   try{
     var r=await api("/api/customer-karte",{id:current,action:"edit",recordId:recordId,body:body});
     var j=await r.json();
     if(j&&j.ok){ openKarte(); }
-    else { alert(j&&j.error==="not_editable"?"この記録は編集できません":"編集に失敗しました"); }
-  }catch(e){ alert("編集に失敗しました"); }
+    else { uiAlert(j&&j.error==="not_editable"?"この記録は編集できません":"編集に失敗しました"); }
+  }catch(e){ uiAlert("編集に失敗しました"); }
 }
 async function doApptCancel(apptId){
   if(!current||!apptId)return;
-  var reason=prompt("この予約をキャンセルします。理由（任意・患者に送る自動連絡に使われる場合があります）:","クリニック都合");
+  var reason=await uiPrompt("この予約をキャンセルします。理由（任意・患者に送る自動連絡に使われる場合があります）:","クリニック都合");
   if(reason===null)return;
   try{
     var r=await api("/api/customer-appt-cancel",{id:current,appointmentId:apptId,reason:reason});
     var j=await r.json();
     if(j&&j.ok){ loadCustomer(current); }
-    else { alert(j&&j.error==="not_cancellable"?"この予約はキャンセルできません(期限切れ/過去/処理済み)":"キャンセルに失敗しました"); }
-  }catch(e){ alert("キャンセルに失敗しました"); }
+    else { uiAlert(j&&j.error==="not_cancellable"?"この予約はキャンセルできません(期限切れ/過去/処理済み)":"キャンセルに失敗しました"); }
+  }catch(e){ uiAlert("キャンセルに失敗しました"); }
 }
 function linkToggle(){ var b=document.getElementById("custLinkBox"); if(!b)return; b.style.display=(!b.style.display||b.style.display==="none")?"block":"none"; }
 function cpOpen(url){ try{ window.open(url,"_blank"); }catch(e){} }
@@ -3385,13 +3413,13 @@ async function custSearchGo(){
 }
 async function doLink(pid){
   if(!current)return;
-  if(!confirm("この顧客を現在のLINE会話に連携しますか？"))return;
+  if(!await uiConfirm("この顧客を現在のLINE会話に連携しますか？"))return;
   try{
     var r=await api("/api/customer-link",{id:current,patientId:pid,action:"link"});
     var j=await r.json();
     if(j&&j.ok){ loadCustomer(current); }
-    else { alert(j&&j.error==="already_linked_other"?"このLINEは別の顧客に連携済みです":(j&&j.error==="not_line"?"LINE会話のみ連携できます":"連携に失敗しました")); }
-  }catch(e){ alert("連携に失敗しました"); }
+    else { uiAlert(j&&j.error==="already_linked_other"?"このLINEは別の顧客に連携済みです":(j&&j.error==="not_line"?"LINE会話のみ連携できます":"連携に失敗しました")); }
+  }catch(e){ uiAlert("連携に失敗しました"); }
 }
 // ===== 質問チップ：返信する内容を選んで下書きを作り直す =====
 let selTopics=null;
@@ -3408,12 +3436,12 @@ function renderTopicChips(r){
     '<button type="button" id="redraftBtn" class="cbtn" style="margin:2px 0 6px;font-size:12px;padding:5px 10px;" onclick="redraftSelected()">選んだ内容で下書きを作成</button>';
 }
 function toggleTopic(i){ const r=DATA.find(x=>x.id===current); if(!r||!Array.isArray(r.topics))return; const tp=r.topics.filter(x=>x&&x.q); const q=tp[i]&&tp[i].q; if(q==null)return; if(!selTopics)selTopics=new Set(); if(selTopics.has(q))selTopics.delete(q); else selTopics.add(q); renderTopicChips(r); }
-async function redraftSelected(){ if(!current||!selTopics)return; const sel=[...selTopics]; if(!sel.length){alert("返信する内容を1つ以上選んでください");return;} const btn=document.getElementById("redraftBtn"); if(btn){btn.disabled=true;btn.textContent="作成中…";} try{ const rr=await api("/api/redraft",{id:current,selected:sel}); const j=await rr.json(); if(j&&j.ok&&typeof j.draft==="string"){ const d=document.getElementById("draft"); if(d)d.value=j.draft; const cd=DATA.find(x=>x.id===current); if(cd){cd.draft=j.draft; if(Array.isArray(j.topics))cd.topics=j.topics;} }else{ alert("作り直しに失敗しました"); } }catch(e){ alert("作り直しに失敗しました"); } if(btn){btn.disabled=false;btn.textContent="選んだ内容で下書きを作成";} }
+async function redraftSelected(){ if(!current||!selTopics)return; const sel=[...selTopics]; if(!sel.length){uiAlert("返信する内容を1つ以上選んでください");return;} const btn=document.getElementById("redraftBtn"); if(btn){btn.disabled=true;btn.textContent="作成中…";} try{ const rr=await api("/api/redraft",{id:current,selected:sel}); const j=await rr.json(); if(j&&j.ok&&typeof j.draft==="string"){ const d=document.getElementById("draft"); if(d)d.value=j.draft; const cd=DATA.find(x=>x.id===current); if(cd){cd.draft=j.draft; if(Array.isArray(j.topics))cd.topics=j.topics;} }else{ uiAlert("作り直しに失敗しました"); } }catch(e){ uiAlert("作り直しに失敗しました"); } if(btn){btn.disabled=false;btn.textContent="選んだ内容で下書きを作成";} }
 async function markDone(){const id=current;await api("/api/done",{id});await load();}
-async function markAllDone(){if(!confirm("すべてのチャットを「対応済み」に変更します。よろしいですか？"))return;try{const r=await api("/api/done-all",{});const j=await r.json();closeSet();if(current){closeChat();}await load();alert((j.count||0)+"件を対応済みにしました");}catch(e){alert("変更に失敗しました");}}
-async function sendMsg(){if(window.__sendBusy)return;const id=current;const t=document.getElementById("draft").value.trim();if(!t)return;window.__sendBusy=true;const _sb=document.querySelector("#cbtns .send");if(_sb){_sb.disabled=true;_sb.textContent="送信中…";}try{const cd0=DATA.find(x=>x.id===id);const orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim();const edited=(t!==orig);let instr="";try{if(dSessions&&dSessions[id]&&Array.isArray(dSessions[id].hist)){instr=dSessions[id].hist.filter(m=>m&&m.role==="user").map(m=>String(m.content||"")).join(" / ").slice(0,1500);}}catch(e){}const r=await api("/api/send",{id,text:t,instr:edited?instr:""});let j={};try{j=await r.json();}catch(e){}if(j.sent){const d0=document.getElementById("draft");if(d0)d0.value="";const cd=DATA.find(x=>x.id===id);if(cd)cd.draft="";if(j.conflict){showConflict(j.conflict);}else if(j.learnedRules&&j.learnedRules.length){showRuleToast(j.learnedRules);}else if(edited&&orig.length>0){showLearnToast(j.learnedId);}await load();}else{const m={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です"}[j.sendErr]||("送信失敗: "+(j.sendErr||"不明"));alert(m+"\\n（下書きは消えていません）");}}finally{window.__sendBusy=false;const _sb2=document.querySelector("#cbtns .send");if(_sb2){_sb2.disabled=false;_sb2.textContent="送信";}}}
-function attach(){const inp=document.createElement("input");inp.type="file";inp.accept="image/*,video/*,application/pdf,.pdf,.doc,.docx,.xls,.xlsx";inp.onchange=async()=>{const f=inp.files[0];if(!f)return;if(f.size>10*1024*1024){alert("10MB以下のファイルにしてください");return;}const btn=document.getElementById("attach");if(btn){btn.disabled=true;btn.textContent="⏳";}try{const b64=await new Promise((res,rej)=>{const rd=new FileReader();rd.onload=()=>res(String(rd.result).split(",")[1]);rd.onerror=rej;rd.readAsDataURL(f);});const up=await api("/api/upload",{name:f.name,mime:f.type||"application/octet-stream",data:b64});const uj=await up.json();if(!uj.ok)throw new Error(uj.error||"upload");const sr=await api("/api/send-file",{id:current,fileId:uj.fileId});const sj=await sr.json();if(!sj.sent)alert("送信失敗: "+(sj.sendErr||"不明"));await load();}catch(e){alert("ファイル送信に失敗しました: "+e.message);}if(btn){btn.disabled=false;btn.textContent="📎";}};inp.click();}
-async function shareClinic(){const note=prompt("現場に伝える内容を入力してください（空欄のままOKを押すと、お客様の直近メッセージをそのまま共有します）","");if(note===null)return;try{const r=await api("/api/share",{id:current,note:note||""});const j=await r.json();if(j.ok)alert("現場ボードに共有しました");else alert("共有に失敗しました");}catch(e){alert("共有に失敗しました");}}
+async function markAllDone(){if(!await uiConfirm("すべてのチャットを「対応済み」に変更します。よろしいですか？"))return;try{const r=await api("/api/done-all",{});const j=await r.json();closeSet();if(current){closeChat();}await load();uiAlert((j.count||0)+"件を対応済みにしました");}catch(e){uiAlert("変更に失敗しました");}}
+async function sendMsg(){if(window.__sendBusy)return;const id=current;const t=document.getElementById("draft").value.trim();if(!t)return;window.__sendBusy=true;const _sb=document.querySelector("#cbtns .send");if(_sb){_sb.disabled=true;_sb.textContent="送信中…";}try{const cd0=DATA.find(x=>x.id===id);const orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim();const edited=(t!==orig);let instr="";try{if(dSessions&&dSessions[id]&&Array.isArray(dSessions[id].hist)){instr=dSessions[id].hist.filter(m=>m&&m.role==="user").map(m=>String(m.content||"")).join(" / ").slice(0,1500);}}catch(e){}const r=await api("/api/send",{id,text:t,instr:edited?instr:""});let j={};try{j=await r.json();}catch(e){}if(j.sent){const d0=document.getElementById("draft");if(d0)d0.value="";const cd=DATA.find(x=>x.id===id);if(cd)cd.draft="";if(j.conflict){showConflict(j.conflict);}else if(j.learnedRules&&j.learnedRules.length){showRuleToast(j.learnedRules);}else if(edited&&orig.length>0){showLearnToast(j.learnedId);}await load();}else{const m={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です"}[j.sendErr]||("送信失敗: "+(j.sendErr||"不明"));uiAlert(m+"\\n（下書きは消えていません）");}}finally{window.__sendBusy=false;const _sb2=document.querySelector("#cbtns .send");if(_sb2){_sb2.disabled=false;_sb2.textContent="送信";}}}
+function attach(){const inp=document.createElement("input");inp.type="file";inp.accept="image/*,video/*,application/pdf,.pdf,.doc,.docx,.xls,.xlsx";inp.onchange=async()=>{const f=inp.files[0];if(!f)return;if(f.size>10*1024*1024){uiAlert("10MB以下のファイルにしてください");return;}const btn=document.getElementById("attach");if(btn){btn.disabled=true;btn.textContent="⏳";}try{const b64=await new Promise((res,rej)=>{const rd=new FileReader();rd.onload=()=>res(String(rd.result).split(",")[1]);rd.onerror=rej;rd.readAsDataURL(f);});const up=await api("/api/upload",{name:f.name,mime:f.type||"application/octet-stream",data:b64});const uj=await up.json();if(!uj.ok)throw new Error(uj.error||"upload");const sr=await api("/api/send-file",{id:current,fileId:uj.fileId});const sj=await sr.json();if(!sj.sent)uiAlert("送信失敗: "+(sj.sendErr||"不明"));await load();}catch(e){uiAlert("ファイル送信に失敗しました: "+e.message);}if(btn){btn.disabled=false;btn.textContent="📎";}};inp.click();}
+async function shareClinic(){const note=await uiPrompt("現場に伝える内容を入力してください（空欄のままOKを押すと、お客様の直近メッセージをそのまま共有します）","");if(note===null)return;try{const r=await api("/api/share",{id:current,note:note||""});const j=await r.json();if(j.ok)uiAlert("現場ボードに共有しました");else uiAlert("共有に失敗しました");}catch(e){uiAlert("共有に失敗しました");}}
 async function toggleFlag(){if(!current)return;try{const r=await api("/api/tag",{id:current});const j=await r.json();const b=document.getElementById("flagBtn");if(b)b.textContent=j.flag?"⚑ 要対応を外す":"⚑ 要対応";const cd=DATA.find(x=>x.id===current);if(cd)cd.flag=j.flag;renderList();}catch(e){}}
 // ---- AIで作り直す（会話型・下書きを会話で磨く。会話ごとにセッションを保持し再開可能）----
 let dHist=[],dLog=[],dSessions={};
@@ -3546,7 +3574,7 @@ async function asstSend(){const t=document.getElementById("asstText");const txt=
   const ph=spinAdd(asstMsgsEl,"考え中…");asstCall(ph);}
 function asstAttach(){const inp=document.createElement("input");inp.type="file";inp.accept="image/*,.pdf,.csv,.txt";
   inp.onchange=async()=>{const f=inp.files[0];if(!f)return;
-    if(f.size>14*1024*1024){alert("14MB以下のファイルにしてください");return;}
+    if(f.size>14*1024*1024){uiAlert("14MB以下のファイルにしてください");return;}
     amAdd("user","📎 "+f.name);const ph=spinAdd(asstMsgsEl,"資料を読み込んでいます…（少し時間がかかります）");
     try{
       const b64=await new Promise((res2,rej)=>{const rd=new FileReader();rd.onload=()=>res2(String(rd.result).split(",")[1]);rd.onerror=rej;rd.readAsDataURL(f);});
@@ -3570,7 +3598,7 @@ function asstAttach(){const inp=document.createElement("input");inp.type="file";
   inp.click();}
 // スタッフの記憶（恒久ルール）の一覧描画・追加・削除
 function renderPrefs(prefs){const el=document.getElementById("prefList");if(!el)return;const a=Array.isArray(prefs)?prefs:[];if(!a.length){el.innerHTML='<span style="color:#9ca3af;">まだ記憶はありません。</span>';return;}el.innerHTML=a.map(p=>{const id=(p&&p.id!=null)?p.id:"";const tx=(typeof p==="string")?p:((p&&p.text)||"");return '<div style="display:flex;align-items:center;gap:6px;padding:3px 0;"><span style="flex:1;">・'+esc(tx)+'</span><button onclick="delPref('+JSON.stringify(id)+')" style="border:none;background:transparent;color:#dc2626;cursor:pointer;font-size:14px;">×</button></div>';}).join("");}
-async function addPref(){const inp=document.getElementById("prefInput");const text=(inp&&inp.value||"").trim();if(!text)return;try{const r=await api("/api/pref-add",{text});const j=await r.json();if(j.ok){if(inp)inp.value="";renderPrefs(j.prefs||[]);}}catch(e){alert("追加に失敗しました");}}
+async function addPref(){const inp=document.getElementById("prefInput");const text=(inp&&inp.value||"").trim();if(!text)return;try{const r=await api("/api/pref-add",{text});const j=await r.json();if(j.ok){if(inp)inp.value="";renderPrefs(j.prefs||[]);}}catch(e){uiAlert("追加に失敗しました");}}
 async function delPref(id){try{const r=await api("/api/pref-delete",{id});const j=await r.json();if(j.ok)renderPrefs(j.prefs||[]);}catch(e){}}
 // 学習トースト：下書きを修正して送った直後だけ「✓学習しました」と控えめに表示。特例だった場合は「学習しない」で今保存した例を取り消せる。
 let learnToastTimer=null;
@@ -3616,62 +3644,62 @@ function renderAccts(c){const el=document.getElementById("acctList");if(!el)retu
   (c.extraMails||[]).forEach((a,i)=>{h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;"><span>✉ '+esc(a.name)+' <span style="color:#9ca3af;">'+esc(a.smtpUser)+'</span></span><button class="cbtn" onclick="delAcct(&quot;mail&quot;,'+i+')">削除</button></div>';});
   el.innerHTML=h||'<div style="color:#9ca3af;">追加アカウントはまだありません</div>';}
 async function addLineAcct(){
-  const name=prompt("表示名（例：銀座7丁目院LINE）");if(!name)return;
-  const token=prompt("チャネルアクセストークン（LINE Developersからコピー）");if(!token)return;
-  const secret=prompt("チャネルシークレット");if(!secret)return;
+  const name=await uiPrompt("表示名（例：銀座7丁目院LINE）");if(!name)return;
+  const token=await uiPrompt("チャネルアクセストークン（LINE Developersからコピー）");if(!token)return;
+  const secret=await uiPrompt("チャネルシークレット");if(!secret)return;
   try{const r=await api("/api/conn-add",{kind:"line",name,token:token.trim(),secret:secret.trim()});const j=await r.json();
-    if(j.ok){alert("LINEアカウントを追加しました。\\nLINE Developersのそのチャネルに、このアプリと同じWebhook URLを設定してください。");openSet();}
-    else alert("追加失敗: "+(j.error==="bad_token"?"トークンが正しくありません":j.error||"不明"));
-  }catch(e){alert("追加に失敗しました");}}
+    if(j.ok){uiAlert("LINEアカウントを追加しました。\\nLINE Developersのそのチャネルに、このアプリと同じWebhook URLを設定してください。");openSet();}
+    else uiAlert("追加失敗: "+(j.error==="bad_token"?"トークンが正しくありません":j.error||"不明"));
+  }catch(e){uiAlert("追加に失敗しました");}}
 async function addMailAcct(){
-  const name=prompt("表示名（例：本院メール）");if(!name)return;
-  const u=prompt("メールアドレス");if(!u)return;
-  const p=prompt("アプリパスワード（送受信共通）");if(!p)return;
-  const host=prompt("SMTPホスト（Gmailなら空欄のままOK）","");if(host===null)return;
-  const ihost=host?prompt("IMAPホスト","")||"":"";
+  const name=await uiPrompt("表示名（例：本院メール）");if(!name)return;
+  const u=await uiPrompt("メールアドレス");if(!u)return;
+  const p=await uiPrompt("アプリパスワード（送受信共通）");if(!p)return;
+  const host=await uiPrompt("SMTPホスト（Gmailなら空欄のままOK）","");if(host===null)return;
+  const ihost=host?await uiPrompt("IMAPホスト","")||"":"";
   try{const body={kind:"mail",name,smtpUser:u.trim(),smtpPass:p.trim()};if(host)body.smtpHost=host.trim();if(ihost)body.imapHost=ihost.trim();
     const r=await api("/api/conn-add",body);const j=await r.json();
-    if(j.ok){alert("メールアカウントを追加しました。受信監視も自動で始まります。");openSet();}
-    else alert("追加失敗: "+(j.error||"不明"));
-  }catch(e){alert("追加に失敗しました");}}
-async function delAcct(kind,i){if(!confirm("この連携を削除しますか？（この連携で届く新着が止まります）"))return;
+    if(j.ok){uiAlert("メールアカウントを追加しました。受信監視も自動で始まります。");openSet();}
+    else uiAlert("追加失敗: "+(j.error||"不明"));
+  }catch(e){uiAlert("追加に失敗しました");}}
+async function delAcct(kind,i){if(!await uiConfirm("この連携を削除しますか？（この連携で届く新着が止まります）"))return;
   try{await api("/api/conn-del",{kind,i});}catch(e){}openSet();}
-async function saveConn(){const g=id=>document.getElementById(id).value.trim();const body={lineSecret:g("cLineSecret"),lineToken:g("cLineToken"),smtpHost:g("cSmtpHost"),smtpPort:g("cSmtpPort"),smtpUser:g("cSmtpUser"),smtpPass:g("cSmtpPass"),imapHost:g("cImapHost"),imapPort:g("cImapPort"),imapUser:g("cImapUser"),imapPass:g("cImapPass"),emailInternal:document.getElementById("cEmailInternal").checked};try{const r=await api("/api/conn",body);const j=await r.json();if(j.ok){alert("連携設定を保存しました。\\nLINE: "+(j.lineConfigured?"設定済み":"未設定")+" / メール: "+(j.mailConfigured?"設定済み":"未設定")+" / メール直接監視: "+(j.emailInternal?"オン":"オフ"));["cLineSecret","cLineToken","cSmtpPass","cImapPass"].forEach(id=>document.getElementById(id).value="");}else alert("保存に失敗しました");}catch(e){alert("保存に失敗しました");}}
+async function saveConn(){const g=id=>document.getElementById(id).value.trim();const body={lineSecret:g("cLineSecret"),lineToken:g("cLineToken"),smtpHost:g("cSmtpHost"),smtpPort:g("cSmtpPort"),smtpUser:g("cSmtpUser"),smtpPass:g("cSmtpPass"),imapHost:g("cImapHost"),imapPort:g("cImapPort"),imapUser:g("cImapUser"),imapPass:g("cImapPass"),emailInternal:document.getElementById("cEmailInternal").checked};try{const r=await api("/api/conn",body);const j=await r.json();if(j.ok){uiAlert("連携設定を保存しました。\\nLINE: "+(j.lineConfigured?"設定済み":"未設定")+" / メール: "+(j.mailConfigured?"設定済み":"未設定")+" / メール直接監視: "+(j.emailInternal?"オン":"オフ"));["cLineSecret","cLineToken","cSmtpPass","cImapPass"].forEach(id=>document.getElementById(id).value="");}else uiAlert("保存に失敗しました");}catch(e){uiAlert("保存に失敗しました");}}
 function closeSet(){document.getElementById("setPop").style.display="none";}
-async function saveSet(){const autoReply=document.getElementById("setAuto").checked;const bookingActions=document.getElementById("setBookingActions").checked;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{await api("/api/settings",{autoReply,bookingActions,level,tone,engine,autoDelayMin});alert("設定を保存しました");}catch(e){alert("保存に失敗しました");}closeSet();}
+async function saveSet(){const autoReply=document.getElementById("setAuto").checked;const bookingActions=document.getElementById("setBookingActions").checked;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{await api("/api/settings",{autoReply,bookingActions,level,tone,engine,autoDelayMin});uiAlert("設定を保存しました");}catch(e){uiAlert("保存に失敗しました");}closeSet();}
 async function changeLoginId(){
-  const next=prompt("新しいログインID（半角英数字3〜30文字。スタッフ全員のログインに使います）");if(!next)return;
+  const next=await uiPrompt("新しいログインID（半角英数字3〜30文字。スタッフ全員のログインに使います）");if(!next)return;
   try{const r=await api("/api/change-loginid",{next:next.trim()});const j=await r.json();
-    if(j.ok)alert("ログインIDを「"+j.loginId+"」に変更しました。スタッフに共有してください");
-    else alert(j.error==="id_taken"?"このIDは既に使われています":j.error==="bad_id"?"半角英数字3〜30文字にしてください":"変更に失敗しました");
-  }catch(e){alert("変更に失敗しました");}}
+    if(j.ok)uiAlert("ログインIDを「"+j.loginId+"」に変更しました。スタッフに共有してください");
+    else uiAlert(j.error==="id_taken"?"このIDは既に使われています":j.error==="bad_id"?"半角英数字3〜30文字にしてください":"変更に失敗しました");
+  }catch(e){uiAlert("変更に失敗しました");}}
 async function changePass(){
-  const cur=prompt("現在のパスワードを入力してください");if(cur===null)return;
-  const np=prompt("新しいパスワード（8文字以上）を入力してください");if(np===null)return;
+  const cur=await uiPrompt("現在のパスワードを入力してください");if(cur===null)return;
+  const np=await uiPrompt("新しいパスワード（8文字以上）を入力してください");if(np===null)return;
   try{const r=await api("/api/change-pass",{current:cur,next:np});
-    if(r.ok){alert("パスワードを変更しました。他のスタッフにも新しいパスワードを共有してください（各端末で次回ログインし直しが必要です）。");}
-    else{const j=await r.json().catch(()=>({}));alert(j.error==="wrong_current"?"現在のパスワードが違います":j.error==="too_short"?"8文字以上にしてください":"変更に失敗しました");}
-  }catch(e){alert("変更に失敗しました");}
+    if(r.ok){uiAlert("パスワードを変更しました。他のスタッフにも新しいパスワードを共有してください（各端末で次回ログインし直しが必要です）。");}
+    else{const j=await r.json().catch(()=>({}));uiAlert(j.error==="wrong_current"?"現在のパスワードが違います":j.error==="too_short"?"8文字以上にしてください":"変更に失敗しました");}
+  }catch(e){uiAlert("変更に失敗しました");}
 }
-async function doLogout(){if(!confirm("ログアウトしますか？"))return;try{await api("/api/logout",{});}catch(e){}location.reload();}
+async function doLogout(){if(!await uiConfirm("ログアウトしますか？"))return;try{await api("/api/logout",{});}catch(e){}location.reload();}
 // ---- push notifications ----
 if("serviceWorker" in navigator){navigator.serviceWorker.register("/sw.js").catch(()=>{});}
 function ub64(s){const p="=".repeat((4-s.length%4)%4);const b=(s+p).replace(/-/g,"+").replace(/_/g,"/");const r=atob(b);const a=new Uint8Array(r.length);for(let i=0;i<r.length;i++)a[i]=r.charCodeAt(i);return a;}
 async function enablePush(){
   try{
-    if(!("serviceWorker" in navigator)||!("PushManager" in window)){alert("この端末・ブラウザは通知に対応していません");return;}
+    if(!("serviceWorker" in navigator)||!("PushManager" in window)){uiAlert("この端末・ブラウザは通知に対応していません");return;}
     const ios=/iP(hone|ad|od)/.test(navigator.userAgent);
-    if(ios && !window.matchMedia("(display-mode: standalone)").matches){alert("iPhoneの場合：\\n1. Safariの共有ボタン（□↑）→「ホーム画面に追加」\\n2. ホーム画面のアイコンから開く\\n3. もう一度🔔を押す\\nの順でお願いします");return;}
+    if(ios && !window.matchMedia("(display-mode: standalone)").matches){uiAlert("iPhoneの場合：\\n1. Safariの共有ボタン（□↑）→「ホーム画面に追加」\\n2. ホーム画面のアイコンから開く\\n3. もう一度🔔を押す\\nの順でお願いします");return;}
     const reg=await navigator.serviceWorker.register("/sw.js");
     const perm=await Notification.requestPermission();
-    if(perm!=="granted"){alert("通知が許可されませんでした。端末の設定から許可してください。");return;}
+    if(perm!=="granted"){uiAlert("通知が許可されませんでした。端末の設定から許可してください。");return;}
     const kr=await fetch("/api/push-key");const kj=await kr.json();
-    if(!kj.key){alert("サーバー側の通知設定が未完了です");return;}
+    if(!kj.key){uiAlert("サーバー側の通知設定が未完了です");return;}
     const sub=await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:ub64(kj.key)});
     await api("/api/subscribe",{sub:JSON.parse(JSON.stringify(sub))});
     const b=document.getElementById("bellBtn");if(b)b.textContent="🔔ON";
-    alert("通知をオンにしました。新しい問い合わせが届くとこの端末に通知されます。");
-  }catch(e){alert("通知設定に失敗しました: "+e.message);}
+    uiAlert("通知をオンにしました。新しい問い合わせが届くとこの端末に通知されます。");
+  }catch(e){uiAlert("通知設定に失敗しました: "+e.message);}
 }
 async function refreshModelAlert(){
   try{
