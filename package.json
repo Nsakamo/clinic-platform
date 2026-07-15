@@ -4,7 +4,8 @@
   "description": "右腕くん（問い合わせ自動返答SaaS・マルチテナント）",
   "main": "migiude.js",
   "scripts": {
-    "start": "node migiude.js"
+    "start": "node migiude.js",
+    "check": "node scripts/check-source.js"
   },
   "engines": {
     "node": ">=18"
