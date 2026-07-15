@@ -18,6 +18,7 @@ API を変える／足すときは、まず正本を更新し、右腕くん（`
 - `POST /api/partner/password-reset` … 登録済み管理者メールへ1時間・1回限りの再設定リンクを送信（パスワード非表示）
 - `PUT  /api/partner/account` … パスワード再設定用のアカウントメールを登録・更新
 - `POST /api/partner/send-line` … 患者へLINE送信
+- `POST /api/partner/outbound-events` … うけつけるんがLINE送信に成功した本文・送信時刻・補助コンテンツを右腕くん履歴へ冪等同期
 
 認証キー：`x-partner-key` == `ADMIN_SECRET`（= うけつけるん側の共有キー / `PLATFORM_SECRET`）。
 

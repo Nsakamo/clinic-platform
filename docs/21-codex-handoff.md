@@ -50,6 +50,10 @@
 - 今後の完全な履歴を保証するには、通常返信・Slack承認後の返信をすべて右腕くんのMessaging API経由へ
   集約する。公式管理画面で例外的に送った内容は自動同期できないため、右腕くんで「外部送信メモ」として
   手動記録する補助機能を別途検討する。
+- うけつけるんがMessaging APIで送った予約確認・リマインド・問診催促・各種通知・一斉配信は、
+  `POST /api/partner/outbound-events`で右腕くんへ本文と時刻を同期する。右腕くんに会話が無くても作成し、
+  既存会話があれば送信側メッセージとして追加する。イベントIDと本文＋時刻で再送・右腕くん経由送信との
+  重複を防ぐ。これにより両製品経由のLINE履歴は右腕くんへ集約できる。
 - `CRED_KEY`: 既存資格情報とSlack Webhookの保存時暗号化。32バイト（hex64桁またはbase64）。
 - `PLATFORM_SECRET`, `PARTNER_BOOKING_URL`: うけつけるん連携。右腕くん単体テナントのSlackには不要。
 - `RESET_SMTP_HOST`, `RESET_SMTP_PORT`, `RESET_SMTP_USER`, `RESET_SMTP_PASS`, `RESET_SMTP_FROM`: パスワード再設定メール専用の送信設定。未設定時は対象テナントのSMTPへ後方互換フォールバック。

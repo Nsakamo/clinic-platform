@@ -2924,6 +2924,51 @@ app.post("/api/partner/reset-login", pGuard, async (req,res)=>{
   console.log("partner reset-login:", t.slug, "resetId=" + (req.body.resetId === true)); // 操作ログ（パスワードは記録しない）
   res.json({ ok:true, loginId, password: pw });
 });
+// 受付くんが別経路で送ったLINE本文を右腕くんの会話履歴へ同期する。
+// LINE側には送信履歴本文を取得するAPIがないため、送信元の成功ログをID付きで冪等に取り込む。
+app.post("/api/partner/outbound-events", pGuard, async (req,res)=>{
+  const t = TEN[String(req.body.slug||"")];
+  if(!t) return res.status(404).json({ok:false,error:"no_tenant"});
+  const input = Array.isArray(req.body.events) ? req.body.events.slice(0,200) : [];
+  const accepted = [];
+  const baseTs = new Map();
+  // 既存履歴より古いバックフィルは新しい順にunshiftすると最終的に時系列順になる。新着は古い順にpushする。
+  input.sort((a,b)=>Number(a&&a.ts||0)-Number(b&&b.ts||0));
+  const old = [], fresh = [];
+  for(const ev of input){
+    const uid = String(ev&&ev.userId||"").trim();
+    const c = t.store["line:"+uid];
+    const cutoff = c ? Number(c.ts||0) : 0;
+    (Number(ev&&ev.ts||0) > 0 && Number(ev.ts) <= cutoff ? old : fresh).push(ev);
+  }
+  const ordered = old.sort((a,b)=>Number(b.ts||0)-Number(a.ts||0)).concat(fresh.sort((a,b)=>Number(a.ts||0)-Number(b.ts||0)));
+  for(const ev of ordered){
+    const eventId = String(ev&&ev.id||"").trim().slice(0,200);
+    const channel = String(ev&&ev.channel||"");
+    const uid = String(ev&&ev.userId||"").trim().slice(0,200);
+    const text = String(ev&&ev.text||"").trim().slice(0,5000);
+    const sentAt = Number(ev&&ev.ts||0);
+    if(!eventId || channel!=="line" || !uid || !text || !Number.isFinite(sentAt) || sentAt<=0) continue;
+    const id = "line:"+uid;
+    let c = t.store[id];
+    if(!c){ c=t.store[id]={id,userId:uid,name:String(ev.name||"LINEのお客様").slice(0,120),channel:"line",color:colorFor(id),status:"done",flag:false,msgs:[],draft:"",ts:0}; }
+    if(!baseTs.has(id)) baseTs.set(id, Number(c.ts||0));
+    if((c.msgs||[]).some(m=>m&&(m.externalEventId===eventId||(Array.isArray(m.externalEventAliases)&&m.externalEventAliases.includes(eventId))))){ accepted.push(eventId); continue; }
+    // 右腕くん経由send-lineの直後に同じmessage_logが再同期された場合は、既存1通へIDだけ付けて二重表示しない。
+    const candidates = (c.msgs||[]).filter(m=>{ if(!m||m.from!=="us"||(m.via!=="partner"&&m.via!=="uketsukerun")) return false; const mt=String(m.text||"").trim(); const bodyMatch=mt===text||(Math.min(mt.length,text.length)>=8&&(mt.includes(text)||text.includes(mt))); return bodyMatch&&Math.abs(Number(m.sentAt||0)-sentAt)<120000; }).sort((a,b)=>Math.abs(Number(a.sentAt||0)-sentAt)-Math.abs(Number(b.sentAt||0)-sentAt));
+    const same = candidates[0];
+    if(same){ if(same.externalEventId&&same.externalEventId!==eventId){ same.externalEventAliases=Array.isArray(same.externalEventAliases)?same.externalEventAliases:[]; if(!same.externalEventAliases.includes(eventId)) same.externalEventAliases.push(eventId); }else same.externalEventId=eventId; same.via="uketsukerun"; accepted.push(eventId); dbSave(t,c); continue; }
+    const d = new Date(sentAt);
+    const time = Number.isFinite(d.getTime()) ? d.toLocaleTimeString("ja-JP",{timeZone:"Asia/Tokyo",hour:"2-digit",minute:"2-digit",hour12:false}) : nowt();
+    const msg={from:"us",text,time,sentAt,via:"uketsukerun",externalEventId:eventId,template:String(ev.template||"").slice(0,120)};
+    const cutoff = baseTs.get(id)||0;
+    if(cutoff && sentAt<=cutoff) c.msgs.unshift(msg); else c.msgs.push(msg);
+    if(sentAt>=Number(c.ts||0)){ c.ts=sentAt; c.time=time; c.last=lastText(c); }
+    if(ev.name&&(!c.name||c.name==="LINEのお客様")) c.name=String(ev.name).slice(0,120);
+    accepted.push(eventId); dbSave(t,c);
+  }
+  res.json({ok:true,accepted});
+});
 // 受付くんのAIアシスタント用: 患者へLINE送信（partner key必須）。line_uid優先、無ければphone/emailで既存LINE会話を解決
 app.post("/api/partner/send-line", pGuard, async (req,res)=>{
   const t = TEN[String(req.body.slug||"")];
@@ -2961,7 +3006,7 @@ app.post("/api/partner/send-line", pGuard, async (req,res)=>{
   // 会話履歴にも残す（既存会話があれば）
   try{
     const c = t.store["line:" + uid];
-    if(c){ c.msgs.push({ from:"us", text, time: nowt(), via:"partner" }); c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c); }
+    if(c){ const sentAt=Date.now(); c.msgs.push({ from:"us", text, time: nowt(), sentAt, via:"partner" }); c.time = nowt(); c.ts = sentAt; c.last = lastText(c); dbSave(t, c); }
   }catch(e){}
   console.log("partner send-line:", t.slug, "uid=" + uid.slice(0,8) + "…");
   res.json({ ok:true });
