@@ -2764,6 +2764,8 @@ app.get("/forgot", (req,res)=>{ res.set("Content-Type","text/html; charset=utf-8
 app.post("/api/forgot", async (req,res)=>{
   const email = normalizeEmail(req.body.email);
   const loginId = String(req.body.loginId||"").trim();
+  const e2eDebug = process.env.RAILWAY_ENVIRONMENT_NAME === "staging" && req.get("x-e2e-test") === "テスト";
+  let debug = "rate_limited";
   try{
     const now = Date.now();
     const rateKey = sha(loginId + "|" + email);
@@ -2777,10 +2779,11 @@ app.post("/api/forgot", async (req,res)=>{
         const base = String(PUBLIC_BASE_URL || ("https://" + (req.headers["x-forwarded-host"] || req.headers.host || ""))).replace(/\/$/, "");
         const sent = /^https:\/\//i.test(base) && await sendResetEmail(t, email, base + "/reset?token=" + tok);
         if(!sent){ delete t.config.passwordReset; await saveTenantConfig(t); console.error("forgot: reset mail unavailable for", t.slug); }
-      }else console.warn("forgot: recovery lookup failed");
+        debug = sent ? "accepted" : "send_failed";
+      }else{ debug = "lookup_failed"; console.warn("forgot: recovery lookup failed"); }
     }
   }catch(e){ console.error("forgot:", e.message); }
-  res.json({ ok:true }); // 列挙対策: 登録有無に関わらず常に成功扱い
+  res.json(e2eDebug ? { ok:true, debug } : { ok:true }); // 通常応答は列挙対策で登録有無に関わらず常に成功扱い
 });
 app.get("/reset", (req,res)=>{
   res.set("Content-Type","text/html; charset=utf-8"); res.set("Cache-Control","no-store");
