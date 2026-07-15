@@ -2957,7 +2957,7 @@ app.post("/api/partner/outbound-events", pGuard, async (req,res)=>{
     // 右腕くん経由send-lineの直後に同じmessage_logが再同期された場合は、既存1通へIDだけ付けて二重表示しない。
     const candidates = (c.msgs||[]).filter(m=>{ if(!m||m.from!=="us"||(m.via!=="partner"&&m.via!=="uketsukerun")) return false; const mt=String(m.text||"").trim(); const bodyMatch=mt===text||(Math.min(mt.length,text.length)>=8&&(mt.includes(text)||text.includes(mt))); return bodyMatch&&Math.abs(Number(m.sentAt||0)-sentAt)<120000; }).sort((a,b)=>Math.abs(Number(a.sentAt||0)-sentAt)-Math.abs(Number(b.sentAt||0)-sentAt));
     const same = candidates[0];
-    if(same){ if(same.externalEventId&&same.externalEventId!==eventId){ same.externalEventAliases=Array.isArray(same.externalEventAliases)?same.externalEventAliases:[]; if(!same.externalEventAliases.includes(eventId)) same.externalEventAliases.push(eventId); }else same.externalEventId=eventId; same.via="uketsukerun"; accepted.push(eventId); dbSave(t,c); continue; }
+    if(same){ if(same.externalEventId&&same.externalEventId!==eventId){ same.externalEventAliases=Array.isArray(same.externalEventAliases)?same.externalEventAliases:[]; if(!same.externalEventAliases.includes(eventId)) same.externalEventAliases.push(eventId); }else same.externalEventId=eventId; same.via="uketsukerun"; if(ev.name&&(!c.name||c.name==="LINEのお客様")) c.name=String(ev.name).slice(0,120); accepted.push(eventId); dbSave(t,c); continue; }
     const d = new Date(sentAt);
     const time = Number.isFinite(d.getTime()) ? d.toLocaleTimeString("ja-JP",{timeZone:"Asia/Tokyo",hour:"2-digit",minute:"2-digit",hour12:false}) : nowt();
     const msg={from:"us",text,time,sentAt,via:"uketsukerun",externalEventId:eventId,template:String(ev.template||"").slice(0,120)};
