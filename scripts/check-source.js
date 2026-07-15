@@ -22,6 +22,7 @@ scripts.forEach((script, index) => new vm.Script(script, { filename: "PAGE-scrip
   "/api/slack-test",
   "/api/staff-booking-action",
   "/api/staff-booking-confirm",
+  "/api/partner/password-reset",
   "setSlackWebhook",
   "staffBookingPending"
 ].forEach((required) => {

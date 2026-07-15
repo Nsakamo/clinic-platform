@@ -7,7 +7,7 @@ API を変える／足すときは、まず正本を更新し、右腕くん（`
 ## この repo（右腕くん）が提供するエンドポイント（`migiude.js` 内、`pGuard` 認証）
 
 - `GET  /api/partner/tenants` … 顧客一覧
-- `POST /api/partner/tenants` … 新規作成（空テナント）`{name, slug?, accountEmail?}` → `{slug,name}`
+- `POST /api/partner/tenants` … 新規作成（空テナント）`{name, accountEmail, slug?}` → `{slug,name,loginId,accountEmailConfigured}`
 - `DELETE /api/partner/tenants/:slug` … 完全削除
 - `GET  /api/partner/conn?slug=` … 連携状態
 - `PUT  /api/partner/line-config` … LINE設定（うけつけるん運営画面から）
@@ -15,6 +15,7 @@ API を変える／足すときは、まず正本を更新し、右腕くん（`
 - `POST /api/partner/suspend` … 停止/再開
 - `POST /api/partner/sso` … SSO URL発行
 - `POST /api/partner/reset-login` … ログイン再発行
+- `POST /api/partner/password-reset` … 登録済み管理者メールへ1時間・1回限りの再設定リンクを送信（パスワード非表示）
 - `PUT  /api/partner/account` … パスワード再設定用のアカウントメールを登録・更新
 - `POST /api/partner/send-line` … 患者へLINE送信
 

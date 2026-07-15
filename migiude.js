@@ -2559,15 +2559,17 @@ app.get("/api/partner/conn", pGuard, (req,res)=>{
 app.post("/api/partner/tenants", pGuard, async (req,res)=>{
   const name = String(req.body.name||"").trim().slice(0,80);
   if(!name) return res.status(400).json({ok:false,error:"name"});
+  const accountEmail = normalizeEmail(req.body.accountEmail);
+  if(!accountEmail) return res.status(400).json({ok:false,error:"bad_email"});
   let slug = String(req.body.slug||"").trim().toLowerCase().replace(/[^a-z0-9-]/g,"").slice(0,30);
   if(slug && TEN[slug]) return res.status(409).json({ok:false,error:"slug_exists"});
   if(!slug){ slug = slugify(name); if(TEN[slug]) return res.status(409).json({ok:false,error:"slug_exists"}); }
   // パスワード未指定ならランダム生成（顧客はSSO経由で入る。後からパスワード設定も可能）
   const pass = String(req.body.password||"") || crypto.randomBytes(12).toString("hex");
-  const config = { passHash: hashPassword(pass), accountEmail:normalizeEmail(req.body.accountEmail), conn: {}, settings: { autoReply: false, level: "high", tone: "" } };
+  const config = { passHash: hashPassword(pass), accountEmail, conn: {}, settings: { autoReply: false, level: "high", tone: "" } };
   const t = TEN[slug] = newTenant(slug, name, config);
   if(pool){ try{ await pool.query("INSERT INTO tenants (slug,name,config) VALUES ($1,$2,$3)", [slug, name, t.config]); }catch(e){ delete TEN[slug]; return res.status(500).json({ok:false,error:"db"}); } }
-  res.status(201).json({ slug, name });
+  res.status(201).json({ slug, name, loginId:slug, accountEmailConfigured:true });
 });
 app.put("/api/partner/account", pGuard, async (req,res)=>{
   const t = TEN[String(req.body.slug||"")]; if(!t) return res.status(404).json({ok:false,error:"no_tenant"});
@@ -2766,6 +2768,36 @@ async function sendResetEmail(t, toEmail, link){
     return "smtp_failed";
   }
 }
+async function issuePasswordReset(t, toEmail, baseUrl){
+  const base = String(baseUrl || "").replace(/\/$/, "");
+  if(!/^https:\/\//i.test(base)) return "invalid_base_url";
+  const tok = crypto.randomBytes(24).toString("hex");
+  t.config.passwordReset = { hash:sha(tok), exp:Date.now() + 60*60000 }; // raw tokenは保存しない
+  await saveTenantConfig(t);
+  const mailStatus = await sendResetEmail(t, toEmail, base + "/reset?token=" + tok);
+  if(mailStatus !== "accepted"){
+    delete t.config.passwordReset;
+    await saveTenantConfig(t);
+  }
+  return mailStatus;
+}
+// 運営画面から登録済み管理者メールへ再設定リンクを送る。パスワードやトークンは返さない。
+app.post("/api/partner/password-reset", pGuard, async (req,res)=>{
+  const t = TEN[String(req.body.slug||"")];
+  if(!t || t.config.suspended) return res.status(404).json({ok:false,error:"no_tenant"});
+  const email = normalizeEmail(t.config.accountEmail);
+  if(!email) return res.status(400).json({ok:false,error:"account_email_required"});
+  try{
+    const base = String(PUBLIC_BASE_URL || ("https://" + (req.headers["x-forwarded-host"] || req.headers.host || "")));
+    const mailStatus = await issuePasswordReset(t, email, base);
+    if(mailStatus !== "accepted") return res.status(502).json({ok:false,error:"reset_mail_unavailable"});
+    console.log("partner password-reset: reset mail accepted for", t.slug);
+    res.json({ok:true,loginId:t.config.loginId||t.slug});
+  }catch(e){
+    console.error("partner password-reset:", e.message);
+    res.status(500).json({ok:false,error:"reset_failed"});
+  }
+});
 app.get("/forgot", (req,res)=>{ res.set("Content-Type","text/html; charset=utf-8"); res.set("Cache-Control","no-store"); res.send(FORGOT_PAGE); });
 app.post("/api/forgot", async (req,res)=>{
   const email = normalizeEmail(req.body.email);
@@ -2780,13 +2812,9 @@ app.post("/api/forgot", async (req,res)=>{
       RESET_REQ_AT[rateKey] = now;
       const t = tenantByRecovery(loginId, email);
       if(t){
-        const tok = crypto.randomBytes(24).toString("hex");
-        t.config.passwordReset = { hash:sha(tok), exp:now + 60*60000 }; // raw tokenは保存しない
-        await saveTenantConfig(t);
         const base = String(PUBLIC_BASE_URL || ("https://" + (req.headers["x-forwarded-host"] || req.headers.host || ""))).replace(/\/$/, "");
-        const mailStatus = /^https:\/\//i.test(base) ? await sendResetEmail(t, email, base + "/reset?token=" + tok) : "invalid_base_url";
-        const sent = mailStatus === "accepted";
-        if(!sent){ delete t.config.passwordReset; await saveTenantConfig(t); console.error("forgot: reset mail unavailable for", t.slug); }
+        const mailStatus = await issuePasswordReset(t, email, base);
+        if(mailStatus !== "accepted") console.error("forgot: reset mail unavailable for", t.slug);
         debug = mailStatus;
       }else{ debug = "lookup_failed"; console.warn("forgot: recovery lookup failed"); }
     }
