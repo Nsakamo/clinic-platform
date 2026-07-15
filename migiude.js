@@ -27,6 +27,14 @@ const PARTNER_HOOK_URL = process.env.PARTNER_HOOK_URL || "https://smilemedi-clou
 const PARTNER_BOOKING_URL = process.env.PARTNER_BOOKING_URL || "https://smilemedi-cloud-web.vercel.app/api/partner/booking"; // AI下書き前の予約照会
 const PARTNER_BASE = PARTNER_BOOKING_URL.replace(/\/booking$/, ""); // うけつけるんパートナーAPIのベース（/api/partner）
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || process.env.APP_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? "https://" + process.env.RAILWAY_PUBLIC_DOMAIN : "");
+// パスワード再設定メールは患者対応用メールとは分離できる。未設定時だけ当該テナントのSMTPへ後方互換フォールバック。
+const RESET_SMTP = {
+  host: process.env.RESET_SMTP_HOST || "smtp.gmail.com",
+  port: +(process.env.RESET_SMTP_PORT || 465),
+  user: process.env.RESET_SMTP_USER || "",
+  pass: process.env.RESET_SMTP_PASS || "",
+  from: process.env.RESET_SMTP_FROM || process.env.RESET_SMTP_USER || ""
+};
 
 // ---------- Postgres ----------
 let pool = null;
@@ -38,7 +46,7 @@ if (process.env.DATABASE_URL) {
 // ---------- tenant model ----------
 // TEN: slug -> t = { slug, name, config, store:{}, rules:{}, ruleSeq, alerts:[], alertSeq, push:{} }
 // t.config（tenantsテーブルのjsonbに永続化）:
-//   passHash, conn:{lineToken,lineSecret,smtp*,imap*,emailInternal,lines[],mails[],seenIds,mailCutoff,lineBotId,lineName,mailName},
+//   passHash, loginId, accountEmail, passwordReset:{hash,exp}, conn:{lineToken,lineSecret,smtp*,imap*,emailInternal,lines[],mails[],seenIds,mailCutoff,lineBotId,lineName,mailName},
 //   settings:{autoReply,level,tone}
 const TEN = {};
 function newTenant(slug, name, config) {
@@ -338,6 +346,18 @@ function slugify(name) { const base = String(name || "clinic").toLowerCase().rep
 function loginIdTaken(id, exceptSlug){
   return Object.values(TEN).some(x => x.slug !== exceptSlug && ((x.config.loginId || x.slug) === id));
 }
+function normalizeEmail(value){
+  const email = String(value || "").trim().toLowerCase();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : "";
+}
+function tenantAccount(t){
+  return {
+    name: t.name || t.slug,
+    loginId: t.config.loginId || t.slug,
+    accountEmail: normalizeEmail(t.config.accountEmail),
+    resetEmailReady: !!(RESET_SMTP.user && RESET_SMTP.pass) || mailAccounts(t).length > 0
+  };
+}
 app.post("/api/signup", async (req, res) => {
   return res.status(403).json({ ok: false, error: "signup_closed" }); // 新規契約は運営（受付くん管理画面）経由のみ
 
@@ -382,6 +402,16 @@ app.post("/api/change-loginid", guard, async (req, res) => {
   t.config.loginId = next;
   try { await saveTenantConfig(t); } catch (e) { return res.status(500).json({ ok: false, error: "save" }); }
   res.json({ ok: true, loginId: next });
+});
+app.get("/api/account", guard, (req, res) => res.json(tenantAccount(req.tenant)));
+app.post("/api/account", guard, async (req, res) => {
+  const t = req.tenant;
+  const email = normalizeEmail(req.body.accountEmail);
+  if (!email) return res.status(400).json({ ok:false, error:"bad_email" });
+  t.config.accountEmail = email;
+  try { await saveTenantConfig(t); }
+  catch (e) { return res.status(500).json({ ok:false, error:"save" }); }
+  res.json({ ok:true, account:tenantAccount(t) });
 });
 app.post("/api/logout", (req, res) => {
   // このcookieのセッションだけをサーバ側集合から破棄（他端末のログインは維持）
@@ -2507,18 +2537,18 @@ app.post("/api/import-own", guard, async (req,res)=>{
 function partnerOk(req){ return !!ADMIN_SECRET && safeEq(req.headers["x-partner-key"], ADMIN_SECRET); }
 function pGuard(req,res,next){ if(partnerOk(req)) return next(); res.status(401).json({error:"auth"}); }
 const SSO_TOKENS = {}; // token -> {slug, exp}
-const RESET_TOKENS = {}; // パスワード再設定トークン token -> {slug, exp}
 const RESET_REQ_AT = {}; // email -> 最終リクエスト時刻(ms)。簡易レート制限
 app.get("/api/partner/tenants", pGuard, (req,res)=>{
   res.json(Object.values(TEN).map(t=>({ slug:t.slug, name:t.name,
     convos:Object.keys(t.store||{}).length, rules:Object.keys(t.rules||{}).length,
     line: !!(t.config.conn&&t.config.conn.lineToken), mail: !!(t.config.conn&&t.config.conn.smtpUser),
+    accountEmailConfigured: !!normalizeEmail(t.config.accountEmail),
     suspended: !!t.config.suspended })));
 });
 app.get("/api/partner/conn", pGuard, (req,res)=>{
   const t = TEN[String(req.query.slug||"")]; if(!t) return res.status(404).json({error:"no_tenant"});
   const cn = t.config.conn || {};
-  res.json({ slug:t.slug, name:t.name,
+  res.json({ slug:t.slug, name:t.name, loginId:t.config.loginId||t.slug, accountEmail:normalizeEmail(t.config.accountEmail),
     lineConfigured: !!cn.lineToken, lineBotId: cn.lineBotId||"",
     mailConfigured: !!cn.smtpUser, mailAddress: cn.smtpUser||"",
     extraLines: (cn.lines||[]).map(a=>({name:a.name,botId:a.botId||""})),
@@ -2534,10 +2564,19 @@ app.post("/api/partner/tenants", pGuard, async (req,res)=>{
   if(!slug){ slug = slugify(name); if(TEN[slug]) return res.status(409).json({ok:false,error:"slug_exists"}); }
   // パスワード未指定ならランダム生成（顧客はSSO経由で入る。後からパスワード設定も可能）
   const pass = String(req.body.password||"") || crypto.randomBytes(12).toString("hex");
-  const config = { passHash: hashPassword(pass), conn: {}, settings: { autoReply: false, level: "high", tone: "" } };
+  const config = { passHash: hashPassword(pass), accountEmail:normalizeEmail(req.body.accountEmail), conn: {}, settings: { autoReply: false, level: "high", tone: "" } };
   const t = TEN[slug] = newTenant(slug, name, config);
   if(pool){ try{ await pool.query("INSERT INTO tenants (slug,name,config) VALUES ($1,$2,$3)", [slug, name, t.config]); }catch(e){ delete TEN[slug]; return res.status(500).json({ok:false,error:"db"}); } }
   res.status(201).json({ slug, name });
+});
+app.put("/api/partner/account", pGuard, async (req,res)=>{
+  const t = TEN[String(req.body.slug||"")]; if(!t) return res.status(404).json({ok:false,error:"no_tenant"});
+  const email = normalizeEmail(req.body.accountEmail);
+  if(!email) return res.status(400).json({ok:false,error:"bad_email"});
+  const prev = t.config.accountEmail; t.config.accountEmail = email;
+  try{ await saveTenantConfig(t); }
+  catch(e){ t.config.accountEmail = prev; return res.status(500).json({ok:false,error:"db"}); }
+  res.json({ok:true,accountEmail:email,loginId:t.config.loginId||t.slug});
 });
 // テナント完全削除（解約時）
 app.delete("/api/partner/tenants/:slug", pGuard, async (req,res)=>{
@@ -2680,27 +2719,37 @@ app.get("/sso", (req,res)=>{
   setSess(res, t);
   res.redirect("/");
 });
-setInterval(()=>{ const now=Date.now(); for(const k of Object.keys(SSO_TOKENS)) if(SSO_TOKENS[k].exp < now) delete SSO_TOKENS[k]; for(const k of Object.keys(RESET_TOKENS)) if(RESET_TOKENS[k].exp < now) delete RESET_TOKENS[k]; }, 60000);
+setInterval(()=>{ const now=Date.now(); for(const k of Object.keys(SSO_TOKENS)) if(SSO_TOKENS[k].exp < now) delete SSO_TOKENS[k]; }, 60000);
 
 // ===== パスワードを忘れた方（顧客の自己解決リセット。右腕くん単独で完結） =====
-function tenantByEmail(email){
-  const e = String(email||"").trim().toLowerCase();
-  if(!e || e.indexOf("@") < 0) return null;
-  for(const slug of Object.keys(TEN)){
-    const t = TEN[slug];
-    if(t.config && t.config.suspended) continue;
-    if(mailAccounts(t).some(a => String(a.smtpUser||"").toLowerCase() === e)) return t;
-  }
-  return null;
+function tenantByRecovery(loginId, email){
+  const id = String(loginId || "").trim();
+  const e = normalizeEmail(email);
+  if(!id || !e) return null;
+  const t = Object.values(TEN).find(x => !x.config.suspended && (x.config.loginId || x.slug) === id);
+  if(!t) return null;
+  const registered = normalizeEmail(t.config.accountEmail);
+  if(registered) return safeEq(registered, e) ? t : null;
+  // 従来テナントはアカウントメールが未登録なので、既存の送受信メールだけを移行用に許可する。
+  return mailAccounts(t).some(a => normalizeEmail(a.smtpUser) === e || normalizeEmail(a.imapUser) === e) ? t : null;
+}
+function resetTokenTenant(token){
+  const hash = sha(String(token || ""));
+  return Object.values(TEN).find(t => t.config.passwordReset && t.config.passwordReset.exp > Date.now() && safeEq(t.config.passwordReset.hash, hash)) || null;
+}
+function resetMailAccount(t){
+  if(RESET_SMTP.user && RESET_SMTP.pass) return { smtpHost:RESET_SMTP.host, smtpPort:RESET_SMTP.port, smtpUser:RESET_SMTP.user, smtpPass:RESET_SMTP.pass, from:RESET_SMTP.from };
+  const a = mailAccounts(t)[0];
+  return a ? Object.assign({ from:a.smtpUser }, a) : null;
 }
 async function sendResetEmail(t, toEmail, link){
-  const a = mailAccounts(t).find(x => String(x.smtpUser||"").toLowerCase() === String(toEmail||"").toLowerCase()) || mailAccounts(t)[0];
+  const a = resetMailAccount(t);
   if(!a) return false;
   try{
     const nodemailer = require("nodemailer");
     const tp = nodemailer.createTransport({ host:a.smtpHost, port:a.smtpPort, secure:a.smtpPort===465, auth:{user:a.smtpUser, pass:a.smtpPass} });
     await tp.sendMail({
-      from: (t.name || "受信トレイ") + " <" + a.smtpUser + ">",
+      from: (t.name || "右腕くん") + " <" + a.from + ">",
       to: toEmail,
       subject: "【受信トレイ】パスワード再設定のご案内",
       text: "受信トレイのパスワード再設定リクエストを受け付けました。\n下記リンクから新しいパスワードを設定してください（1時間有効・1回のみ）。\n\n" + link + "\n\nお心当たりが無い場合はこのメールを破棄してください。"
@@ -2710,17 +2759,21 @@ async function sendResetEmail(t, toEmail, link){
 }
 app.get("/forgot", (req,res)=>{ res.set("Content-Type","text/html; charset=utf-8"); res.set("Cache-Control","no-store"); res.send(FORGOT_PAGE); });
 app.post("/api/forgot", async (req,res)=>{
-  const email = String(req.body.email||"").trim().toLowerCase();
+  const email = normalizeEmail(req.body.email);
+  const loginId = String(req.body.loginId||"").trim();
   try{
     const now = Date.now();
-    if(email && email.indexOf("@")>0 && !(RESET_REQ_AT[email] && now - RESET_REQ_AT[email] < 60000)){
-      RESET_REQ_AT[email] = now;
-      const t = tenantByEmail(email);
+    const rateKey = sha(loginId + "|" + email);
+    if(email && loginId && !(RESET_REQ_AT[rateKey] && now - RESET_REQ_AT[rateKey] < 60000)){
+      RESET_REQ_AT[rateKey] = now;
+      const t = tenantByRecovery(loginId, email);
       if(t){
         const tok = crypto.randomBytes(24).toString("hex");
-        RESET_TOKENS[tok] = { slug: t.slug, exp: now + 60*60000 }; // 1時間有効
-        const link = "https://" + (req.headers.host||"") + "/reset?token=" + tok;
-        await sendResetEmail(t, email, link);
+        t.config.passwordReset = { hash:sha(tok), exp:now + 60*60000 }; // raw tokenは保存しない
+        await saveTenantConfig(t);
+        const base = String(PUBLIC_BASE_URL || ("https://" + (req.headers["x-forwarded-host"] || req.headers.host || ""))).replace(/\/$/, "");
+        const sent = /^https:\/\//i.test(base) && await sendResetEmail(t, email, base + "/reset?token=" + tok);
+        if(!sent){ delete t.config.passwordReset; await saveTenantConfig(t); console.error("forgot: reset mail unavailable for", t.slug); }
       }
     }
   }catch(e){ console.error("forgot:", e.message); }
@@ -2728,24 +2781,22 @@ app.post("/api/forgot", async (req,res)=>{
 });
 app.get("/reset", (req,res)=>{
   res.set("Content-Type","text/html; charset=utf-8"); res.set("Cache-Control","no-store");
-  const e = RESET_TOKENS[String(req.query.token||"")];
-  if(!e || Date.now() > e.exp) return res.send(RESET_INVALID_PAGE);
+  const t = resetTokenTenant(req.query.token);
+  if(!t) return res.send(RESET_INVALID_PAGE);
   res.send(RESET_PAGE(String(req.query.token||"")));
 });
 app.post("/api/reset", async (req,res)=>{
   const tok = String(req.body.token||"");
   const password = String(req.body.password||"");
-  const e = RESET_TOKENS[tok];
-  if(!e || Date.now() > e.exp){ if(e) delete RESET_TOKENS[tok]; return res.status(400).json({ ok:false, error:"expired" }); }
+  const t = resetTokenTenant(tok);
+  if(!t) return res.status(400).json({ ok:false, error:"expired" });
   if(password.length < 8) return res.status(400).json({ ok:false, error:"too_short" });
-  const t = TEN[e.slug];
-  if(!t){ delete RESET_TOKENS[tok]; return res.status(404).json({ ok:false }); }
-  const prev = t.config.passHash;
+  const prev = t.config.passHash, prevReset = t.config.passwordReset;
   t.config.passHash = hashPassword(password);
+  delete t.config.passwordReset;
   destroyAllSessions(t); // パスワード再設定で既存セッションを全破棄
   try{ await saveTenantConfig(t); }
-  catch(err){ t.config.passHash = prev; return res.status(500).json({ ok:false, error:"db" }); }
-  delete RESET_TOKENS[tok]; // 1回限り
+  catch(err){ t.config.passHash = prev; t.config.passwordReset = prevReset; return res.status(500).json({ ok:false, error:"db" }); }
   console.log("self password reset:", t.slug);
   res.json({ ok:true });
 });
@@ -2785,12 +2836,13 @@ const FORGOT_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
 <body style="font-family:-apple-system,'Hiragino Kaku Gothic ProN',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f3f4f6;">
 <div style="background:#fff;padding:28px 24px;border-radius:14px;width:min(90vw,340px);box-shadow:0 2px 14px rgba(0,0,0,.08);">
 <div style="font-size:17px;font-weight:600;margin-bottom:4px;">🔑 パスワード再設定</div>
-<div style="font-size:13px;color:#6b7280;margin-bottom:16px;">登録メールアドレスに再設定リンクをお送りします。</div>
-<input id="em" type="email" placeholder="登録メールアドレス" autocapitalize="off" autofocus style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;" onkeydown="if(event.key==='Enter'&&!event.isComposing&&event.keyCode!==229)send()">
+<div style="font-size:13px;color:#6b7280;margin-bottom:16px;">ログインIDと、アカウント設定に登録したメールアドレスを入力してください。</div>
+<input id="lid" placeholder="ログインID" autocapitalize="off" autofocus style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;">
+<input id="em" type="email" placeholder="登録メールアドレス" autocapitalize="off" style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;" onkeydown="if(event.key==='Enter'&&!event.isComposing&&event.keyCode!==229)send()">
 <button onclick="send()" id="sb" style="width:100%;padding:11px;border:none;border-radius:8px;background:#06c755;color:#fff;font-size:15px;font-weight:600;cursor:pointer;">再設定リンクを送る</button>
 <div id="msg" style="font-size:12px;margin-top:10px;min-height:14px;color:#374151;"></div>
 <div style="text-align:center;margin-top:12px;font-size:12px;"><a href="/" style="color:#06c755;text-decoration:none;">ログインに戻る</a></div></div>
-<script>async function send(){const email=document.getElementById("em").value.trim();const b=document.getElementById("sb");b.disabled=true;try{await fetch("/api/forgot",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email})});}catch(e){}document.getElementById("msg").textContent="ご登録があれば、再設定リンクをメールでお送りしました。届かない場合は迷惑メールをご確認のうえ、運営にお問い合わせください。";b.disabled=false;}</script>
+<script>async function send(){const loginId=document.getElementById("lid").value.trim(),email=document.getElementById("em").value.trim(),b=document.getElementById("sb"),m=document.getElementById("msg");if(!loginId||!email){m.textContent="ログインIDと登録メールアドレスを入力してください";return;}b.disabled=true;try{await fetch("/api/forgot",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({loginId,email})});}catch(e){}m.textContent="入力内容が登録情報と一致する場合、再設定リンクをお送りしました。届かない場合は迷惑メールをご確認のうえ、運営にお問い合わせください。";b.disabled=false;}</script>
 </body></html>`;
 
 const RESET_INVALID_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>パスワード再設定</title></head>
@@ -3075,10 +3127,18 @@ const PAGE = `<!DOCTYPE html>
 </div></div>
 <div id="setPop" style="position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:65;display:none;align-items:center;justify-content:center;"><div style="background:#fff;border-radius:14px;padding:18px;width:min(92vw,360px);max-height:86vh;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;">
   <h3 style="margin:0 0 12px;font-size:15px;">⚙ 設定</h3>
+  <div style="border:1px solid #dbeafe;background:#f8fbff;border-radius:10px;padding:10px;margin-bottom:12px;">
+    <div style="font-size:13px;font-weight:700;margin-bottom:7px;">👤 アカウント設定</div>
+    <div id="accountLoginId" style="font-size:11px;color:#6b7280;margin-bottom:5px;">ログインID: 読み込み中…</div>
+    <input type="email" id="setAccountEmail" autocomplete="email" placeholder="パスワード再設定用メールアドレス" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;">
+    <div id="accountEmailStat" style="font-size:11px;color:#6b7280;margin-top:4px;">パスワード再設定メールの送信先です</div>
+    <button type="button" class="cbtn" style="margin-top:7px;" onclick="saveAccount()">アカウント情報を保存</button>
+  </div>
   <label style="display:flex;align-items:center;gap:10px;font-size:14px;padding:8px 0;cursor:pointer;"><input type="checkbox" id="setAuto" style="width:18px;height:18px;"> 自動返信を有効にする</label>
   <label style="display:flex;align-items:center;gap:10px;font-size:14px;padding:8px 0;cursor:pointer;"><input type="checkbox" id="setBookingActions" style="width:18px;height:18px;"> 予約の自動受付（確認・変更・キャンセル）</label>
   <div style="font-size:11px;color:#888;margin:-6px 0 6px 28px;">予約システム（うけつけるん）連携。本人確認と、患者様の「はい」承認をはさんだうえで、予約のキャンセル・日時変更・LINE連携まで自動で行います。</div>
-  <div style="border-top:1px solid #e5e7eb;margin-top:10px;padding-top:10px;">
+  <div id="slackSettings" style="border:1px solid #fde68a;background:#fffbeb;border-radius:10px;margin-top:10px;padding:10px;">
+    <div style="font-size:13px;font-weight:700;margin-bottom:6px;">🔔 Slack通知設定</div>
     <label style="display:flex;align-items:center;gap:10px;font-size:14px;padding:4px 0;cursor:pointer;"><input type="checkbox" id="setSlackEnabled" style="width:18px;height:18px;"> 要対応をSlackへ通知する</label>
     <input type="password" id="setSlackWebhook" autocomplete="off" placeholder="Incoming Webhook URL（空欄なら現在の設定を保持）" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;margin-top:5px;">
     <div id="slackStat" style="font-size:11px;color:#6b7280;margin-top:4px;">未設定</div>
@@ -3902,7 +3962,8 @@ function renderRuleGauge(){
     else { warn.style.display="none"; }
   }
 }
-async function openSet(){try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setBookingActions").checked=!!s.bookingActions;document.getElementById("setSlackEnabled").checked=!!s.slackEnabled;document.getElementById("setSlackWebhook").value="";document.getElementById("slackStat").textContent=(s.slackConfigured?"Webhook設定済み":"Webhook未設定")+(s.publicUrlConfigured?"・会話リンク設定済み":"・会話リンクにはRailwayのPUBLIC_BASE_URL設定が必要");document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"gemini";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);window.__rules=s.rules||null;renderRuleGauge();renderPrefs(s.prefs||[]);
+async function openSet(){try{const ar=await fetch("/api/account");const a=await ar.json();document.getElementById("accountLoginId").textContent="ログインID: "+(a.loginId||"");document.getElementById("setAccountEmail").value=a.accountEmail||"";document.getElementById("accountEmailStat").textContent=(a.accountEmail?"再設定メールアドレス登録済み":"再設定メールアドレス未登録")+(a.resetEmailReady?"・メール送信可能":"・送信メール設定が必要");}catch(e){}
+  try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setBookingActions").checked=!!s.bookingActions;document.getElementById("setSlackEnabled").checked=!!s.slackEnabled;document.getElementById("setSlackWebhook").value="";document.getElementById("slackStat").textContent=(s.slackConfigured?"Webhook設定済み":"Webhook未設定")+(s.publicUrlConfigured?"・会話リンク設定済み":"・会話リンクにはRailwayのPUBLIC_BASE_URL設定が必要");document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"gemini";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);window.__rules=s.rules||null;renderRuleGauge();renderPrefs(s.prefs||[]);
   if(s.engines){const n=document.getElementById("engineNote");n.textContent="文章作成は選択中のAIで生成（GPT"+(s.engines.gpt?"✓":"⚠キー未設定")+"・Gemini"+(s.engines.gemini?"✓":"⚠")+"・Claude"+(s.engines.claude?"✓":"⚠")+"）。キー未設定のエンジンを選ぶと安全のためClaudeで生成します。";}}catch(e){}
   refreshModelAlert();
   try{const cr=await fetch("/api/conn");const c=await cr.json();document.getElementById("connStat").textContent=(c.lineConfigured?"LINE✓ ":"LINE未 ")+(c.mailConfigured?"メール✓":"メール未");document.getElementById("cSmtpHost").value=c.smtpHost||"";document.getElementById("cSmtpPort").value=c.smtpPort||"";document.getElementById("cSmtpUser").value=c.smtpUser||"";document.getElementById("cImapHost").value=c.imapHost||"";document.getElementById("cImapPort").value=c.imapPort||"";document.getElementById("cImapUser").value=c.imapUser||"";document.getElementById("cEmailInternal").checked=!!c.emailInternal;renderAccts(c);}catch(e){}
@@ -3933,6 +3994,7 @@ async function addMailAcct(){
 async function delAcct(kind,i){if(!await uiConfirm("この連携を削除しますか？（この連携で届く新着が止まります）"))return;
   try{await api("/api/conn-del",{kind,i});}catch(e){}openSet();}
 async function saveConn(){const g=id=>document.getElementById(id).value.trim();const body={lineSecret:g("cLineSecret"),lineToken:g("cLineToken"),smtpHost:g("cSmtpHost"),smtpPort:g("cSmtpPort"),smtpUser:g("cSmtpUser"),smtpPass:g("cSmtpPass"),imapHost:g("cImapHost"),imapPort:g("cImapPort"),imapUser:g("cImapUser"),imapPass:g("cImapPass"),emailInternal:document.getElementById("cEmailInternal").checked};try{const r=await api("/api/conn",body);const j=await r.json();if(j.ok){uiAlert("連携設定を保存しました。\\nLINE: "+(j.lineConfigured?"設定済み":"未設定")+" / メール: "+(j.mailConfigured?"設定済み":"未設定")+" / メール直接監視: "+(j.emailInternal?"オン":"オフ"));["cLineSecret","cLineToken","cSmtpPass","cImapPass"].forEach(id=>document.getElementById(id).value="");}else uiAlert("保存に失敗しました");}catch(e){uiAlert("保存に失敗しました");}}
+async function saveAccount(){const accountEmail=document.getElementById("setAccountEmail").value.trim();try{const r=await api("/api/account",{accountEmail});const j=await r.json();if(j.ok){document.getElementById("accountEmailStat").textContent="再設定メールアドレス登録済み"+(j.account.resetEmailReady?"・メール送信可能":"・送信メール設定が必要");uiAlert("アカウント情報を保存しました");}else uiAlert(j.error==="bad_email"?"正しいメールアドレスを入力してください":"保存に失敗しました");}catch(e){uiAlert("保存に失敗しました");}}
 function closeSet(){document.getElementById("setPop").style.display="none";}
 async function testSlack(){const webhook=document.getElementById("setSlackWebhook").value.trim();try{const r=await api("/api/slack-test",{webhook});const j=await r.json();if(j.ok)uiAlert("Slackへテスト通知を送りました");else uiAlert(j.error==="invalid_slack_webhook"?"Webhook URLが正しくありません":"Slackへ接続できませんでした");}catch(e){uiAlert("Slackへ接続できませんでした");}}
 async function saveSet(){const autoReply=document.getElementById("setAuto").checked;const bookingActions=document.getElementById("setBookingActions").checked;const slackEnabled=document.getElementById("setSlackEnabled").checked;const slackWebhook=document.getElementById("setSlackWebhook").value.trim();const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{const r=await api("/api/settings",{autoReply,bookingActions,slackEnabled,slackWebhook,level,tone,engine,autoDelayMin});const j=await r.json();if(!j.ok)throw new Error(j.error||"save");uiAlert("設定を保存しました");closeSet();}catch(e){uiAlert(e.message==="invalid_slack_webhook"?"Slack Webhook URLが正しくありません":"保存に失敗しました");}}
