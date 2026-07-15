@@ -3084,6 +3084,19 @@ const PAGE = `<!DOCTYPE html>
     <div id="slackStat" style="font-size:11px;color:#6b7280;margin-top:4px;">未設定</div>
     <button type="button" class="cbtn" style="margin-top:7px;" onclick="testSlack()">Slackへテスト通知</button>
     <div style="font-size:11px;color:#6b7280;margin-top:5px;line-height:1.5;">AIが要対応・緊急と判断した時や、予約自動受付を継続できない時に右腕くんから直接通知します。Webhook URLは秘密情報として保存され、画面へ再表示しません。</div>
+    <details style="margin-top:9px;border:1px solid #dbeafe;background:#f8fbff;border-radius:9px;padding:8px 10px;">
+      <summary style="font-size:12px;font-weight:600;color:#1d4ed8;cursor:pointer;">初めてのSlack連携手順を表示</summary>
+      <ol style="font-size:11px;color:#374151;line-height:1.65;margin:8px 0 6px;padding-left:20px;">
+        <li>Slackで通知専用チャンネルを作ります（例：<b>#右腕くん-テスト</b>）。</li>
+        <li><a href="https://api.slack.com/apps" target="_blank" rel="noopener noreferrer" style="color:#2563eb;font-weight:600;">Slack App管理画面を開く</a> → <b>Create New App</b> → <b>From scratch</b>。</li>
+        <li>アプリ名を「右腕くん通知」などにして、利用するSlackワークスペースを選びます。</li>
+        <li>左メニューの <b>Incoming Webhooks</b> を開き、<b>Activate Incoming Webhooks</b> をONにします。</li>
+        <li><b>Add New Webhook to Workspace</b> を押し、手順1のチャンネルを選んで許可します。</li>
+        <li>表示された <b>Webhook URL</b> をコピーし、この上の入力欄へ貼ります。URLはパスワードと同じ秘密情報なので、チャットやメールへ貼らないでください。</li>
+        <li><b>Slackへテスト通知</b>を押し、届いたら画面下の<b>設定を保存</b>を押して完了です。</li>
+      </ol>
+      <div style="font-size:10.5px;color:#6b7280;line-height:1.55;">通知から該当会話を直接開くには、運営側でRailwayの <b>PUBLIC_BASE_URL</b> に右腕くんの公開URLを設定します。通常の利用者が操作する必要はありません。</div>
+    </details>
   </div>
   <div style="font-size:12px;color:#6b7280;margin:2px 0 10px;">AIの確信率が高い問い合わせに、スタッフを待たずAIが自動で返信します。緊急・要対応と判定されたものは自動返信されません。</div>
   <div style="font-size:13px;margin-bottom:4px;">自動返信の対象</div>
