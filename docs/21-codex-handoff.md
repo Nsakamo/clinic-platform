@@ -41,6 +41,7 @@
 - 埋め込み `PAGE` のブラウザーJavaScript構文解析: 成功。
 - `git diff --check`: 成功。
 - 外部サービスを使うE2Eは未実施。隔離stagingとテスト専用Slackチャンネルが必要。
+- staging公開後は `/forgot` に「ログインIDと、アカウント設定に登録したメールアドレス」が表示されることを確認する。旧文言のままならRailwayが旧コミットを配信している。
 
 ## Claude E2E確認項目
 
