@@ -11,6 +11,7 @@ const express = require("express");
 const crypto = require("crypto");
 const app = express();
 app.use(express.json({ limit: "16mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
+app.use(express.urlencoded({ extended: false, limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 const PORT = process.env.PORT || 3000;
 // 秘密鍵の定数時間比較（タイミング攻撃対策）。長さ不一致は即false（timingSafeEqualは同長が前提）。
 function safeEq(a, b) {
@@ -31,7 +32,8 @@ const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || process.env.APP_URL || (p
 const SLACK_OAUTH = {
   clientId: process.env.SLACK_CLIENT_ID || "",
   clientSecret: process.env.SLACK_CLIENT_SECRET || "",
-  stateSecret: process.env.SLACK_OAUTH_STATE_SECRET || ""
+  stateSecret: process.env.SLACK_OAUTH_STATE_SECRET || "",
+  signingSecret: process.env.SLACK_SIGNING_SECRET || ""
 };
 // パスワード再設定メールは患者対応用メールとは分離できる。未設定時だけ当該テナントのSMTPへ後方互換フォールバック。
 const RESET_SMTP = {
@@ -68,6 +70,7 @@ function newTenant(slug, name, config) {
   if (!Array.isArray(config.settings.prefs)) config.settings.prefs = []; // スタッフの記憶（全返信に効く恒久ルール）
   if (typeof config.settings.bookingActions !== "boolean") config.settings.bookingActions = false; // 予約自動受付（うけつけるん連携でのキャンセル・変更・LINE連携）。既定OFF
   if (typeof config.settings.slackEnabled !== "boolean") config.settings.slackEnabled = false; // 要対応のSlack通知。右腕くん単体で完結
+  if (!["review_all", "exceptions"].includes(config.settings.slackReplyMode)) config.settings.slackReplyMode = "exceptions";
   return { slug, name: name || slug, config, store: {}, rules: {}, ruleSeq: 1, examples: {}, exampleSeq: 1, alerts: [], alertSeq: 1, push: {} };
 }
 async function saveTenantConfig(t) {
@@ -105,6 +108,7 @@ const C = {
   imapUser: (t) => cf(t, "imapUser") || cf(t, "smtpUser"),
   imapPass: (t) => cfSec(t, "imapPass") || cfSec(t, "smtpPass"),
   slackWebhook: (t) => cfSec(t, "slackWebhook"),
+  slackBotToken: (t) => cfSec(t, "slackBotToken"),
 };
 function emailOn(t) { return !!t.config.conn.emailInternal; }
 function S(t) { return t.config.settings; }
@@ -213,7 +217,7 @@ function decField(stored) {
   } catch (e) { console.error("decField:", e.message); return ""; }
 }
 // conn配下の資格情報フィールドを保存直前に暗号化する（メイン＋追加アカウント lines[]/mails[]）。冪等（enc:済みは再暗号化しない）。
-const ENC_CONN_KEYS = ["lineToken", "lineSecret", "smtpPass", "imapPass", "slackWebhook"];
+const ENC_CONN_KEYS = ["lineToken", "lineSecret", "smtpPass", "imapPass", "slackWebhook", "slackBotToken"];
 function encryptConnSecrets(conn) {
   if (!conn || typeof conn !== "object" || !CRED_KEY) return; // 鍵なしなら平文のまま（後方互換）
   ENC_CONN_KEYS.forEach(k => { if (typeof conn[k] === "string" && conn[k]) conn[k] = encField(conn[k]); });
@@ -229,7 +233,7 @@ function validSlackWebhook(value) {
     return u.protocol === "https:" && u.hostname === "hooks.slack.com" && /^\/services\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/.test(u.pathname);
   } catch (e) { return false; }
 }
-function slackOAuthReady() { return !!(SLACK_OAUTH.clientId && SLACK_OAUTH.clientSecret && SLACK_OAUTH.stateSecret && /^https:\/\//i.test(PUBLIC_BASE_URL)); }
+function slackOAuthReady() { return !!(SLACK_OAUTH.clientId && SLACK_OAUTH.clientSecret && SLACK_OAUTH.stateSecret && SLACK_OAUTH.signingSecret && /^https:\/\//i.test(PUBLIC_BASE_URL)); }
 function b64url(value) { return Buffer.from(value).toString("base64url"); }
 function slackStateSignature(payload) { return crypto.createHmac("sha256", SLACK_OAUTH.stateSecret).update(payload).digest("base64url"); }
 function issueSlackState(req, t) {
@@ -260,6 +264,89 @@ async function postSlackWebhook(webhook, payload) {
     finally { clearTimeout(timer); }
     return r && r.ok ? { ok: true } : { ok: false, error: "slack_http_error" };
   } catch (e) { return { ok: false, error: "slack_unreachable" }; }
+}
+function slackReviewAll(t) {
+  return !!(S(t).autoReply && S(t).slackEnabled && S(t).slackReplyMode === "review_all");
+}
+async function slackApi(t, method, body) {
+  const token = C.slackBotToken(t);
+  if (!token) return { ok: false, error: "no_bot_token" };
+  try {
+    const r = await fetch("https://slack.com/api/" + method, { method: "POST", headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json; charset=utf-8" }, body: JSON.stringify(body || {}) });
+    const j = await r.json();
+    return r.ok && j.ok ? j : { ok: false, error: (j && j.error) || "slack_api_error" };
+  } catch (e) { return { ok: false, error: "slack_unreachable" }; }
+}
+function slackApprovalById(id) {
+  for (const t of Object.values(TEN)) for (const c of Object.values(t.store || {})) {
+    if (c && c.slackApproval && c.slackApproval.id === id) return { t, c, approval: c.slackApproval };
+  }
+  return null;
+}
+function slackApprovalByThread(teamId, channelId, threadTs) {
+  for (const t of Object.values(TEN)) {
+    if (String(t.config.conn.slackTeamId || "") !== String(teamId || "")) continue;
+    for (const c of Object.values(t.store || {})) {
+      const a = c && c.slackApproval;
+      if (a && a.status === "pending" && a.channelId === channelId && a.threadTs === threadTs) return { t, c, approval: a };
+    }
+  }
+  return null;
+}
+function slackHistoryText(c) {
+  return (c.msgs || []).slice(-10).map(m => (m.from === "them" ? "患者" : "スタッフ") + ": " + String(m.text || (m.media ? "［" + m.media + "］" : "")).slice(0, 500)).join("\n");
+}
+function slackMrkdwn(value) { return String(value || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+async function slackSummary(t, c) {
+  const history = slackHistoryText(c);
+  if (!history) return "新しい問い合わせです。";
+  try {
+    const out = await aiChat(t, "患者との会話をスタッフが30秒で把握できるよう、事実だけを日本語で3文以内に要約する。医療判断や推測はしない。患者への返信文は書かない。", [{ role: "user", content: history }], 300);
+    if (out) return String(out).trim().slice(0, 1200);
+  } catch (e) {}
+  return history.slice(-1200);
+}
+function slackApprovalBlocks(c, summary, draft, reason, id) {
+  const safeSummary = slackMrkdwn(String(summary || "").slice(0, 2800)), safeDraft = slackMrkdwn(String(draft || "").slice(0, 2800));
+  return [
+    { type: "header", text: { type: "plain_text", text: "右腕くん：返信の確認", emoji: true } },
+    { type: "section", text: { type: "mrkdwn", text: "*お客様:* " + slackMrkdwn(String(c.name || "名称未取得").slice(0, 120)) + "（" + (c.channel === "mail" ? "メール" : "LINE") + "）\n*確認理由:* " + slackMrkdwn(String(reason || "送信前の確認").slice(0, 300)) } },
+    { type: "section", text: { type: "mrkdwn", text: "*これまでのやり取り:*\n" + safeSummary } },
+    { type: "section", text: { type: "mrkdwn", text: "*患者様への返信案:*\n```" + safeDraft.replace(/```/g, "'''") + "```" } },
+    { type: "actions", elements: [
+      { type: "button", action_id: "migiude_send", text: { type: "plain_text", text: "この内容で送信", emoji: true }, style: "primary", value: id },
+      { type: "button", action_id: "migiude_info", text: { type: "plain_text", text: "患者・予約情報を確認", emoji: true }, value: id },
+      { type: "button", action_id: "migiude_cancel", text: { type: "plain_text", text: "今回は送信しない", emoji: true }, style: "danger", value: id }
+    ] },
+    { type: "context", elements: [{ type: "mrkdwn", text: "修正する場合は、このメッセージのスレッドへ「もう少し柔らかく」などと返信してください。最終送信には必ず上の承認ボタンが必要です。" }] }
+  ];
+}
+async function slackRequestApproval(t, c, reason) {
+  const draft = String(c && c.draft || "").trim();
+  const channel = String(t.config.conn.slackChannelId || "");
+  if (!S(t).slackEnabled || !draft || !channel || !C.slackBotToken(t)) return false;
+  const latest = (c.msgs || []).slice().reverse().find(m => m && m.from === "them") || {};
+  const eventKey = sha([c.id, latest.time || "", latest.text || "", draft].join("|"));
+  if (c.slackApproval && c.slackApproval.eventKey === eventKey && c.slackApproval.status === "pending") return true;
+  const id = crypto.randomBytes(18).toString("hex");
+  const summary = await slackSummary(t, c);
+  const blocks = slackApprovalBlocks(c, summary, draft, reason, id);
+  const r = await slackApi(t, "chat.postMessage", { channel, text: "右腕くん：" + (c.name || "お客様") + "への返信確認", blocks });
+  if (!r.ok || !r.ts) return false;
+  c.slackApproval = { id, eventKey, draft, draftHash: sha(draft), status: "pending", createdAt: Date.now(), expiresAt: Date.now() + 24 * 60 * 60 * 1000, channelId: channel, threadTs: String(r.ts) };
+  c.status = "todo"; c.flag = true; dbSave(t, c);
+  return true;
+}
+async function slackReviseDraft(t, c, instruction) {
+  const history = slackHistoryText(c);
+  let booking = ""; try { booking = await fetchBooking(t, c); } catch (e) {}
+  const sys = "あなたは店舗の受付スタッフ。会話、現在の返信案、スタッフの修正指示を踏まえ、患者へ送る返信本文だけを作る。医療判断や情報の推測はしない。" + (booking ? "\n予約システムの確認結果:\n" + booking : "");
+  const content = "会話:\n" + history + "\n\n現在の返信案:\n" + String(c.draft || "") + "\n\nスタッフの修正指示:\n" + String(instruction || "").slice(0, 1200);
+  const out = await aiChat(t, sys, [{ role: "user", content }], 1800);
+  return String(out || "").trim();
+}
+async function slackUpdateApproval(t, channel, ts, text) {
+  return slackApi(t, "chat.update", { channel, ts, text, blocks: [{ type: "section", text: { type: "mrkdwn", text } }] });
 }
 const slackInFlight = new Set();
 async function slackEscalate(t, c, reason) {
@@ -1150,6 +1237,7 @@ function scheduleAutoReply(t, c, draftText, recvAt, delayMin) {
       const cur = t.store[c.id];
       if (!cur) return;
       if (!S(t).autoReply) return;                 // 待機中に自動返信OFFにされた
+      if (slackReviewAll(t)) { await slackRequestApproval(t, cur, "毎回確認モードのため、送信前に承認が必要です"); return; }
       if (cur.status === "done" || cur.flag) return; // 既に対応済み/フラグ付き
       if (!cur.draft || cur.draft.trim() !== draftText) return; // 下書きが変わった/消えた
       const lastMsg = cur.msgs[cur.msgs.length - 1];
@@ -1269,7 +1357,7 @@ async function handleInbound(t, opts) {
     const g = await genDraft(t, c);
     if (g) { c.draft = String(g.draft || ""); c.draft0 = c.draft; confidence = g.confidence; needsHuman = g.needs_human; urgent = g.is_urgent; siteAlert = g.site_alert; siteSummary = g.site_summary; c.topics = Array.isArray(g.topics) ? g.topics : []; }
     // ===== 予約自動受付: AIが操作依頼(action)を出したら、確認文の送信までを自動処理 =====
-    if (g && baEnabled(t) && PARTNER_KEY && g.action && typeof g.action === "object" && g.action.type && g.action.type !== "none") {
+    if (g && !slackReviewAll(t) && baEnabled(t) && PARTNER_KEY && g.action && typeof g.action === "object" && g.action.type && g.action.type !== "none") {
       try { baDone = await baAction(t, c, g.action, g.baCtx); } catch (e) { console.error("ba action:", e && e.message); }
       if (baDone) { c.draft = ""; c.draft0 = ""; }
       else if (String(needsHuman) !== "true" && String(urgent) !== "true") {
@@ -1294,7 +1382,7 @@ async function handleInbound(t, opts) {
     const conf = String(confidence || "").toLowerCase();
     const confOk = conf === "high" || (S(t).level === "medium" && conf === "medium");
     const safe = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med;
-    if (!baDone && S(t).autoReply && confOk && safe && c.draft && c.draft.trim()) {
+    if (!baDone && S(t).autoReply && !slackReviewAll(t) && confOk && safe && c.draft && c.draft.trim()) {
       const draftText = c.draft.trim();
       const delayMin = Number(S(t).autoDelayMin || 0);
       if (delayMin > 0 && (recvAt + delayMin * 60000 - Date.now()) > 0) {
@@ -1308,9 +1396,16 @@ async function handleInbound(t, opts) {
     }
   } catch (e) {}
   try { if (autoSent) notifyAll(t, "🤖 自動返信済み: " + (c.name || ""), (c.last || "").slice(0, 90)); else if (!baDone) notifyAll(t, c.name || "新着メッセージ", (c.last || "新しいメッセージが届きました").slice(0, 90)); } catch (e) {}
-  if (String(needsHuman) === "true" || String(urgent) === "true" || c.flag) {
-    const reason = String(urgent) === "true" ? "緊急性のある問い合わせとAIが判定しました" : (c.flag ? "要対応フラグが付いています" : "AIが人による判断を必要と判定しました");
-    slackEscalate(t, c, reason).catch(() => {});
+  const confForSlack = String(confidence || "").toLowerCase();
+  const confOkForSlack = confForSlack === "high" || (S(t).level === "medium" && confForSlack === "medium");
+  const safeForSlack = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med;
+  const exceptionNeedsReview = S(t).autoReply && S(t).slackReplyMode === "exceptions" && !baDone && c.draft && c.draft.trim() && (!confOkForSlack || !safeForSlack);
+  if (slackReviewAll(t) && !baDone && c.draft && c.draft.trim()) {
+    slackRequestApproval(t, c, "毎回確認モードのため、送信前に承認が必要です").catch(() => {});
+  } else if (exceptionNeedsReview || String(needsHuman) === "true" || String(urgent) === "true" || c.flag) {
+    const reason = String(urgent) === "true" ? "緊急性のある問い合わせとAIが判定しました" : (c.flag ? "要対応フラグが付いています" : (!confOkForSlack ? "自動送信に必要な確信率を満たさないため確認が必要です" : "AIが人による判断を必要と判定しました"));
+    if (c.draft && c.draft.trim() && S(t).slackReplyMode === "exceptions" && C.slackBotToken(t)) slackRequestApproval(t, c, reason).catch(() => {});
+    else slackEscalate(t, c, reason).catch(() => {});
   }
   try { forwardToPartner(t, c, { autoSent: autoSent || baDone, autoScheduled }); } catch (e) {} // 受付くんへ受信イベントを転送
   return { id, autoSent: autoSent || baDone, autoScheduled };
@@ -1539,23 +1634,24 @@ async function deliverText(t, c, text) {
   return { sent, sendErr };
 }
 
-const sendLocks = new Set(); // 二重送信ガード（会話単位の実行中ロック）
+const sendLocks = new Set(); // 二重送信ガード（法人＋会話単位の実行中ロック）
 app.post("/api/send", guard, async (req, res) => {
   const t = req.tenant;
   const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" });
   cancelAutoReply(t, c.id); // スタッフが手動返信したので保留中の自動返信は取り消す
   const text = (req.body.text || "").trim(); if (!text) return res.status(400).json({ error: "empty" });
   // 二重押し対策1: 同じ会話への送信が実行中なら受け付けない（1通目の結果に相乗り）
-  if (sendLocks.has(c.id)) return res.json({ ok: true, sent: true, dup: true });
+  const sendLockKey = t.slug + "::" + c.id;
+  if (sendLocks.has(sendLockKey)) return res.json({ ok: true, sent: true, dup: true });
   // 二重押し対策2: 直近60秒以内に同一本文を送信済みなら再送しない
   const lastUs = (c.msgs || []).slice().reverse().find((m) => m && m.from === "us");
   if (lastUs && String(lastUs.text || "").trim() === text && Date.now() - (c.ts || 0) < 60000) {
     return res.json({ ok: true, sent: true, dup: true });
   }
-  sendLocks.add(c.id);
+  sendLocks.add(sendLockKey);
   let sent = false, sendErr = null;
   try { ({ sent, sendErr } = await deliverText(t, c, text)); }
-  finally { sendLocks.delete(c.id); }
+  finally { sendLocks.delete(sendLockKey); }
   let learnedId = null, conflict = null, learnedRules = [];
   if (sent) {
     const draft0 = String(c.draft0 || "").trim(); // 学習判定用に、消す前のAI初回下書きを確保
@@ -1686,6 +1782,7 @@ function publicSettings(t) {
       channel: String(t.config.conn.slackChannelName || "").slice(0, 120),
       oauth: t.config.conn.slackConnectionType === "oauth"
     } : null,
+    slackInteractive: !!(C.slackBotToken(t) && t.config.conn.slackChannelId),
     publicUrlConfigured: !!publicConversationUrl({ id: "preview" }),
     engines: { claude: !!ANTHROPIC_KEY, gpt: !!process.env.OPENAI_KEY, gemini: !!process.env.GEMINI_KEY },
     rules: { chars: rulesCharTotal(t), count: rulesList(t).length, budget: ruleBudget(t), budgets: RULE_BUDGETS }
@@ -1696,7 +1793,7 @@ app.get("/api/slack/oauth/start", guard, (req, res) => {
   if (!slackOAuthReady()) return res.status(503).send("Slack OAuth is not configured");
   const state = issueSlackState(req, req.tenant);
   const redirectUri = PUBLIC_BASE_URL.replace(/\/$/, "") + "/api/slack/oauth/callback";
-  const q = new URLSearchParams({ client_id: SLACK_OAUTH.clientId, scope: "incoming-webhook", redirect_uri: redirectUri, state });
+  const q = new URLSearchParams({ client_id: SLACK_OAUTH.clientId, scope: "incoming-webhook,chat:write,channels:history,groups:history", redirect_uri: redirectUri, state });
   res.redirect("https://slack.com/oauth/v2/authorize?" + q.toString());
 });
 app.get("/api/slack/oauth/callback", async (req, res) => {
@@ -1709,8 +1806,9 @@ app.get("/api/slack/oauth/callback", async (req, res) => {
     const r = await fetch("https://slack.com/api/oauth.v2.access", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
     const j = await r.json();
     const incoming = j && j.incoming_webhook;
-    if (!r.ok || !j.ok || !incoming || !validSlackWebhook(incoming.url)) throw new Error("oauth_failed");
+    if (!r.ok || !j.ok || !incoming || !validSlackWebhook(incoming.url) || !String(j.access_token || "")) throw new Error("oauth_failed");
     t.config.conn.slackWebhook = incoming.url;
+    t.config.conn.slackBotToken = String(j.access_token || "");
     t.config.conn.slackConnectionType = "oauth";
     t.config.conn.slackTeamId = String((j.team && j.team.id) || "").slice(0, 80);
     t.config.conn.slackTeamName = String((j.team && j.team.name) || "").slice(0, 120);
@@ -1723,10 +1821,91 @@ app.get("/api/slack/oauth/callback", async (req, res) => {
     return res.redirect(base + "/?slack=connected");
   } catch (e) { return res.redirect(base + "/?slack=error"); }
 });
+function verifySlackRequest(req) {
+  const ts = String(req.headers["x-slack-request-timestamp"] || "");
+  const sig = String(req.headers["x-slack-signature"] || "");
+  if (!SLACK_OAUTH.signingSecret || !/^\d+$/.test(ts) || Math.abs(Date.now() / 1000 - Number(ts)) > 300 || !req.rawBody) return false;
+  const expected = "v0=" + crypto.createHmac("sha256", SLACK_OAUTH.signingSecret).update("v0:" + ts + ":").update(req.rawBody).digest("hex");
+  return safeEq(sig, expected);
+}
+const slackEventSeen = new Map();
+app.post("/api/slack/events", async (req, res) => {
+  if (!verifySlackRequest(req)) return res.status(401).send("invalid signature");
+  if (req.body && req.body.type === "url_verification") return res.json({ challenge: req.body.challenge });
+  res.sendStatus(200);
+  const eventId = String(req.body && req.body.event_id || "");
+  if (eventId) {
+    if (slackEventSeen.has(eventId)) return;
+    slackEventSeen.set(eventId, Date.now());
+    if (slackEventSeen.size > 1000) for (const [k, v] of slackEventSeen) if (Date.now() - v > 10 * 60 * 1000 || slackEventSeen.size > 900) slackEventSeen.delete(k);
+  }
+  const ev = req.body && req.body.event;
+  if (!ev || ev.type !== "message" || ev.subtype || ev.bot_id || !ev.thread_ts || !String(ev.text || "").trim()) return;
+  const found = slackApprovalByThread(req.body.team_id, ev.channel, String(ev.thread_ts));
+  if (!found || found.approval.expiresAt < Date.now()) return;
+  const instruction = String(ev.text || "").trim().slice(0, 1200);
+  try {
+    if (/^(それで|それでいい|この内容で|その内容で|そのまま)(送って|送信して|大丈夫|いい|お願いします)?[。！!\s]*$/.test(instruction)) {
+      await slackApi(found.t, "chat.postMessage", { channel: ev.channel, thread_ts: ev.thread_ts, text: "安全のため、返信案にある「この内容で送信」ボタンを押して確定してください。" });
+      return;
+    }
+    if (/(患者|予約|来院|顧客).*(確認|情報|教え|見せ)|情報.*(患者|予約)/.test(instruction)) {
+      let info = "予約システムに確認できる情報がありません。";
+      try { info = (await fetchBooking(found.t, found.c)) || info; } catch (e) {}
+      await slackApi(found.t, "chat.postMessage", { channel: ev.channel, thread_ts: ev.thread_ts, text: "確認結果です。\n" + String(info).slice(0, 2800), mrkdwn: false });
+      return;
+    }
+    const revised = await slackReviseDraft(found.t, found.c, instruction);
+    if (!revised) throw new Error("no_draft");
+    found.c.draft = revised;
+    found.approval.status = "revised";
+    const nextId = crypto.randomBytes(18).toString("hex");
+    const next = { id: nextId, eventKey: found.approval.eventKey, draft: revised, draftHash: sha(revised), status: "pending", createdAt: Date.now(), expiresAt: Date.now() + 24 * 60 * 60 * 1000, channelId: ev.channel, threadTs: ev.thread_ts };
+    found.c.slackApproval = next; dbSave(found.t, found.c);
+    await slackApi(found.t, "chat.postMessage", { channel: ev.channel, thread_ts: ev.thread_ts, text: "修正した返信案です。", blocks: slackApprovalBlocks(found.c, "スタッフの修正指示：「" + instruction + "」", revised, "修正後の再確認", nextId) });
+  } catch (e) { await slackApi(found.t, "chat.postMessage", { channel: ev.channel, thread_ts: ev.thread_ts, text: "返信案を修正できませんでした。右腕くんの画面で確認してください。" }); }
+});
+app.post("/api/slack/actions", async (req, res) => {
+  if (!verifySlackRequest(req)) return res.status(401).send("invalid signature");
+  let p; try { p = JSON.parse(req.body.payload || "{}"); } catch (e) { return res.status(400).send("bad payload"); }
+  const action = p.actions && p.actions[0];
+  const found = action && slackApprovalById(String(action.value || ""));
+  res.status(200).send();
+  if (!found || found.approval.status !== "pending") return;
+  const channel = p.channel && p.channel.id, ts = p.message && p.message.ts;
+  if (found.approval.expiresAt < Date.now()) {
+    found.approval.status = "expired"; dbSave(found.t, found.c);
+    return void slackUpdateApproval(found.t, channel, ts, "⌛ この承認依頼は期限切れです。右腕くんで最新の返信案を確認してください。");
+  }
+  if (action.action_id === "migiude_cancel") {
+    found.approval.status = "cancelled"; dbSave(found.t, found.c);
+    return void slackUpdateApproval(found.t, channel, ts, "⛔ 今回は送信しませんでした。下書きは右腕くんに残っています。");
+  }
+  if (action.action_id === "migiude_info") {
+    let info = "予約システムに確認できる情報がありません。";
+    try { info = (await fetchBooking(found.t, found.c)) || info; } catch (e) {}
+    return void slackApi(found.t, "chat.postMessage", { channel, thread_ts: found.approval.threadTs, text: "患者・予約情報の確認結果です。\n" + String(info).slice(0, 2800), mrkdwn: false });
+  }
+  if (action.action_id !== "migiude_send" || sha(String(found.c.draft || "").trim()) !== found.approval.draftHash) return;
+  const lockKey = found.t.slug + "::" + found.c.id;
+  if (sendLocks.has(lockKey)) return;
+  sendLocks.add(lockKey); found.approval.status = "sending"; dbSave(found.t, found.c);
+  try {
+    const text = String(found.c.draft || "").trim();
+    const r = await deliverText(found.t, found.c, text);
+    if (!r.sent) {
+      found.approval.status = "pending"; dbSave(found.t, found.c);
+      return void slackUpdateApproval(found.t, channel, ts, "⚠️ 送信に失敗しました。患者様には送られていません。右腕くんで送信設定を確認してください。");
+    }
+    found.c.msgs.push({ from: "us", text, auto: false, approvedVia: "slack", approvedBy: String(p.user && p.user.id || ""), time: nowt() });
+    found.c.draft = ""; found.c.draft0 = ""; found.c.status = "done"; found.c.flag = false; found.c.lastAuto = false; found.c.time = nowt(); found.c.ts = Date.now(); found.c.last = lastText(found.c); found.approval.status = "sent"; dbSave(found.t, found.c); statBump(found.t, "staff");
+    return void slackUpdateApproval(found.t, channel, ts, "✅ 承認した内容を患者様へ送信しました。\n承認者: <@" + String(p.user && p.user.id || "") + ">");
+  } finally { sendLocks.delete(lockKey); }
+});
 app.post("/api/slack/disconnect", guard, async (req, res) => {
   const t = req.tenant;
   S(t).slackEnabled = false;
-  ["slackWebhook", "slackConnectionType", "slackTeamId", "slackTeamName", "slackChannelId", "slackChannelName"].forEach(k => { delete t.config.conn[k]; });
+  ["slackWebhook", "slackBotToken", "slackConnectionType", "slackTeamId", "slackTeamName", "slackChannelId", "slackChannelName"].forEach(k => { delete t.config.conn[k]; });
   try { await saveTenantConfig(t); } catch (e) { return res.status(500).json({ ok: false }); }
   res.json({ ok: true });
 });
@@ -1735,18 +1914,21 @@ app.post("/api/settings", guard, async (req, res) => {
   if (typeof req.body.autoReply === "boolean") S(t).autoReply = req.body.autoReply;
   if (typeof req.body.bookingActions === "boolean") S(t).bookingActions = req.body.bookingActions;
   if (req.body.slackWebhookClear === true) {
-    ["slackWebhook", "slackConnectionType", "slackTeamId", "slackTeamName", "slackChannelId", "slackChannelName"].forEach(k => { delete t.config.conn[k]; });
+    ["slackWebhook", "slackBotToken", "slackConnectionType", "slackTeamId", "slackTeamName", "slackChannelId", "slackChannelName"].forEach(k => { delete t.config.conn[k]; });
   }
   if (typeof req.body.slackWebhook === "string" && req.body.slackWebhook.trim()) {
     if (!validSlackWebhook(req.body.slackWebhook)) return res.status(400).json({ ok: false, error: "invalid_slack_webhook" });
     t.config.conn.slackWebhook = req.body.slackWebhook.trim();
     t.config.conn.slackConnectionType = "manual";
-    ["slackTeamId", "slackTeamName", "slackChannelId", "slackChannelName"].forEach(k => { delete t.config.conn[k]; });
+    ["slackBotToken", "slackTeamId", "slackTeamName", "slackChannelId", "slackChannelName"].forEach(k => { delete t.config.conn[k]; });
   }
+  const nextSlackMode = ["review_all", "exceptions"].includes(req.body.slackReplyMode) ? req.body.slackReplyMode : S(t).slackReplyMode;
   if (typeof req.body.slackEnabled === "boolean") {
     if (req.body.slackEnabled && !validSlackWebhook(C.slackWebhook(t))) return res.status(400).json({ ok: false, error: "slack_not_configured" });
+    if (req.body.slackEnabled && nextSlackMode === "review_all" && !(C.slackBotToken(t) && t.config.conn.slackChannelId)) return res.status(400).json({ ok: false, error: "slack_interactive_required" });
     S(t).slackEnabled = req.body.slackEnabled;
   }
+  S(t).slackReplyMode = nextSlackMode;
   if (req.body.level === "high" || req.body.level === "medium") S(t).level = req.body.level;
   if (typeof req.body.tone === "string") S(t).tone = req.body.tone.slice(0, 1500);
   if (req.body.autoDelayMin != null && isFinite(Number(req.body.autoDelayMin))) S(t).autoDelayMin = Math.min(60, Math.max(0, Math.round(Number(req.body.autoDelayMin))));
@@ -3255,6 +3437,12 @@ const PAGE = `<!DOCTYPE html>
   <div id="slackSettings" style="border:1px solid #fde68a;background:#fffbeb;border-radius:10px;margin-top:10px;padding:10px;">
     <div style="font-size:13px;font-weight:700;margin-bottom:6px;">🔔 Slack通知設定</div>
     <label style="display:flex;align-items:center;gap:10px;font-size:14px;padding:4px 0;cursor:pointer;"><input type="checkbox" id="setSlackEnabled" style="width:18px;height:18px;"> 要対応をSlackへ通知する</label>
+    <div style="font-size:12px;font-weight:600;margin-top:6px;">Slack接続時の返信運用</div>
+    <select id="setSlackReplyMode" style="width:100%;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;margin-top:4px;">
+      <option value="review_all">毎回Slackで承認してから送信（安全優先）</option>
+      <option value="exceptions">安全な返信は自動送信・要確認だけSlack</option>
+    </select>
+    <div id="slackModeNote" style="font-size:10.5px;color:#6b7280;margin-top:3px;line-height:1.5;">自動返信がONの場合に適用します。Slackでは返信案の承認、修正指示、患者・予約情報の確認ができます。</div>
     <div id="slackStat" style="font-size:12px;color:#6b7280;margin-top:5px;line-height:1.6;">未接続</div>
     <div id="slackOAuthActions" style="display:none;gap:6px;flex-wrap:wrap;margin-top:7px;">
       <button type="button" id="slackConnectBtn" class="cbtn" onclick="connectSlack()">Slackに接続</button>
@@ -4072,7 +4260,7 @@ function renderRuleGauge(){
   }
 }
 async function openSet(){try{const ar=await fetch("/api/account");const a=await ar.json();document.getElementById("accountLoginId").textContent="ログインID: "+(a.loginId||"");document.getElementById("setAccountEmail").value=a.accountEmail||"";document.getElementById("accountEmailStat").textContent=(a.accountEmail?"再設定メールアドレス登録済み":"再設定メールアドレス未登録")+(a.resetEmailReady?"・メール送信可能":"・送信メール設定が必要");}catch(e){}
-  try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setBookingActions").checked=!!s.bookingActions;document.getElementById("setSlackEnabled").checked=!!s.slackEnabled;document.getElementById("setSlackWebhook").value="";const sc=s.slackConnection||null;document.getElementById("slackStat").innerHTML=sc&&sc.oauth?("接続先：<b>"+esc(sc.team||"Slack")+" / #"+esc(sc.channel||"通知先")+"</b><br>通知："+(s.slackEnabled?"有効":"停止中（内容を確認して保存すると有効化できます）")):(s.slackConfigured?"Webhook手動設定済み":"Slack未接続");const actions=document.getElementById("slackOAuthActions");actions.style.display=s.slackOAuthAvailable?"flex":"none";const cb=document.getElementById("slackConnectBtn");cb.textContent=s.slackConfigured?"接続先を変更":"Slackに接続";document.getElementById("slackTestBtn").style.display=s.slackConfigured?"inline-block":"none";document.getElementById("slackDisconnectBtn").style.display=s.slackConfigured?"inline-block":"none";document.getElementById("slackLegacy").style.display=s.slackOAuthAvailable?"none":"block";document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"gemini";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);window.__rules=s.rules||null;renderRuleGauge();renderPrefs(s.prefs||[]);
+  try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setBookingActions").checked=!!s.bookingActions;document.getElementById("setSlackEnabled").checked=!!s.slackEnabled;document.getElementById("setSlackReplyMode").value=s.slackReplyMode||"exceptions";document.getElementById("setSlackReplyMode").disabled=!s.slackInteractive;document.getElementById("slackModeNote").textContent=s.slackInteractive?"自動返信がONの場合に適用します。Slackでは返信案の承認、修正指示、患者・予約情報の確認ができます。":"SlackへOAuth接続すると承認・修正機能を選べます。手動Webhookは通知だけです。";document.getElementById("setSlackWebhook").value="";const sc=s.slackConnection||null;document.getElementById("slackStat").innerHTML=sc&&sc.oauth?("接続先：<b>"+esc(sc.team||"Slack")+" / #"+esc(sc.channel||"通知先")+"</b><br>通知："+(s.slackEnabled?"有効":"停止中（内容を確認して保存すると有効化できます）")):(s.slackConfigured?"Webhook手動設定済み":"Slack未接続");const actions=document.getElementById("slackOAuthActions");actions.style.display=s.slackOAuthAvailable?"flex":"none";const cb=document.getElementById("slackConnectBtn");cb.textContent=s.slackConfigured?"接続先を変更":"Slackに接続";document.getElementById("slackTestBtn").style.display=s.slackConfigured?"inline-block":"none";document.getElementById("slackDisconnectBtn").style.display=s.slackConfigured?"inline-block":"none";document.getElementById("slackLegacy").style.display=s.slackOAuthAvailable?"none":"block";document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"gemini";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);window.__rules=s.rules||null;renderRuleGauge();renderPrefs(s.prefs||[]);
   if(s.engines){const n=document.getElementById("engineNote");n.textContent="文章作成は選択中のAIで生成（GPT"+(s.engines.gpt?"✓":"⚠キー未設定")+"・Gemini"+(s.engines.gemini?"✓":"⚠")+"・Claude"+(s.engines.claude?"✓":"⚠")+"）。キー未設定のエンジンを選ぶと安全のためClaudeで生成します。";}}catch(e){}
   refreshModelAlert();
   try{const cr=await fetch("/api/conn");const c=await cr.json();document.getElementById("connStat").textContent=(c.lineConfigured?"LINE✓ ":"LINE未 ")+(c.mailConfigured?"メール✓":"メール未");document.getElementById("cSmtpHost").value=c.smtpHost||"";document.getElementById("cSmtpPort").value=c.smtpPort||"";document.getElementById("cSmtpUser").value=c.smtpUser||"";document.getElementById("cImapHost").value=c.imapHost||"";document.getElementById("cImapPort").value=c.imapPort||"";document.getElementById("cImapUser").value=c.imapUser||"";document.getElementById("cEmailInternal").checked=!!c.emailInternal;renderAccts(c);}catch(e){}
@@ -4108,7 +4296,7 @@ function closeSet(){document.getElementById("setPop").style.display="none";}
 function connectSlack(){location.href="/api/slack/oauth/start";}
 async function testSlack(){const webhook=document.getElementById("setSlackWebhook").value.trim();try{const r=await api("/api/slack-test",{webhook});const j=await r.json();if(j.ok)uiAlert("Slackへテスト通知を送りました");else uiAlert(j.error==="invalid_slack_webhook"?"Webhook URLが正しくありません":"Slackへ接続できませんでした");}catch(e){uiAlert("Slackへ接続できませんでした");}}
 async function disconnectSlack(){if(!await uiConfirm("右腕くんとSlackの連携を解除しますか？\\nSlack通知は停止します。"))return;try{const r=await api("/api/slack/disconnect",{});const j=await r.json();if(!j.ok)throw new Error("disconnect");uiAlert("Slack連携を解除しました");openSet();}catch(e){uiAlert("連携解除に失敗しました");}}
-async function saveSet(){const autoReply=document.getElementById("setAuto").checked;const bookingActions=document.getElementById("setBookingActions").checked;const slackEnabled=document.getElementById("setSlackEnabled").checked;const slackWebhook=document.getElementById("setSlackWebhook").value.trim();const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{const r=await api("/api/settings",{autoReply,bookingActions,slackEnabled,slackWebhook,level,tone,engine,autoDelayMin});const j=await r.json();if(!j.ok)throw new Error(j.error||"save");uiAlert("設定を保存しました");closeSet();}catch(e){uiAlert(e.message==="invalid_slack_webhook"?"Slack Webhook URLが正しくありません":e.message==="slack_not_configured"?"先にSlackへ接続してください":"保存に失敗しました");}}
+async function saveSet(){const autoReply=document.getElementById("setAuto").checked;const bookingActions=document.getElementById("setBookingActions").checked;const slackEnabled=document.getElementById("setSlackEnabled").checked;const slackReplyMode=document.getElementById("setSlackReplyMode").value;const slackWebhook=document.getElementById("setSlackWebhook").value.trim();const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{const r=await api("/api/settings",{autoReply,bookingActions,slackEnabled,slackReplyMode,slackWebhook,level,tone,engine,autoDelayMin});const j=await r.json();if(!j.ok)throw new Error(j.error||"save");uiAlert("設定を保存しました");closeSet();}catch(e){uiAlert(e.message==="invalid_slack_webhook"?"Slack Webhook URLが正しくありません":e.message==="slack_not_configured"?"先にSlackへ接続してください":e.message==="slack_interactive_required"?"Slackを再接続して承認機能を有効にしてください":"保存に失敗しました");}}
 async function changeLoginId(){
   const next=await uiPrompt("新しいログインID（半角英数字3〜30文字。スタッフ全員のログインに使います）");if(!next)return;
   try{const r=await api("/api/change-loginid",{next:next.trim()});const j=await r.json();

@@ -23,6 +23,6 @@
 
 ## セキュリティ
 
-- `PLATFORM_SECRET`、`CRED_KEY`、APIキー、LINEトークン、メールパスワード、Slack Webhook URLをコード・ログ・チャットへ出さない。
+- `PLATFORM_SECRET`、`CRED_KEY`、APIキー、LINEトークン、メールパスワード、Slack Webhook URL・Bot Token・Signing Secretをコード・ログ・チャットへ出さない。
 - Slackは共通AppのOAuth接続を優先し、Webhook URLの手動入力は高度な設定の後方互換だけにする。APIは接続先のワークスペース名・チャンネル名と設定済みかだけ返し、Webhook値を返さない。
 - 予約のキャンセル・日時変更は、現在の会話の本人確認済み患者と予約IDをサーバーで再照合し、スタッフの最終確認後だけ実行する。

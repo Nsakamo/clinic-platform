@@ -24,14 +24,32 @@
   ワークスペースとチャンネルを選択でき、接続後は名称を表示する。「接続先を変更」で選び直し、
   「連携解除」で右腕くん側の通知資格情報を削除する。切り替え直後は通知OFFとし、表示された接続先を
   確認してから明示的に有効化する。従来Webhook入力はOAuth未設定環境の高度な設定として残す。
+- 自動返信ON＋Slack接続時の返信運用を2モード化。「毎回Slackで承認」は生成した返信を送信せず、
+  会話要約・返信案・送信承認ボタンをSlackへ出す。「安全な返信は自動送信・要確認だけSlack」は
+  従来の安全判定を通った返信だけ自動送信し、例外を同じ承認フローへ送る。Slackスレッドの修正指示で
+  返信案を再生成でき、患者・予約情報の確認要求はうけつけるんの照会結果をスレッドへ返す。
+  承認ID・返信本文ハッシュ・24時間期限・送信ロック・承認者Slack IDを記録し、明示ボタン以外では送信しない。
 
 ## 環境変数
 
 - `PUBLIC_BASE_URL`: 右腕くんの公開URL。Slackの会話直接リンクに使用。無ければ通知は届くがリンクは省略。
 - `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`: 共通の「右腕くん通知」Slack AppのOAuth資格情報。
 - `SLACK_OAUTH_STATE_SECRET`: OAuthの接続要求をログイン法人・セッションへ結び付ける署名鍵。十分に長いランダム値。
-  OAuthを表示するには上記3変数とHTTPSの`PUBLIC_BASE_URL`が必要。Redirect URLは
-  `{PUBLIC_BASE_URL}/api/slack/oauth/callback`。Bot Token Scopeは`incoming-webhook`だけを指定する。
+- `SLACK_SIGNING_SECRET`: Slack Events APIとInteractivityリクエストの署名検証に使用。
+  OAuthを表示するには上記4変数とHTTPSの`PUBLIC_BASE_URL`が必要。Redirect URLは
+  `{PUBLIC_BASE_URL}/api/slack/oauth/callback`。Bot Token Scopesは`incoming-webhook`, `chat:write`,
+  `channels:history`, `groups:history`。Interactivity Request URLは`{PUBLIC_BASE_URL}/api/slack/actions`、
+  Event Subscriptions Request URLは`{PUBLIC_BASE_URL}/api/slack/events`で、bot eventの
+  `message.channels`と`message.groups`を購読する。
+
+## LINEの全メッセージ表示
+
+- 患者からのメッセージはLINE Webhookで右腕くんへ保存できる。
+- LINE公式アカウント管理画面からスタッフが手動送信した本文を後から取得するMessaging APIはない。
+  送信数の集計値は取得できるが、宛先別の本文履歴には使えない。
+- 今後の完全な履歴を保証するには、通常返信・Slack承認後の返信をすべて右腕くんのMessaging API経由へ
+  集約する。公式管理画面で例外的に送った内容は自動同期できないため、右腕くんで「外部送信メモ」として
+  手動記録する補助機能を別途検討する。
 - `CRED_KEY`: 既存資格情報とSlack Webhookの保存時暗号化。32バイト（hex64桁またはbase64）。
 - `PLATFORM_SECRET`, `PARTNER_BOOKING_URL`: うけつけるん連携。右腕くん単体テナントのSlackには不要。
 - `RESET_SMTP_HOST`, `RESET_SMTP_PORT`, `RESET_SMTP_USER`, `RESET_SMTP_PASS`, `RESET_SMTP_FROM`: パスワード再設定メール専用の送信設定。未設定時は対象テナントのSMTPへ後方互換フォールバック。
@@ -70,3 +88,6 @@
 11. OAuthでテスト用ワークスペース／チャンネルへ接続し、接続名が表示され、接続直後は通知OFFになる。
 12. 「接続先を変更」で別のテスト用チャンネルへ切り替え、以後のテスト通知が新しい通知先だけへ届く。
 13. 「連携解除」で通知が停止し、Webhook URLやOAuth秘密情報が画面・API・ログへ出ない。
+14. 毎回承認モードでテストメッセージを受信し、患者へ送られずSlackへ要約と返信案が届く。
+15. Slackスレッドで修正し、新しい返信案が出るが承認前は送信されない。「この内容で送信」は1回だけ反映され、承認者が記録される。
+16. 例外確認モードで安全なテスト問い合わせは自動送信、低確信・緊急・要対応だけSlack承認待ちになる。
