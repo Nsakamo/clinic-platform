@@ -2764,7 +2764,8 @@ app.get("/forgot", (req,res)=>{ res.set("Content-Type","text/html; charset=utf-8
 app.post("/api/forgot", async (req,res)=>{
   const email = normalizeEmail(req.body.email);
   const loginId = String(req.body.loginId||"").trim();
-  const e2eDebug = req.hostname === "clinic-platform-staging.up.railway.app" && req.get("x-e2e-test") === "テスト";
+  const requestHost = String(req.headers["x-forwarded-host"] || req.headers.host || "").split(",")[0].trim().toLowerCase();
+  const e2eDebug = requestHost === "clinic-platform-staging.up.railway.app" && req.get("x-e2e-test") === "テスト";
   let debug = "rate_limited";
   try{
     const now = Date.now();
