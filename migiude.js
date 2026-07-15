@@ -2744,7 +2744,7 @@ function resetMailAccount(t){
 }
 async function sendResetEmail(t, toEmail, link){
   const a = resetMailAccount(t);
-  if(!a) return false;
+  if(!a) return "no_mail_config";
   try{
     const nodemailer = require("nodemailer");
     const tp = nodemailer.createTransport({ host:a.smtpHost, port:a.smtpPort, secure:a.smtpPort===465, auth:{user:a.smtpUser, pass:a.smtpPass} });
@@ -2755,10 +2755,16 @@ async function sendResetEmail(t, toEmail, link){
       text: "受信トレイのパスワード再設定リクエストを受け付けました。\n下記リンクから新しいパスワードを設定してください（1時間有効・1回のみ）。\n\n" + link + "\n\nお心当たりが無い場合はこのメールを破棄してください。"
     });
     const accepted = Array.isArray(info.accepted) && info.accepted.some(x => normalizeEmail(x) === normalizeEmail(toEmail));
-    if(!accepted) throw new Error("SMTP did not accept reset recipient");
+    if(!accepted) return "recipient_not_accepted";
     console.log("forgot: reset mail accepted for", t.slug);
-    return true;
-  }catch(e){ console.error("reset-mail:", e.message); return false; }
+    return "accepted";
+  }catch(e){
+    console.error("reset-mail:", e.message);
+    if(e && e.code === "EAUTH") return "smtp_auth_failed";
+    if(/sender/i.test(String(e && e.message || ""))) return "sender_rejected";
+    if(/recipient/i.test(String(e && e.message || ""))) return "recipient_rejected";
+    return "smtp_failed";
+  }
 }
 app.get("/forgot", (req,res)=>{ res.set("Content-Type","text/html; charset=utf-8"); res.set("Cache-Control","no-store"); res.send(FORGOT_PAGE); });
 app.post("/api/forgot", async (req,res)=>{
@@ -2778,9 +2784,10 @@ app.post("/api/forgot", async (req,res)=>{
         t.config.passwordReset = { hash:sha(tok), exp:now + 60*60000 }; // raw tokenは保存しない
         await saveTenantConfig(t);
         const base = String(PUBLIC_BASE_URL || ("https://" + (req.headers["x-forwarded-host"] || req.headers.host || ""))).replace(/\/$/, "");
-        const sent = /^https:\/\//i.test(base) && await sendResetEmail(t, email, base + "/reset?token=" + tok);
+        const mailStatus = /^https:\/\//i.test(base) ? await sendResetEmail(t, email, base + "/reset?token=" + tok) : "invalid_base_url";
+        const sent = mailStatus === "accepted";
         if(!sent){ delete t.config.passwordReset; await saveTenantConfig(t); console.error("forgot: reset mail unavailable for", t.slug); }
-        debug = sent ? "accepted" : "send_failed";
+        debug = mailStatus;
       }else{ debug = "lookup_failed"; console.warn("forgot: recovery lookup failed"); }
     }
   }catch(e){ console.error("forgot:", e.message); }
