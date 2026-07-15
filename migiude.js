@@ -3090,8 +3090,9 @@ const PAGE = `<!DOCTYPE html>
         <li>Slackで通知専用チャンネルを作ります（例：<b>#右腕くん-テスト</b>）。</li>
         <li><a href="https://api.slack.com/apps" target="_blank" rel="noopener noreferrer" style="color:#2563eb;font-weight:600;">Slack App管理画面を開く</a> → <b>Create New App</b> → <b>From scratch</b>。</li>
         <li>アプリ名を「右腕くん通知」などにして、利用するSlackワークスペースを選びます。</li>
+        <li>左メニューの <b>OAuth &amp; Permissions</b> → <b>Scopes</b> → <b>Bot Token Scopes</b> で <b>Add an OAuth Scope</b> を押し、<b>incoming-webhook</b> を追加します。これを先に行わないと「インストールするボットユーザーがありません」と表示されます。</li>
         <li>左メニューの <b>Incoming Webhooks</b> を開き、<b>Activate Incoming Webhooks</b> をONにします。</li>
-        <li><b>Add New Webhook to Workspace</b> を押し、手順1のチャンネルを選んで許可します。</li>
+        <li><b>Add New Webhook to Workspace</b> を押し、手順1のチャンネルを選んで許可します。すでに一度インストールした場合は <b>Reinstall to Workspace</b> を押します。</li>
         <li>表示された <b>Webhook URL</b> をコピーし、この上の入力欄へ貼ります。URLはパスワードと同じ秘密情報なので、チャットやメールへ貼らないでください。</li>
         <li><b>Slackへテスト通知</b>を押し、届いたら画面下の<b>設定を保存</b>を押して完了です。</li>
       </ol>

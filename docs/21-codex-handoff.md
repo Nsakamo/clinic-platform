@@ -18,6 +18,8 @@
 - 予約の一回限りの実行命令は患者向け恒久メモへ保存しない。
 - 設定画面のSlack欄に、Slack App作成・Incoming Webhook有効化・通知先チャンネル選択・テスト・保存までの
   折りたたみ式ガイドと公式管理画面リンクを追加。Webhookをチャットやメールへ貼らない注意も画面内に表示。
+- Slack Appのボット未作成エラーを避けるため、Incoming Webhookを追加する前に `OAuth & Permissions` の
+  Bot Token Scopesへ `incoming-webhook` を追加する手順と、既存インストール時の再インストール手順を追記。
 
 ## 環境変数
 
