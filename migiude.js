@@ -2748,12 +2748,15 @@ async function sendResetEmail(t, toEmail, link){
   try{
     const nodemailer = require("nodemailer");
     const tp = nodemailer.createTransport({ host:a.smtpHost, port:a.smtpPort, secure:a.smtpPort===465, auth:{user:a.smtpUser, pass:a.smtpPass} });
-    await tp.sendMail({
+    const info = await tp.sendMail({
       from: (t.name || "右腕くん") + " <" + a.from + ">",
       to: toEmail,
       subject: "【受信トレイ】パスワード再設定のご案内",
       text: "受信トレイのパスワード再設定リクエストを受け付けました。\n下記リンクから新しいパスワードを設定してください（1時間有効・1回のみ）。\n\n" + link + "\n\nお心当たりが無い場合はこのメールを破棄してください。"
     });
+    const accepted = Array.isArray(info.accepted) && info.accepted.some(x => normalizeEmail(x) === normalizeEmail(toEmail));
+    if(!accepted) throw new Error("SMTP did not accept reset recipient");
+    console.log("forgot: reset mail accepted for", t.slug);
     return true;
   }catch(e){ console.error("reset-mail:", e.message); return false; }
 }
@@ -2774,7 +2777,7 @@ app.post("/api/forgot", async (req,res)=>{
         const base = String(PUBLIC_BASE_URL || ("https://" + (req.headers["x-forwarded-host"] || req.headers.host || ""))).replace(/\/$/, "");
         const sent = /^https:\/\//i.test(base) && await sendResetEmail(t, email, base + "/reset?token=" + tok);
         if(!sent){ delete t.config.passwordReset; await saveTenantConfig(t); console.error("forgot: reset mail unavailable for", t.slug); }
-      }
+      }else console.warn("forgot: recovery lookup failed");
     }
   }catch(e){ console.error("forgot:", e.message); }
   res.json({ ok:true }); // 列挙対策: 登録有無に関わらず常に成功扱い
