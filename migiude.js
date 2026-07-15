@@ -2764,7 +2764,7 @@ app.get("/forgot", (req,res)=>{ res.set("Content-Type","text/html; charset=utf-8
 app.post("/api/forgot", async (req,res)=>{
   const email = normalizeEmail(req.body.email);
   const loginId = String(req.body.loginId||"").trim();
-  const e2eDebug = process.env.RAILWAY_ENVIRONMENT_NAME === "staging" && req.get("x-e2e-test") === "テスト";
+  const e2eDebug = req.hostname === "clinic-platform-staging.up.railway.app" && req.get("x-e2e-test") === "テスト";
   let debug = "rate_limited";
   try{
     const now = Date.now();
