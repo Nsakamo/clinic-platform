@@ -3486,9 +3486,58 @@ const PAGE = `<!DOCTYPE html>
   @keyframes slideinY{from{transform:translateY(102%);}to{transform:translateY(0);}}
   @keyframes slideoutX{from{transform:translateX(0);}to{transform:translateX(102%);}}
   @keyframes slideoutY{from{transform:translateY(0);}to{transform:translateY(102%);}}
+  /* 設定はPCでは情報を横に整理し、スマホでは操作しやすい全画面表示にする */
+  #setPop,#learnManagePop{position:fixed;inset:0;background:rgba(0,0,0,.38);display:none;align-items:center;justify-content:center;padding:16px;}
+  #setPop{z-index:65;}
+  #learnManagePop{z-index:78;background:rgba(0,0,0,.44);}
+  .settingsCard{width:min(94vw,920px);max-height:92vh;background:#f8fafc;border-radius:16px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.22);}
+  .settingsHeader{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:15px 18px;background:#fff;border-bottom:1px solid var(--line);flex-shrink:0;}
+  .settingsHeader h3{margin:0;font-size:16px;}
+  .settingsBody{padding:14px;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;}
+  .settingsGrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;align-items:start;}
+  .settingsColumn{display:flex;flex-direction:column;gap:12px;min-width:0;}
+  .settingsSection{background:#fff;border:1px solid var(--line);border-radius:12px;padding:12px;min-width:0;}
+  .settingsSection.account{border-color:#dbeafe;background:#f8fbff;}
+  .settingsSection.slack{border-color:#fde68a;background:#fffbeb;}
+  .settingsSectionTitle{font-size:13px;font-weight:700;margin-bottom:7px;}
+  .settingsCheck{display:flex;align-items:center;gap:10px;font-size:14px;padding:7px 0;cursor:pointer;}
+  .settingsCheck input{width:18px;height:18px;flex-shrink:0;}
+  .settingsDivider{border-top:1px solid var(--line);margin-top:12px;padding-top:10px;}
+  .settingsActions{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
+  .settingsActions .cbtn{width:100%;}
+  .settingsFooter{display:flex;gap:8px;justify-content:flex-end;padding:12px 18px;background:#fff;border-top:1px solid var(--line);flex-shrink:0;}
+  .learningCard{width:min(96vw,900px);max-height:92vh;background:#fff;border-radius:16px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.22);}
+  .learningHeader{padding:15px 16px 11px;border-bottom:1px solid var(--line);}
+  .learningHeaderRow{display:flex;align-items:center;justify-content:space-between;gap:10px;}
+  .learningHeaderRow h3{margin:0;font-size:16px;}
+  .learningToolbar{padding:10px 16px;border-bottom:1px solid var(--line);display:flex;gap:7px;flex-wrap:wrap;align-items:center;}
+  #learnSearch{margin-left:auto;min-width:180px;flex:1;max-width:280px;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;}
+  .learningFooter{padding:10px 16px;border-top:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:8px;}
   @media(max-width:760px){#list{width:100%;}#chat{display:none;position:absolute;inset:0;}#app.chatopen #list{display:none;}#app.chatopen #chat{display:flex;}#backBtn{display:block;}
     #draft{min-height:44px;}#draft:focus{min-height:140px;}
-    #draft,#search,#popInput,#asstText,#setTone{font-size:16px;}}
+    #draft,#search,#popInput,#asstText,#setTone{font-size:16px;}
+    #setPop,#learnManagePop{padding:0;align-items:stretch;background:#fff;}
+    .settingsCard,.learningCard{width:100vw;max-height:none;height:100vh;height:100dvh;border-radius:0;box-shadow:none;}
+    .settingsHeader{padding:calc(12px + env(safe-area-inset-top)) 14px 12px;}
+    .settingsBody{padding:10px 10px calc(12px + env(safe-area-inset-bottom));}
+    .settingsGrid{grid-template-columns:1fr;gap:10px;}
+    .settingsColumn{gap:10px;}
+    .settingsSection{padding:12px;border-radius:12px;}
+    .settingsFooter{padding:10px 12px calc(10px + env(safe-area-inset-bottom));}
+    .settingsFooter .cbtn{min-height:44px;flex:1;}
+    .settingsActions{grid-template-columns:1fr;}
+    .settingsCard input,.settingsCard select,.settingsCard textarea,#learnSearch{font-size:16px!important;}
+    .settingsCard .cbtn,.learningCard .cbtn{min-height:42px;}
+    .learningHeader{padding:calc(12px + env(safe-area-inset-top)) 12px 10px;}
+    .learningHeaderRow h3{font-size:15px;}
+    .learningToolbar{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));padding:9px 10px;gap:6px;}
+    .learningToolbar .learnTabBtn{padding:7px 3px;font-size:11px;white-space:normal;line-height:1.25;}
+    #learnSearch{grid-column:1/-1;margin-left:0;max-width:none;width:100%;min-width:0;}
+    #learnHelp{padding:8px 11px!important;}
+    #learnList{padding:10px!important;min-height:0!important;}
+    .learningFooter{padding:9px 10px calc(9px + env(safe-area-inset-bottom));}
+    .learningFooter #learnAddBtn{min-width:132px;}
+  }
 </style>
 </head>
 <body>
@@ -3518,21 +3567,25 @@ const PAGE = `<!DOCTYPE html>
   </div>
   <div style="display:flex;gap:8px;padding:10px;border-top:1px solid var(--line);align-items:flex-end;"><textarea id="dText" placeholder="どう変えたいか入力…（例：予約確定メールに記載の院に来てと案内して）" onkeydown="if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing&&event.keyCode!==229){event.preventDefault();dSend();}"></textarea><button class="cbtn send" onclick="dSend()">送信</button></div>
 </div></div>
-<div id="setPop" style="position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:65;display:none;align-items:center;justify-content:center;"><div style="background:#fff;border-radius:14px;padding:18px;width:min(92vw,360px);max-height:86vh;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;">
-  <h3 style="margin:0 0 12px;font-size:15px;">⚙ 設定</h3>
-  <div style="border:1px solid #dbeafe;background:#f8fbff;border-radius:10px;padding:10px;margin-bottom:12px;">
-    <div style="font-size:13px;font-weight:700;margin-bottom:7px;">👤 アカウント設定</div>
+<div id="setPop"><div class="settingsCard">
+  <div class="settingsHeader"><h3>⚙ 設定</h3><button type="button" class="cbtn" onclick="closeSet()">閉じる</button></div>
+  <div class="settingsBody"><div class="settingsGrid"><div class="settingsColumn">
+  <div class="settingsSection account">
+    <div class="settingsSectionTitle">👤 アカウント設定</div>
     <div id="accountLoginId" style="font-size:11px;color:#6b7280;margin-bottom:5px;">ログインID: 読み込み中…</div>
     <input type="email" id="setAccountEmail" autocomplete="email" placeholder="パスワード再設定用メールアドレス" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;">
     <div id="accountEmailStat" style="font-size:11px;color:#6b7280;margin-top:4px;">パスワード再設定メールの送信先です</div>
     <button type="button" class="cbtn" style="margin-top:7px;" onclick="saveAccount()">アカウント情報を保存</button>
   </div>
-  <label style="display:flex;align-items:center;gap:10px;font-size:14px;padding:8px 0;cursor:pointer;"><input type="checkbox" id="setAuto" style="width:18px;height:18px;"> 自動返信を有効にする</label>
-  <label style="display:flex;align-items:center;gap:10px;font-size:14px;padding:8px 0;cursor:pointer;"><input type="checkbox" id="setBookingActions" style="width:18px;height:18px;"> 予約の自動受付（確認・変更・キャンセル）</label>
+  <div class="settingsSection">
+  <div class="settingsSectionTitle">🤖 自動対応</div>
+  <label class="settingsCheck"><input type="checkbox" id="setAuto"> 自動返信を有効にする</label>
+  <label class="settingsCheck"><input type="checkbox" id="setBookingActions"> 予約の自動受付（確認・変更・キャンセル）</label>
   <div style="font-size:11px;color:#888;margin:-6px 0 6px 28px;">予約システム（うけつけるん）連携。本人確認と、患者様の「はい」承認をはさんだうえで、予約のキャンセル・日時変更・LINE連携まで自動で行います。</div>
-  <div id="slackSettings" style="border:1px solid #fde68a;background:#fffbeb;border-radius:10px;margin-top:10px;padding:10px;">
-    <div style="font-size:13px;font-weight:700;margin-bottom:6px;">🔔 Slack通知設定</div>
-    <label style="display:flex;align-items:center;gap:10px;font-size:14px;padding:4px 0;cursor:pointer;"><input type="checkbox" id="setSlackEnabled" style="width:18px;height:18px;"> 要対応をSlackへ通知する</label>
+  </div>
+  <div id="slackSettings" class="settingsSection slack">
+    <div class="settingsSectionTitle">🔔 Slack通知設定</div>
+    <label class="settingsCheck"><input type="checkbox" id="setSlackEnabled"> 要対応をSlackへ通知する</label>
     <div style="font-size:12px;font-weight:600;margin-top:6px;">Slack接続時の返信運用</div>
     <select id="setSlackReplyMode" style="width:100%;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;margin-top:4px;">
       <option value="review_all">毎回Slackで承認してから送信（安全優先）</option>
@@ -3545,13 +3598,15 @@ const PAGE = `<!DOCTYPE html>
       <button type="button" id="slackTestBtn" class="cbtn" onclick="testSlack()" style="display:none;">テスト通知</button>
       <button type="button" id="slackDisconnectBtn" class="cbtn" onclick="disconnectSlack()" style="display:none;color:#b91c1c;">連携解除</button>
     </div>
-    <div style="font-size:11px;color:#6b7280;margin-top:6px;line-height:1.55;">AIが要対応・緊急と判断した時や、予約自動受付を継続できない時に、店舗名・お客様名・理由・最新メッセージ・会話リンクを通知します。Slackから患者様へ返信したり、予約を操作したりする機能は現在ありません。</div>
+    <div style="font-size:11px;color:#6b7280;margin-top:6px;line-height:1.55;">AIが要対応・緊急と判断した時や、予約自動受付を継続できない時に通知します。OAuth接続では、会話要約と返信案の確認、修正指示、患者・予約情報の確認、承認後の送信までSlack内で行えます。</div>
     <details id="slackLegacy" style="margin-top:9px;border:1px solid #e5e7eb;background:#fff;border-radius:9px;padding:8px 10px;">
       <summary style="font-size:11px;font-weight:600;color:#6b7280;cursor:pointer;">高度な設定：Webhook URLを手動入力</summary>
       <input type="password" id="setSlackWebhook" autocomplete="off" placeholder="Incoming Webhook URL（空欄なら現在の設定を保持）" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;margin-top:7px;">
       <div style="font-size:10.5px;color:#6b7280;margin-top:4px;line-height:1.5;">OAuthが使えない場合だけ利用します。URLは秘密情報として保存し、画面へ再表示しません。</div>
     </details>
   </div>
+  <div class="settingsSection">
+  <div class="settingsSectionTitle">⚡ 自動返信の条件</div>
   <div style="font-size:12px;color:#6b7280;margin:2px 0 10px;">AIの確信率が高い問い合わせに、スタッフを待たずAIが自動で返信します。緊急・要対応と判定されたものは自動返信されません。</div>
   <div style="font-size:13px;margin-bottom:4px;">自動返信の対象</div>
   <select id="setLevel" style="width:100%;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:13px;">
@@ -3561,7 +3616,9 @@ const PAGE = `<!DOCTYPE html>
   <div style="font-size:13px;margin:12px 0 4px;">⏱ 自動返信までの待ち時間（分）</div>
   <input type="number" id="setDelay" min="0" max="60" step="1" inputmode="numeric" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:13px;">
   <div style="font-size:11px;color:#6b7280;margin-top:2px;">例：5 と入れると、メッセージ受信から5分後に自動返信します。0 なら即時。返信文の生成に設定時間以上かかった場合は、できあがり次第すぐ送信します。</div>
-  <div style="border-top:1px solid #e5e7eb;margin-top:14px;padding-top:10px;">
+  </div>
+  </div><div class="settingsColumn">
+  <div class="settingsSection">
     <div style="font-size:13px;margin-bottom:4px;">🧠 返信文を作るAIエンジン</div>
     <select id="setEngine" onchange="renderRuleGauge()" style="width:100%;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:13px;">
       <option value="gpt">GPT（OpenAI・gpt-5系）</option>
@@ -3571,25 +3628,25 @@ const PAGE = `<!DOCTYPE html>
     <div id="engineNote" style="font-size:11px;color:#6b7280;margin-top:2px;">文章作成（AI下書き・自動返信・AIで作り直す）に使うAIです。GPTを使うにはRailwayに OPENAI_KEY（必要なら OPENAI_MODEL）の設定が必要です。未設定のまま選ぶと安全のためClaudeで生成します。みぎうで君チャットと資料読み込みは引き続きClaude/Geminiを使用します。</div>
     <div id="modelAlert" style="display:none;font-size:11px;background:#fef3c7;border:1px solid #fcd34d;color:#92400e;border-radius:8px;padding:8px;margin-top:6px;line-height:1.5;"></div>
   </div>
-  <div style="border-top:1px solid #e5e7eb;margin-top:14px;padding-top:10px;">
+  <div class="settingsSection">
     <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;"><span style="font-size:13px;">📚 ルールブックの使用量</span><span id="ruleGaugePct" style="font-size:12px;font-weight:600;color:#6b7280;">—</span></div>
     <div style="background:#e5e7eb;border-radius:999px;height:10px;overflow:hidden;"><div id="ruleGaugeBar" style="height:100%;width:0%;background:#16a34a;transition:width .25s,background .25s;"></div></div>
     <div id="ruleGaugeText" style="font-size:11px;color:#6b7280;margin-top:4px;">読み込み中…</div>
     <div id="ruleGaugeWarn" style="font-size:11px;color:#dc2626;margin-top:2px;display:none;"></div>
   </div>
-  <div style="border-top:1px solid #e5e7eb;margin-top:14px;padding-top:10px;">
+  <div class="settingsSection">
     <div style="font-size:13px;margin-bottom:4px;">🎨 回答全体のトーン・文体</div>
     <textarea id="setTone" placeholder="例：少し柔らかめで親しみやすい敬語にする。文章は短めに。「〜でございます」は使わない。" style="width:100%;box-sizing:border-box;min-height:70px;border:1px solid #d1d5db;border-radius:8px;padding:8px;font-size:13px;font-family:inherit;"></textarea>
     <div style="font-size:11px;color:#6b7280;margin-top:2px;">ここに書いた指示は、AI下書き・自動返信・AIで作り直す、すべてに最優先で反映されます。空欄なら標準のトーンです。</div>
   </div>
-  <div style="border-top:1px solid #e5e7eb;margin-top:14px;padding-top:10px;">
+  <div class="settingsSection">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
       <div style="font-size:13px;font-weight:600;">🧠 学習データ管理</div>
       <button type="button" class="cbtn" onclick="openLearning()">確認・編集</button>
     </div>
     <div style="font-size:11px;color:#6b7280;margin-top:5px;line-height:1.55;">店舗ルール、スタッフの記憶、過去の対応例を一か所で確認・編集・削除できます。用途が違うため、データは混ぜずに安全に管理します。</div>
   </div>
-  <div style="border-top:1px solid #e5e7eb;margin-top:14px;padding-top:10px;">
+  <div class="settingsSection">
     <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;" onclick="document.getElementById('connBox').style.display=document.getElementById('connBox').style.display==='none'?'block':'none'"><span style="font-size:13px;font-weight:600;">🔗 連携設定（LINE・メール）</span><span id="connStat" style="font-size:11px;color:#16a34a;"></span></div>
     <div id="connBox" style="display:none;margin-top:8px;">
       <div style="font-size:12px;font-weight:600;margin:6px 0 2px;">LINE連携</div>
@@ -3616,33 +3673,37 @@ const PAGE = `<!DOCTYPE html>
       </div>
     </div>
   </div>
-  <div style="border-top:1px solid #e5e7eb;margin-top:14px;padding-top:10px;">
+  <div class="settingsSection">
     <div style="font-size:13px;margin-bottom:6px;">✅ 一括操作</div>
     <button class="cbtn" style="width:100%;" onclick="markAllDone()">すべてのチャットを対応済みにする</button>
     <div style="font-size:11px;color:#6b7280;margin-top:4px;">未対応・要対応をまとめて「対応済み」にします。元に戻すときは各チャットを個別に開いて操作してください。</div>
   </div>
-  <div style="border-top:1px solid #e5e7eb;margin-top:12px;padding-top:10px;display:flex;flex-direction:column;gap:8px;">
+  <div class="settingsSection">
+    <div class="settingsSectionTitle">🔐 アカウント操作</div>
+    <div class="settingsActions">
     <button class="cbtn" style="width:100%;" onclick="changeLoginId()">🪪 ログインIDを変更</button>
     <button class="cbtn" style="width:100%;" onclick="changePass()">🔑 ログインパスワードを変更</button>
     <button class="cbtn" style="width:100%;" onclick="location.href='/api/backup'">💾 バックアップをダウンロード（会話・ルール・設定）</button>
     <button class="cbtn" style="width:100%;" onclick="doLogout()">↩ ログアウト</button>
+    </div>
   </div>
-  <div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end;"><button class="cbtn" onclick="closeSet()">閉じる</button><button class="cbtn send" onclick="saveSet()">保存</button></div>
+  </div></div></div>
+  <div class="settingsFooter"><button class="cbtn" onclick="closeSet()">キャンセル</button><button class="cbtn send" onclick="saveSet()">設定を保存</button></div>
 </div></div>
-<div id="learnManagePop" style="position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:78;display:none;align-items:center;justify-content:center;padding:14px;"><div style="background:#fff;border-radius:14px;width:min(96vw,900px);max-height:92vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.22);">
-  <div style="padding:15px 16px 11px;border-bottom:1px solid #e5e7eb;">
-    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;"><h3 style="margin:0;font-size:16px;">🧠 学習データ管理</h3><button type="button" class="cbtn" onclick="closeLearning()">閉じる</button></div>
+<div id="learnManagePop"><div class="learningCard">
+  <div class="learningHeader">
+    <div class="learningHeaderRow"><h3>🧠 学習データ管理</h3><button type="button" class="cbtn" onclick="closeLearning()">閉じる</button></div>
     <div style="font-size:11px;color:#6b7280;line-height:1.6;margin-top:6px;">3種類は役割が違います。<b>店舗ルール</b>は店舗の事実・規定、<b>スタッフの記憶</b>は全返信に常に適用する指示、<b>過去の対応例</b>は似た質問のときだけ参考にする実例です。</div>
   </div>
-  <div style="padding:10px 16px;border-bottom:1px solid #e5e7eb;display:flex;gap:7px;flex-wrap:wrap;align-items:center;">
+  <div class="learningToolbar">
     <button type="button" class="cbtn learnTabBtn" data-tab="rules" onclick="setLearningTab('rules')">📚 店舗ルール <span id="learnRulesCount"></span></button>
     <button type="button" class="cbtn learnTabBtn" data-tab="prefs" onclick="setLearningTab('prefs')">🧠 スタッフの記憶 <span id="learnPrefsCount"></span></button>
     <button type="button" class="cbtn learnTabBtn" data-tab="examples" onclick="setLearningTab('examples')">💬 過去の対応例 <span id="learnExamplesCount"></span></button>
-    <input id="learnSearch" oninput="renderLearning()" placeholder="この種類を検索" style="margin-left:auto;min-width:180px;flex:1;max-width:280px;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;box-sizing:border-box;">
+    <input id="learnSearch" oninput="renderLearning()" placeholder="この種類を検索">
   </div>
   <div id="learnHelp" style="padding:9px 16px;background:#f8fafc;border-bottom:1px solid #e5e7eb;font-size:11px;color:#475569;line-height:1.55;"></div>
   <div id="learnList" style="padding:12px 16px;overflow-y:auto;overscroll-behavior:contain;flex:1;min-height:220px;"></div>
-  <div style="padding:10px 16px;border-top:1px solid #e5e7eb;display:flex;justify-content:space-between;align-items:center;gap:8px;"><span id="learnStatus" style="font-size:11px;color:#6b7280;"></span><button type="button" id="learnAddBtn" class="cbtn send" onclick="addLearningItem()">＋追加</button></div>
+  <div class="learningFooter"><span id="learnStatus" style="font-size:11px;color:#6b7280;"></span><button type="button" id="learnAddBtn" class="cbtn send" onclick="addLearningItem()">＋追加</button></div>
 </div></div>
 <div id="asst"><div id="asstCard">
   <div id="asstHead"><span>🤝 みぎうで君（ルールブック編集）</span><button class="cbtn" onclick="closeAsst()">閉じる</button></div>
