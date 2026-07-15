@@ -143,9 +143,9 @@ async function dbInit() {
   console.log("loaded " + Object.keys(TEN).length + " tenants");
 }
 function dbSave(t, c) {
-  if (!pool || !c) return;
-  pool.query("INSERT INTO convos (tenant,id,ts,data) VALUES ($1,$2,$3,$4) ON CONFLICT (tenant,id) DO UPDATE SET ts=EXCLUDED.ts, data=EXCLUDED.data",
-    [t.slug, c.id, c.ts || 0, c]).catch(e => console.error("dbSave:", e.message));
+  if (!pool || !c) return Promise.resolve(false);
+  return pool.query("INSERT INTO convos (tenant,id,ts,data) VALUES ($1,$2,$3,$4) ON CONFLICT (tenant,id) DO UPDATE SET ts=EXCLUDED.ts, data=EXCLUDED.data",
+    [t.slug, c.id, c.ts || 0, c]).then(() => true).catch(e => { console.error("dbSave:", e.message); return false; });
 }
 
 // ---------- 資格情報保護ヘルパー（後方互換最優先） ----------
@@ -3007,7 +3007,7 @@ app.post("/api/partner/outbound-events", pGuard, async (req,res)=>{
     // 右腕くん経由send-lineの直後に同じmessage_logが再同期された場合は、既存1通へIDだけ付けて二重表示しない。
     const candidates = (c.msgs||[]).filter(m=>{ if(!m||m.from!=="us"||(m.via!=="partner"&&m.via!=="uketsukerun")) return false; const mt=String(m.text||"").trim(); const bodyMatch=mt===text||(Math.min(mt.length,text.length)>=8&&(mt.includes(text)||text.includes(mt))); return bodyMatch&&Math.abs(Number(m.sentAt||0)-sentAt)<120000; }).sort((a,b)=>Math.abs(Number(a.sentAt||0)-sentAt)-Math.abs(Number(b.sentAt||0)-sentAt));
     const same = candidates[0];
-    if(same){ if(same.externalEventId&&same.externalEventId!==eventId){ same.externalEventAliases=Array.isArray(same.externalEventAliases)?same.externalEventAliases:[]; if(!same.externalEventAliases.includes(eventId)) same.externalEventAliases.push(eventId); }else same.externalEventId=eventId; same.via="uketsukerun"; if(ev.name&&(!c.name||c.name==="LINEのお客様")) c.name=String(ev.name).slice(0,120); accepted.push(eventId); dbSave(t,c); continue; }
+    if(same){ if(same.externalEventId&&same.externalEventId!==eventId){ same.externalEventAliases=Array.isArray(same.externalEventAliases)?same.externalEventAliases:[]; if(!same.externalEventAliases.includes(eventId)) same.externalEventAliases.push(eventId); }else same.externalEventId=eventId; same.via="uketsukerun"; if(ev.name&&(!c.name||c.name==="LINEのお客様")) c.name=String(ev.name).slice(0,120); if(!await dbSave(t,c)) return res.status(500).json({ok:false,error:"db"}); accepted.push(eventId); continue; }
     const d = new Date(sentAt);
     const time = Number.isFinite(d.getTime()) ? d.toLocaleTimeString("ja-JP",{timeZone:"Asia/Tokyo",hour:"2-digit",minute:"2-digit",hour12:false}) : nowt();
     const msg={from:"us",text,time,sentAt,via:"uketsukerun",externalEventId:eventId,template:String(ev.template||"").slice(0,120)};
@@ -3015,8 +3015,9 @@ app.post("/api/partner/outbound-events", pGuard, async (req,res)=>{
     if(cutoff && sentAt<=cutoff) c.msgs.unshift(msg); else c.msgs.push(msg);
     if(sentAt>=Number(c.ts||0)){ c.ts=sentAt; c.time=time; c.last=lastText(c); }
     if(ev.name&&(!c.name||c.name==="LINEのお客様")) c.name=String(ev.name).slice(0,120);
-    accepted.push(eventId); dbSave(t,c);
+    if(!await dbSave(t,c)) return res.status(500).json({ok:false,error:"db"}); accepted.push(eventId);
   }
+  console.log("partner outbound-events:", t.slug, "received=" + input.length, "accepted=" + accepted.length);
   res.json({ok:true,accepted});
 });
 // 受付くんのAIアシスタント用: 患者へLINE送信（partner key必須）。line_uid優先、無ければphone/emailで既存LINE会話を解決
