@@ -20,10 +20,18 @@
   折りたたみ式ガイドと公式管理画面リンクを追加。Webhookをチャットやメールへ貼らない注意も画面内に表示。
 - Slack Appのボット未作成エラーを避けるため、Incoming Webhookを追加する前に `OAuth & Permissions` の
   Bot Token Scopesへ `incoming-webhook` を追加する手順と、既存インストール時の再インストール手順を追記。
+- 法人導入時の手作業を減らすため、共通Slack AppのOAuth接続を追加。設定画面の「Slackに接続」から
+  ワークスペースとチャンネルを選択でき、接続後は名称を表示する。「接続先を変更」で選び直し、
+  「連携解除」で右腕くん側の通知資格情報を削除する。切り替え直後は通知OFFとし、表示された接続先を
+  確認してから明示的に有効化する。従来Webhook入力はOAuth未設定環境の高度な設定として残す。
 
 ## 環境変数
 
 - `PUBLIC_BASE_URL`: 右腕くんの公開URL。Slackの会話直接リンクに使用。無ければ通知は届くがリンクは省略。
+- `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`: 共通の「右腕くん通知」Slack AppのOAuth資格情報。
+- `SLACK_OAUTH_STATE_SECRET`: OAuthの接続要求をログイン法人・セッションへ結び付ける署名鍵。十分に長いランダム値。
+  OAuthを表示するには上記3変数とHTTPSの`PUBLIC_BASE_URL`が必要。Redirect URLは
+  `{PUBLIC_BASE_URL}/api/slack/oauth/callback`。Bot Token Scopeは`incoming-webhook`だけを指定する。
 - `CRED_KEY`: 既存資格情報とSlack Webhookの保存時暗号化。32バイト（hex64桁またはbase64）。
 - `PLATFORM_SECRET`, `PARTNER_BOOKING_URL`: うけつけるん連携。右腕くん単体テナントのSlackには不要。
 - `RESET_SMTP_HOST`, `RESET_SMTP_PORT`, `RESET_SMTP_USER`, `RESET_SMTP_PASS`, `RESET_SMTP_FROM`: パスワード再設定メール専用の送信設定。未設定時は対象テナントのSMTPへ後方互換フォールバック。
@@ -59,3 +67,6 @@
 8. カードの患者名・予約日時・内容を確認し、「実行しない」は無変更、「実行」は1回だけ反映される。
 9. 別患者の予約ID、操作不可予約、患者確認待ちとの競合、期限切れ、二重クリックが安全に拒否される。
 10. 右腕くん由来の通知が、うけつけるん側Slackから重複して届かない。
+11. OAuthでテスト用ワークスペース／チャンネルへ接続し、接続名が表示され、接続直後は通知OFFになる。
+12. 「接続先を変更」で別のテスト用チャンネルへ切り替え、以後のテスト通知が新しい通知先だけへ届く。
+13. 「連携解除」で通知が停止し、Webhook URLやOAuth秘密情報が画面・API・ログへ出ない。
