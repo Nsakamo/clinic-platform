@@ -1958,9 +1958,59 @@ app.post("/api/rule-undo", guard, async (req, res) => {
   const ok = t.rules[id] ? await ruleDelete(t, id) : false;
   res.json({ ok });
 });
+app.get("/api/learning-data", guard, (req, res) => {
+  const t = req.tenant;
+  const prefs = (Array.isArray(S(t).prefs) ? S(t).prefs : []).map((p, i) => ({
+    key: p && typeof p === "object" && p.id != null ? String(p.id) : "legacy:" + i,
+    text: String(typeof p === "string" ? p : ((p && p.text) || ""))
+  })).filter(p => p.text);
+  const examples = Object.values(t.examples || {}).sort((a, b) => (b.ts || 0) - (a.ts || 0) || b.id - a.id).map(e => ({
+    id: e.id, q: e.q || "", final: e.final || "", draft0: e.draft0 || "", instr: e.instr || "", ts: e.ts || 0
+  }));
+  res.json({ ok: true, rules: rulesList(t).map(r => ({ id: r.id, title: r.title || "", content: r.content || "" })), prefs, examples });
+});
+app.post("/api/rule-save", guard, async (req, res) => {
+  const t = req.tenant; const title = String(req.body.title || "").trim().slice(0, 100); const content = String(req.body.content || "").trim().slice(0, 2000);
+  if (!title || !content) return res.status(400).json({ ok: false, error: "required" });
+  try {
+    const id = req.body.id == null || req.body.id === "" ? null : Number(req.body.id);
+    const rule = id == null ? await ruleAdd(t, title, content) : await ruleUpdate(t, id, title, content);
+    if (!rule) return res.status(404).json({ ok: false, error: "not_found" });
+    res.json({ ok: true, rule });
+  } catch (e) { res.status(500).json({ ok: false, error: "save" }); }
+});
+app.post("/api/rule-delete", guard, async (req, res) => {
+  try { const ok = await ruleDelete(req.tenant, Number(req.body.id)); res.status(ok ? 200 : 404).json({ ok, error: ok ? undefined : "not_found" }); }
+  catch (e) { res.status(500).json({ ok: false, error: "delete" }); }
+});
+app.post("/api/example-update", guard, async (req, res) => {
+  const t = req.tenant; const id = Number(req.body.id); const ex = t.examples && t.examples[id];
+  if (!ex) return res.status(404).json({ ok: false, error: "not_found" });
+  const q = String(req.body.q || "").trim().slice(0, 600); const final = String(req.body.final || "").trim().slice(0, 1500); const instr = String(req.body.instr || "").trim().slice(0, 800);
+  if (!q || !final) return res.status(400).json({ ok: false, error: "required" });
+  ex.q = q; ex.final = final; ex.instr = instr;
+  try { if (pool) await pool.query("UPDATE examples SET q=$1,final=$2,instr=$3 WHERE tenant=$4 AND id=$5", [q, final, instr, t.slug, id]); }
+  catch (e) { return res.status(500).json({ ok: false, error: "save" }); }
+  res.json({ ok: true, example: ex });
+});
 app.post("/api/example-delete", guard, (req, res) => { const t = req.tenant; const id = Number(req.body.id); if (t.examples && t.examples[id]) { delete t.examples[id]; if (pool) pool.query("DELETE FROM examples WHERE tenant=$1 AND id=$2", [t.slug, id]).catch(() => {}); } res.json({ ok: true }); });
 app.post("/api/pref-add", guard, (req, res) => { const t = req.tenant; const text = String(req.body.text || "").trim().slice(0, 200); if (!text) return res.json({ ok: false }); const cur = (Array.isArray(S(t).prefs)) ? S(t).prefs : (S(t).prefs = []); if (!cur.some(p => (typeof p === "string" ? p : p.text) === text)) { cur.push({ id: Date.now(), text }); while (cur.length > 40) cur.shift(); saveTenantConfig(t).catch(() => {}); } res.json({ ok: true, prefs: S(t).prefs }); });
-app.post("/api/pref-delete", guard, (req, res) => { const t = req.tenant; const id = req.body.id; const cur = Array.isArray(S(t).prefs) ? S(t).prefs : []; S(t).prefs = cur.filter(p => String(p && p.id) !== String(id)); saveTenantConfig(t).catch(() => {}); res.json({ ok: true, prefs: S(t).prefs }); });
+app.post("/api/pref-update", guard, async (req, res) => {
+  const t = req.tenant; const key = String(req.body.key || ""); const text = String(req.body.text || "").trim().slice(0, 200); const cur = Array.isArray(S(t).prefs) ? S(t).prefs : [];
+  if (!text) return res.status(400).json({ ok: false, error: "required" });
+  let i = key.startsWith("legacy:") ? Number(key.slice(7)) : cur.findIndex(p => p && typeof p === "object" && String(p.id) === key);
+  if (!Number.isInteger(i) || i < 0 || i >= cur.length) return res.status(404).json({ ok: false, error: "not_found" });
+  const old = cur[i]; cur[i] = { id: old && typeof old === "object" && old.id != null ? old.id : Date.now(), text }; S(t).prefs = cur;
+  try { await saveTenantConfig(t); } catch (e) { return res.status(500).json({ ok: false, error: "save" }); }
+  res.json({ ok: true, prefs: S(t).prefs });
+});
+app.post("/api/pref-delete", guard, async (req, res) => {
+  const t = req.tenant; const key = String(req.body.key != null ? req.body.key : req.body.id); const cur = Array.isArray(S(t).prefs) ? S(t).prefs : [];
+  const i = key.startsWith("legacy:") ? Number(key.slice(7)) : cur.findIndex(p => p && typeof p === "object" && String(p.id) === key);
+  if (Number.isInteger(i) && i >= 0 && i < cur.length) cur.splice(i, 1); S(t).prefs = cur;
+  try { await saveTenantConfig(t); } catch (e) { return res.status(500).json({ ok: false, error: "save" }); }
+  res.json({ ok: true, prefs: S(t).prefs });
+});
 
 // ---------- うけつけるん 顧客情報パネル（中継: guard付き、パートナーAPIへ x-partner-key で転送） ----------
 async function partnerGet(path) {
@@ -3532,13 +3582,11 @@ const PAGE = `<!DOCTYPE html>
     <div style="font-size:11px;color:#6b7280;margin-top:2px;">ここに書いた指示は、AI下書き・自動返信・AIで作り直す、すべてに最優先で反映されます。空欄なら標準のトーンです。</div>
   </div>
   <div style="border-top:1px solid #e5e7eb;margin-top:14px;padding-top:10px;">
-    <div style="font-size:13px;margin-bottom:4px;">🧠 スタッフの記憶（全返信に効く恒久ルール）</div>
-    <div id="prefList" style="font-size:12px;color:#374151;"></div>
-    <div style="display:flex;gap:6px;margin-top:6px;">
-      <input id="prefInput" placeholder="例：返信の冒頭に『様』を付けない" style="flex:1;box-sizing:border-box;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;">
-      <button class="cbtn" onclick="addPref()">＋追加</button>
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+      <div style="font-size:13px;font-weight:600;">🧠 学習データ管理</div>
+      <button type="button" class="cbtn" onclick="openLearning()">確認・編集</button>
     </div>
-    <div style="font-size:11px;color:#6b7280;margin-top:4px;">「AIで作り直す」で『今後〜』『常に〜』のように指示すると自動でここに記憶され、以後の全返信に効きます。手動の追加・削除もここで。</div>
+    <div style="font-size:11px;color:#6b7280;margin-top:5px;line-height:1.55;">店舗ルール、スタッフの記憶、過去の対応例を一か所で確認・編集・削除できます。用途が違うため、データは混ぜずに安全に管理します。</div>
   </div>
   <div style="border-top:1px solid #e5e7eb;margin-top:14px;padding-top:10px;">
     <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;" onclick="document.getElementById('connBox').style.display=document.getElementById('connBox').style.display==='none'?'block':'none'"><span style="font-size:13px;font-weight:600;">🔗 連携設定（LINE・メール）</span><span id="connStat" style="font-size:11px;color:#16a34a;"></span></div>
@@ -3579,6 +3627,21 @@ const PAGE = `<!DOCTYPE html>
     <button class="cbtn" style="width:100%;" onclick="doLogout()">↩ ログアウト</button>
   </div>
   <div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end;"><button class="cbtn" onclick="closeSet()">閉じる</button><button class="cbtn send" onclick="saveSet()">保存</button></div>
+</div></div>
+<div id="learnManagePop" style="position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:78;display:none;align-items:center;justify-content:center;padding:14px;"><div style="background:#fff;border-radius:14px;width:min(96vw,900px);max-height:92vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.22);">
+  <div style="padding:15px 16px 11px;border-bottom:1px solid #e5e7eb;">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;"><h3 style="margin:0;font-size:16px;">🧠 学習データ管理</h3><button type="button" class="cbtn" onclick="closeLearning()">閉じる</button></div>
+    <div style="font-size:11px;color:#6b7280;line-height:1.6;margin-top:6px;">3種類は役割が違います。<b>店舗ルール</b>は店舗の事実・規定、<b>スタッフの記憶</b>は全返信に常に適用する指示、<b>過去の対応例</b>は似た質問のときだけ参考にする実例です。</div>
+  </div>
+  <div style="padding:10px 16px;border-bottom:1px solid #e5e7eb;display:flex;gap:7px;flex-wrap:wrap;align-items:center;">
+    <button type="button" class="cbtn learnTabBtn" data-tab="rules" onclick="setLearningTab('rules')">📚 店舗ルール <span id="learnRulesCount"></span></button>
+    <button type="button" class="cbtn learnTabBtn" data-tab="prefs" onclick="setLearningTab('prefs')">🧠 スタッフの記憶 <span id="learnPrefsCount"></span></button>
+    <button type="button" class="cbtn learnTabBtn" data-tab="examples" onclick="setLearningTab('examples')">💬 過去の対応例 <span id="learnExamplesCount"></span></button>
+    <input id="learnSearch" oninput="renderLearning()" placeholder="この種類を検索" style="margin-left:auto;min-width:180px;flex:1;max-width:280px;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;box-sizing:border-box;">
+  </div>
+  <div id="learnHelp" style="padding:9px 16px;background:#f8fafc;border-bottom:1px solid #e5e7eb;font-size:11px;color:#475569;line-height:1.55;"></div>
+  <div id="learnList" style="padding:12px 16px;overflow-y:auto;overscroll-behavior:contain;flex:1;min-height:220px;"></div>
+  <div style="padding:10px 16px;border-top:1px solid #e5e7eb;display:flex;justify-content:space-between;align-items:center;gap:8px;"><span id="learnStatus" style="font-size:11px;color:#6b7280;"></span><button type="button" id="learnAddBtn" class="cbtn send" onclick="addLearningItem()">＋追加</button></div>
 </div></div>
 <div id="asst"><div id="asstCard">
   <div id="asstHead"><span>🤝 みぎうで君（ルールブック編集）</span><button class="cbtn" onclick="closeAsst()">閉じる</button></div>
@@ -4190,8 +4253,8 @@ async function dSend(){if(window.__dBusy)return;const x=document.getElementById(
     if(meta.ok===false||(!fin.reply&&!fin.draft))throw new Error("stream_empty");
     if(fin.reply&&meta.engine){aiEl.textContent=fin.reply+" 〔"+meta.engine+"で作成〕";logEntry.text=aiEl.textContent;}
     dHist.push({role:"assistant",content:(fin.draft||fin.reply||"").slice(0,4000)});
-    if(meta.memory)dAdd("sysn","🧠 記憶しました：「"+meta.memory+"」（今後の全返信に適用します。設定→スタッフの記憶 で確認・削除できます）");
-    if(meta.rule)dAdd("sysn","📚 ルールを学習：「"+meta.rule.title+"」（今後は聞かれたら自動でこの内容を答えます。設定→店舗ルール で確認・編集できます）");
+    if(meta.memory)dAdd("sysn","🧠 記憶しました：「"+meta.memory+"」（今後の全返信に適用します。設定→学習データ管理 で確認・編集できます）");
+    if(meta.rule)dAdd("sysn","📚 ルールを学習：「"+meta.rule.title+"」（今後は聞かれたら自動でこの内容を答えます。設定→学習データ管理 で確認・編集できます）");
     if(meta.action)await dHandleBookingAction(meta.action);
   }catch(e){
     // フォールバック: 従来のJSON API
@@ -4203,8 +4266,8 @@ async function dSend(){if(window.__dBusy)return;const x=document.getElementById(
         aiEl.textContent=j.reply||"できました";logEntry.text=aiEl.textContent;
         if(!cardEntry)dNewCard(j.draft);else{cardEntry.draft=j.draft;const cEl=cardEntry._el?cardEntry._el.querySelector(".c"):null;if(cEl)cEl.textContent=j.draft;}
         dHist.push({role:"assistant",content:j.draft});
-        if(j.memory)dAdd("sysn","🧠 記憶しました：「"+j.memory+"」（今後の全返信に適用します。設定→スタッフの記憶 で確認・削除できます）");
-        if(j.rule)dAdd("sysn","📚 ルールを学習：「"+j.rule.title+"」（今後は聞かれたら自動でこの内容を答えます。設定→店舗ルール で確認・編集できます）");
+        if(j.memory)dAdd("sysn","🧠 記憶しました：「"+j.memory+"」（今後の全返信に適用します。設定→学習データ管理 で確認・編集できます）");
+        if(j.rule)dAdd("sysn","📚 ルールを学習：「"+j.rule.title+"」（今後は聞かれたら自動でこの内容を答えます。設定→学習データ管理 で確認・編集できます）");
         if(j.action)await dHandleBookingAction(j.action);
       }else{aiEl.textContent="エラー: "+(j.error||"不明");logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";}
     }catch(e2){aiEl.textContent="通信エラーが発生しました";logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";}
@@ -4270,12 +4333,65 @@ function asstAttach(){const inp=document.createElement("input");inp.type="file";
 function renderPrefs(prefs){const el=document.getElementById("prefList");if(!el)return;const a=Array.isArray(prefs)?prefs:[];if(!a.length){el.innerHTML='<span style="color:#9ca3af;">まだ記憶はありません。</span>';return;}el.innerHTML=a.map(p=>{const id=(p&&p.id!=null)?p.id:"";const tx=(typeof p==="string")?p:((p&&p.text)||"");return '<div style="display:flex;align-items:center;gap:6px;padding:3px 0;"><span style="flex:1;">・'+esc(tx)+'</span><button onclick="delPref('+JSON.stringify(id)+')" style="border:none;background:transparent;color:#dc2626;cursor:pointer;font-size:14px;">×</button></div>';}).join("");}
 async function addPref(){const inp=document.getElementById("prefInput");const text=(inp&&inp.value||"").trim();if(!text)return;try{const r=await api("/api/pref-add",{text});const j=await r.json();if(j.ok){if(inp)inp.value="";renderPrefs(j.prefs||[]);}}catch(e){uiAlert("追加に失敗しました");}}
 async function delPref(id){try{const r=await api("/api/pref-delete",{id});const j=await r.json();if(j.ok)renderPrefs(j.prefs||[]);}catch(e){}}
+// 店舗ルール・スタッフの記憶・過去の対応例を、保存先は分けたまま一画面で管理する。
+let LEARN={rules:[],prefs:[],examples:[]},learnTab="rules";
+function learnField(label,value,rows,readOnly){
+  const box=document.createElement("label");box.style.cssText="display:block;margin-top:8px;font-size:11px;font-weight:600;color:#475569;";box.appendChild(document.createTextNode(label));
+  const el=rows?document.createElement("textarea"):document.createElement("input");if(!rows)el.type="text";el.value=value||"";if(rows)el.rows=rows;if(readOnly)el.readOnly=true;
+  el.style.cssText="display:block;width:100%;box-sizing:border-box;margin-top:3px;padding:8px;border:1px solid #d1d5db;border-radius:8px;font:12px/1.55 inherit;resize:vertical;"+(readOnly?"background:#f8fafc;color:#64748b;":"");box.appendChild(el);return {box,el};
+}
+function learnButton(label,primary,fn){const b=document.createElement("button");b.type="button";b.className="cbtn"+(primary?" send":"");b.textContent=label;b.onclick=fn;return b;}
+function learnCard(){const d=document.createElement("div");d.style.cssText="border:1px solid #e5e7eb;border-radius:11px;padding:11px;margin-bottom:10px;background:#fff;";return d;}
+function setLearnStatus(text,bad){const e=document.getElementById("learnStatus");if(e){e.textContent=text||"";e.style.color=bad?"#dc2626":"#6b7280";}}
+async function reloadLearning(){
+  setLearnStatus("読み込み中…");
+  try{const r=await fetch("/api/learning-data");const j=await r.json();if(!r.ok||!j.ok)throw new Error("load");LEARN={rules:j.rules||[],prefs:j.prefs||[],examples:j.examples||[]};renderLearning();setLearnStatus("");}
+  catch(e){setLearnStatus("学習データを読み込めませんでした",true);}
+}
+function openLearning(){document.getElementById("learnManagePop").style.display="flex";reloadLearning();}
+function closeLearning(){document.getElementById("learnManagePop").style.display="none";}
+function setLearningTab(tab){learnTab=tab;document.getElementById("learnSearch").value="";renderLearning();}
+function learningMatches(item,query){if(!query)return true;return Object.values(item||{}).some(v=>String(v||"").toLowerCase().includes(query));}
+function renderLearning(){
+  const list=document.getElementById("learnList");if(!list)return;list.innerHTML="";
+  document.getElementById("learnRulesCount").textContent="("+LEARN.rules.length+")";document.getElementById("learnPrefsCount").textContent="("+LEARN.prefs.length+")";document.getElementById("learnExamplesCount").textContent="("+LEARN.examples.length+")";
+  document.querySelectorAll(".learnTabBtn").forEach(b=>{const on=b.dataset.tab===learnTab;b.style.background=on?"#ecfdf5":"#fff";b.style.borderColor=on?"#10b981":"#d1d5db";b.style.color=on?"#047857":"#374151";});
+  const help=document.getElementById("learnHelp"),add=document.getElementById("learnAddBtn");
+  if(learnTab==="rules"){help.textContent="店舗の料金・営業時間・対応可否などの事実や規定です。関連する質問への回答では最優先で使われます。";add.style.display="inline-block";add.textContent="＋店舗ルールを追加";}
+  else if(learnTab==="prefs"){help.textContent="文体や案内方針など、すべての返信に毎回適用する指示です。患者固有の情報は登録しないでください。";add.style.display="inline-block";add.textContent="＋スタッフの記憶を追加";}
+  else{help.textContent="スタッフが実際に送った返信の実例です。似た問い合わせのときだけ参考にします。患者情報を含む場合があるため、不要な例は削除できます。";add.style.display="none";}
+  const q=(document.getElementById("learnSearch").value||"").trim().toLowerCase();const items=(LEARN[learnTab]||[]).filter(x=>learningMatches(x,q));
+  if(!items.length){const e=document.createElement("div");e.style.cssText="text-align:center;color:#94a3b8;padding:42px 10px;font-size:13px;";e.textContent=q?"検索に一致するデータはありません":"まだデータはありません";list.appendChild(e);return;}
+  items.forEach(item=>{if(learnTab==="rules")renderLearnRule(list,item);else if(learnTab==="prefs")renderLearnPref(list,item);else renderLearnExample(list,item);});
+}
+function renderLearnRule(list,item){
+  const card=learnCard(),title=learnField("見出し",item.title||"",0),content=learnField("ルール本文",item.content||"",4);card.appendChild(title.box);card.appendChild(content.box);
+  const row=document.createElement("div");row.style.cssText="display:flex;justify-content:flex-end;gap:7px;margin-top:9px;";
+  if(item.id!=null)row.appendChild(learnButton("削除",false,async()=>{if(!await uiConfirm("この店舗ルールを削除しますか？"))return;await learnMutate("/api/rule-delete",{id:item.id},"削除しました");}));
+  row.appendChild(learnButton("保存",true,async()=>{await learnMutate("/api/rule-save",{id:item.id,title:title.el.value,content:content.el.value},"保存しました");}));card.appendChild(row);list.appendChild(card);
+}
+function renderLearnPref(list,item){
+  const card=learnCard(),text=learnField("全返信に適用する指示",item.text||"",3);card.appendChild(text.box);const row=document.createElement("div");row.style.cssText="display:flex;justify-content:flex-end;gap:7px;margin-top:9px;";
+  if(item.key)row.appendChild(learnButton("削除",false,async()=>{if(!await uiConfirm("このスタッフの記憶を削除しますか？"))return;await learnMutate("/api/pref-delete",{key:item.key},"削除しました");}));
+  row.appendChild(learnButton("保存",true,async()=>{await learnMutate(item.key?"/api/pref-update":"/api/pref-add",item.key?{key:item.key,text:text.el.value}:{text:text.el.value},"保存しました");}));card.appendChild(row);list.appendChild(card);
+}
+function renderLearnExample(list,item){
+  const card=learnCard();const date=document.createElement("div");date.style.cssText="font-size:10px;color:#94a3b8;";date.textContent=item.ts?new Date(item.ts).toLocaleString("ja-JP"):"日時不明";card.appendChild(date);
+  const q=learnField("患者からの問い合わせ",item.q||"",3),final=learnField("スタッフが実際に送った返信",item.final||"",5),instr=learnField("返信作成時の修正指示（任意）",item.instr||"",2);card.appendChild(q.box);card.appendChild(final.box);card.appendChild(instr.box);
+  if(item.draft0){const det=document.createElement("details");det.style.cssText="margin-top:8px;font-size:11px;color:#64748b;";const sum=document.createElement("summary");sum.textContent="元のAI下書きを確認（編集不可）";sum.style.cursor="pointer";det.appendChild(sum);const draft=learnField("",item.draft0,3,true);det.appendChild(draft.box);card.appendChild(det);}
+  const row=document.createElement("div");row.style.cssText="display:flex;justify-content:flex-end;gap:7px;margin-top:9px;";row.appendChild(learnButton("削除",false,async()=>{if(!await uiConfirm("この過去の対応例を削除しますか？"))return;await learnMutate("/api/example-delete",{id:item.id},"削除しました");}));row.appendChild(learnButton("保存",true,async()=>{await learnMutate("/api/example-update",{id:item.id,q:q.el.value,final:final.el.value,instr:instr.el.value},"保存しました");}));card.appendChild(row);list.appendChild(card);
+}
+async function learnMutate(path,body,done){
+  setLearnStatus("保存中…");try{const r=await api(path,body);const j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error(j.error||"save");await reloadLearning();setLearnStatus(done||"保存しました");setTimeout(()=>{const e=document.getElementById("learnStatus");if(e&&e.textContent===done)e.textContent="";},1800);}
+  catch(e){setLearnStatus(e.message==="required"?"未入力の項目があります":"保存できませんでした",true);}
+}
+function addLearningItem(){if(learnTab==="rules")LEARN.rules.unshift({id:null,title:"",content:""});else if(learnTab==="prefs")LEARN.prefs.unshift({key:"",text:""});renderLearning();const list=document.getElementById("learnList");if(list)list.scrollTop=0;}
 // 学習トースト：下書きを修正して送った直後だけ「✓学習しました」と控えめに表示。特例だった場合は「学習しない」で今保存した例を取り消せる。
 let learnToastTimer=null;
 function showLearnToast(id){ const b=document.getElementById("learnToast"); if(!b)return; b.innerHTML='✓ この対応を学習しました'+(id?' ・ <span style="text-decoration:underline;cursor:pointer;color:#a7f3d0;" onclick="undoLearn('+id+')">特例だった（学習しない）</span>':''); b.style.display="block"; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";}, id?6000:2500); }
 // ルール蒸留の結果トースト。何を覚えたかを具体的に見せる（addのみ取り消し可。updateは店舗ルール画面で編集）。
 function showRuleToast(rules){ const b=document.getElementById("learnToast"); if(!b||!rules||!rules.length)return; const r=rules[0]; const more=rules.length>1?(" 他"+(rules.length-1)+"件"):""; const undo=(r.action==="add")?' ・ <span style="text-decoration:underline;cursor:pointer;color:#a7f3d0;" onclick="undoRule('+r.id+')">取り消す</span>':'（既存ルールを更新）'; b.innerHTML='📚 ルールを学習：「'+esc(r.title)+'」'+more+undo; b.style.display="block"; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";}, 9000); }
-async function undoRule(id){ let ok=false; try{ const r=await api("/api/rule-undo",{id}); const j=await r.json(); ok=!!j.ok; }catch(e){} const b=document.getElementById("learnToast"); if(b){ b.innerHTML=ok?'ルールを取り消しました':'取り消せませんでした（設定→店舗ルール から削除できます）'; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";},2500); } }
+async function undoRule(id){ let ok=false; try{ const r=await api("/api/rule-undo",{id}); const j=await r.json(); ok=!!j.ok; }catch(e){} const b=document.getElementById("learnToast"); if(b){ b.innerHTML=ok?'ルールを取り消しました':'取り消せませんでした（設定→学習データ管理 から削除できます）'; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";},2500); } }
 async function undoLearn(id){ try{ await api("/api/example-delete",{id}); }catch(e){} const b=document.getElementById("learnToast"); if(b){ b.innerHTML='↩ 学習を取り消しました（特例として記録しません）'; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";},2000); } }
 // 矛盾の確認：前の答えと今回の答えが食い違った時に出す。基準を選ぶと不要な方の対応例を削除。
 let conflictData=null;
