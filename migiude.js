@@ -750,7 +750,16 @@ async function aiChatOne(eng, system, messages, maxTokens){
     const r = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", { method:"POST",
       headers: { "Content-Type":"application/json", "Authorization":"Bearer "+process.env.GEMINI_KEY },
       body: JSON.stringify({ model, max_tokens:maxTokens, messages:[{role:"system",content:system}].concat(messages) }) });
-    if(!r.ok) throw new Error("gemini_"+r.status);
+    if(!r.ok){
+      const detail = (await r.text().catch(()=>"")).replace(/\s+/g," ").slice(0,300);
+      console.error("gemini-openai:", r.status, detail);
+      // OpenAI互換APIはモデル更新時に一部パラメータの受付が先に変わることがある。
+      // 同じGemini公式のネイティブAPIへ切り替え、返信生成を止めない。
+      const userText = messages.map(m => String((m && m.content) || "")).join("\n\n");
+      const native = await geminiGenerate(system, [{ text:userText }], maxTokens);
+      if(native) return native;
+      throw new Error("gemini_"+r.status);
+    }
     const d = await r.json(); return d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
   }
   const r = await fetch("https://api.anthropic.com/v1/messages", { method:"POST",
