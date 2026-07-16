@@ -1917,6 +1917,7 @@ function staffLineStatus(t, req) {
   return {
     configured: !!(C.staffLineToken(t) && C.staffLineSecret(t) && t.config.conn.staffLineBotId),
     botName: String(t.config.conn.staffLineName || "").slice(0, 120),
+    basicId: String(t.config.conn.staffLineBasicId || "").slice(0, 80),
     groupConnected: !!t.config.conn.staffLineGroupId,
     groupName: String(t.config.conn.staffLineGroupName || "").slice(0, 120),
     webhookUrl: base ? base + "/webhook/staff-line" : "",
@@ -1955,6 +1956,7 @@ app.post("/api/staff-line/config", guard, async (req, res) => {
   if (suppliedSecret) conn.staffLineSecret = suppliedSecret.slice(0, 500);
   conn.staffLineBotId = botId;
   conn.staffLineName = String(info.displayName || "スタッフLINE").slice(0, 120);
+  conn.staffLineBasicId = String(info.basicId || "").slice(0, 80);
   if (changedBot) {
     delete conn.staffLineGroupId; delete conn.staffLineGroupName; delete t.config.staffLineLink;
     t.config.staffLineStaff = []; S(t).staffLineEnabled = false;
@@ -1998,7 +2000,7 @@ app.post("/api/staff-line/staff-delete", guard, async (req, res) => {
 });
 app.post("/api/staff-line/disconnect", guard, async (req, res) => {
   const t = req.tenant; S(t).staffLineEnabled = false;
-  ["staffLineToken", "staffLineSecret", "staffLineBotId", "staffLineName", "staffLineGroupId", "staffLineGroupName"].forEach(k => { delete t.config.conn[k]; });
+  ["staffLineToken", "staffLineSecret", "staffLineBotId", "staffLineName", "staffLineBasicId", "staffLineGroupId", "staffLineGroupName"].forEach(k => { delete t.config.conn[k]; });
   delete t.config.staffLineLink; t.config.staffLineStaff = [];
   try { await saveTenantConfig(t); } catch (e) { return res.status(500).json({ ok: false, error: "save" }); }
   res.json({ ok: true });
@@ -3675,11 +3677,16 @@ const PAGE = `<!DOCTYPE html>
       <button type="button" id="staffLineDisconnectBtn" class="cbtn" onclick="disconnectStaffLine()" style="display:none;color:#b91c1c;">連携解除</button>
     </div>
     <div id="staffLineSetup" style="display:none;margin-top:10px;border-top:1px solid #a7f3d0;padding-top:10px;">
-      <div style="font-size:11px;color:#374151;line-height:1.65;">1. 法人専用のLINE公式アカウントとMessaging APIチャネルを作成<br>2. LINE公式アカウントManagerで「グループ・複数人チャットへの参加を許可」をON<br>3. 下の2項目を保存<br>4. 表示されたWebhook URLをLINE Developersに登録して「Webhookの利用」をON<br>5. 公式アカウントをスタッフ用LINEグループへ招待<br>6. 接続コードを発行し、そのグループへ送信</div>
+      <div style="font-size:11px;color:#374151;line-height:1.65;">1. 法人専用のLINE公式アカウントとMessaging APIチャネルを作成<br>2. LINE公式アカウントManagerで「グループ・複数人チャットへの参加を許可」をON<br>3. 下の2項目を保存<br>4. 表示されたWebhook URLをLINE Developersに登録して「Webhookの利用」をON<br>5. LINEアプリのホームで「友だち」→「ID検索」を開き、下に表示されるIDを検索して友だち追加<br>6. 公式アカウントをスタッフ用LINEグループへ招待<br>7. 接続コードを発行し、そのグループへ送信</div>
       <a href="https://developers.line.biz/console/" target="_blank" rel="noopener" style="display:inline-block;margin-top:6px;font-size:11px;color:#047857;">LINE Developersを開く ↗</a>
       <input type="password" id="setStaffLineToken" autocomplete="new-password" placeholder="チャネルアクセストークン（空欄なら現在の設定を保持）" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #a7f3d0;border-radius:8px;font-size:12px;margin-top:8px;">
       <input type="password" id="setStaffLineSecret" autocomplete="new-password" placeholder="チャネルシークレット（空欄なら現在の設定を保持）" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #a7f3d0;border-radius:8px;font-size:12px;margin-top:6px;">
       <button type="button" class="cbtn send" onclick="saveStaffLineConfig()" style="margin-top:7px;">保存して接続確認</button>
+      <div id="staffLineBasicIdBox" style="display:none;margin-top:10px;padding:9px;border:1px solid #a7f3d0;border-radius:9px;background:#f0fdf4;">
+        <div style="font-size:11px;font-weight:700;color:#166534;">LINEで友だち追加するときの検索ID</div>
+        <div style="display:flex;gap:5px;margin-top:5px;"><input id="staffLineBasicId" readonly style="min-width:0;flex:1;padding:7px;border:1px solid #86efac;border-radius:8px;background:#fff;font-size:13px;font-weight:700;"><button type="button" class="cbtn" onclick="copyStaffLineBasicId()">コピー</button></div>
+        <div style="font-size:10.5px;color:#4b5563;margin-top:5px;line-height:1.5;">LINEアプリのホーム上部にある検索から「友だち」→「ID検索」を選び、このIDを入力してください。</div>
+      </div>
       <div style="font-size:11px;font-weight:700;margin-top:10px;">Webhook URL</div>
       <div style="display:flex;gap:5px;margin-top:4px;"><input id="staffLineWebhook" readonly style="min-width:0;flex:1;padding:7px;border:1px solid #d1d5db;border-radius:8px;background:#f8fafc;font-size:11px;"><button type="button" class="cbtn" onclick="copyStaffLineWebhook()">コピー</button></div>
       <button type="button" id="staffLineCodeBtn" class="cbtn" onclick="issueStaffLineCode()" style="display:none;margin-top:8px;">グループ接続コードを発行</button>
@@ -4575,6 +4582,7 @@ async function loadStaffLine(){
   try{const r=await fetch("/api/staff-line"),s=await r.json();if(!r.ok)throw new Error("load");
     document.getElementById("setStaffLineEnabled").checked=!!s.enabled;document.getElementById("setStaffLineReplyMode").value=s.replyMode||"exceptions";
     document.getElementById("staffLineWebhook").value=s.webhookUrl||"";document.getElementById("setStaffLineToken").value="";document.getElementById("setStaffLineSecret").value="";
+    const basicId=String(s.basicId||"").trim();document.getElementById("staffLineBasicId").value=basicId;document.getElementById("staffLineBasicIdBox").style.display=basicId?"block":"none";
     const code=document.getElementById("staffLineCode");code.style.display="none";code.textContent="";
     const stat=document.getElementById("staffLineStat");stat.innerHTML=s.groupConnected?("接続先：<b>"+esc(s.botName||"スタッフLINE")+" / "+esc(s.groupName||"スタッフグループ")+"</b><br>運用："+(s.enabled?"有効":"停止中（設定を保存すると開始）")):(s.configured?("LINE公式アカウント「<b>"+esc(s.botName||"スタッフLINE")+"</b>」確認済み・グループ未接続"):"未接続");
     document.getElementById("staffLineTestBtn").style.display=s.groupConnected?"inline-block":"none";document.getElementById("staffLineDisconnectBtn").style.display=s.configured?"inline-block":"none";document.getElementById("staffLineCodeBtn").style.display=s.configured?"inline-block":"none";
@@ -4612,6 +4620,7 @@ async function saveAccount(){const accountEmail=document.getElementById("setAcco
 function closeSet(){document.getElementById("setPop").style.display="none";}
 function toggleStaffLineSetup(){const e=document.getElementById("staffLineSetup");e.style.display=e.style.display==="none"?"block":"none";}
 function copyStaffLineWebhook(){const v=document.getElementById("staffLineWebhook").value;if(!v)return;copyText(v);uiAlert("Webhook URLをコピーしました");}
+function copyStaffLineBasicId(){const id=document.getElementById("staffLineBasicId").value.trim();if(!id)return;copyText(id);uiAlert("友だち追加用IDをコピーしました");}
 async function saveStaffLineConfig(){const token=document.getElementById("setStaffLineToken").value.trim(),secret=document.getElementById("setStaffLineSecret").value.trim();try{const r=await api("/api/staff-line/config",{token,secret});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");uiAlert("LINE公式アカウントを確認しました。次にWebhook URLを登録し、グループ接続コードを送信してください。");await loadStaffLine();}catch(e){const m={credential_encryption_not_configured:"運営側の暗号化設定が未完了です。秘密情報は保存していません。",missing_credentials:"アクセストークンとチャネルシークレットを入力してください",invalid_token:"アクセストークンを確認できませんでした",secret_required_for_channel_change:"別のLINE公式アカウントへ切り替える場合は、そのアカウントのチャネルシークレットも入力してください",patient_line_channel_not_allowed:"患者向けLINEと同じチャネルは使えません。法人専用のスタッフLINEを作成してください",channel_already_registered:"このLINE公式アカウントは別法人に登録済みです",line_unreachable:"LINEへ接続できませんでした"};uiAlert(m[e.message]||"スタッフLINE設定を保存できませんでした");}}
 async function issueStaffLineCode(){try{const r=await api("/api/staff-line/link-code",{}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"issue");const e=document.getElementById("staffLineCode");e.style.display="block";e.innerHTML=esc(j.code)+'<div style="font-size:10.5px;font-weight:400;letter-spacing:0;color:#6b7280;margin-top:5px;">10分以内にスタッフ用LINEグループへそのまま送信してください</div>';copyText(j.code);uiAlert("接続コードを発行し、コピーしました。スタッフ用グループへ送信してください。");}catch(e){uiAlert("接続コードを発行できませんでした");}}
 async function testStaffLine(){try{const r=await api("/api/staff-line/test",{}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"test");uiAlert("スタッフ用LINEグループへテスト通知を送りました");}catch(e){uiAlert("テスト通知を送れませんでした。LINE DevelopersのWebhookとグループ接続を確認してください");}}
