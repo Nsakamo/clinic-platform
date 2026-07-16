@@ -1500,9 +1500,13 @@ function staffLineConsumeEvent(eventId) {
 app.post("/webhook/staff-line", async (req, res) => {
   const dest = String(req.body && req.body.destination || ""), sig = String(req.headers["x-line-signature"] || "");
   const t = Object.values(TEN).find(x => !x.config.suspended && String(x.config.conn.staffLineBotId || "") === dest);
-  if (!t || !C.staffLineSecret(t) || !req.rawBody) return res.status(401).end();
-  let expected = ""; try { expected = crypto.createHmac("sha256", C.staffLineSecret(t)).update(req.rawBody).digest("base64"); } catch (e) {}
-  if (!safeEq(sig, expected)) return res.status(401).end();
+  // 認証情報そのものはログへ出さず、拒否理由だけを残す。LINE Developersの検証失敗を安全に切り分けるため。
+  if (!t) { console.warn("staff line webhook rejected: tenant_not_found", dest ? "destination_present" : "destination_missing"); return res.status(401).end(); }
+  const signingSecret = C.staffLineSecret(t);
+  if (!signingSecret) { console.warn("staff line webhook rejected: secret_unavailable", t.slug); return res.status(401).end(); }
+  if (!req.rawBody) { console.warn("staff line webhook rejected: raw_body_missing", t.slug); return res.status(401).end(); }
+  let expected = ""; try { expected = crypto.createHmac("sha256", signingSecret).update(req.rawBody).digest("base64"); } catch (e) {}
+  if (!safeEq(sig, expected)) { console.warn("staff line webhook rejected: signature_mismatch", t.slug); return res.status(401).end(); }
   res.status(200).end();
   for (const ev of (req.body.events || [])) {
     try {
