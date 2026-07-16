@@ -361,8 +361,9 @@ async function staffLineEscalate(t, c, reason) {
   staffLineInFlight.add(eventKey);
   const link = publicConversationUrl(c), latest = String(incoming.text || (incoming.media ? "［" + incoming.media + "］" : "新着メッセージ")).slice(0, 1000);
   const text = "【" + String(t.name || t.slug).slice(0, 100) + "】右腕くんでスタッフ対応が必要です\nお客様: " + String(c.name || "名称未取得").slice(0, 100) + "\n理由: " + String(reason || "AIが要対応と判定").slice(0, 240) + "\n最新メッセージ: " + latest + (link ? "\n右腕くんで開く: " + link : "");
-  const r = await staffLinePush(t, t.config.conn.staffLineGroupId, [staffLineText(text)]);
-  staffLineInFlight.delete(eventKey);
+  let r;
+  try { r = await staffLinePush(t, t.config.conn.staffLineGroupId, [staffLineText(text)]); }
+  finally { staffLineInFlight.delete(eventKey); }
   if (!r.ok) return false;
   c.staffLineLastEventKey = eventKey; c.staffLineLastNotifiedAt = Date.now(); dbSave(t, c); return true;
 }
@@ -1607,6 +1608,11 @@ app.post("/webhook/staff-line", async (req, res) => {
         found.c.msgs.push({ from: "us", text: outgoing, auto: false, approvedVia: "staff_line", approvedBy: userId, approvedByName: staff.name, time: nowt() });
         found.c.draft = ""; found.c.draft0 = ""; found.c.status = "done"; found.c.flag = false; found.c.lastAuto = false; found.c.time = nowt(); found.c.ts = Date.now(); found.c.last = lastText(found.c); found.approval.status = "sent"; dbSave(t, found.c); statBump(t, "staff");
         await staffLineReply(t, ev.replyToken, [staffLineText("✅ " + staff.name + "さんの承認内容を患者様へ送信しました。")]);
+      } catch (e) {
+        // 通信例外などでも承認を再試行可能な状態へ戻す。sending のまま残すと以後の操作が全て拒否される。
+        found.approval.status = "pending"; dbSave(t, found.c);
+        try { await staffLineReply(t, ev.replyToken, [staffLineText("⚠️ 送信処理でエラーが発生しました。患者様には送られていません。時間をおいて再度お試しください。")]); } catch (_) {}
+        console.error("staff line send:", e && e.message);
       } finally { sendLocks.delete(lockKey); }
     } catch (e) { console.error("staff line webhook:", e && e.message); }
   }
@@ -1931,12 +1937,16 @@ app.post("/api/staff-line/config", guard, async (req, res) => {
   } catch (e) { return res.status(502).json({ ok: false, error: "line_unreachable" }); }
   const botId = String(info && info.userId || "");
   if (!botId) return res.status(400).json({ ok: false, error: "invalid_token" });
+  // 別チャネルへ切り替える場合は古いチャネルのsecretを流用させない。
+  // LINE APIではtokenから対応secretを照合できないため、同時再入力を必須にして署名不一致を防ぐ。
+  const changesChannel = !conn.staffLineBotId || String(conn.staffLineBotId) !== botId;
+  if (changesChannel && !suppliedSecret) return res.status(400).json({ ok: false, error: "secret_required_for_channel_change" });
   // 患者向けLINEと同じチャネルや、他法人のスタッフLINEは登録不可。
   const usedByPatient = Object.values(TEN).some(x => lineAccounts(x).some(a => String(a.botId || "") === botId || safeEq(String(a.token || ""), token)));
   const usedByOtherTenant = Object.values(TEN).some(x => x !== t && String(x.config.conn.staffLineBotId || "") === botId);
   if (usedByPatient) return res.status(409).json({ ok: false, error: "patient_line_channel_not_allowed" });
   if (usedByOtherTenant) return res.status(409).json({ ok: false, error: "channel_already_registered" });
-  const changedBot = !!conn.staffLineBotId && String(conn.staffLineBotId) !== botId;
+  const changedBot = !!conn.staffLineBotId && changesChannel;
   if (suppliedToken) conn.staffLineToken = suppliedToken.slice(0, 2000);
   if (suppliedSecret) conn.staffLineSecret = suppliedSecret.slice(0, 500);
   conn.staffLineBotId = botId;
@@ -4598,7 +4608,7 @@ async function saveAccount(){const accountEmail=document.getElementById("setAcco
 function closeSet(){document.getElementById("setPop").style.display="none";}
 function toggleStaffLineSetup(){const e=document.getElementById("staffLineSetup");e.style.display=e.style.display==="none"?"block":"none";}
 function copyStaffLineWebhook(){const v=document.getElementById("staffLineWebhook").value;if(!v)return;copyText(v);uiAlert("Webhook URLをコピーしました");}
-async function saveStaffLineConfig(){const token=document.getElementById("setStaffLineToken").value.trim(),secret=document.getElementById("setStaffLineSecret").value.trim();try{const r=await api("/api/staff-line/config",{token,secret});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");uiAlert("LINE公式アカウントを確認しました。次にWebhook URLを登録し、グループ接続コードを送信してください。");await loadStaffLine();}catch(e){const m={credential_encryption_not_configured:"運営側の暗号化設定が未完了です。秘密情報は保存していません。",missing_credentials:"アクセストークンとチャネルシークレットを入力してください",invalid_token:"アクセストークンを確認できませんでした",patient_line_channel_not_allowed:"患者向けLINEと同じチャネルは使えません。法人専用のスタッフLINEを作成してください",channel_already_registered:"このLINE公式アカウントは別法人に登録済みです",line_unreachable:"LINEへ接続できませんでした"};uiAlert(m[e.message]||"スタッフLINE設定を保存できませんでした");}}
+async function saveStaffLineConfig(){const token=document.getElementById("setStaffLineToken").value.trim(),secret=document.getElementById("setStaffLineSecret").value.trim();try{const r=await api("/api/staff-line/config",{token,secret});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");uiAlert("LINE公式アカウントを確認しました。次にWebhook URLを登録し、グループ接続コードを送信してください。");await loadStaffLine();}catch(e){const m={credential_encryption_not_configured:"運営側の暗号化設定が未完了です。秘密情報は保存していません。",missing_credentials:"アクセストークンとチャネルシークレットを入力してください",invalid_token:"アクセストークンを確認できませんでした",secret_required_for_channel_change:"別のLINE公式アカウントへ切り替える場合は、そのアカウントのチャネルシークレットも入力してください",patient_line_channel_not_allowed:"患者向けLINEと同じチャネルは使えません。法人専用のスタッフLINEを作成してください",channel_already_registered:"このLINE公式アカウントは別法人に登録済みです",line_unreachable:"LINEへ接続できませんでした"};uiAlert(m[e.message]||"スタッフLINE設定を保存できませんでした");}}
 async function issueStaffLineCode(){try{const r=await api("/api/staff-line/link-code",{}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"issue");const e=document.getElementById("staffLineCode");e.style.display="block";e.innerHTML=esc(j.code)+'<div style="font-size:10.5px;font-weight:400;letter-spacing:0;color:#6b7280;margin-top:5px;">10分以内にスタッフ用LINEグループへそのまま送信してください</div>';copyText(j.code);uiAlert("接続コードを発行し、コピーしました。スタッフ用グループへ送信してください。");}catch(e){uiAlert("接続コードを発行できませんでした");}}
 async function testStaffLine(){try{const r=await api("/api/staff-line/test",{}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"test");uiAlert("スタッフ用LINEグループへテスト通知を送りました");}catch(e){uiAlert("テスト通知を送れませんでした。LINE DevelopersのWebhookとグループ接続を確認してください");}}
 async function disconnectStaffLine(){if(!await uiConfirm("右腕くんとスタッフLINEの連携を解除しますか？\\n通知・承認は停止し、登録スタッフも解除されます。"))return;try{const r=await api("/api/staff-line/disconnect",{}),j=await r.json();if(!r.ok||!j.ok)throw new Error("disconnect");document.getElementById("setStaffLineEnabled").checked=false;uiAlert("スタッフLINE連携を解除しました");await loadStaffLine();}catch(e){uiAlert("連携解除に失敗しました");}}
