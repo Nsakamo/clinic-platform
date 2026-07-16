@@ -29,6 +29,8 @@ scripts.forEach((script, index) => new vm.Script(script, { filename: "PAGE-scrip
   "/api/partner/password-reset",
   "setStaffLineToken",
   "staffLineApprovalMessage",
+  "staffLineHistoryPageMessage",
+  "enrichStaffLineBookingPreview",
   "finalizeGeneratedDraft",
   "isPersistentConversationInstruction",
   "staffBookingPending"

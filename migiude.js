@@ -320,9 +320,36 @@ function staffLineApprovalMessage(t, c, approval, summary, reason) {
   const id = approval.id;
   return { type: "flex", altText: "右腕くん：" + String(c.name || "お客様") + "への返信確認", contents: { type: "bubble", size: "giga", body: { type: "box", layout: "vertical", contents: body }, footer: { type: "box", layout: "vertical", spacing: "sm", contents: [
     staffLinePostback("対応する", "migiude=claim&id=" + id, "primary"),
-    { type: "box", layout: "horizontal", spacing: "sm", contents: [staffLinePostback("情報確認", "migiude=info&id=" + id), staffLinePostback("返信を修正", "migiude=edit&id=" + id)] },
+    { type: "box", layout: "horizontal", spacing: "sm", contents: [staffLinePostback("会話履歴", "migiude=history&id=" + id + "&page=0"), staffLinePostback("患者・予約情報", "migiude=info&id=" + id)] },
+    staffLinePostback("返信を修正", "migiude=edit&id=" + id),
     { type: "box", layout: "horizontal", spacing: "sm", contents: [staffLinePostback("この内容で送信", "migiude=send&id=" + id, "primary"), staffLinePostback("送信しない", "migiude=cancel&id=" + id)] }
   ] } } };
+}
+function staffLineHistoryPageMessage(c, approvalId, page) {
+  const msgs = Array.isArray(c && c.msgs) ? c.msgs : [];
+  const perPage = 12;
+  const maxPage = Math.max(0, Math.ceil(msgs.length / perPage) - 1);
+  const p = Math.max(0, Math.min(Number(page) || 0, maxPage));
+  const end = Math.max(0, msgs.length - p * perPage);
+  const start = Math.max(0, end - perPage);
+  const lines = msgs.slice(start, end).map((m) => {
+    const who = m.from === "them" ? "患者" : "スタッフ";
+    const body = String(m.text || (m.media ? "［" + m.media + "］" : "")).trim() || "［内容なし］";
+    return who + "（" + String(m.time || "時刻不明") + "）\n" + body.slice(0, 700);
+  });
+  const range = msgs.length ? (start + 1) + "〜" + end + "件目 / 全" + msgs.length + "件" : "履歴はまだありません";
+  const nav = [];
+  if (start > 0) nav.push(staffLinePostback("さらに過去", "migiude=history&id=" + approvalId + "&page=" + (p + 1)));
+  if (p > 0) nav.push(staffLinePostback("新しい履歴へ", "migiude=history&id=" + approvalId + "&page=" + (p - 1)));
+  const footer = nav.length ? { type: "box", layout: "horizontal", spacing: "sm", contents: nav } : undefined;
+  const bubble = { type: "bubble", size: "giga", body: { type: "box", layout: "vertical", contents: [
+    { type: "text", text: "患者との会話履歴", weight: "bold", size: "lg", color: "#047857" },
+    { type: "text", text: String(c.name || "名称未取得") + "｜" + range, size: "xs", color: "#6b7280", margin: "sm", wrap: true },
+    { type: "separator", margin: "md" },
+    { type: "text", text: lines.join("\n\n").slice(0, 4500) || "履歴はまだありません。", size: "sm", margin: "md", wrap: true }
+  ] } };
+  if (footer) bubble.footer = { type: "box", layout: "vertical", spacing: "sm", contents: [footer] };
+  return { type: "flex", altText: "右腕くん：" + String(c.name || "お客様") + "の会話履歴", contents: bubble };
 }
 function staffLineApprovalById(t, id) {
   for (const c of Object.values(t.store || {})) {
@@ -1325,7 +1352,8 @@ async function genDraft(t, c, opts) {
     }
     if (opts.baSlotsTxt) {
       baTxt += "\n\n【空き枠の照会結果（システムが今取得した実データ。この範囲だけを根拠に答える）】\n" + opts.baSlotsTxt
-        + "\n患者の質問・条件（一番遅い/早い・◯時以降・土日など）に沿って、この結果から計算して端的に答える。全枠の羅列はせず、条件に合う候補を最大6件まで。条件に合う枠が無ければ正直に無いと伝え、近い代替を提案する。回答の最後に、ご希望が決まればこのまま日時変更できる旨を一言添える。追加の空き照会（type:slots）はもう出さない。";
+        + "\n患者の質問・条件（一番遅い/早い・◯時以降・土日など）に沿って、この結果から計算して端的に答える。希望時刻が明示されている場合は、その時刻が空いているかを最初に明言する。全枠の羅列はせず、条件に合う候補を最大6件まで。条件に合う枠が無ければ正直に無いと伝え、近い代替を提案する。回答の最後に、ご希望が決まればこのまま日時変更できる旨を一言添える。追加の空き照会（type:slots）はもう出さない。"
+        + (opts.bookingReviewPreview ? "\nこれはスタッフ承認前の返信案である。予約変更が完了したとは絶対に書かず、確認できた空き状況を伝えたうえで『この日時へ変更をご希望ですか』と患者の意思を確認する。actionはtype:noneにする。" : "");
     }
   }
   const sys = "あなたはクリニック・店舗「" + (t.name || "クリニック") + "」の受付スタッフです。お客様とこの会話をしてきた本人として、最新のメッセージへ、自然で温かく、簡潔な敬語で返信します。"
@@ -1364,6 +1392,47 @@ async function genDraft(t, c, opts) {
   } catch (e) { return null; }
 }
 
+// 毎回承認モードでも、予約を変更せず「空き枠を読むだけ」の事前確認は行う。
+// 取得結果を返信案へ反映し、スタッフLINE上で根拠のある案を承認できるようにする。
+async function enrichStaffLineBookingPreview(t, c, generated) {
+  try {
+    if (!generated || !generated.action || !baEnabled(t) || !PARTNER_KEY) return generated;
+    const action = generated.action;
+    const type = String(action.type || "none");
+    if (type !== "slots" && type !== "reschedule") return generated;
+    const ctx = generated.baCtx;
+    if (!(ctx && ctx.ok && ctx.verified)) return generated;
+    const changeable = Array.isArray(ctx.appointments) ? ctx.appointments.filter(a => a && a.changeable) : [];
+    const appointmentId = String(action.appointmentId || "") || (changeable.length === 1 ? String(changeable[0].id || "") : "");
+    if (!appointmentId) return generated;
+    let dates = Array.isArray(action.dates) ? action.dates.map(String) : [];
+    if (action.date) dates.push(String(action.date));
+    if (type === "reschedule" && action.newDateTime) dates.push(String(action.newDateTime).slice(0, 10));
+    dates = Array.from(new Set(dates.filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d)))).slice(0, 7);
+    if (!dates.length) return generated;
+    const checked = await Promise.all(dates.map(async (date) => {
+      const result = await baCall(t, c, "slots", { appointmentId, date });
+      return result && result.ok ? { date, slots: Array.isArray(result.slots) ? result.slots : [] } : null;
+    }));
+    const results = checked.filter(Boolean);
+    if (!results.length) return generated;
+    const fmtD = (ds) => { const d = new Date(ds + "T00:00:00+09:00"); return (d.getMonth() + 1) + "月" + d.getDate() + "日(" + "日月火水木金土"[d.getDay()] + ")"; };
+    const slotsTxt = results.map(x => fmtD(x.date) + ": " + (x.slots.length ? x.slots.map(s => s.label).join(" ") : "空きなし")).join("\n");
+    const revised = await genDraft(t, c, { baSlotsTxt: slotsTxt, bookingReviewPreview: true });
+    if (revised && String(revised.draft || "").trim()) {
+      generated.draft = revised.draft;
+      generated.confidence = revised.confidence || generated.confidence;
+      generated.needs_human = revised.needs_human;
+      generated.is_urgent = revised.is_urgent;
+      generated.site_alert = revised.site_alert;
+      generated.site_summary = revised.site_summary;
+      generated.topics = Array.isArray(revised.topics) ? revised.topics : generated.topics;
+      generated.bookingPreview = slotsTxt;
+    }
+  } catch (e) { console.error("staff line booking preview:", e && e.message); }
+  return generated;
+}
+
 // ===== shared inbound handler (LINE webhook / email poller / ingest all funnel here) =====
 async function handleInbound(t, opts) {
   const channel = opts.channel === "mail" ? "mail" : "line";
@@ -1393,7 +1462,8 @@ async function handleInbound(t, opts) {
 
   if (typeof opts.draft === "string") { c.draft = opts.draft; c.draft0 = opts.draft; }
   else if (!med && !baDone) { // generate draft in-app for text messages
-    const g = await genDraft(t, c);
+    let g = await genDraft(t, c);
+    if (g && staffLineReviewAll(t)) g = await enrichStaffLineBookingPreview(t, c, g);
     if (g) { c.draft = String(g.draft || ""); c.draft0 = c.draft; confidence = g.confidence; needsHuman = g.needs_human; urgent = g.is_urgent; siteAlert = g.site_alert; siteSummary = g.site_summary; c.topics = Array.isArray(g.topics) ? g.topics : []; }
     // ===== 予約自動受付: AIが操作依頼(action)を出したら、確認文の送信までを自動処理 =====
     if (g && !staffLineReviewAll(t) && baEnabled(t) && PARTNER_KEY && g.action && typeof g.action === "object" && g.action.type && g.action.type !== "none") {
@@ -1637,12 +1707,18 @@ app.post("/webhook/staff-line", async (req, res) => {
         else await staffLineReply(t, ev.replyToken, [staffLineText(found.approval.assignedUserId === userId ? "この案件はあなたが対応中です。" : "この案件は" + found.approval.assignedName + "さんが対応中です。")]);
         continue;
       }
-      if (!found.approval.assignedUserId) { found.approval.assignedUserId = userId; found.approval.assignedName = staff.name; dbSave(t, found.c); }
-      if (found.approval.assignedUserId !== userId) { await staffLineReply(t, ev.replyToken, [staffLineText("この案件は" + found.approval.assignedName + "さんが対応中です。重複対応を防ぐため操作できません。")]); continue; }
+      // 閲覧だけでは担当を確保しない。複数スタッフが履歴・予約情報を確認してから、
+      // 実際に対応する人が「対応する」または修正・送信操作で担当になる。
+      if (action === "history") {
+        const page = Math.max(0, Number(q.get("page")) || 0);
+        await staffLineReply(t, ev.replyToken, [staffLineHistoryPageMessage(found.c, found.approval.id, page)]); continue;
+      }
       if (action === "info") {
         let info = "予約システムに確認できる情報がありません。"; try { info = (await fetchBooking(t, found.c)) || info; } catch (e) {}
         await staffLineReply(t, ev.replyToken, [staffLineText("患者・予約情報の確認結果です。\n" + String(info).slice(0, 4500))]); continue;
       }
+      if (!found.approval.assignedUserId) { found.approval.assignedUserId = userId; found.approval.assignedName = staff.name; dbSave(t, found.c); }
+      if (found.approval.assignedUserId !== userId) { await staffLineReply(t, ev.replyToken, [staffLineText("この案件は" + found.approval.assignedName + "さんが対応中です。重複対応を防ぐため操作できません。")]); continue; }
       if (action === "edit") {
         staffLineEditSessions.set(staffLineEditKey(t, groupId, userId), { approvalId: found.approval.id, exp: Date.now() + 10 * 60 * 1000 });
         await staffLineReply(t, ev.replyToken, [staffLineText("修正内容を10分以内にこのグループへ送ってください。例：『予約日時を確認してから案内する文章に直して』\n\n安全のため、修正後にもう一度「この内容で送信」を押すまで患者様には送られません。")]); continue;
