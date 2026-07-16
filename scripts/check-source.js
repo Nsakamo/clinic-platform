@@ -19,14 +19,22 @@ if (!scripts.length) throw new Error("browser script not found in PAGE");
 scripts.forEach((script, index) => new vm.Script(script, { filename: "PAGE-script-" + index + ".js" }));
 
 [
-  "/api/slack-test",
+  "/webhook/staff-line",
+  "/api/staff-line/config",
+  "/api/staff-line/link-code",
+  "/api/staff-line/test",
   "/api/staff-booking-action",
   "/api/staff-booking-confirm",
   "/api/partner/password-reset",
-  "setSlackWebhook",
+  "setStaffLineToken",
+  "staffLineApprovalMessage",
   "staffBookingPending"
 ].forEach((required) => {
   if (!source.includes(required)) throw new Error("required implementation missing: " + required);
+});
+
+["/api/slack/", "/api/slack-test", "setSlackWebhook"].forEach((removed) => {
+  if (source.includes(removed)) throw new Error("removed Slack implementation still present: " + removed);
 });
 
 console.log("server and embedded browser scripts parsed successfully");
