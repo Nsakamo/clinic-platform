@@ -1342,7 +1342,9 @@ async function genDraft(t, c, opts) {
   if(!opts.skipExternal){ try { bookingTxt = await fetchBooking(t, c); } catch (e) { bookingTxt = ""; } }
   // 予約自動受付: 本人確認つきコンテキスト。未確認の相手には既存の照会テキストも渡さない（個人情報を出させない）。
   let baCtx = null, baTxt = "";
-  if (!opts.skipExternal && baEnabled(t) && PARTNER_KEY) {
+  // 予約の自動操作がOFFでも、スタッフLINEの毎回承認モードでは安全な読み取り照会を使う。
+  // handleInbound側で書き込みactionは実行しないため、予約・顧客情報を返信案へ反映するだけになる。
+  if (!opts.skipExternal && (baEnabled(t) || staffLineReviewAll(t)) && PARTNER_KEY) {
     try { baCtx = await baCall(t, c, "context", { email: (c.ba && c.ba.email) || undefined }); } catch (e) { baCtx = null; }
     baTxt = baPromptBlock(baCtx);
     // 本人確認が取れていない相手（照会失敗も含む）には既存の照会テキストも渡さない（個人情報を出させない）
@@ -1396,7 +1398,7 @@ async function genDraft(t, c, opts) {
 // 取得結果を返信案へ反映し、スタッフLINE上で根拠のある案を承認できるようにする。
 async function enrichStaffLineBookingPreview(t, c, generated) {
   try {
-    if (!generated || !generated.action || !baEnabled(t) || !PARTNER_KEY) return generated;
+    if (!generated || !generated.action || !(baEnabled(t) || staffLineReviewAll(t)) || !PARTNER_KEY) return generated;
     const action = generated.action;
     const type = String(action.type || "none");
     if (type !== "slots" && type !== "reschedule") return generated;
