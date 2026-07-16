@@ -23,11 +23,14 @@ scripts.forEach((script, index) => new vm.Script(script, { filename: "PAGE-scrip
   "/api/staff-line/config",
   "/api/staff-line/link-code",
   "/api/staff-line/test",
+  "/api/quality-preview",
   "/api/staff-booking-action",
   "/api/staff-booking-confirm",
   "/api/partner/password-reset",
   "setStaffLineToken",
   "staffLineApprovalMessage",
+  "finalizeGeneratedDraft",
+  "isPersistentConversationInstruction",
   "staffBookingPending"
 ].forEach((required) => {
   if (!source.includes(required)) throw new Error("required implementation missing: " + required);
