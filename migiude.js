@@ -308,17 +308,22 @@ function staffLinePostback(label, data, style) {
 }
 function staffLineApprovalMessage(t, c, approval, summary, reason) {
   const assigned = approval.assignedName ? ("\n担当: " + approval.assignedName) : "\n担当: 未定（最初に『対応する』を押したスタッフ）";
+  const verifiedName = String(c.verifiedPatientName || "").trim();
+  const lineName = String(c.name || "名称未取得").trim();
+  const customerLabel = verifiedName
+    ? ("患者名: " + verifiedName.slice(0, 100) + "\nLINE表示名: " + lineName.slice(0, 100))
+    : ("お客様: " + lineName.slice(0, 100));
   const body = [
     { type: "text", text: "右腕くん｜返信確認", weight: "bold", size: "lg", color: "#047857" },
     { type: "text", text: String(t.name || t.slug).slice(0, 120), size: "sm", color: "#6b7280", margin: "sm" },
     { type: "separator", margin: "md" },
-    { type: "text", text: "お客様: " + String(c.name || "名称未取得").slice(0, 80) + "（" + (c.channel === "mail" ? "メール" : "LINE") + "）", wrap: true, margin: "md" },
+    { type: "text", text: customerLabel + "（" + (c.channel === "mail" ? "メール" : "LINE") + "）", wrap: true, margin: "md" },
     { type: "text", text: "確認理由: " + String(reason || approval.reason || "送信前確認").slice(0, 240) + assigned, wrap: true, size: "sm", color: "#4b5563", margin: "sm" },
     { type: "text", text: "会話要約\n" + String(summary || approval.summary || "").slice(0, 1200), wrap: true, size: "sm", margin: "md" },
     { type: "text", text: "返信案\n" + String(approval.draft || "").slice(0, 1800), wrap: true, size: "sm", margin: "md", color: "#111827" }
   ];
   const id = approval.id;
-  return { type: "flex", altText: "右腕くん：" + String(c.name || "お客様") + "への返信確認", contents: { type: "bubble", size: "giga", body: { type: "box", layout: "vertical", contents: body }, footer: { type: "box", layout: "vertical", spacing: "sm", contents: [
+  return { type: "flex", altText: "右腕くん：" + String(verifiedName || c.name || "お客様") + "への返信確認", contents: { type: "bubble", size: "giga", body: { type: "box", layout: "vertical", contents: body }, footer: { type: "box", layout: "vertical", spacing: "sm", contents: [
     staffLinePostback("対応する", "migiude=claim&id=" + id, "primary"),
     { type: "box", layout: "horizontal", spacing: "sm", contents: [staffLinePostback("会話履歴", "migiude=history&id=" + id + "&page=0"), staffLinePostback("患者・予約情報", "migiude=info&id=" + id)] },
     staffLinePostback("返信を修正", "migiude=edit&id=" + id),
@@ -344,12 +349,12 @@ function staffLineHistoryPageMessage(c, approvalId, page) {
   const footer = nav.length ? { type: "box", layout: "horizontal", spacing: "sm", contents: nav } : undefined;
   const bubble = { type: "bubble", size: "giga", body: { type: "box", layout: "vertical", contents: [
     { type: "text", text: "患者との会話履歴", weight: "bold", size: "lg", color: "#047857" },
-    { type: "text", text: String(c.name || "名称未取得") + "｜" + range, size: "xs", color: "#6b7280", margin: "sm", wrap: true },
+    { type: "text", text: String(c.verifiedPatientName || c.name || "名称未取得") + "｜" + range, size: "xs", color: "#6b7280", margin: "sm", wrap: true },
     { type: "separator", margin: "md" },
     { type: "text", text: lines.join("\n\n").slice(0, 4500) || "履歴はまだありません。", size: "sm", margin: "md", wrap: true }
   ] } };
   if (footer) bubble.footer = { type: "box", layout: "vertical", spacing: "sm", contents: [footer] };
-  return { type: "flex", altText: "右腕くん：" + String(c.name || "お客様") + "の会話履歴", contents: bubble };
+  return { type: "flex", altText: "右腕くん：" + String(c.verifiedPatientName || c.name || "お客様") + "の会話履歴", contents: bubble };
 }
 function staffLineApprovalById(t, id) {
   for (const c of Object.values(t.store || {})) {
@@ -1466,7 +1471,11 @@ async function handleInbound(t, opts) {
   else if (!med && !baDone) { // generate draft in-app for text messages
     let g = await genDraft(t, c);
     if (g && staffLineReviewAll(t)) g = await enrichStaffLineBookingPreview(t, c, g);
-    if (g) { c.draft = String(g.draft || ""); c.draft0 = c.draft; confidence = g.confidence; needsHuman = g.needs_human; urgent = g.is_urgent; siteAlert = g.site_alert; siteSummary = g.site_summary; c.topics = Array.isArray(g.topics) ? g.topics : []; }
+    if (g) {
+      const verifiedName = g.baCtx && g.baCtx.ok && g.baCtx.verified && g.baCtx.patient && String(g.baCtx.patient.name || "").trim();
+      if (verifiedName) c.verifiedPatientName = verifiedName.slice(0, 120);
+      c.draft = String(g.draft || ""); c.draft0 = c.draft; confidence = g.confidence; needsHuman = g.needs_human; urgent = g.is_urgent; siteAlert = g.site_alert; siteSummary = g.site_summary; c.topics = Array.isArray(g.topics) ? g.topics : [];
+    }
     // ===== 予約自動受付: AIが操作依頼(action)を出したら、確認文の送信までを自動処理 =====
     if (g && !staffLineReviewAll(t) && baEnabled(t) && PARTNER_KEY && g.action && typeof g.action === "object" && g.action.type && g.action.type !== "none") {
       try { baDone = await baAction(t, c, g.action, g.baCtx); } catch (e) { console.error("ba action:", e && e.message); }
