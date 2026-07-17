@@ -2736,9 +2736,11 @@ function normalizeRichMenuDraft(body) {
 function richMenuPublic(t) {
   const draft = t.config.richMenuDraft || null;
   const published = t.config.richMenuPublished || null;
+  const schedules = (Array.isArray(t.config.richMenuSchedules) ? t.config.richMenuSchedules : []).slice().sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0)).slice(0, 50);
   return {
     draft: draft ? Object.assign({}, draft, { imageUrl: draft.imageFileId ? "/files/" + draft.imageFileId : "" }) : null,
     published: published ? { richMenuId: String(published.richMenuId || ""), accountKey: String(published.accountKey || ""), publishedAt: Number(published.publishedAt || 0) } : null,
+    schedules: schedules.map(s => ({ id: String(s.id || ""), name: String(s.name || ""), accountKey: String(s.accountKey || ""), startAt: Number(s.startAt || 0), endAt: Number(s.endAt || 0), status: String(s.status || "scheduled"), createdAt: Number(s.createdAt || 0), activatedAt: Number(s.activatedAt || 0), completedAt: Number(s.completedAt || 0), createdBy: String(s.createdBy || ""), lastError: String(s.lastError || "") })),
     accounts: richMenuAccounts(t).map(a => ({ key: a.key, name: a.name, botId: a.botId })),
     configured: richMenuAccounts(t).length > 0
   };
@@ -2755,6 +2757,56 @@ async function saveRichMenuDraft(t, body) {
   try { await saveTenantConfig(t); } catch (e) { return { ok: false, status: 500, error: "save" }; }
   return { ok: true, draft, file };
 }
+function richMenuActiveSchedule(t, accountKey) {
+  return (Array.isArray(t.config.richMenuSchedules) ? t.config.richMenuSchedules : []).find(s => s && s.status === "active" && (!accountKey || s.accountKey === accountKey)) || null;
+}
+function richMenuLineBody(draft) {
+  const width = 2500, height = draft.size === "small" ? 843 : 1686;
+  const areas = draft.areas.map(a => {
+    const bounds = { x: Math.max(0, Math.min(width - 1, Math.round(a.x * width))), y: Math.max(0, Math.min(height - 1, Math.round(a.y * height))), width: Math.max(1, Math.min(width, Math.round(a.w * width))), height: Math.max(1, Math.min(height, Math.round(a.h * height))) };
+    if (bounds.x + bounds.width > width) bounds.width = width - bounds.x;
+    if (bounds.y + bounds.height > height) bounds.height = height - bounds.y;
+    const action = a.type === "message" ? { type: "message", label: a.label.slice(0, 20), text: a.value.slice(0, 300) } : { type: "uri", label: a.label.slice(0, 20), uri: a.value.slice(0, 1000) };
+    return { bounds, action };
+  });
+  return { size: { width, height }, selected: true, name: draft.name, chatBarText: draft.chatBarText, areas };
+}
+async function createLineRichMenu(account, draft, file) {
+  if (!file.data || file.data.length > 1024 * 1024) throw new Error("image_too_large");
+  const create = await fetch("https://api.line.me/v2/bot/richmenu", { method: "POST", headers: { "Authorization": "Bearer " + account.token, "Content-Type": "application/json" }, body: JSON.stringify(richMenuLineBody(draft)) });
+  const json = await create.json().catch(() => ({}));
+  if (!create.ok || !json.richMenuId) throw new Error("line_create_" + create.status);
+  const id = String(json.richMenuId);
+  try {
+    const upload = await fetch("https://api-data.line.me/v2/bot/richmenu/" + encodeURIComponent(id) + "/content", { method: "POST", headers: { "Authorization": "Bearer " + account.token, "Content-Type": file.mime }, body: file.data });
+    if (!upload.ok) throw new Error("line_image_" + upload.status);
+    return id;
+  } catch (e) {
+    await deleteLineRichMenu(account, id);
+    throw e;
+  }
+}
+async function setLineRichMenu(account, id) {
+  const r = await fetch("https://api.line.me/v2/bot/user/all/richmenu/" + encodeURIComponent(String(id)), { method: "POST", headers: { "Authorization": "Bearer " + account.token } });
+  if (!r.ok) throw new Error("line_default_" + r.status);
+}
+async function clearLineRichMenu(account) {
+  const r = await fetch("https://api.line.me/v2/bot/user/all/richmenu", { method: "DELETE", headers: { "Authorization": "Bearer " + account.token } });
+  if (!r.ok && r.status !== 404) throw new Error("line_clear_" + r.status);
+}
+async function currentLineRichMenu(account) {
+  const r = await fetch("https://api.line.me/v2/bot/user/all/richmenu", { headers: { "Authorization": "Bearer " + account.token } });
+  // 404は未設定、403はLINE Official Account Manager側の既定メニュー。
+  // どちらもMessaging API側の既定IDは無いため、終了時にclearすると元のManager側表示へ戻る。
+  if (r.status === 404 || r.status === 403) return "";
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error("line_current_" + r.status);
+  return String(j.richMenuId || "");
+}
+async function deleteLineRichMenu(account, id) {
+  if (!id) return;
+  await fetch("https://api.line.me/v2/bot/richmenu/" + encodeURIComponent(String(id)), { method: "DELETE", headers: { "Authorization": "Bearer " + account.token } }).catch(() => {});
+}
 app.get("/api/rich-menu", guard, (req, res) => res.json(richMenuPublic(req.tenant)));
 app.post("/api/rich-menu/save", guard, async (req, res) => {
   const t = req.tenant, saved = await saveRichMenuDraft(t, req.body);
@@ -2766,50 +2818,21 @@ app.post("/api/rich-menu/publish", guard, async (req, res) => {
   if (!saved.ok) return res.status(saved.status).json({ ok: false, error: saved.error });
   const draft = saved.draft, file = saved.file, account = richMenuAccount(t, draft.accountKey);
   if (!account || !account.token) return res.status(400).json({ ok: false, error: "line_not_configured" });
-  if (!file.data || file.data.length > 1024 * 1024) return res.status(400).json({ ok: false, error: "image_too_large" });
-  const width = 2500, height = draft.size === "small" ? 843 : 1686;
-  const areas = draft.areas.map(a => {
-    const bounds = {
-      x: Math.max(0, Math.min(width - 1, Math.round(a.x * width))),
-      y: Math.max(0, Math.min(height - 1, Math.round(a.y * height))),
-      width: Math.max(1, Math.min(width, Math.round(a.w * width))),
-      height: Math.max(1, Math.min(height, Math.round(a.h * height)))
-    };
-    if (bounds.x + bounds.width > width) bounds.width = width - bounds.x;
-    if (bounds.y + bounds.height > height) bounds.height = height - bounds.y;
-    const action = a.type === "message"
-      ? { type: "message", label: a.label.slice(0, 20), text: a.value.slice(0, 300) }
-      : { type: "uri", label: a.label.slice(0, 20), uri: a.value.slice(0, 1000) };
-    return { bounds, action };
-  });
+  if (richMenuActiveSchedule(t, account.key)) return res.status(409).json({ ok: false, error: "schedule_active" });
   let createdId = "";
   try {
-    const create = await fetch("https://api.line.me/v2/bot/richmenu", {
-      method: "POST",
-      headers: { "Authorization": "Bearer " + account.token, "Content-Type": "application/json" },
-      body: JSON.stringify({ size: { width, height }, selected: true, name: draft.name, chatBarText: draft.chatBarText, areas })
-    });
-    const createJson = await create.json().catch(() => ({}));
-    if (!create.ok || !createJson.richMenuId) return res.status(502).json({ ok: false, error: "line_create_" + create.status });
-    createdId = String(createJson.richMenuId);
-    const upload = await fetch("https://api-data.line.me/v2/bot/richmenu/" + encodeURIComponent(createdId) + "/content", {
-      method: "POST", headers: { "Authorization": "Bearer " + account.token, "Content-Type": file.mime }, body: file.data
-    });
-    if (!upload.ok) throw new Error("line_image_" + upload.status);
-    const setDefault = await fetch("https://api.line.me/v2/bot/user/all/richmenu/" + encodeURIComponent(createdId), {
-      method: "POST", headers: { "Authorization": "Bearer " + account.token }
-    });
-    if (!setDefault.ok) throw new Error("line_default_" + setDefault.status);
+    createdId = await createLineRichMenu(account, draft, file);
+    await setLineRichMenu(account, createdId);
     const old = t.config.richMenuPublished;
     t.config.richMenuPublished = { richMenuId: createdId, accountKey: account.key, publishedAt: Date.now() };
     await saveTenantConfig(t);
     // 新メニューの公開成功後に、同じ公式アカウントの旧メニューだけを掃除する。失敗しても新公開は維持する。
     if (old && old.richMenuId && old.richMenuId !== createdId && old.accountKey === account.key) {
-      fetch("https://api.line.me/v2/bot/richmenu/" + encodeURIComponent(String(old.richMenuId)), { method: "DELETE", headers: { "Authorization": "Bearer " + account.token } }).catch(() => {});
+      deleteLineRichMenu(account, old.richMenuId);
     }
     return res.json(Object.assign({ ok: true }, richMenuPublic(t)));
   } catch (e) {
-    if (createdId) fetch("https://api.line.me/v2/bot/richmenu/" + encodeURIComponent(createdId), { method: "DELETE", headers: { "Authorization": "Bearer " + account.token } }).catch(() => {});
+    if (createdId) deleteLineRichMenu(account, createdId);
     return res.status(502).json({ ok: false, error: String(e.message || "line_publish").slice(0, 80) });
   }
 });
@@ -2818,15 +2841,122 @@ app.post("/api/rich-menu/unpublish", guard, async (req, res) => {
   if (!published || !published.richMenuId) return res.json(Object.assign({ ok: true }, richMenuPublic(t)));
   const account = richMenuAccount(t, published.accountKey);
   if (!account || !account.token) return res.status(400).json({ ok: false, error: "line_not_configured" });
+  if (richMenuActiveSchedule(t, account.key)) return res.status(409).json({ ok: false, error: "schedule_active" });
   try {
-    const clear = await fetch("https://api.line.me/v2/bot/user/all/richmenu", { method: "DELETE", headers: { "Authorization": "Bearer " + account.token } });
-    if (!clear.ok && clear.status !== 404) return res.status(502).json({ ok: false, error: "line_clear_" + clear.status });
-    await fetch("https://api.line.me/v2/bot/richmenu/" + encodeURIComponent(String(published.richMenuId)), { method: "DELETE", headers: { "Authorization": "Bearer " + account.token } }).catch(() => {});
+    await clearLineRichMenu(account);
+    await deleteLineRichMenu(account, published.richMenuId);
     delete t.config.richMenuPublished;
     await saveTenantConfig(t);
     res.json(Object.assign({ ok: true }, richMenuPublic(t)));
   } catch (e) { res.status(502).json({ ok: false, error: "line_unreachable" }); }
 });
+app.post("/api/rich-menu/schedule", guard, async (req, res) => {
+  const t = req.tenant, saved = await saveRichMenuDraft(t, req.body);
+  if (!saved.ok) return res.status(saved.status).json({ ok: false, error: saved.error });
+  if (!req.body.startAt && !req.body.endAt) return res.status(400).json({ ok: false, error: "period_required" });
+  const account = richMenuAccount(t, saved.draft.accountKey);
+  if (!account || !account.token) return res.status(400).json({ ok: false, error: "line_not_configured" });
+  const now = Date.now(), startAt = req.body.startAt ? Number(req.body.startAt) : now, endAt = req.body.endAt ? Number(req.body.endAt) : 0;
+  if (!Number.isFinite(startAt) || startAt < now - 60000) return res.status(400).json({ ok: false, error: "invalid_start" });
+  if (endAt && (!Number.isFinite(endAt) || endAt <= Math.max(startAt, now) + 60000)) return res.status(400).json({ ok: false, error: "invalid_end" });
+  const schedules = Array.isArray(t.config.richMenuSchedules) ? t.config.richMenuSchedules : (t.config.richMenuSchedules = []);
+  if (schedules.filter(s => s && ["scheduled", "active"].includes(s.status)).length >= 20) return res.status(409).json({ ok: false, error: "schedule_limit" });
+  const newEnd = endAt || Number.MAX_SAFE_INTEGER;
+  const overlap = schedules.find(s => s && s.accountKey === account.key && ["scheduled", "active"].includes(s.status) && startAt < (Number(s.endAt || 0) || Number.MAX_SAFE_INTEGER) && Number(s.startAt || 0) < newEnd);
+  if (overlap) return res.status(409).json({ ok: false, error: "schedule_overlap" });
+  let richMenuId = "", item = null, persisted = false;
+  try {
+    richMenuId = await createLineRichMenu(account, saved.draft, saved.file);
+    item = {
+      id: crypto.randomBytes(10).toString("hex"), name: saved.draft.name, accountKey: account.key,
+      richMenuId, draft: saved.draft, startAt, endAt, status: "scheduled", createdAt: now,
+      createdBy: String(t.config.loginId || t.slug).slice(0, 80), lastError: ""
+    };
+    schedules.push(item);
+    while (schedules.length > 50) { const i = schedules.findIndex(s => s && ["completed", "cancelled"].includes(s.status)); if (i < 0) break; schedules.splice(i, 1); }
+    await saveTenantConfig(t);
+    persisted = true;
+    await processRichMenuSchedulesForTenant(t);
+    res.json(Object.assign({ ok: true }, richMenuPublic(t)));
+  } catch (e) {
+    // DB保存後の即時切替だけが一時失敗した場合、予約とLINE上の事前作成メニューは残して定期処理で再試行する。
+    if (persisted) return res.status(202).json(Object.assign({ ok: true, pending: true }, richMenuPublic(t)));
+    if (item) { const i = schedules.indexOf(item); if (i >= 0) schedules.splice(i, 1); }
+    if (richMenuId) await deleteLineRichMenu(account, richMenuId);
+    res.status(502).json({ ok: false, error: String(e.message || "schedule_save").slice(0, 80) });
+  }
+});
+app.post("/api/rich-menu/schedule-cancel", guard, async (req, res) => {
+  const t = req.tenant, id = String(req.body.id || ""), schedules = Array.isArray(t.config.richMenuSchedules) ? t.config.richMenuSchedules : [];
+  const item = schedules.find(s => s && s.id === id && ["scheduled", "active"].includes(s.status));
+  if (!item) return res.status(404).json({ ok: false, error: "schedule_not_found" });
+  const account = richMenuAccount(t, item.accountKey);
+  if (!account || !account.token) return res.status(400).json({ ok: false, error: "line_not_configured" });
+  try {
+    if (item.status === "active") {
+      if (item.fallbackRichMenuId) await setLineRichMenu(account, item.fallbackRichMenuId); else await clearLineRichMenu(account);
+      if (item.fallbackPublished) t.config.richMenuPublished = item.fallbackPublished; else delete t.config.richMenuPublished;
+    }
+    await deleteLineRichMenu(account, item.richMenuId);
+    item.status = "cancelled"; item.completedAt = Date.now(); item.lastError = "";
+    await saveTenantConfig(t);
+    res.json(Object.assign({ ok: true }, richMenuPublic(t)));
+  } catch (e) { res.status(502).json({ ok: false, error: String(e.message || "cancel_failed").slice(0, 80) }); }
+});
+
+const richMenuScheduleLocks = new Set();
+async function richMenuScheduleFailure(t, item, e) {
+  item.lastError = String(e && e.message || "line_schedule_failed").slice(0, 100);
+  if (!item.errorNotifiedAt) {
+    item.errorNotifiedAt = Date.now();
+    try { await alertAdd(t, "システム", "LINEリッチメニュー「" + String(item.name || "名称未設定") + "」の自動切替に失敗しました。設定画面を確認してください。", ""); } catch (_) {}
+  }
+  try { await saveTenantConfig(t); } catch (_) {}
+}
+async function processRichMenuSchedulesForTenant(t) {
+  if (!t || richMenuScheduleLocks.has(t.slug)) return;
+  richMenuScheduleLocks.add(t.slug);
+  try {
+    const schedules = Array.isArray(t.config.richMenuSchedules) ? t.config.richMenuSchedules : [], now = Date.now();
+    // 終了を先に処理し、終了時刻と次の開始時刻が同じ場合も通常メニューを正しく引き継ぐ。
+    for (const item of schedules.filter(s => s && s.status === "active" && s.endAt && s.endAt <= now)) {
+      const account = richMenuAccount(t, item.accountKey);
+      if (!account || !account.token) { await richMenuScheduleFailure(t, item, new Error("line_not_configured")); continue; }
+      try {
+        if (item.fallbackRichMenuId) await setLineRichMenu(account, item.fallbackRichMenuId); else await clearLineRichMenu(account);
+        if (item.fallbackPublished) t.config.richMenuPublished = item.fallbackPublished; else delete t.config.richMenuPublished;
+        await deleteLineRichMenu(account, item.richMenuId);
+        item.status = "completed"; item.completedAt = now; item.lastError = "";
+        await saveTenantConfig(t);
+      } catch (e) { await richMenuScheduleFailure(t, item, e); }
+    }
+    for (const item of schedules.filter(s => s && s.status === "scheduled" && s.startAt <= now)) {
+      const account = richMenuAccount(t, item.accountKey);
+      if (!account || !account.token) { await richMenuScheduleFailure(t, item, new Error("line_not_configured")); continue; }
+      try {
+        // サーバー停止中に期間全体が過ぎた予約は一瞬だけ表示せず、安全にスキップする。
+        if (item.endAt && item.endAt <= now) {
+          await deleteLineRichMenu(account, item.richMenuId);
+          item.status = "completed"; item.completedAt = now; item.lastError = "period_elapsed";
+          await saveTenantConfig(t); continue;
+        }
+        if (!item.fallbackCapturedAt) {
+          item.fallbackRichMenuId = await currentLineRichMenu(account);
+          item.fallbackPublished = t.config.richMenuPublished && t.config.richMenuPublished.accountKey === account.key ? Object.assign({}, t.config.richMenuPublished) : null;
+          item.fallbackCapturedAt = now;
+          await saveTenantConfig(t);
+        }
+        await setLineRichMenu(account, item.richMenuId);
+        item.status = "active"; item.activatedAt = now; item.lastError = ""; item.errorNotifiedAt = 0;
+        t.config.richMenuPublished = { richMenuId: item.richMenuId, accountKey: account.key, publishedAt: now, scheduleId: item.id };
+        await saveTenantConfig(t);
+      } catch (e) { await richMenuScheduleFailure(t, item, e); }
+    }
+  } finally { richMenuScheduleLocks.delete(t.slug); }
+}
+async function processAllRichMenuSchedules() {
+  for (const t of Object.values(TEN)) await processRichMenuSchedulesForTenant(t);
+}
 // 公開URL（LINEの画像送信等はセッション無しで取得する）。idは128bitランダム。
 // ログイン中のテナントが他テナントのファイルidを開いた場合は404（tenant check）
 app.get("/files/:id", async (req, res) => {
@@ -3578,6 +3708,7 @@ app.get("/board", (req, res) => { res.set("Content-Type", "text/html; charset=ut
   try { if (pool) await dbInit(); } catch (e) { console.error("dbInit failed:", e.message); }
   try { await pushInit(); } catch (e) { console.error("pushInit failed:", e.message); }
   setInterval(() => { pollAll().catch(() => {}); }, 60000); setTimeout(() => { pollAll().catch(() => {}); }, 8000);
+  setInterval(() => { processAllRichMenuSchedules().catch(() => {}); }, 30000); setTimeout(() => { processAllRichMenuSchedules().catch(() => {}); }, 5000);
   setTimeout(() => { Object.values(TEN).forEach(t => ensureLineBotId(t).catch(() => {})); }, 3000);
   const server = app.listen(PORT, () => console.log("clinic-inbox platform listening on " + PORT));
   // Railwayの前段プロキシよりNodeが先にkeep-alive接続を切ると、切断直後のPOST(LINE Webhook等)が
@@ -3912,6 +4043,12 @@ const PAGE = `<!DOCTYPE html>
   .rmAreaRow.sel{border-color:#fb923c;background:#fff7ed;}
   .rmAreaRow input,.rmAreaRow select{box-sizing:border-box;width:100%;min-height:38px;border:1px solid #d1d5db;border-radius:8px;padding:7px 8px;font-size:12px;background:#fff;}
   .rmAreaRow .rmRow2{display:grid;grid-template-columns:110px minmax(0,1fr);gap:6px;margin-top:6px;}
+  .rmScheduleBox{margin-top:12px;padding-top:11px;border-top:1px solid #e2e8f0;}
+  .rmScheduleGrid{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:7px;}
+  .rmScheduleGrid label{font-size:10.5px;color:#64748b;}
+  .rmScheduleGrid input{box-sizing:border-box;width:100%;min-height:38px;margin-top:3px;border:1px solid #d1d5db;border-radius:8px;padding:6px;font-size:11px;background:#fff;}
+  .rmScheduleItem{border:1px solid #e2e8f0;border-radius:9px;padding:8px;margin-top:7px;font-size:11px;line-height:1.55;}
+  .rmScheduleItem.active{border-color:#34d399;background:#ecfdf5;}.rmScheduleItem.error{border-color:#fca5a5;background:#fef2f2;}
   .rmFooter{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;padding:10px 14px;background:#fff;border-top:1px solid var(--line);}
   #rmStatus{font-size:11px;color:#64748b;}
   @media(max-width:760px){#list{width:100%;}#chat{display:none;position:absolute;inset:0;}#app.chatopen #list{display:none;}#app.chatopen #chat{display:flex;}#backBtn{display:block;}
@@ -3947,6 +4084,7 @@ const PAGE = `<!DOCTYPE html>
     .rmCanvasPane{min-height:260px;overflow:visible;padding:7px;flex-shrink:0;}
     .rmSide{overflow:visible;min-height:180px;}
     .rmAreaRow input,.rmAreaRow select{font-size:16px;}
+    .rmScheduleGrid input{font-size:16px;}
     .rmFooter{padding:8px 9px calc(8px + env(safe-area-inset-bottom));}
     .rmFooter .cbtn{min-height:42px;}
     .learningFooter #learnAddBtn{min-width:132px;}
@@ -4148,6 +4286,13 @@ const PAGE = `<!DOCTYPE html>
       <div class="rmHelp"><b>使い方</b><br>1. 画像をアップロード<br>2. ボタンにしたい範囲をドラッグ<br>3. ボタン名と動作を設定<br>4. 下書き保存後、「LINEへ公開」</div>
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:7px;"><b style="font-size:13px;">ボタン範囲</b><span id="rmAreaCount" style="font-size:11px;color:#64748b;">0件</span></div>
       <div id="rmAreaList"></div>
+      <div class="rmScheduleBox">
+        <b style="font-size:13px;">表示期間</b>
+        <div style="font-size:10.5px;color:#64748b;line-height:1.5;margin-top:3px;">開始を空欄にすると今すぐ開始、終了を空欄にすると無期限です。終了後は元の通常メニューへ戻ります。反映にはLINE側で最大1分ほどかかる場合があります。</div>
+        <div class="rmScheduleGrid"><label>公開開始<input id="rmStartAt" type="datetime-local"></label><label>公開終了<input id="rmEndAt" type="datetime-local"></label></div>
+        <button type="button" class="cbtn send" style="width:100%;margin-top:7px;" onclick="scheduleRichMenu()">この期間で公開予約</button>
+        <div id="rmScheduleList"></div>
+      </div>
     </div>
   </div>
   <div class="rmFooter"><span id="rmStatus">読み込み前</span><div style="display:flex;gap:7px;flex-wrap:wrap;"><button type="button" id="rmUnpublishBtn" class="cbtn" style="display:none;color:#b91c1c;" onclick="unpublishRichMenu()">公開停止</button><button type="button" class="cbtn" onclick="saveRichMenu(false)">下書き保存</button><button type="button" class="cbtn send" onclick="saveRichMenu(true)">LINEへ公開</button></div></div>
@@ -4918,10 +5063,10 @@ function showRuleToast(rules){ const b=document.getElementById("learnToast"); if
 async function undoRule(id){ let ok=false; try{ const r=await api("/api/rule-undo",{id}); const j=await r.json(); ok=!!j.ok; }catch(e){} const b=document.getElementById("learnToast"); if(b){ b.innerHTML=ok?'ルールを取り消しました':'取り消せませんでした（設定→学習データ管理 から削除できます）'; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";},2500); } }
 
 // ---- 患者向けLINE リッチメニューエディター ----
-let RM={imageFileId:"",imageName:"",imageUrl:"",size:"large",name:"患者向けメニュー",chatBarText:"メニュー",accountKey:"",areas:[],published:null},rmDraw=null,rmSelected="";
+let RM={imageFileId:"",imageName:"",imageUrl:"",size:"large",name:"患者向けメニュー",chatBarText:"メニュー",accountKey:"",areas:[],published:null,schedules:[]},rmDraw=null,rmSelected="";
 function rmStatus(text,bad){const e=document.getElementById("rmStatus");if(e){e.textContent=text;e.style.color=bad?"#b91c1c":"#64748b";}}
 function rmAttr(s){return esc(String(s||"")).replace(/"/g,"&quot;").replace(/'/g,"&#39;");}
-async function openRichMenu(){document.getElementById("richMenuPop").style.display="flex";rmStatus("設定を読み込んでいます…");try{const r=await fetch("/api/rich-menu"),j=await r.json();if(!r.ok)throw new Error("load");const d=j.draft||{};RM={imageFileId:d.imageFileId||"",imageName:d.imageName||"",imageUrl:d.imageUrl||"",size:d.size==="small"?"small":"large",name:d.name||"患者向けメニュー",chatBarText:d.chatBarText||"メニュー",accountKey:d.accountKey||"",areas:Array.isArray(d.areas)?d.areas:[],published:j.published||null};const ac=document.getElementById("rmAccount");ac.innerHTML=(j.accounts||[]).map(a=>'<option value="'+esc(a.key)+'">'+esc(a.name)+'</option>').join("")||'<option value="">患者向けLINE未接続</option>';if(RM.accountKey)ac.value=RM.accountKey;else if(ac.options.length)RM.accountKey=ac.value;document.getElementById("rmSize").value=RM.size;document.getElementById("rmName").value=RM.name;document.getElementById("rmChatBar").value=RM.chatBarText;rmSelected=RM.areas[0]&&RM.areas[0].id||"";renderRichMenu();rmStatus(RM.published?"LINEへ公開済み。編集内容は再公開するまで反映されません":"下書きです。LINEにはまだ公開されていません");}catch(e){rmStatus("リッチメニュー設定を読み込めませんでした",true);}}
+async function openRichMenu(){document.getElementById("richMenuPop").style.display="flex";rmStatus("設定を読み込んでいます…");try{const r=await fetch("/api/rich-menu"),j=await r.json();if(!r.ok)throw new Error("load");const d=j.draft||{};RM={imageFileId:d.imageFileId||"",imageName:d.imageName||"",imageUrl:d.imageUrl||"",size:d.size==="small"?"small":"large",name:d.name||"患者向けメニュー",chatBarText:d.chatBarText||"メニュー",accountKey:d.accountKey||"",areas:Array.isArray(d.areas)?d.areas:[],published:j.published||null,schedules:Array.isArray(j.schedules)?j.schedules:[]};const ac=document.getElementById("rmAccount");ac.innerHTML=(j.accounts||[]).map(a=>'<option value="'+esc(a.key)+'">'+esc(a.name)+'</option>').join("")||'<option value="">患者向けLINE未接続</option>';if(RM.accountKey)ac.value=RM.accountKey;else if(ac.options.length)RM.accountKey=ac.value;document.getElementById("rmSize").value=RM.size;document.getElementById("rmName").value=RM.name;document.getElementById("rmChatBar").value=RM.chatBarText;rmSelected=RM.areas[0]&&RM.areas[0].id||"";renderRichMenu();rmStatus(RM.published?"LINEへ公開済み。編集内容は再公開するまで反映されません":"下書きです。LINEにはまだ公開されていません");}catch(e){rmStatus("リッチメニュー設定を読み込めませんでした",true);}}
 function closeRichMenu(){document.getElementById("richMenuPop").style.display="none";rmDraw=null;}
 function chooseRichMenuImage(){document.getElementById("rmImageInput").click();}
 function changeRichMenuSize(){const next=document.getElementById("rmSize").value==="small"?"small":"large";if(next===RM.size)return;RM.size=next;RM.imageFileId="";RM.imageUrl="";RM.areas=[];rmSelected="";document.getElementById("rmImageInput").value="";renderRichMenu();rmStatus("サイズを変更しました。画像をもう一度アップロードしてください",true);}
@@ -4929,7 +5074,7 @@ function blobBase64(blob){return new Promise((resolve,reject)=>{const rd=new Fil
 function canvasBlob(canvas,quality){return new Promise(resolve=>canvas.toBlob(resolve,"image/jpeg",quality));}
 async function encodeRichMenuImage(img){const w=2500,h=RM.size==="small"?843:1686,c=document.createElement("canvas");c.width=w;c.height=h;const g=c.getContext("2d"),scale=Math.min(w/img.naturalWidth,h/img.naturalHeight),dw=img.naturalWidth*scale,dh=img.naturalHeight*scale,dx=(w-dw)/2,dy=(h-dh)/2;g.fillStyle="#fff";g.fillRect(0,0,w,h);g.drawImage(img,dx,dy,dw,dh);let b=null;for(const q of [.86,.74,.62,.5,.4]){b=await canvasBlob(c,q);if(b&&b.size<=1024*1024)break;}return b;}
 async function loadRichMenuImage(input){const f=input.files&&input.files[0];if(!f)return;if(!/^image\\/(jpeg|png)$/i.test(f.type)){uiAlert("JPEGまたはPNG画像を選んでください");return;}if(f.size>12*1024*1024){uiAlert("元画像は12MB以下にしてください");return;}rmStatus("LINE用サイズに画像を調整しています…");try{const url=URL.createObjectURL(f),img=new Image();await new Promise((resolve,reject)=>{img.onload=resolve;img.onerror=reject;img.src=url;});const blob=await encodeRichMenuImage(img);URL.revokeObjectURL(url);if(!blob||blob.size>1024*1024)throw new Error("large");const data=await blobBase64(blob),r=await api("/api/upload",{name:"rich-menu-"+Date.now()+".jpg",mime:"image/jpeg",data}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"upload");RM.imageFileId=j.fileId;RM.imageName=f.name.slice(0,120);RM.imageUrl="/files/"+j.fileId;RM.areas=[];rmSelected="";renderRichMenu();rmStatus("画像をアップロードしました。ボタン範囲をドラッグしてください");}catch(e){rmStatus("画像を準備できませんでした",true);uiAlert(e.message==="large"?"画像を1MB以下へ変換できませんでした。別の画像を選んでください":"画像のアップロードに失敗しました");}}
-function renderRichMenu(){const st=document.getElementById("rmStage"),im=document.getElementById("rmImage"),empty=document.getElementById("rmEmpty");st.classList.toggle("small",RM.size==="small");if(RM.imageUrl){im.src=RM.imageUrl;im.style.display="block";empty.style.display="none";}else{im.removeAttribute("src");im.style.display="none";empty.style.display="flex";}renderRichAreas();document.getElementById("rmUnpublishBtn").style.display=RM.published?"inline-block":"none";}
+function renderRichMenu(){const st=document.getElementById("rmStage"),im=document.getElementById("rmImage"),empty=document.getElementById("rmEmpty");st.classList.toggle("small",RM.size==="small");if(RM.imageUrl){im.src=RM.imageUrl;im.style.display="block";empty.style.display="none";}else{im.removeAttribute("src");im.style.display="none";empty.style.display="flex";}renderRichAreas();renderRichSchedules();document.getElementById("rmUnpublishBtn").style.display=RM.published?"inline-block":"none";}
 function renderRichAreas(){const box=document.getElementById("rmAreas");let all=RM.areas.slice();if(rmDraw)all=all.concat([{id:"__drawing",label:"新しいボタン",x:rmDraw.x,y:rmDraw.y,w:rmDraw.w,h:rmDraw.h,drawing:true}]);box.innerHTML=all.map(a=>'<div class="rmArea '+(a.id===rmSelected?'sel ':'')+(a.drawing?'drawing':'')+'" data-id="'+esc(a.id)+'" style="left:'+(a.x*100)+'%;top:'+(a.y*100)+'%;width:'+(a.w*100)+'%;height:'+(a.h*100)+'%;">'+esc(a.label||"ボタン")+'</div>').join("");renderRichAreaList();}
 function renderRichAreaList(){const list=document.getElementById("rmAreaList");document.getElementById("rmAreaCount").textContent=RM.areas.length+"件";if(!RM.areas.length){list.innerHTML='<div style="padding:18px 8px;text-align:center;color:#94a3b8;font-size:12px;">画像上をドラッグすると<br>ボタン範囲が追加されます</div>';return;}list.innerHTML=RM.areas.map(a=>'<div class="rmAreaRow '+(a.id===rmSelected?'sel':'')+'" onclick="selectRichArea(&quot;'+esc(a.id)+'&quot;)"><div style="display:flex;gap:6px;align-items:center;"><input value="'+rmAttr(a.label)+'" maxlength="40" aria-label="ボタン名" onclick="event.stopPropagation()" oninput="updateRichArea(&quot;'+esc(a.id)+'&quot;,&quot;label&quot;,this.value)"><button type="button" class="cbtn" style="padding:7px 9px;color:#b91c1c;" onclick="event.stopPropagation();deleteRichArea(&quot;'+esc(a.id)+'&quot;)">削除</button></div><div class="rmRow2"><select onclick="event.stopPropagation()" onchange="updateRichArea(&quot;'+esc(a.id)+'&quot;,&quot;type&quot;,this.value)"><option value="uri"'+(a.type==="uri"?' selected':'')+'>URLを開く</option><option value="message"'+(a.type==="message"?' selected':'')+'>メッセージ送信</option></select><input value="'+rmAttr(a.value)+'" onclick="event.stopPropagation()" oninput="updateRichArea(&quot;'+esc(a.id)+'&quot;,&quot;value&quot;,this.value)" placeholder="'+(a.type==="message"?'送信する文章':'https://...')+'"></div></div>').join("");}
 function selectRichArea(id){rmSelected=id;renderRichAreas();}
@@ -4941,8 +5086,14 @@ function rmPointerMove(ev){if(!rmDraw)return;const p=rmPoint(ev);rmDraw.x=Math.m
 function rmPointerUp(ev){if(!rmDraw)return;const d=rmDraw;rmDraw=null;if(d.w>=.02&&d.h>=.02){const id="area-"+Date.now().toString(36),label="ボタン"+String.fromCharCode(65+Math.min(RM.areas.length,25));RM.areas.push({id,label,x:d.x,y:d.y,w:d.w,h:d.h,type:"uri",value:"https://"});rmSelected=id;}renderRichAreas();ev.preventDefault();}
 function rmPointerCancel(){rmDraw=null;renderRichAreas();}
 function richMenuPayload(){return{imageFileId:RM.imageFileId,imageName:RM.imageName,size:RM.size,name:document.getElementById("rmName").value.trim(),chatBarText:document.getElementById("rmChatBar").value.trim(),accountKey:document.getElementById("rmAccount").value,areas:RM.areas};}
+function applyRichMenuResponse(j){const d=j.draft||{};RM.imageFileId=d.imageFileId||RM.imageFileId;RM.imageUrl=d.imageUrl||RM.imageUrl;RM.imageName=d.imageName||RM.imageName;RM.size=d.size||RM.size;RM.areas=d.areas||RM.areas;RM.published=j.published||null;RM.schedules=Array.isArray(j.schedules)?j.schedules:RM.schedules;renderRichMenu();}
+function rmDateTime(ts){return ts?new Date(ts).toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"}):"無期限";}
+function renderRichSchedules(){const box=document.getElementById("rmScheduleList");if(!box)return;const all=(RM.schedules||[]).slice(0,10),labels={scheduled:"公開予約",active:"公開中",completed:"終了",cancelled:"取消"};if(!all.length){box.innerHTML='<div style="font-size:10.5px;color:#94a3b8;text-align:center;padding:12px 0 3px;">公開予約はありません</div>';return;}box.innerHTML=all.map(s=>{const can=["scheduled","active"].includes(s.status),err=s.lastError&&s.lastError!=="period_elapsed";return '<div class="rmScheduleItem '+(s.status==="active"?'active ':'')+(err?'error':'')+'"><div style="display:flex;justify-content:space-between;gap:5px;"><b>'+esc(s.name||"リッチメニュー")+'</b><span>'+esc(labels[s.status]||s.status)+'</span></div><div style="color:#64748b;">'+rmDateTime(s.startAt)+' 〜 '+rmDateTime(s.endAt)+'</div>'+(err?'<div style="color:#b91c1c;">自動切替を再試行しています</div>':'')+(can?'<button type="button" class="cbtn" style="width:100%;margin-top:5px;color:#b91c1c;" onclick="cancelRichMenuSchedule(&quot;'+esc(s.id)+'&quot;)">この予約を取り消す</button>':'')+'</div>';}).join("");}
+function validateRichMenuInputs(){if(!RM.imageFileId){uiAlert("画像をアップロードしてください");return false;}if(!RM.areas.length){uiAlert("ボタン範囲を1つ以上作成してください");return false;}const invalid=RM.areas.find(a=>!String(a.value||"").trim()||(a.type==="uri"&&!/^(https:\\/\\/|http:\\/\\/localhost(?::\\d+)?\\/|tel:|mailto:|line:\\/\\/)/i.test(a.value)));if(invalid){uiAlert("「"+invalid.label+"」のURLまたは動作内容を正しく入力してください");selectRichArea(invalid.id);return false;}return true;}
 async function saveRichMenu(publish){if(!RM.imageFileId){uiAlert("画像をアップロードしてください");return;}if(!RM.areas.length){uiAlert("ボタン範囲を1つ以上作成してください");return;}const invalid=RM.areas.find(a=>!String(a.value||"").trim()||(a.type==="uri"&&!/^(https:\\/\\/|http:\\/\\/localhost(?::\\d+)?\\/|tel:|mailto:|line:\\/\\/)/i.test(a.value)));if(invalid){uiAlert("「"+invalid.label+"」のURLまたは動作内容を正しく入力してください");selectRichArea(invalid.id);return;}if(publish&&!await uiConfirm("この内容を患者向けLINEの既定リッチメニューとして公開しますか？\\n現在公開中のメニューは新しい内容へ置き換わります。"))return;rmStatus(publish?"LINEへ公開しています…":"下書きを保存しています…");try{const r=await api(publish?"/api/rich-menu/publish":"/api/rich-menu/save",richMenuPayload()),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");const d=j.draft||{};RM.imageFileId=d.imageFileId||RM.imageFileId;RM.imageUrl=d.imageUrl||RM.imageUrl;RM.imageName=d.imageName||RM.imageName;RM.size=d.size||RM.size;RM.areas=d.areas||RM.areas;RM.published=j.published||null;renderRichMenu();rmStatus(publish?"LINEへ公開しました":"下書きを保存しました");if(publish)uiAlert("患者向けLINEへリッチメニューを公開しました");}catch(e){const m={line_not_configured:"先に患者向けLINEを接続してください",image_too_large:"画像がLINEの上限1MBを超えています",image_required:"画像をアップロードしてください",area_required:"ボタン範囲を作成してください",invalid_image:"画像データを確認できません"};rmStatus(m[e.message]||"保存・公開に失敗しました",true);uiAlert(m[e.message]||("LINEへ反映できませんでした（"+e.message+"）"));}}
 async function unpublishRichMenu(){if(!await uiConfirm("患者向けLINEから現在のリッチメニューを非表示にしますか？\\n下書きは残ります。"))return;rmStatus("公開を停止しています…");try{const r=await api("/api/rich-menu/unpublish",{}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"stop");RM.published=null;renderRichMenu();rmStatus("LINEでの公開を停止しました。下書きは残っています");}catch(e){rmStatus("公開を停止できませんでした",true);uiAlert("公開停止に失敗しました");}}
+async function scheduleRichMenu(){if(!validateRichMenuInputs())return;const sv=document.getElementById("rmStartAt").value,ev=document.getElementById("rmEndAt").value;if(!sv&&!ev){uiAlert("開始日時または終了日時を設定してください。無期限で今すぐ公開する場合は、下の「LINEへ公開」を使ってください");return;}const startAt=sv?new Date(sv).getTime():0,endAt=ev?new Date(ev).getTime():0;if((sv&&!startAt)||(ev&&!endAt)){uiAlert("表示期間を正しく入力してください");return;}if(endAt&&endAt<=Math.max(startAt||Date.now(),Date.now())+60000){uiAlert("終了日時は開始日時より後に設定してください");return;}if(!await uiConfirm("指定した期間だけこのリッチメニューを表示しますか？\\n終了後は現在の通常メニューへ自動で戻ります。"))return;rmStatus("LINEへ公開予約を登録しています…");try{const body=Object.assign(richMenuPayload(),{startAt,endAt}),r=await api("/api/rich-menu/schedule",body),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"schedule");applyRichMenuResponse(j);document.getElementById("rmStartAt").value="";document.getElementById("rmEndAt").value="";rmStatus(startAt&&startAt>Date.now()?"公開予約を登録しました":"期間公開を開始しました");uiAlert("表示期間を登録しました。終了後は元のメニューへ自動で戻ります");}catch(e){const m={schedule_overlap:"同じLINE公式アカウントの公開期間が重複しています",invalid_start:"開始日時は現在以降に設定してください",invalid_end:"終了日時は開始日時より後に設定してください",period_required:"開始日時または終了日時を設定してください",line_not_configured:"先に患者向けLINEを接続してください",image_too_large:"画像がLINEの上限1MBを超えています"};rmStatus(m[e.message]||"公開予約に失敗しました",true);uiAlert(m[e.message]||"公開予約を登録できませんでした");}}
+async function cancelRichMenuSchedule(id){if(!await uiConfirm("この公開予約を取り消しますか？\\n公開中の場合は元の通常メニューへ戻ります。"))return;rmStatus("公開予約を取り消しています…");try{const r=await api("/api/rich-menu/schedule-cancel",{id}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"cancel");applyRichMenuResponse(j);rmStatus("公開予約を取り消しました");}catch(e){rmStatus("公開予約を取り消せませんでした",true);uiAlert("LINEとの接続を確認して、もう一度お試しください");}}
 async function undoLearn(id){ try{ await api("/api/example-delete",{id}); }catch(e){} const b=document.getElementById("learnToast"); if(b){ b.innerHTML='↩ 学習を取り消しました（特例として記録しません）'; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";},2000); } }
 // 矛盾の確認：前の答えと今回の答えが食い違った時に出す。基準を選ぶと不要な方の対応例を削除。
 let conflictData=null;

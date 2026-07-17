@@ -29,6 +29,8 @@ scripts.forEach((script, index) => new vm.Script(script, { filename: "PAGE-scrip
   "/api/partner/password-reset",
   "/api/rich-menu/publish",
   "/api/rich-menu/unpublish",
+  "/api/rich-menu/schedule",
+  "/api/rich-menu/schedule-cancel",
   "setStaffLineToken",
   "staffLineApprovalMessage",
   "staffLineHistoryPageMessage",
@@ -36,6 +38,7 @@ scripts.forEach((script, index) => new vm.Script(script, { filename: "PAGE-scrip
   "finalizeGeneratedDraft",
   "normalizeRichArea",
   "rmPointerDown",
+  "processAllRichMenuSchedules",
   "isPersistentConversationInstruction",
   "staffBookingPending"
 ].forEach((required) => {
