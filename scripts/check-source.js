@@ -27,11 +27,15 @@ scripts.forEach((script, index) => new vm.Script(script, { filename: "PAGE-scrip
   "/api/staff-booking-action",
   "/api/staff-booking-confirm",
   "/api/partner/password-reset",
+  "/api/rich-menu/publish",
+  "/api/rich-menu/unpublish",
   "setStaffLineToken",
   "staffLineApprovalMessage",
   "staffLineHistoryPageMessage",
   "enrichStaffLineBookingPreview",
   "finalizeGeneratedDraft",
+  "normalizeRichArea",
+  "rmPointerDown",
   "isPersistentConversationInstruction",
   "staffBookingPending"
 ].forEach((required) => {
