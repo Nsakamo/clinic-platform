@@ -698,13 +698,21 @@ async function distillRules(t, c, opts) {
 }
 
 function recentCustomerQuestion(c) {
-  return (c && Array.isArray(c.msgs) ? c.msgs : [])
+  return activeConversationMessages(c)
     .filter((message) => message && message.from === "them")
     .slice(-3)
     .map((message) => String(message.text || "").trim())
     .filter(Boolean)
     .join(" ")
     .slice(0, 600);
+}
+
+// 「送信しない」で対応終了した問い合わせを、次の新着への未回答質問として再利用しない。
+// 会話履歴自体は監査・閲覧用に残し、AIへ渡す作業中の文脈だけを区切る。
+function activeConversationMessages(c) {
+  const msgs = c && Array.isArray(c.msgs) ? c.msgs : [];
+  const start = Math.min(msgs.length, Math.max(0, Number(c && c.handledThroughIndex) || 0));
+  return msgs.slice(start);
 }
 
 // Web画面・スタッフLINEのどちらから送っても、同じ経路で「人が確認した返信」を学習する。
@@ -1384,8 +1392,9 @@ function scheduleAutoReply(t, c, draftText, recvAt, delayMin) {
 async function genDraft(t, c, opts) {
   opts = opts || {};
   const channel = c.channel;
+  const activeMsgs = activeConversationMessages(c);
   // 検索キーは直近3件のお客様メッセージ（最後の一言だけだと文脈語が拾えないため）
-  const recentQuestions = c.msgs.filter(m => m.from === "them").slice(-3).map(m => m.text || "").filter(Boolean);
+  const recentQuestions = activeMsgs.filter(m => m.from === "them").slice(-3).map(m => m.text || "").filter(Boolean);
   const latestQ = recentQuestions[recentQuestions.length - 1] || "";
   const lastQ = recentQuestions.join(" ");
   const rel = rulesRanked(t, lastQ.slice(0, 1500));
@@ -1399,7 +1408,7 @@ async function genDraft(t, c, opts) {
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = channel === "mail" ? "メールなので返信本文の最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
   const msgsArr = []; let cur = null;
-  c.msgs.slice(-16).forEach(m => {
+  activeMsgs.slice(-16).forEach(m => {
     const role = m.from === "them" ? "user" : "assistant";
     const tx = (m.text || (m.media ? "［" + m.media + "を送信］" : "")).trim();
     if (!tx) return;
@@ -1801,8 +1810,13 @@ app.post("/webhook/staff-line", async (req, res) => {
         await staffLineReply(t, ev.replyToken, [staffLineText("修正内容を10分以内にこのグループへ送ってください。例：『予約日時を確認してから案内する文章に直して』\n\n安全のため、修正後にもう一度「この内容で送信」を押すまで患者様には送られません。")]); continue;
       }
       if (action === "cancel") {
-        found.approval.status = "cancelled"; dbSave(t, found.c);
-        await staffLineReply(t, ev.replyToken, [staffLineText("⛔ 今回は送信しませんでした。下書きは右腕くんに残っています。")]); continue;
+        found.approval.status = "cancelled";
+        found.approval.cancelledAt = Date.now();
+        found.c.handledThroughIndex = Array.isArray(found.c.msgs) ? found.c.msgs.length : 0;
+        found.c.draft = ""; found.c.draft0 = ""; found.c.topics = []; found.c.learningRefs = [];
+        found.c.status = "done"; found.c.flag = false; found.c.lastAuto = false;
+        found.c.time = nowt(); found.c.ts = Date.now(); found.c.last = lastText(found.c); dbSave(t, found.c);
+        await staffLineReply(t, ev.replyToken, [staffLineText("⛔ 今回は患者様へ送信せず、この案件を対応済みとして終了しました。次の新着は新しい問い合わせとして判定します。")]); continue;
       }
       if (action !== "send" || sha(String(found.c.draft || "").trim()) !== found.approval.draftHash) { await staffLineReply(t, ev.replyToken, [staffLineText("返信案が更新されています。最新の承認依頼を確認してください。")]); continue; }
       const lockKey = t.slug + "::" + found.c.id;
