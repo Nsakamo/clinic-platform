@@ -21,3 +21,8 @@ test("生成した返信に過去対応例の参照情報を残す", () => {
   assert.match(source, /out\.learningRefs = exRel\.map/);
   assert.match(source, /過去の対応例 "\+refs\.length\+"件を参照/);
 });
+
+test("staging画面は本番との取り違え防止バナーを表示する", () => {
+  assert.match(source, /host !== "clinic-platform-staging\.up\.railway\.app"/);
+  assert.match(source, /id="test-environment-banner"[\s\S]{0,500}>テスト環境<\/div>/);
+});

@@ -3712,7 +3712,13 @@ app.post("/api/partner/password-reset", pGuard, async (req,res)=>{
     res.status(500).json({ok:false,error:"reset_failed"});
   }
 });
-app.get("/forgot", (req,res)=>{ res.set("Content-Type","text/html; charset=utf-8"); res.set("Cache-Control","no-store"); res.send(FORGOT_PAGE); });
+function pageWithEnvironmentBanner(req, html) {
+  const host = String(req.headers["x-forwarded-host"] || req.headers.host || "").split(",")[0].trim().toLowerCase();
+  if (host !== "clinic-platform-staging.up.railway.app") return html;
+  const banner = '<style>body{padding-top:30px!important;box-sizing:border-box!important}</style><div id="test-environment-banner" role="status" style="position:fixed;z-index:2147483647;top:0;left:0;right:0;height:30px;display:flex;align-items:center;justify-content:center;background:#facc15;color:#713f12;font:700 13px/1 -apple-system,BlinkMacSystemFont,\'Hiragino Kaku Gothic ProN\',sans-serif;box-shadow:0 1px 3px rgba(0,0,0,.18);">テスト環境</div>';
+  return String(html || "").replace(/<body([^>]*)>/i, "<body$1>" + banner);
+}
+app.get("/forgot", (req,res)=>{ res.set("Content-Type","text/html; charset=utf-8"); res.set("Cache-Control","no-store"); res.send(pageWithEnvironmentBanner(req, FORGOT_PAGE)); });
 app.post("/api/forgot", async (req,res)=>{
   const email = normalizeEmail(req.body.email);
   const loginId = String(req.body.loginId||"").trim();
@@ -3738,8 +3744,8 @@ app.post("/api/forgot", async (req,res)=>{
 app.get("/reset", (req,res)=>{
   res.set("Content-Type","text/html; charset=utf-8"); res.set("Cache-Control","no-store");
   const t = resetTokenTenant(req.query.token);
-  if(!t) return res.send(RESET_INVALID_PAGE);
-  res.send(RESET_PAGE(String(req.query.token||"")));
+  if(!t) return res.send(pageWithEnvironmentBanner(req, RESET_INVALID_PAGE));
+  res.send(pageWithEnvironmentBanner(req, RESET_PAGE(String(req.query.token||""))));
 });
 app.post("/api/reset", async (req,res)=>{
   const tok = String(req.body.token||"");
@@ -3757,9 +3763,9 @@ app.post("/api/reset", async (req,res)=>{
   res.json({ ok:true });
 });
 
-app.get("/", (req, res) => { res.set("Content-Type", "text/html; charset=utf-8"); res.set("Cache-Control", "no-store"); res.send(tenantFromReq(req) ? PAGE : LOGIN_PAGE); });
+app.get("/", (req, res) => { res.set("Content-Type", "text/html; charset=utf-8"); res.set("Cache-Control", "no-store"); res.send(pageWithEnvironmentBanner(req, tenantFromReq(req) ? PAGE : LOGIN_PAGE)); });
 app.get("/signup", (req, res) => res.redirect("/")); // 申込みは営業契約後に運営が作成
-app.get("/board", (req, res) => { res.set("Content-Type", "text/html; charset=utf-8"); res.set("Cache-Control", "no-store"); res.send(tenantFromReq(req) ? BOARD_PAGE : LOGIN_PAGE); });
+app.get("/board", (req, res) => { res.set("Content-Type", "text/html; charset=utf-8"); res.set("Cache-Control", "no-store"); res.send(pageWithEnvironmentBanner(req, tenantFromReq(req) ? BOARD_PAGE : LOGIN_PAGE)); });
 (async () => {
   if (!CRED_KEY) console.warn("CRED_KEY 未設定: メール/LINE資格情報の at-rest 暗号化は無効です（平文で保存・動作）。設定すると次回保存時から自動的に暗号化されます。");
   try { if (pool) await dbInit(); } catch (e) { console.error("dbInit failed:", e.message); }
