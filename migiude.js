@@ -365,14 +365,19 @@ function staffLineApprovalById(t, id) {
   }
   return null;
 }
-async function staffLineRequestApproval(t, c, reason) {
+async function staffLineRequestApproval(t, c, reason, opts) {
+  opts = opts || {};
   const draft = String(c && c.draft || "").trim(), groupId = String(t.config.conn.staffLineGroupId || "");
   if (!S(t).staffLineEnabled || !staffLineReady(t) || !draft || !groupId) return false;
   const latest = (c.msgs || []).slice().reverse().find(m => m && m.from === "them") || {};
   const eventKey = sha([t.slug, c.id, latest.time || "", latest.text || "", draft].join("|"));
-  if (c.staffLineApproval && c.staffLineApproval.eventKey === eventKey && c.staffLineApproval.status === "pending") return true;
+  const existing = c.staffLineApproval && c.staffLineApproval.eventKey === eventKey && c.staffLineApproval.status === "pending" ? c.staffLineApproval : null;
+  if (existing && !opts.force) return true;
   const summary = await staffLineSummary(t, c);
-  const approval = { id: crypto.randomBytes(18).toString("hex"), tenant: t.slug, conversationId: c.id, eventKey, draft, draftHash: sha(draft), summary, reason: String(reason || "").slice(0, 300), status: "pending", groupId, assignedUserId: "", assignedName: "", createdAt: Date.now(), expiresAt: Date.now() + 24 * 60 * 60 * 1000 };
+  const approval = existing ? Object.assign(existing, {
+    draft, draftHash: sha(draft), summary, reason: String(reason || existing.reason || "").slice(0, 300),
+    groupId, expiresAt: Date.now() + 24 * 60 * 60 * 1000
+  }) : { id: crypto.randomBytes(18).toString("hex"), tenant: t.slug, conversationId: c.id, eventKey, draft, draftHash: sha(draft), summary, reason: String(reason || "").slice(0, 300), status: "pending", groupId, assignedUserId: "", assignedName: "", createdAt: Date.now(), expiresAt: Date.now() + 24 * 60 * 60 * 1000 };
   const r = await staffLinePush(t, groupId, [staffLineApprovalMessage(t, c, approval, summary, reason)]);
   if (!r.ok) return false;
   c.staffLineApproval = approval; c.status = "todo"; c.flag = true; dbSave(t, c);
@@ -2181,6 +2186,17 @@ app.post("/api/staff-line/test", guard, async (req, res) => {
   const text = "✅ 右腕くん スタッフLINE連携テスト\n法人: " + String(t.name || t.slug).slice(0, 120) + "\nこのグループへ要確認の通知が届きます。" + (link ? "\n右腕くん: " + link : "");
   const result = await staffLinePush(t, t.config.conn.staffLineGroupId, [staffLineText(text)]);
   res.status(result.ok ? 200 : 502).json(result);
+});
+app.post("/api/staff-line/resend-approval", guard, async (req, res) => {
+  const t = req.tenant, c = t.store[String(req.body.id || "")];
+  if (!c) return res.status(404).json({ ok: false, error: "conversation_not_found" });
+  if (!String(c.draft || "").trim()) return res.status(400).json({ ok: false, error: "draft_required" });
+  if (!S(t).staffLineEnabled || !staffLineReady(t)) return res.status(400).json({ ok: false, error: "staff_line_not_ready" });
+  try {
+    const ok = await staffLineRequestApproval(t, c, "右腕くん画面から承認依頼を再送しました", { force: true });
+    if (!ok) return res.status(502).json({ ok: false, error: "line_send_failed" });
+    res.json({ ok: true, approvalId: c.staffLineApproval && c.staffLineApproval.id });
+  } catch (e) { res.status(500).json({ ok: false, error: "resend_failed" }); }
 });
 app.post("/api/staff-line/staff-role", guard, async (req, res) => {
   const t = req.tenant, id = String(req.body.id || ""), role = String(req.body.role || "");
@@ -4462,12 +4478,13 @@ function renderLearningRefs(r){const el=document.getElementById("learningUsed");
 function syncMsgs(c){const m=document.getElementById("msgs");if(!m)return;if(m.getAttribute("data-count")!==String(c.msgs.length)){m.innerHTML=bubblesHtml(c);m.setAttribute("data-count",String(c.msgs.length));m.scrollTop=m.scrollHeight;}}
 function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)return; appEl.classList.add("chatopen");
   const bubbles=bubblesHtml(r);
+  const staffReviewButton=(r.draft&&r.staffLineApproval)?'<button class="cbtn" id="staffReviewResend" onclick="resendStaffApproval()">📲 承認依頼を再送</button>':'';
   chatEl.innerHTML='<div id="chatHead"><button id="backBtn" onclick="closeChat()">‹</button>'+av(r,30)+'<span id="chatName">'+esc(r.name)+'　<span style="font-size:11px;color:#6b7280;">'+(r.channel==="line"?"LINE":"メール")+((r.acct&&r.acct.name&&r.acct.name!=="メイン")?"・"+esc(r.acct.name):"")+'</span></span><button class="hbtn" onclick="shareClinic()">🏥 クリニックへ共有</button></div>'+
     '<div id="custTab" class="custTab" style="display:none;" onclick="cpExpand()">うけつけるん情報を表示 ⌄</div>'+
     '<div id="custPanel" class="custPanel">読み込み中…</div>'+
     '<div id="msgs">'+bubbles+'</div>'+
     '<div id="composer"><div id="aiLabel">✨ AI下書き（編集して送れます）</div><div id="learningUsed" style="display:'+(learningRefsText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:#6d28d9;margin:2px 0 5px;">'+esc(learningRefsText(r))+'</div><div id="topicChips" style="display:none;"></div><div id="draftRow"><button id="attach" onclick="attach()" title="写真・動画を添付">📎</button><textarea id="draft">'+esc(r.draft||"")+'</textarea></div>'+
-    '<div id="cbtns"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ AIで作り直す</button><button class="cbtn done" onclick="markDone()">対応済み</button><button class="cbtn send" onclick="sendMsg()">送信</button></div></div>';
+    '<div id="cbtns"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ AIで作り直す</button>'+staffReviewButton+'<button class="cbtn done" onclick="markDone()">対応済み</button><button class="cbtn send" onclick="sendMsg()">送信</button></div></div>';
   const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r); loadCustomer(id); if(!keep)renderList();
 }
 function closeChat(){appEl.classList.remove("chatopen");current=null;renderList();}
@@ -4894,6 +4911,7 @@ async function redraftSelected(){ if(!current||!selTopics)return; const sel=[...
 async function markDone(){const id=current;await api("/api/done",{id});await load();}
 async function markAllDone(){if(!await uiConfirm("すべてのチャットを「対応済み」に変更します。よろしいですか？"))return;try{const r=await api("/api/done-all",{});const j=await r.json();closeSet();if(current){closeChat();}await load();uiAlert((j.count||0)+"件を対応済みにしました");}catch(e){uiAlert("変更に失敗しました");}}
 async function sendMsg(){if(window.__sendBusy)return;const id=current;const t=document.getElementById("draft").value.trim();if(!t)return;window.__sendBusy=true;const _sb=document.querySelector("#cbtns .send");if(_sb){_sb.disabled=true;_sb.textContent="送信中…";}try{const cd0=DATA.find(x=>x.id===id);const orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim();const edited=(t!==orig);let instr="";try{if(dSessions&&dSessions[id]&&Array.isArray(dSessions[id].hist)){instr=dSessions[id].hist.filter(m=>m&&m.role==="user").map(m=>String(m.content||"")).join(" / ").slice(0,1500);}}catch(e){}const r=await api("/api/send",{id,text:t,instr:edited?instr:""});let j={};try{j=await r.json();}catch(e){}if(j.sent){const d0=document.getElementById("draft");if(d0)d0.value="";const cd=DATA.find(x=>x.id===id);if(cd)cd.draft="";if(j.conflict){showConflict(j.conflict);}else if(j.learnedRules&&j.learnedRules.length){showRuleToast(j.learnedRules);}else if(j.learnedId){showLearnToast(j.learnedId);}await load();}else{const m={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です"}[j.sendErr]||("送信失敗: "+(j.sendErr||"不明"));uiAlert(m+"\\n（下書きは消えていません）");}}finally{window.__sendBusy=false;const _sb2=document.querySelector("#cbtns .send");if(_sb2){_sb2.disabled=false;_sb2.textContent="送信";}}}
+async function resendStaffApproval(){if(!current)return;const b=document.getElementById("staffReviewResend");if(b){b.disabled=true;b.textContent="再送中…";}try{const r=await api("/api/staff-line/resend-approval",{id:current}),j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error(j.error||"resend");uiAlert("スタッフLINEへ承認依頼を再送しました");await load();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"スタッフLINE連携を設定・有効化してください":"承認依頼を再送できませんでした");}finally{if(b){b.disabled=false;b.textContent="📲 承認依頼を再送";}}}
 function attach(){const inp=document.createElement("input");inp.type="file";inp.accept="image/*,video/*,application/pdf,.pdf,.doc,.docx,.xls,.xlsx";inp.onchange=async()=>{const f=inp.files[0];if(!f)return;if(f.size>10*1024*1024){uiAlert("10MB以下のファイルにしてください");return;}const btn=document.getElementById("attach");if(btn){btn.disabled=true;btn.textContent="⏳";}try{const b64=await new Promise((res,rej)=>{const rd=new FileReader();rd.onload=()=>res(String(rd.result).split(",")[1]);rd.onerror=rej;rd.readAsDataURL(f);});const up=await api("/api/upload",{name:f.name,mime:f.type||"application/octet-stream",data:b64});const uj=await up.json();if(!uj.ok)throw new Error(uj.error||"upload");const sr=await api("/api/send-file",{id:current,fileId:uj.fileId});const sj=await sr.json();if(!sj.sent)uiAlert("送信失敗: "+(sj.sendErr||"不明"));await load();}catch(e){uiAlert("ファイル送信に失敗しました: "+e.message);}if(btn){btn.disabled=false;btn.textContent="📎";}};inp.click();}
 async function shareClinic(){const note=await uiPrompt("現場に伝える内容を入力してください（空欄のままOKを押すと、お客様の直近メッセージをそのまま共有します）","");if(note===null)return;try{const r=await api("/api/share",{id:current,note:note||""});const j=await r.json();if(j.ok)uiAlert("現場ボードに共有しました");else uiAlert("共有に失敗しました");}catch(e){uiAlert("共有に失敗しました");}}
 async function toggleFlag(){if(!current)return;try{const r=await api("/api/tag",{id:current});const j=await r.json();const b=document.getElementById("flagBtn");if(b)b.textContent=j.flag?"⚑ 要対応を外す":"⚑ 要対応";const cd=DATA.find(x=>x.id===current);if(cd)cd.flag=j.flag;renderList();}catch(e){}}

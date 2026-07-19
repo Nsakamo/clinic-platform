@@ -26,3 +26,9 @@ test("staging画面は本番との取り違え防止バナーを表示する", (
   assert.match(source, /host !== "clinic-platform-staging\.up\.railway\.app"/);
   assert.match(source, /id="test-environment-banner"[\s\S]{0,500}>テスト環境<\/div>/);
 });
+
+test("保留中のスタッフLINE承認依頼を画面から安全に再送できる", () => {
+  assert.match(source, /app\.post\("\/api\/staff-line\/resend-approval", guard/);
+  assert.match(source, /staffLineRequestApproval\(t, c, "右腕くん画面から承認依頼を再送しました", \{ force: true \}\)/);
+  assert.match(source, /id="staffReviewResend"[\s\S]{0,180}resendStaffApproval\(\)/);
+});
