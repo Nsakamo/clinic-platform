@@ -1,0 +1,23 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
+
+test("Web画面とスタッフLINEが同じ学習保存経路を使う", () => {
+  assert.match(source, /learnStaffOutcome\(t, found\.c,[\s\S]{0,300}source: "staff_line"/);
+  assert.match(source, /learnStaffOutcome\(t, c,[\s\S]{0,300}source: "web"/);
+});
+
+test("スタッフLINEの修正指示を学習へ引き渡す", () => {
+  assert.match(source, /found\.approval\.editInstruction = text\.slice/);
+  assert.match(source, /instr: editInstruction, source: "staff_line"/);
+});
+
+test("生成した返信に過去対応例の参照情報を残す", () => {
+  assert.match(source, /out\.learningRefs = exRel\.map/);
+  assert.match(source, /過去の対応例 "\+refs\.length\+"件を参照/);
+});

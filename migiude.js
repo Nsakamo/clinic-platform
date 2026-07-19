@@ -9,6 +9,7 @@ process.on("uncaughtException", (e) => console.error("uncaught:", e && e.message
 process.on("unhandledRejection", (e) => console.error("unhandled:", e && (e.message || e)));
 const express = require("express");
 const crypto = require("crypto");
+const { rankLearningExamples, sameLearningExample } = require("./lib/learning-retrieval");
 const app = express();
 app.use(express.json({ limit: "16mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: false, limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
@@ -118,6 +119,8 @@ async function dbInit() {
   await pool.query("CREATE TABLE IF NOT EXISTS convos (tenant text, id text, ts bigint, data jsonb, PRIMARY KEY(tenant,id))");
   await pool.query("CREATE TABLE IF NOT EXISTS rules (tenant text, id int, title text, content text, updated bigint, PRIMARY KEY(tenant,id))");
   await pool.query("CREATE TABLE IF NOT EXISTS examples (tenant text, id int, q text, final text, draft0 text, instr text, ts bigint, PRIMARY KEY(tenant,id))");
+  await pool.query("ALTER TABLE examples ADD COLUMN IF NOT EXISTS source text DEFAULT 'web'");
+  await pool.query("ALTER TABLE examples ADD COLUMN IF NOT EXISTS confirmed_count int DEFAULT 1");
   await pool.query("CREATE TABLE IF NOT EXISTS alerts (id serial primary key, tenant text, type text, summary text, name text, ts bigint, done boolean default false)");
   await pool.query("CREATE TABLE IF NOT EXISTS files (id text primary key, tenant text, name text, mime text, data bytea, ts bigint)");
   await pool.query("CREATE TABLE IF NOT EXISTS push_subs (tenant text, endpoint text primary key, sub jsonb)");
@@ -130,8 +133,8 @@ async function dbInit() {
     cv.rows.forEach(x => { const c = x.data; if (c && c.id) t.store[c.id] = c; });
     const ru = await pool.query("SELECT id,title,content FROM rules WHERE tenant=$1 ORDER BY id", [slug]);
     ru.rows.forEach(x => { t.rules[x.id] = { id: x.id, title: x.title, content: x.content }; if (x.id >= t.ruleSeq) t.ruleSeq = x.id + 1; });
-    const ex = await pool.query("SELECT id,q,final,draft0,instr,ts FROM examples WHERE tenant=$1 ORDER BY id DESC LIMIT 500", [slug]);
-    ex.rows.forEach(x => { t.examples[x.id] = { id: x.id, q: x.q, final: x.final, draft0: x.draft0, instr: x.instr, ts: Number(x.ts) }; if (x.id >= t.exampleSeq) t.exampleSeq = x.id + 1; });
+    const ex = await pool.query("SELECT id,q,final,draft0,instr,ts,source,confirmed_count FROM examples WHERE tenant=$1 ORDER BY id DESC LIMIT 500", [slug]);
+    ex.rows.forEach(x => { t.examples[x.id] = { id: x.id, q: x.q, final: x.final, draft0: x.draft0, instr: x.instr, ts: Number(x.ts), source: x.source || "web", confirmedCount: Math.max(1, Number(x.confirmed_count || 1)) }; if (x.id >= t.exampleSeq) t.exampleSeq = x.id + 1; });
     const al = await pool.query("SELECT id,type,summary,name,ts,done FROM alerts WHERE tenant=$1 ORDER BY ts DESC LIMIT 200", [slug]);
     t.alerts = al.rows.map(x => ({ id: x.id, type: x.type, summary: x.summary, name: x.name, ts: Number(x.ts), done: x.done }));
     t.alerts.forEach(a => { if (a.id >= t.alertSeq) t.alertSeq = a.id + 1; });
@@ -589,10 +592,26 @@ async function exampleAdd(t, obj) {
   const q = String(obj.q || "").slice(0, 600).trim();
   const final = String(obj.final || "").slice(0, 1500).trim();
   if (!q || !final) return null;
+  const incoming = { q, final };
+  const duplicate = Object.values(t.examples || {}).sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0)).find((example) => sameLearningExample(example, incoming));
+  if (duplicate) {
+    duplicate.q = q;
+    duplicate.final = final;
+    duplicate.draft0 = String(obj.draft0 || duplicate.draft0 || "").slice(0, 1500);
+    duplicate.instr = String(obj.instr || duplicate.instr || "").slice(0, 800);
+    duplicate.source = String(obj.source || duplicate.source || "web").slice(0, 40);
+    duplicate.confirmedCount = Math.max(1, Number(duplicate.confirmedCount || 1)) + 1;
+    duplicate.ts = Date.now();
+    if (pool) {
+      try { await pool.query("UPDATE examples SET q=$1,final=$2,draft0=$3,instr=$4,ts=$5,source=$6,confirmed_count=$7 WHERE tenant=$8 AND id=$9", [duplicate.q, duplicate.final, duplicate.draft0, duplicate.instr, duplicate.ts, duplicate.source, duplicate.confirmedCount, t.slug, duplicate.id]); }
+      catch (e) { console.error("exampleAdd update:", e.message); }
+    }
+    return { ...duplicate, reused: true };
+  }
   const id = t.exampleSeq++;
-  const ex = { id, q, final, draft0: String(obj.draft0 || "").slice(0, 1500), instr: String(obj.instr || "").slice(0, 800), ts: Date.now() };
+  const ex = { id, q, final, draft0: String(obj.draft0 || "").slice(0, 1500), instr: String(obj.instr || "").slice(0, 800), ts: Date.now(), source: String(obj.source || "web").slice(0, 40), confirmedCount: 1 };
   t.examples[id] = ex;
-  if (pool) { try { await pool.query("INSERT INTO examples (tenant,id,q,final,draft0,instr,ts) VALUES ($1,$2,$3,$4,$5,$6,$7)", [t.slug, id, ex.q, ex.final, ex.draft0, ex.instr, ex.ts]); } catch (e) { console.error("exampleAdd:", e.message); } }
+  if (pool) { try { await pool.query("INSERT INTO examples (tenant,id,q,final,draft0,instr,ts,source,confirmed_count) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)", [t.slug, id, ex.q, ex.final, ex.draft0, ex.instr, ex.ts, ex.source, ex.confirmedCount]); } catch (e) { console.error("exampleAdd:", e.message); } }
   const ids = Object.keys(t.examples).map(Number).sort((a, b) => a - b);
   while (ids.length > EXAMPLE_MAX) { const old = ids.shift(); delete t.examples[old]; if (pool) pool.query("DELETE FROM examples WHERE tenant=$1 AND id=$2", [t.slug, old]).catch(() => {}); }
   return ex;
@@ -602,14 +621,10 @@ function prefsBlock(t) {
   const a = (S(t).prefs && Array.isArray(S(t).prefs)) ? S(t).prefs : [];
   return a.map(p => (typeof p === "string" ? p : (p && p.text) || "")).filter(Boolean).map(s => "・" + s).join("\n");
 }
-function examplesRanked(t, query, k) {
+function examplesRanked(t, query, k, context) {
   const list = Object.values(t.examples || {});
   if (!list.length) return [];
-  if (!query) return list.slice(-(k || 4));
-  const qb = bigrams(query);
-  const scored = list.map(e => { const tb = bigrams(e.q + " " + e.final + " " + (e.instr || "")); let n = 0; qb.forEach(b => { if (tb.has(b)) n++; }); return { e, n }; });
-  scored.sort((a, b) => b.n - a.n || b.e.id - a.e.id);
-  return scored.filter(x => x.n > 0).slice(0, k || 4).map(x => x.e);
+  return rankLearningExamples(list, { latest: query, context: context || query }, k || 4);
 }
 // 矛盾検知：今回の返信が、似た過去の対応例と「事実・方針」で食い違うかをAIで判定。食い違えば前の例を返す。
 async function checkConflict(t, q, newFinal, excludeId) {
@@ -675,6 +690,45 @@ async function distillRules(t, c, opts) {
     if (applied.length) statBump(t, "rules", applied.length);
     return applied;
   } catch (e) { console.error("distillRules:", e && e.message); return []; }
+}
+
+function recentCustomerQuestion(c) {
+  return (c && Array.isArray(c.msgs) ? c.msgs : [])
+    .filter((message) => message && message.from === "them")
+    .slice(-3)
+    .map((message) => String(message.text || "").trim())
+    .filter(Boolean)
+    .join(" ")
+    .slice(0, 600);
+}
+
+// Web画面・スタッフLINEのどちらから送っても、同じ経路で「人が確認した返信」を学習する。
+// 対応例の保存は先に完了させ、AIを使うルール蒸留・矛盾判定だけを待ち時間付きで実行する。
+async function learnStaffOutcome(t, c, opts) {
+  opts = opts || {};
+  const q = String(opts.q || recentCustomerQuestion(c)).trim();
+  const finalText = String(opts.final || "").trim();
+  const draft0 = String(opts.draft0 || "").trim();
+  const instr = String(opts.instr || "").trim();
+  if (!q || !finalText) return { learnedId: null, conflict: null, learnedRules: [] };
+
+  const ex = await exampleAdd(t, { q, final: finalText, draft0, instr, source: opts.source || "web" });
+  if (!ex) return { learnedId: null, conflict: null, learnedRules: [] };
+  const changed = finalText !== draft0 || !!instr;
+  const distillP = changed ? distillRules(t, c, { q, final: finalText, draft0, instr }) : Promise.resolve([]);
+  const conflictP = changed ? checkConflict(t, q, finalText, ex.id) : Promise.resolve(null);
+
+  if (opts.waitForAi === false) {
+    distillP.catch((e) => console.error("learnStaffOutcome distill:", e && e.message));
+    conflictP.catch((e) => console.error("learnStaffOutcome conflict:", e && e.message));
+    return { learnedId: ex.id, conflict: null, learnedRules: [], reused: !!ex.reused };
+  }
+
+  const completed = await Promise.race([
+    Promise.all([distillP, conflictP]).then(([learnedRules, conflict]) => ({ learnedRules, conflict })),
+    new Promise((resolve) => setTimeout(() => resolve({ learnedRules: [], conflict: null }), 6000)),
+  ]).catch(() => ({ learnedRules: [], conflict: null }));
+  return { learnedId: ex.id, conflict: completed.conflict, learnedRules: completed.learnedRules, reused: !!ex.reused };
 }
 // 2つのテキストがほぼ同内容か（bigram重なり率）。ルールの二重登録ガード用。
 function similarEnough(a, b) {
@@ -1091,8 +1145,8 @@ async function baDeliver(t, c, text) {
   const r = await deliverText(t, c, text);
   if (r && r.sent) {
     statBump(t, "auto");
-    c.msgs.push({ from: "us", text, auto: true, time: nowt() });
-    c.draft = ""; c.draft0 = ""; c.status = "done"; c.lastAuto = true;
+    c.msgs.push({ from: "us", text, auto: true, learningRefs: c.learningRefs || [], time: nowt() });
+    c.draft = ""; c.draft0 = ""; c.learningRefs = []; c.status = "done"; c.lastAuto = true;
     c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
     try { notifyAll(t, "🤖 予約自動受付: " + (c.name || ""), String(text).slice(0, 90)); } catch (e) {}
     return true;
@@ -1312,8 +1366,8 @@ function scheduleAutoReply(t, c, draftText, recvAt, delayMin) {
       const r = await deliverText(t, cur, draftText);
       if (r.sent) {
         statBump(t, "auto");
-        cur.msgs.push({ from: "us", text: draftText, auto: true, time: nowt() });
-        cur.draft = ""; cur.draft0 = ""; cur.status = "done"; cur.lastAuto = true;
+        cur.msgs.push({ from: "us", text: draftText, auto: true, learningRefs: cur.learningRefs || [], time: nowt() });
+        cur.draft = ""; cur.draft0 = ""; cur.learningRefs = []; cur.status = "done"; cur.lastAuto = true;
         cur.time = nowt(); cur.ts = Date.now(); cur.last = lastText(cur); dbSave(t, cur);
         try { notifyAll(t, "🤖 自動返信済み: " + (cur.name || ""), (cur.last || "").slice(0, 90)); } catch (e) {}
       }
@@ -1326,11 +1380,17 @@ async function genDraft(t, c, opts) {
   opts = opts || {};
   const channel = c.channel;
   // 検索キーは直近3件のお客様メッセージ（最後の一言だけだと文脈語が拾えないため）
-  const lastQ = c.msgs.filter(m => m.from === "them").slice(-3).map(m => m.text || "").join(" ");
+  const recentQuestions = c.msgs.filter(m => m.from === "them").slice(-3).map(m => m.text || "").filter(Boolean);
+  const latestQ = recentQuestions[recentQuestions.length - 1] || "";
+  const lastQ = recentQuestions.join(" ");
   const rel = rulesRanked(t, lastQ.slice(0, 1500));
   const rulesTxt = rulesBlock(rel, ruleBudget(t));
-  const exRel = examplesRanked(t, lastQ.slice(0, 1500), 4); // 自動メモリ：関連する過去の対応例
-  const examplesTxt = exRel.length ? exRel.map(e => "・お客様「" + String(e.q).slice(0, 160) + "」→ スタッフの返信「" + String(e.final).slice(0, 300) + "」" + (e.instr ? "（スタッフが作り直しで出した方針: " + String(e.instr).slice(0, 160) + "）" : "")).join("\n") : "";
+  const exRel = examplesRanked(t, latestQ.slice(0, 800), 4, lastQ.slice(0, 1500));
+  const examplesTxt = exRel.length ? exRel.map(e => {
+    const score = Math.round(Number(e.matchScore || 0) * 100);
+    const confirmed = Math.max(1, Number(e.confirmedCount || 1));
+    return "・[対応例#" + e.id + " / 類似" + score + "% / スタッフ確認" + confirmed + "回] お客様「" + String(e.q).slice(0, 220) + "」→ スタッフの最終返信「" + String(e.final).slice(0, 500) + "」" + (e.instr ? "（修正方針: " + String(e.instr).slice(0, 180) + "）" : "");
+  }).join("\n") : "";
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = channel === "mail" ? "メールなので返信本文の最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
   const msgsArr = []; let cur = null;
@@ -1370,7 +1430,7 @@ async function genDraft(t, c, opts) {
         : "お客様が複数の質問・依頼をしている場合は、その全てにもれなく答えること。1つも取りこぼさない。会話で既に伝えた内容は繰り返さない。")
     + "医療判断・診断はしない。「絶対」「完治」など断定的表現は使わない。絵文字は使わない。" + sig
     + (rulesTxt ? "\n\n【店舗ルール（最優先で従う。料金・規定・対応可否はここに従い、推測で答えない）】\n" + rulesTxt : "")
-    + (examplesTxt ? "\n\n【過去の対応例（スタッフが実際に送った返信。答え方・言い回し・上のルールに無い細かい対応の“参考”にしてよい。ただし料金・規定・対応可否は必ず上の店舗ルールが優先で、例がルールと食い違う場合はルールに従う。特定の人にだけ通じる特別対応は一般化しない）】\n" + examplesTxt : "")
+    + (examplesTxt ? "\n\n【今回の問い合わせに近い、スタッフ確認済みの過去対応】\n同じ種類の問い合わせなら、店舗ルールに反しない限り、過去の最終返信の結論・案内順序・必要な確認事項を引き継ぐ。単なる文体例ではなく、人が確認した回答結果として扱う。ただし特定患者だけの例外は一般化せず、料金・規定・対応可否は必ず店舗ルールを優先する。\n" + examplesTxt : "")
     + (S(t).tone && S(t).tone.trim() ? "\n\n【トーン指示（最優先）】\n" + S(t).tone.trim().slice(0, 1200) : "")
     + (prefsBlock(t) ? "\n\n【スタッフが記憶させた指示（全返信で必ず守る。トーン指示と同格で最優先）】\n" + prefsBlock(t) : "")
     + (notesBlock(c) ? "\n\n【このお客様への対応でスタッフが出した指示メモ（編集チャットでの指示。今回の返信でも引き続き従う。ただし明らかに“その時限り”の内容は無視してよい）】\n" + notesBlock(c) : "")
@@ -1394,6 +1454,7 @@ async function genDraft(t, c, opts) {
       const finalized = await finalizeGeneratedDraft(t, out.draft, channel);
       out.draft = finalized.text; out.qualityIssues = finalized.issues;
       out.baCtx = baCtx; // 予約自動受付: actionの対象特定に使う
+      out.learningRefs = exRel.map((e) => ({ id: e.id, score: Math.round(Number(e.matchScore || 0) * 100), confirmedCount: Math.max(1, Number(e.confirmedCount || 1)) }));
     }
     return out;
   } catch (e) { return null; }
@@ -1467,19 +1528,19 @@ async function handleInbound(t, opts) {
     try { baDone = await baHandlePending(t, c); } catch (e) { console.error("ba pending:", e && e.message); }
   }
 
-  if (typeof opts.draft === "string") { c.draft = opts.draft; c.draft0 = opts.draft; }
+  if (typeof opts.draft === "string") { c.draft = opts.draft; c.draft0 = opts.draft; c.learningRefs = []; }
   else if (!med && !baDone) { // generate draft in-app for text messages
     let g = await genDraft(t, c);
     if (g && staffLineReviewAll(t)) g = await enrichStaffLineBookingPreview(t, c, g);
     if (g) {
       const verifiedName = g.baCtx && g.baCtx.ok && g.baCtx.verified && g.baCtx.patient && String(g.baCtx.patient.name || "").trim();
       if (verifiedName) c.verifiedPatientName = verifiedName.slice(0, 120);
-      c.draft = String(g.draft || ""); c.draft0 = c.draft; confidence = g.confidence; needsHuman = g.needs_human; urgent = g.is_urgent; siteAlert = g.site_alert; siteSummary = g.site_summary; c.topics = Array.isArray(g.topics) ? g.topics : [];
+      c.draft = String(g.draft || ""); c.draft0 = c.draft; confidence = g.confidence; needsHuman = g.needs_human; urgent = g.is_urgent; siteAlert = g.site_alert; siteSummary = g.site_summary; c.topics = Array.isArray(g.topics) ? g.topics : []; c.learningRefs = Array.isArray(g.learningRefs) ? g.learningRefs : [];
     }
     // ===== 予約自動受付: AIが操作依頼(action)を出したら、確認文の送信までを自動処理 =====
     if (g && !staffLineReviewAll(t) && baEnabled(t) && PARTNER_KEY && g.action && typeof g.action === "object" && g.action.type && g.action.type !== "none") {
       try { baDone = await baAction(t, c, g.action, g.baCtx); } catch (e) { console.error("ba action:", e && e.message); }
-      if (baDone) { c.draft = ""; c.draft0 = ""; }
+      if (baDone) { c.draft = ""; c.draft0 = ""; c.learningRefs = []; }
       else if (String(needsHuman) !== "true" && String(urgent) !== "true") {
         // 予約操作の会話で「沈黙」「数分の待ち時間」を作らない：
         // actionを処理できなかったら、AIの繋ぎ下書きを待ち時間なしで即送信（下書きも無ければ定型の案内）。
@@ -1511,7 +1572,7 @@ async function handleInbound(t, opts) {
         autoScheduled = true;
       } else {
         const r = await deliverText(t, c, draftText);
-        if (r.sent) { statBump(t, "auto"); c.msgs.push({ from: "us", text: draftText, auto: true, time: nowt() }); c.draft = ""; c.draft0 = ""; c.status = "done"; c.lastAuto = true; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c); autoSent = true; }
+        if (r.sent) { statBump(t, "auto"); c.msgs.push({ from: "us", text: draftText, auto: true, learningRefs: c.learningRefs || [], time: nowt() }); c.draft = ""; c.draft0 = ""; c.learningRefs = []; c.status = "done"; c.lastAuto = true; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c); autoSent = true; }
       }
     }
   } catch (e) {}
@@ -1698,7 +1759,7 @@ app.post("/webhook/staff-line", async (req, res) => {
         try {
           const revised = await staffLineReviseDraft(t, found.c, text.slice(0, 1200));
           if (!revised) throw new Error("no_draft");
-          found.c.draft = revised; found.approval.draft = revised; found.approval.draftHash = sha(revised); found.approval.reason = "スタッフの修正指示：「" + text.slice(0, 180) + "」"; found.approval.expiresAt = Date.now() + 24 * 60 * 60 * 1000; dbSave(t, found.c);
+          found.c.draft = revised; found.approval.draft = revised; found.approval.draftHash = sha(revised); found.approval.editInstruction = text.slice(0, 1200); found.approval.reason = "スタッフの修正指示：「" + text.slice(0, 180) + "」"; found.approval.expiresAt = Date.now() + 24 * 60 * 60 * 1000; dbSave(t, found.c);
           staffLineEditSessions.delete(key);
           await staffLineReply(t, ev.replyToken, [staffLineApprovalMessage(t, found.c, found.approval, found.approval.summary, found.approval.reason)]);
         } catch (e) { staffLineEditSessions.delete(key); await staffLineReply(t, ev.replyToken, [staffLineText("返信案を修正できませんでした。右腕くんの画面で確認してください。")]); }
@@ -1743,11 +1804,16 @@ app.post("/webhook/staff-line", async (req, res) => {
       if (sendLocks.has(lockKey)) { await staffLineReply(t, ev.replyToken, [staffLineText("送信処理中です。しばらくお待ちください。")]); continue; }
       sendLocks.add(lockKey); found.approval.status = "sending"; dbSave(t, found.c);
       try {
-        const outgoing = String(found.c.draft || "").trim(), sent = await deliverText(t, found.c, outgoing);
+        const outgoing = String(found.c.draft || "").trim();
+        const initialDraft = String(found.c.draft0 || "").trim();
+        const editInstruction = String(found.approval.editInstruction || "").trim();
+        const question = recentCustomerQuestion(found.c);
+        const sent = await deliverText(t, found.c, outgoing);
         if (!sent.sent) { found.approval.status = "pending"; dbSave(t, found.c); await staffLineReply(t, ev.replyToken, [staffLineText("⚠️ 送信に失敗しました。患者様には送られていません。右腕くんで送信設定を確認してください。")]); continue; }
-        found.c.msgs.push({ from: "us", text: outgoing, auto: false, approvedVia: "staff_line", approvedBy: userId, approvedByName: staff.name, time: nowt() });
-        found.c.draft = ""; found.c.draft0 = ""; found.c.status = "done"; found.c.flag = false; found.c.lastAuto = false; found.c.time = nowt(); found.c.ts = Date.now(); found.c.last = lastText(found.c); found.approval.status = "sent"; dbSave(t, found.c); statBump(t, "staff");
-        await staffLineReply(t, ev.replyToken, [staffLineText("✅ " + staff.name + "さんの承認内容を患者様へ送信しました。")]);
+        found.c.msgs.push({ from: "us", text: outgoing, auto: false, approvedVia: "staff_line", approvedBy: userId, approvedByName: staff.name, learningRefs: found.c.learningRefs || [], time: nowt() });
+        found.c.draft = ""; found.c.draft0 = ""; found.c.learningRefs = []; found.c.status = "done"; found.c.flag = false; found.c.lastAuto = false; found.c.time = nowt(); found.c.ts = Date.now(); found.c.last = lastText(found.c); found.approval.status = "sent"; dbSave(t, found.c); statBump(t, "staff");
+        const learned = await learnStaffOutcome(t, found.c, { q: question, final: outgoing, draft0: initialDraft, instr: editInstruction, source: "staff_line", waitForAi: false });
+        await staffLineReply(t, ev.replyToken, [staffLineText("✅ " + staff.name + "さんの承認内容を患者様へ送信しました。" + (learned.learnedId ? "\n🧠 この対応を次回以降の類似問い合わせに反映します。" : ""))]);
       } catch (e) {
         // 通信例外などでも承認を再試行可能な状態へ戻す。sending のまま残すと以後の操作が全て拒否される。
         found.approval.status = "pending"; dbSave(t, found.c);
@@ -1918,25 +1984,14 @@ app.post("/api/send", guard, async (req, res) => {
   let learnedId = null, conflict = null, learnedRules = [];
   if (sent) {
     const draft0 = String(c.draft0 || "").trim(); // 学習判定用に、消す前のAI初回下書きを確保
-    c.msgs.push({ from: "us", text, time: nowt() }); c.draft = ""; c.status = "done"; c.flag = false; c.lastAuto = false; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
+    const q0 = recentCustomerQuestion(c);
+    const instr = String(req.body.instr || "").trim();
+    c.msgs.push({ from: "us", text, learningRefs: c.learningRefs || [], time: nowt() }); c.draft = ""; c.draft0 = ""; c.learningRefs = []; c.status = "done"; c.flag = false; c.lastAuto = false; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
     statBump(t, "staff");
-    const q0 = c.msgs.filter(m => m.from === "them").slice(-3).map(m => m.text || "").join(" ").trim();
-    // ルール蒸留：スタッフの返信＋編集チャットの指示から、再利用できる事実・規定を店舗ルールへ自動登録。
-    // （対応例の保存・矛盾チェックと並列で回して送信応答を遅くしない）
-    const distillP = (text !== draft0 || String(req.body.instr || "").trim())
-      ? distillRules(t, c, { q: q0, final: text, draft0, instr: req.body.instr || "" })
-      : Promise.resolve([]);
-    // 自動メモリ：AIの下書きと違う返信（＝スタッフの貢献）だけを対応例として自動保存。送信したそのままは保存しない。
-    if (text !== draft0 && q0) {
-      const ex = await exampleAdd(t, { q: q0, final: text, draft0, instr: req.body.instr || "" });
-      if (ex) {
-        learnedId = ex.id;
-        const cf = await checkConflict(t, q0, text, ex.id); // 似た過去の対応例と矛盾していないか
-        if (cf) conflict = { oldId: cf.oldId, oldFinal: cf.oldFinal, newId: ex.id, newFinal: text };
-      }
-    }
-    // 蒸留が遅い場合は6秒で応答を返す（学習自体は裏で完走してルール保存される。トーストが出ないだけ）
-    try { learnedRules = await Promise.race([distillP, new Promise((r) => setTimeout(() => r([]), 6000))]); } catch (e) { learnedRules = []; }
+    const learned = await learnStaffOutcome(t, c, { q: q0, final: text, draft0, instr, source: "web", waitForAi: true });
+    learnedId = learned.learnedId;
+    learnedRules = learned.learnedRules || [];
+    if (learned.conflict) conflict = { oldId: learned.conflict.oldId, oldFinal: learned.conflict.oldFinal, newId: learnedId, newFinal: text };
   }
   res.json({ ok: true, sent, sendErr, learnedId, conflict, learnedRules });
 });
@@ -2055,7 +2110,7 @@ app.post("/api/quality-preview", guard, async (req,res)=>{
   const c={id:"quality-preview",userId:"quality-preview",name:"テスト患者",channel,msgs:[{from:"them",text:inquiry,time:nowt()}],draft:""};
   const out=await genDraft(t,c,{skipExternal:true});
   if(!out||!String(out.draft||"").trim()) return res.status(502).json({ok:false,error:"ai_failed"});
-  res.json({ok:true,draft:String(out.draft).slice(0,5000),confidence:String(out.confidence||""),qualityIssues:Array.isArray(out.qualityIssues)?out.qualityIssues:[],engine:activeAiEngine(t)});
+  res.json({ok:true,draft:String(out.draft).slice(0,5000),confidence:String(out.confidence||""),qualityIssues:Array.isArray(out.qualityIssues)?out.qualityIssues:[],learningRefs:Array.isArray(out.learningRefs)?out.learningRefs:[],engine:activeAiEngine(t)});
 });
 function staffLineStatus(t, req) {
   const host = String(req.headers["x-forwarded-host"] || req.headers.host || "").split(",")[0].trim();
@@ -2187,7 +2242,8 @@ app.get("/api/learning-data", guard, (req, res) => {
     text: String(typeof p === "string" ? p : ((p && p.text) || ""))
   })).filter(p => p.text);
   const examples = Object.values(t.examples || {}).sort((a, b) => (b.ts || 0) - (a.ts || 0) || b.id - a.id).map(e => ({
-    id: e.id, q: e.q || "", final: e.final || "", draft0: e.draft0 || "", instr: e.instr || "", ts: e.ts || 0
+    id: e.id, q: e.q || "", final: e.final || "", draft0: e.draft0 || "", instr: e.instr || "", ts: e.ts || 0,
+    source: e.source || "web", confirmedCount: Math.max(1, Number(e.confirmedCount || 1))
   }));
   res.json({ ok: true, rules: rulesList(t).map(r => ({ id: r.id, title: r.title || "", content: r.content || "" })), prefs, examples });
 });
@@ -2322,8 +2378,8 @@ app.post("/api/redraft", guard, async (req, res) => {
   const sel = Array.isArray(req.body.selected) ? req.body.selected.map(String).slice(0, 20) : [];
   const g = await genDraft(t, c, { only: sel });
   if (!g) return res.json({ ok: false });
-  c.draft = String(g.draft || ""); c.draft0 = c.draft; if (Array.isArray(g.topics)) c.topics = g.topics; dbSave(t, c);
-  res.json({ ok: true, draft: c.draft, topics: c.topics || [] });
+  c.draft = String(g.draft || ""); c.draft0 = c.draft; if (Array.isArray(g.topics)) c.topics = g.topics; c.learningRefs = Array.isArray(g.learningRefs) ? g.learningRefs : []; dbSave(t, c);
+  res.json({ ok: true, draft: c.draft, topics: c.topics || [], learningRefs: c.learningRefs });
 });
 app.post("/api/ai-regen", guard, async (req, res) => {
   const t = req.tenant;
@@ -3258,7 +3314,7 @@ app.post("/api/assistant-file", guard, async (req, res) => {
   } catch (e) { res.json({ ok: false, error: String(e.message || e).slice(0, 80) }); }
 });
 
-// 管理者用バックアップ: 会話・ルールブック・設定を1つのJSONでダウンロード（テナント別）
+// 管理者用バックアップ: 会話・ルールブック・学習例・設定を1つのJSONでダウンロード（テナント別）
 app.get("/api/backup", guard, (req, res) => {
   const t = req.tenant;
   const data = {
@@ -3268,6 +3324,7 @@ app.get("/api/backup", guard, (req, res) => {
     exportedAt: new Date().toISOString(),
     conversations: Object.values(t.store),
     rules: rulesList(t),
+    examples: Object.values(t.examples || {}).sort((a, b) => Number(a.id || 0) - Number(b.id || 0)),
     settings: S(t),
     alerts: t.alerts
   };
@@ -4259,7 +4316,7 @@ const PAGE = `<!DOCTYPE html>
     <div class="settingsActions">
     <button class="cbtn" style="width:100%;" onclick="changeLoginId()">🪪 ログインIDを変更</button>
     <button class="cbtn" style="width:100%;" onclick="changePass()">🔑 ログインパスワードを変更</button>
-    <button class="cbtn" style="width:100%;" onclick="location.href='/api/backup'">💾 バックアップをダウンロード（会話・ルール・設定）</button>
+    <button class="cbtn" style="width:100%;" onclick="location.href='/api/backup'">💾 バックアップをダウンロード（会話・ルール・学習・設定）</button>
     <button class="cbtn" style="width:100%;" onclick="doLogout()">↩ ログアウト</button>
     </div>
   </div>
@@ -4394,6 +4451,8 @@ function renderList(){
 function esc(s){return (s||"").replace(/[<>&]/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]));}
 function mediaHtml(m){ var cls='b '+(m.from==="them"?"them":"us"); var src=m.mediaId?('/api/line-media/'+m.mediaId):(m.url||"https://placehold.co/300x220/e5e7eb/6b7280?text=%F0%9F%93%B7"); if(m.media==="image")return '<div class="'+cls+' media"><a href="'+src+'" target="_blank"><img class="ph" src="'+src+'"></a></div>'; if(m.media==="video")return (m.mediaId||m.url)?('<div class="'+cls+' media"><video class="ph" style="max-width:220px;border-radius:10px;" controls preload="metadata" src="'+src+'"></video></div>'):('<div class="'+cls+' media"><div class="vid">▶<span>動画</span></div></div>'); if(m.media==="file")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" style="text-decoration:none;">📄 '+esc(m.fileName||"ファイル")+'</a></div>'; if(m.media==="audio")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" style="text-decoration:none;">🎤 音声メッセージ</a></div>'; return ''; }
 function bubblesHtml(r){return r.msgs.map(m=>{const body=m.media?mediaHtml(m):('<div class="b '+(m.from==="them"?"them":"us")+'">'+esc(m.text)+'</div>');const tl=(m.time||"")+(m.auto?' <span style="color:#7c3aed;">🤖 自動返信</span>':"");return body+'<div class="btime" style="align-self:'+(m.from==="them"?"flex-start":"flex-end")+'">'+tl+'</div>';}).join("");}
+function learningRefsText(r){const refs=(r&&Array.isArray(r.learningRefs))?r.learningRefs:[];if(!refs.length)return "";return "🧠 過去の対応例 "+refs.length+"件を参照（"+refs.map(x=>"#"+x.id+" 類似"+x.score+"%"+(x.confirmedCount>1?"・確認"+x.confirmedCount+"回":"")).join(" / ")+"）";}
+function renderLearningRefs(r){const el=document.getElementById("learningUsed");if(!el)return;const text=learningRefsText(r);el.textContent=text;el.style.display=text?"block":"none";}
 function syncMsgs(c){const m=document.getElementById("msgs");if(!m)return;if(m.getAttribute("data-count")!==String(c.msgs.length)){m.innerHTML=bubblesHtml(c);m.setAttribute("data-count",String(c.msgs.length));m.scrollTop=m.scrollHeight;}}
 function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)return; appEl.classList.add("chatopen");
   const bubbles=bubblesHtml(r);
@@ -4401,7 +4460,7 @@ function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)ret
     '<div id="custTab" class="custTab" style="display:none;" onclick="cpExpand()">うけつけるん情報を表示 ⌄</div>'+
     '<div id="custPanel" class="custPanel">読み込み中…</div>'+
     '<div id="msgs">'+bubbles+'</div>'+
-    '<div id="composer"><div id="aiLabel">✨ AI下書き（編集して送れます）</div><div id="topicChips" style="display:none;"></div><div id="draftRow"><button id="attach" onclick="attach()" title="写真・動画を添付">📎</button><textarea id="draft">'+esc(r.draft||"")+'</textarea></div>'+
+    '<div id="composer"><div id="aiLabel">✨ AI下書き（編集して送れます）</div><div id="learningUsed" style="display:'+(learningRefsText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:#6d28d9;margin:2px 0 5px;">'+esc(learningRefsText(r))+'</div><div id="topicChips" style="display:none;"></div><div id="draftRow"><button id="attach" onclick="attach()" title="写真・動画を添付">📎</button><textarea id="draft">'+esc(r.draft||"")+'</textarea></div>'+
     '<div id="cbtns"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ AIで作り直す</button><button class="cbtn done" onclick="markDone()">対応済み</button><button class="cbtn send" onclick="sendMsg()">送信</button></div></div>';
   const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r); loadCustomer(id); if(!keep)renderList();
 }
@@ -4825,10 +4884,10 @@ function renderTopicChips(r){
     '<button type="button" id="redraftBtn" class="cbtn" style="margin:2px 0 6px;font-size:12px;padding:5px 10px;" onclick="redraftSelected()">選んだ内容で下書きを作成</button>';
 }
 function toggleTopic(i){ const r=DATA.find(x=>x.id===current); if(!r||!Array.isArray(r.topics))return; const tp=r.topics.filter(x=>x&&x.q); const q=tp[i]&&tp[i].q; if(q==null)return; if(!selTopics)selTopics=new Set(); if(selTopics.has(q))selTopics.delete(q); else selTopics.add(q); renderTopicChips(r); }
-async function redraftSelected(){ if(!current||!selTopics)return; const sel=[...selTopics]; if(!sel.length){uiAlert("返信する内容を1つ以上選んでください");return;} const btn=document.getElementById("redraftBtn"); if(btn){btn.disabled=true;btn.textContent="作成中…";} try{ const rr=await api("/api/redraft",{id:current,selected:sel}); const j=await rr.json(); if(j&&j.ok&&typeof j.draft==="string"){ const d=document.getElementById("draft"); if(d)d.value=j.draft; const cd=DATA.find(x=>x.id===current); if(cd){cd.draft=j.draft; if(Array.isArray(j.topics))cd.topics=j.topics;} }else{ uiAlert("作り直しに失敗しました"); } }catch(e){ uiAlert("作り直しに失敗しました"); } if(btn){btn.disabled=false;btn.textContent="選んだ内容で下書きを作成";} }
+async function redraftSelected(){ if(!current||!selTopics)return; const sel=[...selTopics]; if(!sel.length){uiAlert("返信する内容を1つ以上選んでください");return;} const btn=document.getElementById("redraftBtn"); if(btn){btn.disabled=true;btn.textContent="作成中…";} try{ const rr=await api("/api/redraft",{id:current,selected:sel}); const j=await rr.json(); if(j&&j.ok&&typeof j.draft==="string"){ const d=document.getElementById("draft"); if(d)d.value=j.draft; const cd=DATA.find(x=>x.id===current); if(cd){cd.draft=j.draft; if(Array.isArray(j.topics))cd.topics=j.topics;cd.learningRefs=Array.isArray(j.learningRefs)?j.learningRefs:[];renderLearningRefs(cd);} }else{ uiAlert("作り直しに失敗しました"); } }catch(e){ uiAlert("作り直しに失敗しました"); } if(btn){btn.disabled=false;btn.textContent="選んだ内容で下書きを作成";} }
 async function markDone(){const id=current;await api("/api/done",{id});await load();}
 async function markAllDone(){if(!await uiConfirm("すべてのチャットを「対応済み」に変更します。よろしいですか？"))return;try{const r=await api("/api/done-all",{});const j=await r.json();closeSet();if(current){closeChat();}await load();uiAlert((j.count||0)+"件を対応済みにしました");}catch(e){uiAlert("変更に失敗しました");}}
-async function sendMsg(){if(window.__sendBusy)return;const id=current;const t=document.getElementById("draft").value.trim();if(!t)return;window.__sendBusy=true;const _sb=document.querySelector("#cbtns .send");if(_sb){_sb.disabled=true;_sb.textContent="送信中…";}try{const cd0=DATA.find(x=>x.id===id);const orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim();const edited=(t!==orig);let instr="";try{if(dSessions&&dSessions[id]&&Array.isArray(dSessions[id].hist)){instr=dSessions[id].hist.filter(m=>m&&m.role==="user").map(m=>String(m.content||"")).join(" / ").slice(0,1500);}}catch(e){}const r=await api("/api/send",{id,text:t,instr:edited?instr:""});let j={};try{j=await r.json();}catch(e){}if(j.sent){const d0=document.getElementById("draft");if(d0)d0.value="";const cd=DATA.find(x=>x.id===id);if(cd)cd.draft="";if(j.conflict){showConflict(j.conflict);}else if(j.learnedRules&&j.learnedRules.length){showRuleToast(j.learnedRules);}else if(edited&&orig.length>0){showLearnToast(j.learnedId);}await load();}else{const m={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です"}[j.sendErr]||("送信失敗: "+(j.sendErr||"不明"));uiAlert(m+"\\n（下書きは消えていません）");}}finally{window.__sendBusy=false;const _sb2=document.querySelector("#cbtns .send");if(_sb2){_sb2.disabled=false;_sb2.textContent="送信";}}}
+async function sendMsg(){if(window.__sendBusy)return;const id=current;const t=document.getElementById("draft").value.trim();if(!t)return;window.__sendBusy=true;const _sb=document.querySelector("#cbtns .send");if(_sb){_sb.disabled=true;_sb.textContent="送信中…";}try{const cd0=DATA.find(x=>x.id===id);const orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim();const edited=(t!==orig);let instr="";try{if(dSessions&&dSessions[id]&&Array.isArray(dSessions[id].hist)){instr=dSessions[id].hist.filter(m=>m&&m.role==="user").map(m=>String(m.content||"")).join(" / ").slice(0,1500);}}catch(e){}const r=await api("/api/send",{id,text:t,instr:edited?instr:""});let j={};try{j=await r.json();}catch(e){}if(j.sent){const d0=document.getElementById("draft");if(d0)d0.value="";const cd=DATA.find(x=>x.id===id);if(cd)cd.draft="";if(j.conflict){showConflict(j.conflict);}else if(j.learnedRules&&j.learnedRules.length){showRuleToast(j.learnedRules);}else if(j.learnedId){showLearnToast(j.learnedId);}await load();}else{const m={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です"}[j.sendErr]||("送信失敗: "+(j.sendErr||"不明"));uiAlert(m+"\\n（下書きは消えていません）");}}finally{window.__sendBusy=false;const _sb2=document.querySelector("#cbtns .send");if(_sb2){_sb2.disabled=false;_sb2.textContent="送信";}}}
 function attach(){const inp=document.createElement("input");inp.type="file";inp.accept="image/*,video/*,application/pdf,.pdf,.doc,.docx,.xls,.xlsx";inp.onchange=async()=>{const f=inp.files[0];if(!f)return;if(f.size>10*1024*1024){uiAlert("10MB以下のファイルにしてください");return;}const btn=document.getElementById("attach");if(btn){btn.disabled=true;btn.textContent="⏳";}try{const b64=await new Promise((res,rej)=>{const rd=new FileReader();rd.onload=()=>res(String(rd.result).split(",")[1]);rd.onerror=rej;rd.readAsDataURL(f);});const up=await api("/api/upload",{name:f.name,mime:f.type||"application/octet-stream",data:b64});const uj=await up.json();if(!uj.ok)throw new Error(uj.error||"upload");const sr=await api("/api/send-file",{id:current,fileId:uj.fileId});const sj=await sr.json();if(!sj.sent)uiAlert("送信失敗: "+(sj.sendErr||"不明"));await load();}catch(e){uiAlert("ファイル送信に失敗しました: "+e.message);}if(btn){btn.disabled=false;btn.textContent="📎";}};inp.click();}
 async function shareClinic(){const note=await uiPrompt("現場に伝える内容を入力してください（空欄のままOKを押すと、お客様の直近メッセージをそのまま共有します）","");if(note===null)return;try{const r=await api("/api/share",{id:current,note:note||""});const j=await r.json();if(j.ok)uiAlert("現場ボードに共有しました");else uiAlert("共有に失敗しました");}catch(e){uiAlert("共有に失敗しました");}}
 async function toggleFlag(){if(!current)return;try{const r=await api("/api/tag",{id:current});const j=await r.json();const b=document.getElementById("flagBtn");if(b)b.textContent=j.flag?"⚑ 要対応を外す":"⚑ 要対応";const cd=DATA.find(x=>x.id===current);if(cd)cd.flag=j.flag;renderList();}catch(e){}}
@@ -5045,7 +5104,7 @@ function renderLearnPref(list,item){
   row.appendChild(learnButton("保存",true,async()=>{await learnMutate(item.key?"/api/pref-update":"/api/pref-add",item.key?{key:item.key,text:text.el.value}:{text:text.el.value},"保存しました");}));card.appendChild(row);list.appendChild(card);
 }
 function renderLearnExample(list,item){
-  const card=learnCard();const date=document.createElement("div");date.style.cssText="font-size:10px;color:#94a3b8;";date.textContent=item.ts?new Date(item.ts).toLocaleString("ja-JP"):"日時不明";card.appendChild(date);
+  const card=learnCard();const date=document.createElement("div");date.style.cssText="font-size:10px;color:#94a3b8;";const source=item.source==="staff_line"?"スタッフLINE承認":"右腕くん画面";date.textContent=(item.ts?new Date(item.ts).toLocaleString("ja-JP"):"日時不明")+" ・ "+source+" ・ スタッフ確認"+Math.max(1,Number(item.confirmedCount||1))+"回";card.appendChild(date);
   const q=learnField("患者からの問い合わせ",item.q||"",3),final=learnField("スタッフが実際に送った返信",item.final||"",5),instr=learnField("返信作成時の修正指示（任意）",item.instr||"",2);card.appendChild(q.box);card.appendChild(final.box);card.appendChild(instr.box);
   if(item.draft0){const det=document.createElement("details");det.style.cssText="margin-top:8px;font-size:11px;color:#64748b;";const sum=document.createElement("summary");sum.textContent="元のAI下書きを確認（編集不可）";sum.style.cursor="pointer";det.appendChild(sum);const draft=learnField("",item.draft0,3,true);det.appendChild(draft.box);card.appendChild(det);}
   const row=document.createElement("div");row.style.cssText="display:flex;justify-content:flex-end;gap:7px;margin-top:9px;";row.appendChild(learnButton("削除",false,async()=>{if(!await uiConfirm("この過去の対応例を削除しますか？"))return;await learnMutate("/api/example-delete",{id:item.id},"削除しました");}));row.appendChild(learnButton("保存",true,async()=>{await learnMutate("/api/example-update",{id:item.id,q:q.el.value,final:final.el.value,instr:instr.el.value},"保存しました");}));card.appendChild(row);list.appendChild(card);
@@ -5178,7 +5237,7 @@ async function testStaffLine(){try{const r=await api("/api/staff-line/test",{}),
 async function disconnectStaffLine(){if(!await uiConfirm("右腕くんとスタッフLINEの連携を解除しますか？\\n通知・承認は停止し、登録スタッフも解除されます。"))return;try{const r=await api("/api/staff-line/disconnect",{}),j=await r.json();if(!r.ok||!j.ok)throw new Error("disconnect");document.getElementById("setStaffLineEnabled").checked=false;uiAlert("スタッフLINE連携を解除しました");await loadStaffLine();}catch(e){uiAlert("連携解除に失敗しました");}}
 async function changeStaffLineRole(id,role){try{const r=await api("/api/staff-line/staff-role",{id,role}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");renderStaffLineStaff(j.staff||[]);}catch(e){uiAlert(e.message==="last_admin"?"最後の管理者は変更できません。先に別の管理者を指定してください":"権限を変更できませんでした");await loadStaffLine();}}
 async function deleteStaffLineStaff(id){if(!await uiConfirm("このスタッフのLINE操作権限を解除しますか？"))return;try{const r=await api("/api/staff-line/staff-delete",{id}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"delete");renderStaffLineStaff(j.staff||[]);}catch(e){uiAlert(e.message==="last_admin"?"最後の管理者は解除できません":"登録を解除できませんでした");await loadStaffLine();}}
-async function runQualityPreview(){const input=document.getElementById("qualityPreviewInput"),out=document.getElementById("qualityPreviewResult"),btn=document.getElementById("qualityPreviewBtn"),inquiry=input.value.trim();if(!inquiry){uiAlert("テストする問い合わせ文を入力してください");return;}btn.disabled=true;btn.textContent="生成中…";out.style.display="block";out.textContent="返信案を生成しています…";try{const r=await api("/api/quality-preview",{inquiry,channel:document.getElementById("qualityPreviewChannel").value}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"failed");const label=({gpt:"GPT",gemini:"Gemini",claude:"Claude"})[j.engine]||j.engine;out.textContent=j.draft+"\\n\\n―― "+label+" / 確信率 "+(j.confidence||"不明")+(j.qualityIssues&&j.qualityIssues.length?" / 自動校正済み":"");}catch(e){out.textContent=e.message==="no_ai_key"?"AIキーが未設定のため生成できません。運営にAI接続設定を依頼してください。":e.message==="ai_failed"?"登録済みのAIキーを確認できませんでした。キーの失効・利用上限・モデル権限を運営側で確認してください。患者やLINEには送信されていません。":"生成できませんでした。時間をおいて再度お試しください。";}finally{btn.disabled=false;btn.textContent="返信案をテスト生成";}}
+async function runQualityPreview(){const input=document.getElementById("qualityPreviewInput"),out=document.getElementById("qualityPreviewResult"),btn=document.getElementById("qualityPreviewBtn"),inquiry=input.value.trim();if(!inquiry){uiAlert("テストする問い合わせ文を入力してください");return;}btn.disabled=true;btn.textContent="生成中…";out.style.display="block";out.textContent="返信案を生成しています…";try{const r=await api("/api/quality-preview",{inquiry,channel:document.getElementById("qualityPreviewChannel").value}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"failed");const label=({gpt:"GPT",gemini:"Gemini",claude:"Claude"})[j.engine]||j.engine;const refs=Array.isArray(j.learningRefs)?j.learningRefs:[];out.textContent=j.draft+"\\n\\n―― "+label+" / 確信率 "+(j.confidence||"不明")+(j.qualityIssues&&j.qualityIssues.length?" / 自動校正済み":"")+(refs.length?" / 過去対応 "+refs.length+"件参照":" / 過去対応の該当なし");}catch(e){out.textContent=e.message==="no_ai_key"?"AIキーが未設定のため生成できません。運営にAI接続設定を依頼してください。":e.message==="ai_failed"?"登録済みのAIキーを確認できませんでした。キーの失効・利用上限・モデル権限を運営側で確認してください。患者やLINEには送信されていません。":"生成できませんでした。時間をおいて再度お試しください。";}finally{btn.disabled=false;btn.textContent="返信案をテスト生成";}}
 async function saveSet(){const autoReply=document.getElementById("setAuto").checked;const bookingActions=document.getElementById("setBookingActions").checked;const staffLineEnabled=document.getElementById("setStaffLineEnabled").checked;const staffLineReplyMode=document.getElementById("setStaffLineReplyMode").value;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{const r=await api("/api/settings",{autoReply,bookingActions,staffLineEnabled,staffLineReplyMode,level,tone,engine,autoDelayMin});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");uiAlert("設定を保存しました");closeSet();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"先に法人専用スタッフLINEと通知グループを接続してください":e.message==="no_ai_key"?"AIキーが未設定のため自動返信を有効にできません。運営へ接続設定を依頼してください":"保存に失敗しました");}}
 async function changeLoginId(){
   const next=await uiPrompt("新しいログインID（半角英数字3〜30文字。スタッフ全員のログインに使います）");if(!next)return;
