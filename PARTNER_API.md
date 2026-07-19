@@ -33,6 +33,10 @@ API を変える／足すときは、まず正本を更新し、右腕くん（`
 
 詳細な各リクエスト/レスポンス形は正本（うけつけるん `docs/19`）を参照。
 
+stagingのうけつけるんがVercel Deployment Protection下にある場合は、Railway stagingだけに
+`PARTNER_VERCEL_BYPASS_SECRET` を設定する。すべての受信転送・予約照会・患者検索・連携リクエストへ
+`x-vercel-protection-bypass` としてサーバー側で付与される。保護自体は解除せず、値を画面やログへ出さない。
+
 ## 通知とスタッフ操作の責務
 
 - 要対応・緊急問い合わせのSlack通知は右腕くんが直接行い、うけつけるん相談APIを経由しない。

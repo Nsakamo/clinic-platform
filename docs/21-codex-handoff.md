@@ -117,6 +117,7 @@
 - CRED_KEY: LINE・メール資格情報の保存時暗号化。32バイト（hex64桁またはbase64）。スタッフLINEの新規設定では必須。
 - PUBLIC_BASE_URL: 右腕くんの公開URL。スタッフLINE通知内の会話リンクに使用する。
 - PLATFORM_SECRET, PARTNER_BOOKING_URL: うけつけるん連携。
+- PARTNER_VERCEL_BYPASS_SECRET: Vercel Deployment Protection下のうけつけるんstagingへ、右腕くんstagingからだけ到達させる自動化用秘密鍵。本番は未設定。
 - RESET_SMTP_HOST, RESET_SMTP_PORT, RESET_SMTP_USER, RESET_SMTP_PASS, RESET_SMTP_FROM: パスワード再設定専用メール。
 
 ## アカウントとパスワード再設定
@@ -180,3 +181,9 @@
 - git diff --check
 
 外部LINEを使うE2Eは、stagingへ反映後にテスト専用アカウントで実施する。
+
+### 2026-07-20 Vercel保護下のstaging連携
+
+- 右腕くんstagingから受け付けるんstagingの患者検索を行うと、Vercel Deployment ProtectionのSSOへ302リダイレクトされ、画面上は「該当なし」になることを確認した。
+- 保護を解除せず、`PARTNER_VERCEL_BYPASS_SECRET` があるときだけ全パートナー通信へ `x-vercel-protection-bypass` を付ける実装へ統一した。
+- 構文、埋め込みブラウザ、11件のテスト、差分検査は通過。Vercel側の自動化用秘密鍵発行とRailway stagingへの設定後、患者検索・連携・予約照会E2Eを続行する。

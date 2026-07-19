@@ -40,7 +40,10 @@ scripts.forEach((script, index) => new vm.Script(script, { filename: "PAGE-scrip
   "rmPointerDown",
   "processAllRichMenuSchedules",
   "isPersistentConversationInstruction",
-  "staffBookingPending"
+  "staffBookingPending",
+  "PARTNER_VERCEL_BYPASS_SECRET",
+  "x-vercel-protection-bypass",
+  "partnerHeaders(\"application/json\")"
 ].forEach((required) => {
   if (!source.includes(required)) throw new Error("required implementation missing: " + required);
 });
