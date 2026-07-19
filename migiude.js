@@ -1928,12 +1928,13 @@ app.get("/api/stats", guard, (req, res) => {
 });
 
 app.get("/api/conversations", guard, (req, res) => {
+  const staffLineReviewAvailable = !!(S(req.tenant).staffLineEnabled && staffLineReady(req.tenant));
   const arr = Object.values(req.tenant.store).sort((a, b) => {
     if (a.flag && !b.flag) return -1; if (!a.flag && b.flag) return 1;
     if (a.flag && b.flag) return (a.order || 0) - (b.order || 0);
     return (b.ts || 0) - (a.ts || 0);
   });
-  res.json(arr);
+  res.json(arr.map(c => Object.assign({}, c, { staffLineReviewAvailable })));
 });
 
 async function deliverText(t, c, text) {
@@ -2190,6 +2191,12 @@ app.post("/api/staff-line/test", guard, async (req, res) => {
 app.post("/api/staff-line/resend-approval", guard, async (req, res) => {
   const t = req.tenant, c = t.store[String(req.body.id || "")];
   if (!c) return res.status(404).json({ ok: false, error: "conversation_not_found" });
+  const requestedDraft = String(req.body.draft || "").trim().slice(0, 5000);
+  if (requestedDraft) {
+    if (!String(c.draft0 || "").trim()) c.draft0 = requestedDraft;
+    c.draft = requestedDraft;
+    dbSave(t, c);
+  }
   if (!String(c.draft || "").trim()) return res.status(400).json({ ok: false, error: "draft_required" });
   if (!S(t).staffLineEnabled || !staffLineReady(t)) return res.status(400).json({ ok: false, error: "staff_line_not_ready" });
   try {
@@ -4478,7 +4485,7 @@ function renderLearningRefs(r){const el=document.getElementById("learningUsed");
 function syncMsgs(c){const m=document.getElementById("msgs");if(!m)return;if(m.getAttribute("data-count")!==String(c.msgs.length)){m.innerHTML=bubblesHtml(c);m.setAttribute("data-count",String(c.msgs.length));m.scrollTop=m.scrollHeight;}}
 function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)return; appEl.classList.add("chatopen");
   const bubbles=bubblesHtml(r);
-  const staffReviewButton=(r.draft&&r.staffLineApproval)?'<button class="cbtn" id="staffReviewResend" onclick="resendStaffApproval()">📲 承認依頼を再送</button>':'';
+  const staffReviewButton=r.staffLineReviewAvailable?'<button class="cbtn" id="staffReviewResend" onclick="resendStaffApproval()">'+(r.staffLineApproval?'📲 承認依頼を再送':'📲 スタッフLINEで確認')+'</button>':'';
   chatEl.innerHTML='<div id="chatHead"><button id="backBtn" onclick="closeChat()">‹</button>'+av(r,30)+'<span id="chatName">'+esc(r.name)+'　<span style="font-size:11px;color:#6b7280;">'+(r.channel==="line"?"LINE":"メール")+((r.acct&&r.acct.name&&r.acct.name!=="メイン")?"・"+esc(r.acct.name):"")+'</span></span><button class="hbtn" onclick="shareClinic()">🏥 クリニックへ共有</button></div>'+
     '<div id="custTab" class="custTab" style="display:none;" onclick="cpExpand()">うけつけるん情報を表示 ⌄</div>'+
     '<div id="custPanel" class="custPanel">読み込み中…</div>'+
@@ -4911,7 +4918,7 @@ async function redraftSelected(){ if(!current||!selTopics)return; const sel=[...
 async function markDone(){const id=current;await api("/api/done",{id});await load();}
 async function markAllDone(){if(!await uiConfirm("すべてのチャットを「対応済み」に変更します。よろしいですか？"))return;try{const r=await api("/api/done-all",{});const j=await r.json();closeSet();if(current){closeChat();}await load();uiAlert((j.count||0)+"件を対応済みにしました");}catch(e){uiAlert("変更に失敗しました");}}
 async function sendMsg(){if(window.__sendBusy)return;const id=current;const t=document.getElementById("draft").value.trim();if(!t)return;window.__sendBusy=true;const _sb=document.querySelector("#cbtns .send");if(_sb){_sb.disabled=true;_sb.textContent="送信中…";}try{const cd0=DATA.find(x=>x.id===id);const orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim();const edited=(t!==orig);let instr="";try{if(dSessions&&dSessions[id]&&Array.isArray(dSessions[id].hist)){instr=dSessions[id].hist.filter(m=>m&&m.role==="user").map(m=>String(m.content||"")).join(" / ").slice(0,1500);}}catch(e){}const r=await api("/api/send",{id,text:t,instr:edited?instr:""});let j={};try{j=await r.json();}catch(e){}if(j.sent){const d0=document.getElementById("draft");if(d0)d0.value="";const cd=DATA.find(x=>x.id===id);if(cd)cd.draft="";if(j.conflict){showConflict(j.conflict);}else if(j.learnedRules&&j.learnedRules.length){showRuleToast(j.learnedRules);}else if(j.learnedId){showLearnToast(j.learnedId);}await load();}else{const m={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です"}[j.sendErr]||("送信失敗: "+(j.sendErr||"不明"));uiAlert(m+"\\n（下書きは消えていません）");}}finally{window.__sendBusy=false;const _sb2=document.querySelector("#cbtns .send");if(_sb2){_sb2.disabled=false;_sb2.textContent="送信";}}}
-async function resendStaffApproval(){if(!current)return;const b=document.getElementById("staffReviewResend");if(b){b.disabled=true;b.textContent="再送中…";}try{const r=await api("/api/staff-line/resend-approval",{id:current}),j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error(j.error||"resend");uiAlert("スタッフLINEへ承認依頼を再送しました");await load();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"スタッフLINE連携を設定・有効化してください":"承認依頼を再送できませんでした");}finally{if(b){b.disabled=false;b.textContent="📲 承認依頼を再送";}}}
+async function resendStaffApproval(){if(!current)return;const b=document.getElementById("staffReviewResend"),draft=String(document.getElementById("draft")&&document.getElementById("draft").value||"").trim();if(!draft){uiAlert("先に患者様へ送る返信案を入力してください");return;}if(b){b.disabled=true;b.textContent="送信中…";}try{const r=await api("/api/staff-line/resend-approval",{id:current,draft}),j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error(j.error||"resend");uiAlert("スタッフLINEへ承認依頼を送りました");await load();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"スタッフLINE連携を設定・有効化してください":"承認依頼を送れませんでした");}finally{if(b){b.disabled=false;b.textContent="📲 スタッフLINEで確認";}}}
 function attach(){const inp=document.createElement("input");inp.type="file";inp.accept="image/*,video/*,application/pdf,.pdf,.doc,.docx,.xls,.xlsx";inp.onchange=async()=>{const f=inp.files[0];if(!f)return;if(f.size>10*1024*1024){uiAlert("10MB以下のファイルにしてください");return;}const btn=document.getElementById("attach");if(btn){btn.disabled=true;btn.textContent="⏳";}try{const b64=await new Promise((res,rej)=>{const rd=new FileReader();rd.onload=()=>res(String(rd.result).split(",")[1]);rd.onerror=rej;rd.readAsDataURL(f);});const up=await api("/api/upload",{name:f.name,mime:f.type||"application/octet-stream",data:b64});const uj=await up.json();if(!uj.ok)throw new Error(uj.error||"upload");const sr=await api("/api/send-file",{id:current,fileId:uj.fileId});const sj=await sr.json();if(!sj.sent)uiAlert("送信失敗: "+(sj.sendErr||"不明"));await load();}catch(e){uiAlert("ファイル送信に失敗しました: "+e.message);}if(btn){btn.disabled=false;btn.textContent="📎";}};inp.click();}
 async function shareClinic(){const note=await uiPrompt("現場に伝える内容を入力してください（空欄のままOKを押すと、お客様の直近メッセージをそのまま共有します）","");if(note===null)return;try{const r=await api("/api/share",{id:current,note:note||""});const j=await r.json();if(j.ok)uiAlert("現場ボードに共有しました");else uiAlert("共有に失敗しました");}catch(e){uiAlert("共有に失敗しました");}}
 async function toggleFlag(){if(!current)return;try{const r=await api("/api/tag",{id:current});const j=await r.json();const b=document.getElementById("flagBtn");if(b)b.textContent=j.flag?"⚑ 要対応を外す":"⚑ 要対応";const cd=DATA.find(x=>x.id===current);if(cd)cd.flag=j.flag;renderList();}catch(e){}}
