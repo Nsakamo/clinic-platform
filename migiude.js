@@ -141,8 +141,8 @@ async function dbInit() {
     const t = TEN[slug];
     const cv = await pool.query("SELECT data FROM convos WHERE tenant=$1 ORDER BY ts DESC LIMIT 1000", [slug]);
     cv.rows.forEach(x => { const c = x.data; if (c && c.id) t.store[c.id] = c; });
-    const ru = await pool.query("SELECT id,title,content FROM rules WHERE tenant=$1 ORDER BY id", [slug]);
-    ru.rows.forEach(x => { t.rules[x.id] = { id: x.id, title: x.title, content: x.content }; if (x.id >= t.ruleSeq) t.ruleSeq = x.id + 1; });
+    const ru = await pool.query("SELECT id,title,content,updated FROM rules WHERE tenant=$1 ORDER BY id", [slug]);
+    ru.rows.forEach(x => { t.rules[x.id] = { id: x.id, title: x.title, content: x.content, updated: Number(x.updated || 0) }; if (x.id >= t.ruleSeq) t.ruleSeq = x.id + 1; });
     const ex = await pool.query("SELECT id,q,final,draft0,instr,ts,source,confirmed_count FROM examples WHERE tenant=$1 ORDER BY id DESC LIMIT 500", [slug]);
     ex.rows.forEach(x => { t.examples[x.id] = { id: x.id, q: x.q, final: x.final, draft0: x.draft0, instr: x.instr, ts: Number(x.ts), source: x.source || "web", confirmedCount: Math.max(1, Number(x.confirmed_count || 1)) }; if (x.id >= t.exampleSeq) t.exampleSeq = x.id + 1; });
     const al = await pool.query("SELECT id,type,summary,name,ts,done FROM alerts WHERE tenant=$1 ORDER BY ts DESC LIMIT 200", [slug]);
@@ -586,14 +586,16 @@ app.post("/api/change-pass", guard, async (req, res) => {
 function rulesList(t) { return Object.values(t.rules).sort((a, b) => a.id - b.id); }
 async function ruleAdd(t, title, content) {
   const id = t.ruleSeq++;
-  t.rules[id] = { id, title, content };
-  if (pool) { try { await pool.query("INSERT INTO rules (tenant,id,title,content,updated) VALUES ($1,$2,$3,$4,$5)", [t.slug, id, title, content, Date.now()]); } catch (e) { console.error("ruleAdd:", e.message); } }
+  const updated = Date.now();
+  t.rules[id] = { id, title, content, updated };
+  if (pool) { try { await pool.query("INSERT INTO rules (tenant,id,title,content,updated) VALUES ($1,$2,$3,$4,$5)", [t.slug, id, title, content, updated]); } catch (e) { console.error("ruleAdd:", e.message); } }
   return t.rules[id];
 }
 async function ruleUpdate(t, id, title, content) {
   const r = t.rules[id]; if (!r) return null;
   if (title != null) r.title = title; if (content != null) r.content = content;
-  if (pool) await pool.query("UPDATE rules SET title=$1,content=$2,updated=$3 WHERE tenant=$4 AND id=$5", [r.title, r.content, Date.now(), t.slug, id]);
+  r.updated = Date.now();
+  if (pool) await pool.query("UPDATE rules SET title=$1,content=$2,updated=$3 WHERE tenant=$4 AND id=$5", [r.title, r.content, r.updated, t.slug, id]);
   return r;
 }
 async function ruleDelete(t, id) {
@@ -641,6 +643,13 @@ function examplesRanked(t, query, k, context) {
   if (!list.length) return [];
   return rankLearningExamples(list, { latest: query, context: context || query }, k || 4);
 }
+function trustedLearningPrecedent(example) {
+  const score = Number(example && example.matchScore || 0);
+  const confirmations = Math.max(1, Number(example && example.confirmedCount || 1));
+  const explicitlyCorrected = !!String(example && example.instr || "").trim()
+    || (!!String(example && example.draft0 || "").trim() && String(example.draft0).trim() !== String(example.final || "").trim());
+  return score >= 0.55 || (score >= 0.32 && confirmations >= 2) || (score >= 0.38 && explicitlyCorrected);
+}
 // 矛盾検知：今回の返信が、似た過去の対応例と「事実・方針」で食い違うかをAIで判定。食い違えば前の例を返す。
 async function checkConflict(t, q, newFinal, excludeId) {
   const cand = examplesRanked(t, q, 3).filter(e => e.id !== excludeId);
@@ -666,13 +675,14 @@ async function distillRules(t, c, opts) {
     const finalText = String((opts && opts.final) || "").slice(0, 1500);
     if (!finalText) return [];
     const related = rulesSearch(t, q + " " + finalText, 8);
-    const relatedTxt = related.length ? related.map(r => "[ID:" + r.id + "] " + r.title + ": " + String(r.content).slice(0, 200)).join("\n") : "（関連ルールなし）";
+    const relatedTxt = related.length ? related.map(r => "[ID:" + r.id + " / 更新:" + (Number(r.updated || 0) ? new Date(Number(r.updated)).toLocaleDateString("ja-JP") : "不明") + "] " + r.title + ": " + String(r.content).slice(0, 200)).join("\n") : "（関連ルールなし）";
     const instrTxt = String((opts && opts.instr) || "").slice(0, 800);
     const notesTxt = notesBlock(c);
     const sys = "あなたはクリニック受付のナレッジ管理者。スタッフが患者に送った返信と、その作成時の指示から、『他の患者への返信にもそのまま再利用できる、店舗の事実・規定・方針』だけを抽出してルール化する。"
       + "\n抽出してよいもの: 料金・所要時間・可否（できる/できない）・場所・アクセス・持ち物・営業/受付時間・支払い方法・案内先（URL/窓口）・手順・キャンセルや変更の規定など、誰に聞かれても毎回同じ答えになる情報。"
       + "\n絶対に抽出しないもの: この患者固有の事情（氏名・個別の予約日時・体調・経過）、今回限りの特別対応、推測やあいまいな内容、挨拶・言い回しだけの違い。"
       + "\n既存ルールと同じ趣旨で内容も同じ → 出力しない。同じ趣旨だが内容が変わった/正確になった → そのルールIDへの update（本文全体を書き直す）。既存に無い新しい事実 → add。"
+      + "\nスタッフが今回明示した新しい料金・規定・方針は、古い対応例や既存ルールより新しい正解として扱い、該当する既存ルールをupdateする。"
       + "\n出力は必ず次のJSONのみ: {\"rules\":[{\"action\":\"add|update\",\"targetId\":数値またはnull,\"title\":\"短い見出し（例: 駐車場）\",\"content\":\"事実を簡潔に（です・ます不要）\"}]}"
       + "\n抽出できる確実な事実が無ければ {\"rules\":[]}。最大2件。迷ったら出力しない。";
     const u = "【患者の問い合わせ】\n" + (q || "（なし）")
@@ -769,7 +779,7 @@ function rulesRankedWithScores(t, query) {
   if (!query) return list.map(r => ({ r, n: 0, score: 0 }));
   const qb = bigrams(query);
   const scored = list.map(r => { const tb = bigrams(r.title + " " + r.content); let n = 0; qb.forEach(b => { if (tb.has(b)) n++; }); return { r, n, score: n / Math.max(1, Math.min(qb.size, tb.size)) }; });
-  scored.sort((a, b) => b.n - a.n || b.r.id - a.r.id);
+  scored.sort((a, b) => b.n - a.n || Number(b.r.updated || 0) - Number(a.r.updated || 0) || b.r.id - a.r.id);
   return scored;
 }
 function rulesRanked(t, query) {
@@ -780,7 +790,7 @@ function rulesSearch(t, query, limit) {
   if (!query || list.length <= limit) return list;
   const qb = bigrams(query);
   const scored = list.map(r => { const tb = bigrams(r.title + " " + r.content); let n = 0; qb.forEach(b => { if (tb.has(b)) n++; }); return { r, n }; });
-  scored.sort((a, b) => b.n - a.n || b.r.id - a.r.id);
+  scored.sort((a, b) => b.n - a.n || Number(b.r.updated || 0) - Number(a.r.updated || 0) || b.r.id - a.r.id);
   return scored.slice(0, limit).map(x => x.r);
 }
 // ルールをAIに渡すブロックを作る。ルールは絶対に途中で切らない（万一物理上限に近づいたら関連性の低いルールを丸ごと外す）
@@ -796,14 +806,15 @@ function ruleBudget(t) {
 // ルールブックの合計文字数（rulesBlockと同じ換算: 「・タイトル: 本文」＋改行1）
 function rulesCharTotal(t) {
   let n = 0;
-  for (const r of rulesList(t)) { n += ("・" + r.title + ": " + String(r.content || "")).length + 1; }
+  for (const r of rulesList(t)) { const updated = Number(r.updated || 0) ? "（更新" + new Date(Number(r.updated)).toLocaleDateString("ja-JP") + "）" : ""; n += ("・" + r.title + updated + ": " + String(r.content || "")).length + 1; }
   return n;
 }
 function rulesBlock(list, budget) {
   budget = budget || 150000;
   const out = []; let used = 0;
   for (const r of list) {
-    const s = "・" + r.title + ": " + String(r.content || "");
+    const updated = Number(r.updated || 0) ? "（更新" + new Date(Number(r.updated)).toLocaleDateString("ja-JP") + "）" : "";
+    const s = "・" + r.title + updated + ": " + String(r.content || "");
     if (used + s.length > budget) break;
     out.push(s); used += s.length + 1;
   }
@@ -1020,8 +1031,9 @@ async function validateDraftAgainstEvidence(t, input){
     input.rules ? "【関連店舗ルール】\n" + input.rules : "",
     input.booking ? "【本人確認済み予約・患者情報】\n" + input.booking : "",
     input.slots ? "【リアルタイム空き枠】\n" + input.slots : "",
+    input.precedents ? "【類似するスタッフ確定例】\n" + input.precedents : "",
   ].filter(Boolean).join("\n\n") || "（事実の根拠資料なし）";
-  const sys = "あなたは患者返信の送信前監査担当です。返信案を、問い合わせ・会話と根拠資料だけで厳格に検査します。過去対応例は文体と手順の参考であり、料金、規定、日時、空き枠、患者固有情報、医療的安全性の根拠にはできません。根拠にない事実、数字、可否、完了報告、医療判断が1つでもあればpass:false。質問・依頼への回答漏れ、会話との矛盾、別患者情報の混入もpass:false。一般的な挨拶、謝意、確認する旨、必要情報を尋ねる文は根拠なしでも可。必ずJSONのみ: {\"pass\":true|false,\"answered\":true|false,\"unsupported_claims\":[\"\"],\"contradictions\":[\"\"],\"reason\":\"短い日本語\"}";
+  const sys = "あなたは患者返信の送信前監査兼、日本語編集者です。根拠の優先順位は、最新の店舗ルール > 本人確認済みシステムデータ > 類似するスタッフ確定例。同種の店舗ルールが複数あり食い違う場合は更新日が最も新しいものを採用する。新しい店舗ルールと古い確定例が食い違えば必ず店舗ルールを採用する。類似するスタッフ確定例は、同種問い合わせへの結論・案内手順・必要確認・通常の料金や規定の根拠として使えるが、個別患者の予約・体調・特例は引き継がない。根拠にない事実、数字、可否、完了報告、医療判断があればpass:false。回答漏れ、会話との矛盾、別患者情報の混入もpass:false。内容が正しく日本語だけが不自然・冗長な場合は、事実を一切変えず自然で簡潔な受付文へ直してrevised_draftに入れ、pass:trueにできる。一般的な挨拶、謝意、確認する旨、必要情報を尋ねる文は根拠なしでも可。必ずJSONのみ: {\"pass\":true|false,\"answered\":true|false,\"natural\":true|false,\"revised_draft\":\"修正不要なら空文字\",\"unsupported_claims\":[\"\"],\"contradictions\":[\"\"],\"reason\":\"短い日本語\"}";
   const user = "【問い合わせ・直近文脈】\n" + String(input.query || "").slice(0, 2500)
     + "\n\n" + evidence
     + "\n\n【返信案】\n" + String(input.draft || "").slice(0, 5000);
@@ -1034,7 +1046,8 @@ async function validateDraftAgainstEvidence(t, input){
     const contradictions = Array.isArray(parsed.contradictions) ? parsed.contradictions.map(String).filter(Boolean).slice(0, 8) : [];
     const answered = parsed.answered === true;
     const pass = parsed.pass === true && answered && !unsupportedClaims.length && !contradictions.length;
-    return { pass, answered, unsupportedClaims, contradictions, reason: String(parsed.reason || (pass ? "根拠監査済み" : "送信前確認が必要です")).slice(0, 300) };
+    const revisedDraft = pass ? cleanDraftText(String(parsed.revised_draft || "")).slice(0, 5000) : "";
+    return { pass, answered, natural: parsed.natural === true, revisedDraft, unsupportedClaims, contradictions, reason: String(parsed.reason || (pass ? "根拠監査済み" : "送信前確認が必要です")).slice(0, 300) };
   } catch (e) {
     return { pass: false, answered: false, unsupportedClaims: [], contradictions: [], reason: "送信前監査の結果を確認できませんでした" };
   }
@@ -1440,10 +1453,13 @@ async function genDraft(t, c, opts) {
   const rel = rankedRules.map(x => x.r);
   const rulesTxt = rulesBlock(rel, ruleBudget(t));
   const exRel = examplesRanked(t, latestQ.slice(0, 800), 4, lastQ.slice(0, 1500));
+  const trustedPrecedents = exRel.filter(trustedLearningPrecedent);
   const examplesTxt = exRel.length ? exRel.map(e => {
     const score = Math.round(Number(e.matchScore || 0) * 100);
     const confirmed = Math.max(1, Number(e.confirmedCount || 1));
-    return "・[対応例#" + e.id + " / 類似" + score + "% / スタッフ確認" + confirmed + "回] お客様「" + String(e.q).slice(0, 220) + "」→ スタッフの最終返信「" + String(e.final).slice(0, 500) + "」" + (e.instr ? "（修正方針: " + String(e.instr).slice(0, 180) + "）" : "");
+    const date = Number(e.ts || 0) ? new Date(Number(e.ts)).toLocaleDateString("ja-JP") : "日時不明";
+    const role = trustedLearningPrecedent(e) ? "再利用できる確定例" : "参考例";
+    return "・[対応例#" + e.id + " / " + role + " / " + date + " / 類似" + score + "% / スタッフ確認" + confirmed + "回] お客様「" + String(e.q).slice(0, 220) + "」→ スタッフの最終返信「" + String(e.final).slice(0, 500) + "」" + (e.instr ? "（修正方針: " + String(e.instr).slice(0, 180) + "）" : "");
   }).join("\n") : "";
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = channel === "mail" ? "メールなので返信本文の最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
@@ -1483,8 +1499,8 @@ async function genDraft(t, c, opts) {
         ? "お客様は複数の連絡をしているが、今回はスタッフが選んだ次の項目だけに答えること。選ばれていない項目には一切触れない: 「" + opts.only.map(s => String(s)).join("」「") + "」。会話で既に伝えた内容は繰り返さない。"
         : "お客様が複数の質問・依頼をしている場合は、その全てにもれなく答えること。1つも取りこぼさない。会話で既に伝えた内容は繰り返さない。")
     + "医療判断・診断はしない。「絶対」「完治」など断定的表現は使わない。絵文字は使わない。" + sig
-    + (rulesTxt ? "\n\n【店舗ルール（最優先で従う。料金・規定・対応可否はここに従い、推測で答えない）】\n" + rulesTxt : "")
-    + (examplesTxt ? "\n\n【今回の問い合わせに近い、スタッフ確認済みの過去対応】\n過去対応は文章の調子、案内順序、確認すべき項目だけの参考にする。料金・割引・期限・規定・予約枠・患者情報・医療判断など、変わり得る事実の根拠には絶対にしない。それらは今回提示された店舗ルールまたは本人確認済みシステムデータに明記されている場合だけ回答する。特定患者だけの例外を一般化しない。\n" + examplesTxt : "")
+    + (rulesTxt ? "\n\n【店舗ルール（最優先で従う。料金・規定・対応可否はここに従い、推測で答えない。同じ内容が食い違う場合は更新日が新しいルールを使う）】\n" + rulesTxt : "")
+    + (examplesTxt ? "\n\n【今回の問い合わせに近い、スタッフ確認済みの過去対応】\n『再利用できる確定例』は、同じ状況ならスタッフが確定した結論・案内順序・必要な確認事項・通常の料金や規定を次の回答にも引き継ぐ。これが右腕くんの対応学習である。ただし優先順位は、最新の店舗ルール > 本人確認済みシステムデータ > 再利用できる確定例 > 参考例。新しいルールと古い例が矛盾したら必ず新しいルールを使う。個別患者の予約日時・体調・例外対応は他の患者へ引き継がない。『参考例』は文章と手順だけ参考にする。\n" + examplesTxt : "")
     + (S(t).tone && S(t).tone.trim() ? "\n\n【トーン指示（最優先）】\n" + S(t).tone.trim().slice(0, 1200) : "")
     + (prefsBlock(t) ? "\n\n【スタッフが記憶させた指示（全返信で必ず守る。トーン指示と同格で最優先）】\n" + prefsBlock(t) : "")
     + (notesBlock(c) ? "\n\n【このお客様への対応でスタッフが出した指示メモ（編集チャットでの指示。今回の返信でも引き続き従う。ただし明らかに“その時限り”の内容は無視してよい）】\n" + notesBlock(c) : "")
@@ -1518,6 +1534,7 @@ async function genDraft(t, c, opts) {
         query: lastQ,
         draft: out.draft,
         ruleMatches: evidenceRuleMatches,
+        precedentMatches: trustedPrecedents.map(e => ({ id: e.id, trusted: true, score: Number(e.matchScore || 0), confirmedCount: Number(e.confirmedCount || 1) })),
         verifiedBooking: !!(baCtx && baCtx.ok && baCtx.verified),
         verifiedSlots: !!opts.baSlotsTxt,
         learningExampleCount: exRel.length,
@@ -1529,13 +1546,25 @@ async function genDraft(t, c, opts) {
         && (confidence === "high" || confidence === "medium");
       if (validationCandidate) {
         const relevantRulesTxt = evidenceRuleMatches.slice(0, 8).map(r => "・" + r.title + ": " + r.content.slice(0, 1200)).join("\n");
+        const precedentsTxt = trustedPrecedents.slice(0, 4).map(e => "・[" + new Date(Number(e.ts || Date.now())).toLocaleDateString("ja-JP") + "] お客様「" + String(e.q).slice(0, 220) + "」→ スタッフ確定返信「" + String(e.final).slice(0, 700) + "」").join("\n");
         out.validation = await validateDraftAgainstEvidence(t, {
           query: lastQ,
           draft: out.draft,
           rules: relevantRulesTxt,
           booking: baCtx && baCtx.ok && baCtx.verified ? bookingTxt : "",
           slots: opts.baSlotsTxt || "",
+          precedents: precedentsTxt,
         });
+        if (out.validation.pass && out.validation.revisedDraft && out.validation.revisedDraft !== out.draft) {
+          out.draft = out.validation.revisedDraft;
+          out.qualityIssues = Array.from(new Set([...(out.qualityIssues || []), "validator_rewrite"]));
+          out.grounding = evaluateResponseGrounding({
+            query: lastQ, draft: out.draft, ruleMatches: evidenceRuleMatches,
+            precedentMatches: trustedPrecedents.map(e => ({ id: e.id, trusted: true, score: Number(e.matchScore || 0), confirmedCount: Number(e.confirmedCount || 1) })),
+            verifiedBooking: !!(baCtx && baCtx.ok && baCtx.verified), verifiedSlots: !!opts.baSlotsTxt, learningExampleCount: exRel.length,
+          });
+          if (!out.grounding.autoSendAllowed) { out.validation.pass = false; out.validation.reason = out.grounding.reasons[0] || "日本語修正後に再確認が必要です"; }
+        }
         if (!out.validation.pass) {
           out.grounding.autoSendAllowed = false;
           out.grounding.reasons.push(out.validation.reason || "送信前監査で確認が必要と判定されました");
@@ -2366,7 +2395,7 @@ app.get("/api/learning-data", guard, (req, res) => {
     id: e.id, q: e.q || "", final: e.final || "", draft0: e.draft0 || "", instr: e.instr || "", ts: e.ts || 0,
     source: e.source || "web", confirmedCount: Math.max(1, Number(e.confirmedCount || 1))
   }));
-  res.json({ ok: true, rules: rulesList(t).map(r => ({ id: r.id, title: r.title || "", content: r.content || "" })), prefs, examples });
+  res.json({ ok: true, rules: rulesList(t).map(r => ({ id: r.id, title: r.title || "", content: r.content || "", updated: Number(r.updated || 0) })), prefs, examples });
 });
 app.post("/api/rule-save", guard, async (req, res) => {
   const t = req.tenant; const title = String(req.body.title || "").trim().slice(0, 100); const content = String(req.body.content || "").trim().slice(0, 2000);
@@ -4406,7 +4435,7 @@ const PAGE = `<!DOCTYPE html>
       <div style="font-size:13px;font-weight:600;">🧠 学習データ管理</div>
       <button type="button" class="cbtn" onclick="openLearning()">確認・編集</button>
     </div>
-    <div style="font-size:11px;color:#6b7280;margin-top:5px;line-height:1.55;">店舗ルール、スタッフの記憶、過去の対応例を一か所で確認・編集・削除できます。用途が違うため、データは混ぜずに安全に管理します。</div>
+    <div style="font-size:11px;color:#6b7280;margin-top:5px;line-height:1.55;">右腕くん画面またはスタッフLINEで確定して送った返信を学習し、似た問い合わせへ再利用します。LINE公式アカウント管理画面から直接送った返信は右腕くんへ届かないため学習できません。店舗ルール、スタッフの記憶、過去の対応例はここで確認・編集・削除できます。</div>
   </div>
   <div class="settingsSection" style="border-color:#99f6e4;background:#f0fdfa;">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">

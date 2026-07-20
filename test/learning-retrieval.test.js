@@ -49,3 +49,13 @@ test("同じ質問と最終返信は重複例として判定する", () => {
     { q: "発送はいつですか", final: "3営業日以内に発送します" },
   ), true);
 });
+
+test("表現が違っても同じ問い合わせ意図の対応例を取得する", () => {
+  const examples = [
+    { id: 1, q: "発送時期を教えてください", final: "3営業日以内に発送します。", ts: NOW },
+    { id: 2, q: "駐車場はありますか", final: "提携駐車場があります。", ts: NOW },
+  ];
+  const ranked = rankLearningExamples(examples, "商品はいつ届きますか？", 4, NOW);
+  assert.equal(ranked[0].id, 1);
+  assert.equal(ranked.some((item) => item.id === 2), false);
+});
