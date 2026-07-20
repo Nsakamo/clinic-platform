@@ -1889,6 +1889,32 @@ function mailAccounts(t) {
   });
   return arr;
 }
+
+// 保存前に送信(SMTP)・受信(IMAP)の両方へ実際にログインできるか確認する。
+// 資格情報は呼び出し元が接続成功後にだけ保存し、失敗時は破棄する。
+async function verifyMailAccount(a) {
+  const nodemailer = require("nodemailer");
+  const { ImapFlow } = require("imapflow");
+  const smtp = nodemailer.createTransport({
+    host: a.smtpHost, port: +a.smtpPort,
+    secure: +a.smtpPort === 465,
+    auth: { user: a.smtpUser, pass: a.smtpPass },
+    connectionTimeout: 20000, greetingTimeout: 20000, socketTimeout: 30000
+  });
+  try { await smtp.verify(); }
+  catch (_) { return { ok: false, error: "smtp_auth_failed" }; }
+  finally { try { smtp.close(); } catch (_) {} }
+
+  const imap = new ImapFlow({
+    host: a.imapHost, servername: a.imapHost, port: +a.imapPort, secure: true,
+    auth: { user: a.imapUser, pass: a.imapPass }, logger: false,
+    greetingTimeout: 20000, socketTimeout: 30000
+  });
+  imap.on("error", () => {});
+  try { await imap.connect(); await imap.logout(); }
+  catch (_) { try { await imap.logout(); } catch (_) {} return { ok: false, error: "imap_auth_failed" }; }
+  return { ok: true };
+}
 // メインLINEのbotId（宛先振り分け用）を未取得なら取得しておく（テナントごと・遅延）
 async function ensureLineBotId(t) {
   const conn = t.config.conn;
@@ -2296,6 +2322,25 @@ app.get("/api/conn", guard, (req, res) => {
     extraMails: (Array.isArray(conn.mails) ? conn.mails : []).map(a => ({ name: a.name || "メール", smtpUser: a.smtpUser || "" }))
   });
 });
+// Gmail向けの簡単接続。Googleの通常パスワードではなくアプリパスワードを受け取り、
+// SMTP/IMAPの実接続が両方成功した場合だけ暗号化保存して受信監視を開始する。
+app.post("/api/conn-gmail", guard, oneMutationAtATime("connection"), async (req, res) => {
+  const t = req.tenant, conn = t.config.conn;
+  const email = normalizeEmail(req.body && req.body.email);
+  const appPassword = String(req.body && req.body.appPassword || "").replace(/\s/g, "").slice(0, 200);
+  if (!email || !appPassword) return res.status(400).json({ ok: false, error: "missing" });
+  if (!CRED_KEY) return res.status(503).json({ ok: false, error: "credential_encryption_not_configured" });
+  const account = {
+    smtpHost: "smtp.gmail.com", smtpPort: 465, smtpUser: email, smtpPass: appPassword,
+    imapHost: "imap.gmail.com", imapPort: 993, imapUser: email, imapPass: appPassword
+  };
+  const verified = await verifyMailAccount(account);
+  if (!verified.ok) return res.status(400).json(verified);
+  Object.assign(conn, account, { emailInternal: true, mailCutoff: Date.now(), mailName: "Gmail" });
+  try { await saveTenantConfig(t); }
+  catch (_) { return res.status(500).json({ ok: false, error: "db" }); }
+  res.json({ ok: true, mailConfigured: true, emailInternal: true });
+});
 // 追加アカウントの登録・削除（秘密情報は書き込み専用）
 app.post("/api/conn-add", guard, oneMutationAtATime("connection"), async (req, res) => {
   const t = req.tenant; const conn = t.config.conn;
@@ -2320,6 +2365,10 @@ app.post("/api/conn-add", guard, oneMutationAtATime("connection"), async (req, r
       imapUser: String(b.imapUser || "").trim().slice(0, 200), imapPass: String(b.imapPass || "").trim().slice(0, 200)
     };
     if (!a.smtpUser || !a.smtpPass) return res.json({ ok: false, error: "missing" });
+    if (!a.imapUser) a.imapUser = a.smtpUser;
+    if (!a.imapPass) a.imapPass = a.smtpPass;
+    const verified = await verifyMailAccount(a);
+    if (!verified.ok) return res.status(400).json(verified);
     conn.mails = Array.isArray(conn.mails) ? conn.mails : [];
     conn.mails.push(a);
   } else return res.json({ ok: false, error: "kind" });
@@ -4628,6 +4677,15 @@ const PAGE = `<!DOCTYPE html>
       <input id="cLineSecret" type="password" placeholder="チャネルシークレット（変更時のみ入力）" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;margin-bottom:4px;">
       <input id="cLineToken" type="password" placeholder="チャネルアクセストークン（変更時のみ入力）" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;">
       <div style="font-size:12px;font-weight:600;margin:10px 0 2px;">メール連携（Gmail以外もOK）</div>
+      <div style="border:1px solid #bfdbfe;background:#eff6ff;border-radius:9px;padding:9px;margin:5px 0 9px;">
+        <div style="font-size:12px;font-weight:700;color:#1e3a8a;">Gmailなら2項目だけで接続できます</div>
+        <div style="font-size:11px;color:#475569;line-height:1.55;margin:4px 0 7px;">Googleの通常パスワードは使いません。2段階認証を有効にし、Googleの「アプリ パスワード」で16文字の専用パスワードを発行してください。送信・受信を接続テストし、両方成功した場合だけ保存します。</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          <a class="cbtn" href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">Googleでアプリパスワードを発行</a>
+          <button type="button" id="gmailConnectBtn" class="cbtn send" onclick="connectGmail()">Gmailをかんたん接続</button>
+        </div>
+      </div>
+      <details><summary style="font-size:11px;color:#6b7280;cursor:pointer;margin-bottom:6px;">Gmail以外・詳細設定を開く</summary>
       <div style="display:flex;gap:6px;margin-bottom:4px;"><input id="cSmtpHost" placeholder="SMTPホスト" style="flex:2;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;"><input id="cSmtpPort" placeholder="465" style="flex:1;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;"></div>
       <input id="cSmtpUser" placeholder="送信メールアドレス" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;margin-bottom:4px;">
       <input id="cSmtpPass" type="password" placeholder="送信パスワード（変更時のみ入力）" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;margin-bottom:4px;">
@@ -4637,6 +4695,7 @@ const PAGE = `<!DOCTYPE html>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;padding:4px 0;cursor:pointer;"><input type="checkbox" id="cEmailInternal" style="width:16px;height:16px;"> メール受信をこのアプリで直接監視する</label>
       <div style="font-size:11px;color:#6b7280;margin-bottom:8px;">⚠️ オンにする前に、Make等の旧メール監視を必ず停止してください（二重取り込み防止）</div>
       <button id="saveConnBtn" class="cbtn" style="width:100%;" onclick="saveConn()">連携設定を保存</button>
+      </details>
       <div style="border-top:1px dashed #e5e7eb;margin-top:10px;padding-top:8px;">
         <div style="font-size:12px;font-weight:600;margin-bottom:4px;">➕ 追加アカウント（複数のLINE・メールを集約）</div>
         <div id="acctList" style="font-size:12px;color:#374151;"></div>
@@ -5602,6 +5661,17 @@ async function addMailAcct(){
     if(j.ok){uiAlert("メールアカウントを追加しました。受信監視も自動で始まります。");openSet();}
     else uiAlert("追加失敗: "+(j.error||"不明"));
   }catch(e){uiAlert("追加に失敗しました");}});}
+async function connectGmail(){
+  const email=await uiPrompt("接続するGmailアドレス");if(!email)return;
+  const appPassword=await uiPrompt("Googleで発行した16文字のアプリパスワード");if(!appPassword)return;
+  const btn=document.getElementById("gmailConnectBtn");
+  await withBusy("gmail-connect",btn,"送受信を確認中…",async()=>{try{
+    const r=await api("/api/conn-gmail",{email:email.trim(),appPassword:appPassword.trim()}),j=await r.json();
+    if(!r.ok||!j.ok)throw new Error(j.error||"connect");
+    uiAlert("Gmailの送信・受信接続を確認しました。\\n右腕くんでのメール受信監視を開始します。");await openSet();
+  }catch(e){const m={missing:"メールアドレスとアプリパスワードを確認してください",smtp_auth_failed:"Gmail送信へ接続できません。メールアドレスとアプリパスワードを確認してください",imap_auth_failed:"Gmail受信へ接続できません。Gmail側でIMAPの利用状態を確認してください",credential_encryption_not_configured:"運営側の暗号化設定が未完了です。秘密情報は保存していません。"};uiAlert(m[e.message]||"Gmailへ接続できませんでした。入力内容を確認してください");}
+  });
+}
 async function delAcct(kind,i,btn){if(!await uiConfirm("この連携を削除しますか？（この連携で届く新着が止まります）"))return;
   await withBusy("delete-account-"+kind+"-"+i,btn,"削除中…",async()=>{try{await api("/api/conn-del",{kind,i});await openSet();}catch(e){uiAlert("削除に失敗しました");}});}
 async function saveConn(){const g=id=>document.getElementById(id).value.trim();const body={lineSecret:g("cLineSecret"),lineToken:g("cLineToken"),smtpHost:g("cSmtpHost"),smtpPort:g("cSmtpPort"),smtpUser:g("cSmtpUser"),smtpPass:g("cSmtpPass"),imapHost:g("cImapHost"),imapPort:g("cImapPort"),imapUser:g("cImapUser"),imapPass:g("cImapPass"),emailInternal:document.getElementById("cEmailInternal").checked},btn=document.getElementById("saveConnBtn");await withBusy("save-connection",btn,"保存中…",async()=>{try{const r=await api("/api/conn",body);const j=await r.json();if(j.ok){uiAlert("連携設定を保存しました。\\nLINE: "+(j.lineConfigured?"設定済み":"未設定")+" / メール: "+(j.mailConfigured?"設定済み":"未設定")+" / メール直接監視: "+(j.emailInternal?"オン":"オフ"));["cLineSecret","cLineToken","cSmtpPass","cImapPass"].forEach(id=>document.getElementById(id).value="");}else uiAlert("保存に失敗しました");}catch(e){uiAlert("保存に失敗しました");}});}
