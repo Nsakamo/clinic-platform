@@ -10,6 +10,7 @@ process.on("unhandledRejection", (e) => console.error("unhandled:", e && (e.mess
 const express = require("express");
 const crypto = require("crypto");
 const { rankLearningExamples, sameLearningExample } = require("./lib/learning-retrieval");
+const { evaluateResponseGrounding } = require("./lib/response-grounding");
 const app = express();
 app.use(express.json({ limit: "16mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: false, limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
@@ -763,13 +764,16 @@ function similarEnough(a, b) {
 // relevance search (character-bigram overlap; works for Japanese, no tokenizer needed)
 function bigrams(s) { s = String(s || "").replace(/\s+/g, ""); const set = new Set(); for (let i = 0; i < s.length - 1; i++) set.add(s.slice(i, i + 2)); return set; }
 // 全ルールを関連度順で返す（件数制限なし。物理枠を超えた場合のみrulesBlockが関連性の低いものを丸ごと外す）
-function rulesRanked(t, query) {
+function rulesRankedWithScores(t, query) {
   const list = rulesList(t);
-  if (!query) return list;
+  if (!query) return list.map(r => ({ r, n: 0, score: 0 }));
   const qb = bigrams(query);
-  const scored = list.map(r => { const tb = bigrams(r.title + " " + r.content); let n = 0; qb.forEach(b => { if (tb.has(b)) n++; }); return { r, n }; });
+  const scored = list.map(r => { const tb = bigrams(r.title + " " + r.content); let n = 0; qb.forEach(b => { if (tb.has(b)) n++; }); return { r, n, score: n / Math.max(1, Math.min(qb.size, tb.size)) }; });
   scored.sort((a, b) => b.n - a.n || b.r.id - a.r.id);
-  return scored.map(x => x.r);
+  return scored;
+}
+function rulesRanked(t, query) {
+  return rulesRankedWithScores(t, query).map(x => x.r);
 }
 function rulesSearch(t, query, limit) {
   const list = rulesList(t);
@@ -1009,6 +1013,31 @@ async function finalizeGeneratedDraft(t, raw, channel){
     if(candidate && !draftQualityIssues(candidate).includes("empty")) text = candidate;
   }
   return { text, issues };
+}
+async function validateDraftAgainstEvidence(t, input){
+  input = input || {};
+  const evidence = [
+    input.rules ? "【関連店舗ルール】\n" + input.rules : "",
+    input.booking ? "【本人確認済み予約・患者情報】\n" + input.booking : "",
+    input.slots ? "【リアルタイム空き枠】\n" + input.slots : "",
+  ].filter(Boolean).join("\n\n") || "（事実の根拠資料なし）";
+  const sys = "あなたは患者返信の送信前監査担当です。返信案を、問い合わせ・会話と根拠資料だけで厳格に検査します。過去対応例は文体と手順の参考であり、料金、規定、日時、空き枠、患者固有情報、医療的安全性の根拠にはできません。根拠にない事実、数字、可否、完了報告、医療判断が1つでもあればpass:false。質問・依頼への回答漏れ、会話との矛盾、別患者情報の混入もpass:false。一般的な挨拶、謝意、確認する旨、必要情報を尋ねる文は根拠なしでも可。必ずJSONのみ: {\"pass\":true|false,\"answered\":true|false,\"unsupported_claims\":[\"\"],\"contradictions\":[\"\"],\"reason\":\"短い日本語\"}";
+  const user = "【問い合わせ・直近文脈】\n" + String(input.query || "").slice(0, 2500)
+    + "\n\n" + evidence
+    + "\n\n【返信案】\n" + String(input.draft || "").slice(0, 5000);
+  try {
+    const raw = await aiChat(t, sys, [{ role: "user", content: user }], 900);
+    if (!raw) return { pass: false, answered: false, unsupportedClaims: [], contradictions: [], reason: "送信前監査を実行できませんでした" };
+    const match = raw.match(/\{[\s\S]*\}/);
+    const parsed = JSON.parse(match ? match[0] : raw);
+    const unsupportedClaims = Array.isArray(parsed.unsupported_claims) ? parsed.unsupported_claims.map(String).filter(Boolean).slice(0, 8) : [];
+    const contradictions = Array.isArray(parsed.contradictions) ? parsed.contradictions.map(String).filter(Boolean).slice(0, 8) : [];
+    const answered = parsed.answered === true;
+    const pass = parsed.pass === true && answered && !unsupportedClaims.length && !contradictions.length;
+    return { pass, answered, unsupportedClaims, contradictions, reason: String(parsed.reason || (pass ? "根拠監査済み" : "送信前確認が必要です")).slice(0, 300) };
+  } catch (e) {
+    return { pass: false, answered: false, unsupportedClaims: [], contradictions: [], reason: "送信前監査の結果を確認できませんでした" };
+  }
 }
 // 出力が途中で切れる等でJSONがパースできない時、draft本文だけを救出する保険
 function salvageDraft(raw) {
@@ -1382,13 +1411,14 @@ function scheduleAutoReply(t, c, draftText, recvAt, delayMin) {
       if (!S(t).autoReply) return;                 // 待機中に自動返信OFFにされた
       if (staffLineReviewAll(t)) { await staffLineRequestApproval(t, cur, "毎回確認モードのため、送信前に承認が必要です"); return; }
       if (cur.status === "done" || cur.flag) return; // 既に対応済み/フラグ付き
+      if (!(cur.grounding && cur.grounding.autoSendAllowed && cur.validation && cur.validation.pass)) return; // 生成時の根拠監査を通っていない下書きは送らない
       if (!cur.draft || cur.draft.trim() !== draftText) return; // 下書きが変わった/消えた
       const lastMsg = cur.msgs[cur.msgs.length - 1];
       if (!lastMsg || lastMsg.from !== "them") return; // 待機中に誰かが返信した
       const r = await deliverText(t, cur, draftText);
       if (r.sent) {
         statBump(t, "auto");
-        cur.msgs.push({ from: "us", text: draftText, auto: true, learningRefs: cur.learningRefs || [], time: nowt() });
+        cur.msgs.push({ from: "us", text: draftText, auto: true, learningRefs: cur.learningRefs || [], grounding: cur.grounding || null, time: nowt() });
         cur.draft = ""; cur.draft0 = ""; cur.learningRefs = []; cur.status = "done"; cur.lastAuto = true;
         cur.time = nowt(); cur.ts = Date.now(); cur.last = lastText(cur); dbSave(t, cur);
         try { notifyAll(t, "🤖 自動返信済み: " + (cur.name || ""), (cur.last || "").slice(0, 90)); } catch (e) {}
@@ -1406,7 +1436,8 @@ async function genDraft(t, c, opts) {
   const recentQuestions = activeMsgs.filter(m => m.from === "them").slice(-3).map(m => m.text || "").filter(Boolean);
   const latestQ = recentQuestions[recentQuestions.length - 1] || "";
   const lastQ = recentQuestions.join(" ");
-  const rel = rulesRanked(t, lastQ.slice(0, 1500));
+  const rankedRules = rulesRankedWithScores(t, lastQ.slice(0, 1500));
+  const rel = rankedRules.map(x => x.r);
   const rulesTxt = rulesBlock(rel, ruleBudget(t));
   const exRel = examplesRanked(t, latestQ.slice(0, 800), 4, lastQ.slice(0, 1500));
   const examplesTxt = exRel.length ? exRel.map(e => {
@@ -1453,12 +1484,13 @@ async function genDraft(t, c, opts) {
         : "お客様が複数の質問・依頼をしている場合は、その全てにもれなく答えること。1つも取りこぼさない。会話で既に伝えた内容は繰り返さない。")
     + "医療判断・診断はしない。「絶対」「完治」など断定的表現は使わない。絵文字は使わない。" + sig
     + (rulesTxt ? "\n\n【店舗ルール（最優先で従う。料金・規定・対応可否はここに従い、推測で答えない）】\n" + rulesTxt : "")
-    + (examplesTxt ? "\n\n【今回の問い合わせに近い、スタッフ確認済みの過去対応】\n同じ種類の問い合わせなら、店舗ルールに反しない限り、過去の最終返信の結論・案内順序・必要な確認事項を引き継ぐ。単なる文体例ではなく、人が確認した回答結果として扱う。ただし特定患者だけの例外は一般化せず、料金・規定・対応可否は必ず店舗ルールを優先する。\n" + examplesTxt : "")
+    + (examplesTxt ? "\n\n【今回の問い合わせに近い、スタッフ確認済みの過去対応】\n過去対応は文章の調子、案内順序、確認すべき項目だけの参考にする。料金・割引・期限・規定・予約枠・患者情報・医療判断など、変わり得る事実の根拠には絶対にしない。それらは今回提示された店舗ルールまたは本人確認済みシステムデータに明記されている場合だけ回答する。特定患者だけの例外を一般化しない。\n" + examplesTxt : "")
     + (S(t).tone && S(t).tone.trim() ? "\n\n【トーン指示（最優先）】\n" + S(t).tone.trim().slice(0, 1200) : "")
     + (prefsBlock(t) ? "\n\n【スタッフが記憶させた指示（全返信で必ず守る。トーン指示と同格で最優先）】\n" + prefsBlock(t) : "")
     + (notesBlock(c) ? "\n\n【このお客様への対応でスタッフが出した指示メモ（編集チャットでの指示。今回の返信でも引き続き従う。ただし明らかに“その時限り”の内容は無視してよい）】\n" + notesBlock(c) : "")
     + (bookingTxt ? "\n\n【この方の情報（うけつけるん＝予約システムからの照会結果。氏名・会員ランク・ポイント・予約・回数券・最終来院などの参考。日付判断・キャンセル可否・来院案内に使う。ここに無い内容は推測しない。カルテ・診療内容は含まれない）】\n" + bookingTxt : "")
     + baTxt
+    + "\n\n【事実の安全ルール】料金・金額・割引・期限・規定・営業日・対応可否は店舗ルールに明記された内容だけを答える。予約日時・空き枠・患者固有情報・手続き完了は、本人確認済みのシステム照会結果だけを答える。痛み・症状・薬・安全性は診断や『大丈夫』という断定をせず、スタッフ確認へ回す。根拠が無い場合は推測せず『確認してご案内します』と伝え、needs_human:true、confidence:lowにする。"
     + "\n\n" + JP_QUALITY
     + "\n\n出力は必ず次のJSONのみ（前後に説明や```やかぎ括弧を付けない）: {\"draft\":\"お客様への返信文\",\"confidence\":\"high|medium|low\",\"is_urgent\":true|false,\"needs_human\":true|false,\"site_alert\":\"遅刻|当日キャンセル|緊急来院|none\",\"site_summary\":\"現場向け一行要約。site_alertがnoneなら空文字\",\"topics\":[{\"q\":\"短い質問ラベル\",\"need\":true}]"
     + (baTxt ? ",\"action\":{\"type\":\"none|cancel|reschedule|slots|link|verify\",\"appointmentId\":\"\",\"newDateTime\":\"\",\"dates\":[\"YYYY-MM-DD\"],\"phone\":\"\",\"email\":\"\"}" : "")
@@ -1478,6 +1510,40 @@ async function genDraft(t, c, opts) {
       out.draft = finalized.text; out.qualityIssues = finalized.issues;
       out.baCtx = baCtx; // 予約自動受付: actionの対象特定に使う
       out.learningRefs = exRel.map((e) => ({ id: e.id, score: Math.round(Number(e.matchScore || 0) * 100), confirmedCount: Math.max(1, Number(e.confirmedCount || 1)) }));
+      // 問い合わせだけでは「いくらですか」のように語が足りない場合があるため、返信案に現れた事実語も使って根拠ルールを再抽出する。
+      const evidenceRuleMatches = rulesRankedWithScores(t, (lastQ + "\n" + out.draft).slice(0, 6500))
+        .filter(x => x.n >= 2 || x.score >= 0.12).slice(0, 12)
+        .map(x => ({ id: x.r.id, title: x.r.title, content: String(x.r.content || ""), overlap: x.n, score: x.score }));
+      out.grounding = evaluateResponseGrounding({
+        query: lastQ,
+        draft: out.draft,
+        ruleMatches: evidenceRuleMatches,
+        verifiedBooking: !!(baCtx && baCtx.ok && baCtx.verified),
+        verifiedSlots: !!opts.baSlotsTxt,
+        learningExampleCount: exRel.length,
+      });
+      const confidence = String(out.confidence || "").toLowerCase();
+      const validationCandidate = out.grounding.autoSendAllowed
+        && String(out.needs_human) !== "true" && out.needs_human !== true
+        && String(out.is_urgent) !== "true" && out.is_urgent !== true
+        && (confidence === "high" || confidence === "medium");
+      if (validationCandidate) {
+        const relevantRulesTxt = evidenceRuleMatches.slice(0, 8).map(r => "・" + r.title + ": " + r.content.slice(0, 1200)).join("\n");
+        out.validation = await validateDraftAgainstEvidence(t, {
+          query: lastQ,
+          draft: out.draft,
+          rules: relevantRulesTxt,
+          booking: baCtx && baCtx.ok && baCtx.verified ? bookingTxt : "",
+          slots: opts.baSlotsTxt || "",
+        });
+        if (!out.validation.pass) {
+          out.grounding.autoSendAllowed = false;
+          out.grounding.reasons.push(out.validation.reason || "送信前監査で確認が必要と判定されました");
+          out.needs_human = true;
+        }
+      } else {
+        out.validation = { pass: false, skipped: true, reason: "根拠不足・緊急性・人の判断のいずれかにより自動送信対象外です" };
+      }
     }
     return out;
   } catch (e) { return null; }
@@ -1518,6 +1584,8 @@ async function enrichStaffLineBookingPreview(t, c, generated) {
       generated.site_alert = revised.site_alert;
       generated.site_summary = revised.site_summary;
       generated.topics = Array.isArray(revised.topics) ? revised.topics : generated.topics;
+      generated.grounding = revised.grounding;
+      generated.validation = revised.validation;
       generated.bookingPreview = slotsTxt;
     }
   } catch (e) { console.error("staff line booking preview:", e && e.message); }
@@ -1551,14 +1619,18 @@ async function handleInbound(t, opts) {
     try { baDone = await baHandlePending(t, c); } catch (e) { console.error("ba pending:", e && e.message); }
   }
 
-  if (typeof opts.draft === "string") { c.draft = opts.draft; c.draft0 = opts.draft; c.learningRefs = []; }
+  if (typeof opts.draft === "string") {
+    c.draft = opts.draft; c.draft0 = opts.draft; c.learningRefs = [];
+    c.grounding = { autoSendAllowed: false, reasons: ["外部指定の下書きは送信前監査を通していません"], domains: [], sources: [], ruleRefs: [] };
+    c.validation = { pass: false, skipped: true, reason: "送信前監査が必要です" };
+  }
   else if (!med && !baDone) { // generate draft in-app for text messages
     let g = await genDraft(t, c);
     if (g && staffLineReviewAll(t)) g = await enrichStaffLineBookingPreview(t, c, g);
     if (g) {
       const verifiedName = g.baCtx && g.baCtx.ok && g.baCtx.verified && g.baCtx.patient && String(g.baCtx.patient.name || "").trim();
       if (verifiedName) c.verifiedPatientName = verifiedName.slice(0, 120);
-      c.draft = String(g.draft || ""); c.draft0 = c.draft; confidence = g.confidence; needsHuman = g.needs_human; urgent = g.is_urgent; siteAlert = g.site_alert; siteSummary = g.site_summary; c.topics = Array.isArray(g.topics) ? g.topics : []; c.learningRefs = Array.isArray(g.learningRefs) ? g.learningRefs : [];
+      c.draft = String(g.draft || ""); c.draft0 = c.draft; confidence = g.confidence; needsHuman = g.needs_human; urgent = g.is_urgent; siteAlert = g.site_alert; siteSummary = g.site_summary; c.topics = Array.isArray(g.topics) ? g.topics : []; c.learningRefs = Array.isArray(g.learningRefs) ? g.learningRefs : []; c.grounding = g.grounding || null; c.validation = g.validation || null;
     }
     // ===== 予約自動受付: AIが操作依頼(action)を出したら、確認文の送信までを自動処理 =====
     if (g && !staffLineReviewAll(t) && baEnabled(t) && PARTNER_KEY && g.action && typeof g.action === "object" && g.action.type && g.action.type !== "none") {
@@ -1585,7 +1657,8 @@ async function handleInbound(t, opts) {
   try {
     const conf = String(confidence || "").toLowerCase();
     const confOk = conf === "high" || (S(t).level === "medium" && conf === "medium");
-    const safe = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med;
+    const grounded = !!(c.grounding && c.grounding.autoSendAllowed && c.validation && c.validation.pass);
+    const safe = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med && grounded;
     if (!baDone && S(t).autoReply && !staffLineReviewAll(t) && confOk && safe && c.draft && c.draft.trim()) {
       const draftText = c.draft.trim();
       const delayMin = Number(S(t).autoDelayMin || 0);
@@ -1595,19 +1668,21 @@ async function handleInbound(t, opts) {
         autoScheduled = true;
       } else {
         const r = await deliverText(t, c, draftText);
-        if (r.sent) { statBump(t, "auto"); c.msgs.push({ from: "us", text: draftText, auto: true, learningRefs: c.learningRefs || [], time: nowt() }); c.draft = ""; c.draft0 = ""; c.learningRefs = []; c.status = "done"; c.lastAuto = true; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c); autoSent = true; }
+        if (r.sent) { statBump(t, "auto"); c.msgs.push({ from: "us", text: draftText, auto: true, learningRefs: c.learningRefs || [], grounding: c.grounding || null, time: nowt() }); c.draft = ""; c.draft0 = ""; c.learningRefs = []; c.status = "done"; c.lastAuto = true; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c); autoSent = true; }
       }
     }
   } catch (e) {}
   try { if (autoSent) notifyAll(t, "🤖 自動返信済み: " + (c.name || ""), (c.last || "").slice(0, 90)); else if (!baDone) notifyAll(t, c.name || "新着メッセージ", (c.last || "新しいメッセージが届きました").slice(0, 90)); } catch (e) {}
   const confForStaffLine = String(confidence || "").toLowerCase();
   const confOkForStaffLine = confForStaffLine === "high" || (S(t).level === "medium" && confForStaffLine === "medium");
-  const safeForStaffLine = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med;
+  const groundedForStaffLine = !!(c.grounding && c.grounding.autoSendAllowed && c.validation && c.validation.pass);
+  const safeForStaffLine = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med && groundedForStaffLine;
   const exceptionNeedsReview = S(t).autoReply && S(t).staffLineEnabled && S(t).staffLineReplyMode === "exceptions" && !baDone && c.draft && c.draft.trim() && (!confOkForStaffLine || !safeForStaffLine);
   if (staffLineReviewAll(t) && !baDone && c.draft && c.draft.trim()) {
     staffLineRequestApproval(t, c, "毎回確認モードのため、送信前に承認が必要です").catch(() => {});
   } else if (exceptionNeedsReview || String(needsHuman) === "true" || String(urgent) === "true" || c.flag) {
-    const reason = String(urgent) === "true" ? "緊急性のある問い合わせとAIが判定しました" : (c.flag ? "要対応フラグが付いています" : (!confOkForStaffLine ? "自動送信に必要な確信率を満たさないため確認が必要です" : "AIが人による判断を必要と判定しました"));
+    const groundingReason = c.grounding && Array.isArray(c.grounding.reasons) && c.grounding.reasons[0];
+    const reason = String(urgent) === "true" ? "緊急性のある問い合わせとAIが判定しました" : (c.flag ? "要対応フラグが付いています" : (!groundedForStaffLine ? (groundingReason || "送信前の根拠監査を通らなかったため確認が必要です") : (!confOkForStaffLine ? "自動送信に必要な確信率を満たさないため確認が必要です" : "AIが人による判断を必要と判定しました")));
     if (c.draft && c.draft.trim() && S(t).staffLineEnabled && S(t).staffLineReplyMode === "exceptions" && staffLineReady(t)) staffLineRequestApproval(t, c, reason).catch(() => {});
     else staffLineEscalate(t, c, reason).catch(() => {});
   }
@@ -2139,7 +2214,7 @@ app.post("/api/quality-preview", guard, async (req,res)=>{
   const c={id:"quality-preview",userId:"quality-preview",name:"テスト患者",channel,msgs:[{from:"them",text:inquiry,time:nowt()}],draft:""};
   const out=await genDraft(t,c,{skipExternal:true});
   if(!out||!String(out.draft||"").trim()) return res.status(502).json({ok:false,error:"ai_failed"});
-  res.json({ok:true,draft:String(out.draft).slice(0,5000),confidence:String(out.confidence||""),qualityIssues:Array.isArray(out.qualityIssues)?out.qualityIssues:[],learningRefs:Array.isArray(out.learningRefs)?out.learningRefs:[],engine:activeAiEngine(t)});
+  res.json({ok:true,draft:String(out.draft).slice(0,5000),confidence:String(out.confidence||""),qualityIssues:Array.isArray(out.qualityIssues)?out.qualityIssues:[],learningRefs:Array.isArray(out.learningRefs)?out.learningRefs:[],grounding:out.grounding||null,validation:out.validation||null,engine:activeAiEngine(t)});
 });
 function staffLineStatus(t, req) {
   const host = String(req.headers["x-forwarded-host"] || req.headers.host || "").split(",")[0].trim();
@@ -2424,8 +2499,17 @@ app.post("/api/redraft", guard, async (req, res) => {
   const sel = Array.isArray(req.body.selected) ? req.body.selected.map(String).slice(0, 20) : [];
   const g = await genDraft(t, c, { only: sel });
   if (!g) return res.json({ ok: false });
-  c.draft = String(g.draft || ""); c.draft0 = c.draft; if (Array.isArray(g.topics)) c.topics = g.topics; c.learningRefs = Array.isArray(g.learningRefs) ? g.learningRefs : []; dbSave(t, c);
-  res.json({ ok: true, draft: c.draft, topics: c.topics || [], learningRefs: c.learningRefs });
+  c.draft = String(g.draft || ""); c.draft0 = c.draft; if (Array.isArray(g.topics)) c.topics = g.topics; c.learningRefs = Array.isArray(g.learningRefs) ? g.learningRefs : []; c.grounding = g.grounding || null; c.validation = g.validation || null; dbSave(t, c);
+  res.json({ ok: true, draft: c.draft, topics: c.topics || [], learningRefs: c.learningRefs, grounding: c.grounding, validation: c.validation });
+});
+app.post("/api/draft-edited", guard, async (req, res) => {
+  const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ ok: false, error: "no" });
+  cancelAutoReply(t, c.id);
+  c.draft = String(req.body.draft || "").slice(0, 10000);
+  c.grounding = { autoSendAllowed: false, reasons: ["スタッフが下書きを編集したため手動送信します"], domains: [], sources: ["スタッフ編集"], ruleRefs: [] };
+  c.validation = { pass: false, skipped: true, reason: "編集後の文章は自動送信しません" };
+  dbSave(t, c);
+  res.json({ ok: true });
 });
 app.post("/api/ai-regen", guard, async (req, res) => {
   const t = req.tenant;
@@ -4505,6 +4589,10 @@ function mediaHtml(m){ var cls='b '+(m.from==="them"?"them":"us"); var src=m.med
 function bubblesHtml(r){return r.msgs.map(m=>{const body=m.media?mediaHtml(m):('<div class="b '+(m.from==="them"?"them":"us")+'">'+esc(m.text)+'</div>');const tl=(m.time||"")+(m.auto?' <span style="color:#7c3aed;">🤖 自動返信</span>':"");return body+'<div class="btime" style="align-self:'+(m.from==="them"?"flex-start":"flex-end")+'">'+tl+'</div>';}).join("");}
 function learningRefsText(r){const refs=(r&&Array.isArray(r.learningRefs))?r.learningRefs:[];if(!refs.length)return "";return "🧠 過去の対応例 "+refs.length+"件を参照（"+refs.map(x=>"#"+x.id+" 類似"+x.score+"%"+(x.confirmedCount>1?"・確認"+x.confirmedCount+"回":"")).join(" / ")+"）";}
 function renderLearningRefs(r){const el=document.getElementById("learningUsed");if(!el)return;const text=learningRefsText(r);el.textContent=text;el.style.display=text?"block":"none";}
+function groundingText(r){if(!(r&&r.grounding))return "";const g=r.grounding,v=r.validation||{};if(g.autoSendAllowed&&v.pass)return "✓ 送信前の根拠監査済み"+(g.sources&&g.sources.length?"（"+g.sources.join("・")+"）":"");const reasons=Array.isArray(g.reasons)?g.reasons:[];return "⚠ スタッフ確認が必要"+(reasons.length?"："+reasons.join("／"):(v.reason?"："+v.reason:""));}
+function renderGrounding(r){const el=document.getElementById("groundingUsed");if(!el)return;const text=groundingText(r);el.textContent=text;el.style.display=text?"block":"none";el.style.color=(r&&r.grounding&&r.grounding.autoSendAllowed&&r.validation&&r.validation.pass)?"#047857":"#b45309";}
+let draftEditTimer=null;
+function draftEdited(){const d=document.getElementById("draft"),r=DATA.find(x=>x.id===current);if(!d||!r)return;r.draft=d.value;r.grounding={autoSendAllowed:false,reasons:["スタッフが下書きを編集したため手動送信します"],sources:["スタッフ編集"]};r.validation={pass:false,skipped:true,reason:"編集後の文章は自動送信しません"};renderGrounding(r);clearTimeout(draftEditTimer);const id=current,text=d.value;draftEditTimer=setTimeout(()=>api("/api/draft-edited",{id,draft:text}).catch(()=>{}),350);}
 function syncMsgs(c){const m=document.getElementById("msgs");if(!m)return;if(m.getAttribute("data-count")!==String(c.msgs.length)){m.innerHTML=bubblesHtml(c);m.setAttribute("data-count",String(c.msgs.length));m.scrollTop=m.scrollHeight;}}
 function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)return; appEl.classList.add("chatopen");
   const bubbles=bubblesHtml(r);
@@ -4513,7 +4601,7 @@ function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)ret
     '<div id="custTab" class="custTab" style="display:none;" onclick="cpExpand()">うけつけるん情報を表示 ⌄</div>'+
     '<div id="custPanel" class="custPanel">読み込み中…</div>'+
     '<div id="msgs">'+bubbles+'</div>'+
-    '<div id="composer"><div id="aiLabel">✨ AI下書き（編集して送れます）</div><div id="learningUsed" style="display:'+(learningRefsText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:#6d28d9;margin:2px 0 5px;">'+esc(learningRefsText(r))+'</div><div id="topicChips" style="display:none;"></div><div id="draftRow"><button id="attach" onclick="attach()" title="写真・動画を添付">📎</button><textarea id="draft">'+esc(r.draft||"")+'</textarea></div>'+
+    '<div id="composer"><div id="aiLabel">✨ AI下書き（編集して送れます）</div><div id="learningUsed" style="display:'+(learningRefsText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:#6d28d9;margin:2px 0 5px;">'+esc(learningRefsText(r))+'</div><div id="groundingUsed" style="display:'+(groundingText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:'+(r.grounding&&r.grounding.autoSendAllowed&&r.validation&&r.validation.pass?'#047857':'#b45309')+';margin:2px 0 5px;">'+esc(groundingText(r))+'</div><div id="topicChips" style="display:none;"></div><div id="draftRow"><button id="attach" onclick="attach()" title="写真・動画を添付">📎</button><textarea id="draft" oninput="draftEdited()">'+esc(r.draft||"")+'</textarea></div>'+
     '<div id="cbtns"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ AIで作り直す</button>'+staffReviewButton+'<button class="cbtn done" onclick="markDone()">対応済み</button><button class="cbtn send" onclick="sendMsg()">送信</button></div></div>';
   const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r); loadCustomer(id); if(!keep)renderList();
 }
@@ -4937,7 +5025,7 @@ function renderTopicChips(r){
     '<button type="button" id="redraftBtn" class="cbtn" style="margin:2px 0 6px;font-size:12px;padding:5px 10px;" onclick="redraftSelected()">選んだ内容で下書きを作成</button>';
 }
 function toggleTopic(i){ const r=DATA.find(x=>x.id===current); if(!r||!Array.isArray(r.topics))return; const tp=r.topics.filter(x=>x&&x.q); const q=tp[i]&&tp[i].q; if(q==null)return; if(!selTopics)selTopics=new Set(); if(selTopics.has(q))selTopics.delete(q); else selTopics.add(q); renderTopicChips(r); }
-async function redraftSelected(){ if(!current||!selTopics)return; const sel=[...selTopics]; if(!sel.length){uiAlert("返信する内容を1つ以上選んでください");return;} const btn=document.getElementById("redraftBtn"); if(btn){btn.disabled=true;btn.textContent="作成中…";} try{ const rr=await api("/api/redraft",{id:current,selected:sel}); const j=await rr.json(); if(j&&j.ok&&typeof j.draft==="string"){ const d=document.getElementById("draft"); if(d)d.value=j.draft; const cd=DATA.find(x=>x.id===current); if(cd){cd.draft=j.draft; if(Array.isArray(j.topics))cd.topics=j.topics;cd.learningRefs=Array.isArray(j.learningRefs)?j.learningRefs:[];renderLearningRefs(cd);} }else{ uiAlert("作り直しに失敗しました"); } }catch(e){ uiAlert("作り直しに失敗しました"); } if(btn){btn.disabled=false;btn.textContent="選んだ内容で下書きを作成";} }
+async function redraftSelected(){ if(!current||!selTopics)return; const sel=[...selTopics]; if(!sel.length){uiAlert("返信する内容を1つ以上選んでください");return;} const btn=document.getElementById("redraftBtn"); if(btn){btn.disabled=true;btn.textContent="作成中…";} try{ const rr=await api("/api/redraft",{id:current,selected:sel}); const j=await rr.json(); if(j&&j.ok&&typeof j.draft==="string"){ const d=document.getElementById("draft"); if(d)d.value=j.draft; const cd=DATA.find(x=>x.id===current); if(cd){cd.draft=j.draft; if(Array.isArray(j.topics))cd.topics=j.topics;cd.learningRefs=Array.isArray(j.learningRefs)?j.learningRefs:[];cd.grounding=j.grounding||null;cd.validation=j.validation||null;renderLearningRefs(cd);renderGrounding(cd);} }else{ uiAlert("作り直しに失敗しました"); } }catch(e){ uiAlert("作り直しに失敗しました"); } if(btn){btn.disabled=false;btn.textContent="選んだ内容で下書きを作成";} }
 async function markDone(){const id=current;await api("/api/done",{id});await load();}
 async function markAllDone(){if(!await uiConfirm("すべてのチャットを「対応済み」に変更します。よろしいですか？"))return;try{const r=await api("/api/done-all",{});const j=await r.json();closeSet();if(current){closeChat();}await load();uiAlert((j.count||0)+"件を対応済みにしました");}catch(e){uiAlert("変更に失敗しました");}}
 async function sendMsg(){if(window.__sendBusy)return;const id=current;const t=document.getElementById("draft").value.trim();if(!t)return;window.__sendBusy=true;const _sb=document.querySelector("#cbtns .send");if(_sb){_sb.disabled=true;_sb.textContent="送信中…";}try{const cd0=DATA.find(x=>x.id===id);const orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim();const edited=(t!==orig);let instr="";try{if(dSessions&&dSessions[id]&&Array.isArray(dSessions[id].hist)){instr=dSessions[id].hist.filter(m=>m&&m.role==="user").map(m=>String(m.content||"")).join(" / ").slice(0,1500);}}catch(e){}const r=await api("/api/send",{id,text:t,instr:edited?instr:""});let j={};try{j=await r.json();}catch(e){}if(j.sent){const d0=document.getElementById("draft");if(d0)d0.value="";const cd=DATA.find(x=>x.id===id);if(cd)cd.draft="";if(j.conflict){showConflict(j.conflict);}else if(j.learnedRules&&j.learnedRules.length){showRuleToast(j.learnedRules);}else if(j.learnedId){showLearnToast(j.learnedId);}await load();}else{const m={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です"}[j.sendErr]||("送信失敗: "+(j.sendErr||"不明"));uiAlert(m+"\\n（下書きは消えていません）");}}finally{window.__sendBusy=false;const _sb2=document.querySelector("#cbtns .send");if(_sb2){_sb2.disabled=false;_sb2.textContent="送信";}}}
@@ -4955,7 +5043,7 @@ function dDraftCard(entry){const card=document.createElement("div");card.classNa
   const b=document.createElement("button");
   if(entry.applied){b.disabled=true;b.textContent="下書きに反映済み";}
   else{b.textContent="✅ この下書きを使う";
-    b.onclick=()=>{const d=document.getElementById("draft");if(d)d.value=entry.draft;const cd=DATA.find(z=>z.id===current);if(cd)cd.draft=entry.draft;
+    b.onclick=()=>{const d=document.getElementById("draft");if(d){d.value=entry.draft;draftEdited();}const cd=DATA.find(z=>z.id===current);if(cd)cd.draft=entry.draft;
       entry.applied=true;b.disabled=true;b.textContent="下書きに反映済み";
       dAdd("sysn","✅ 下書き欄に反映しました");
       setTimeout(closeDraftChat,500);};}
@@ -5291,7 +5379,7 @@ async function testStaffLine(){try{const r=await api("/api/staff-line/test",{}),
 async function disconnectStaffLine(){if(!await uiConfirm("右腕くんとスタッフLINEの連携を解除しますか？\\n通知・承認は停止し、登録スタッフも解除されます。"))return;try{const r=await api("/api/staff-line/disconnect",{}),j=await r.json();if(!r.ok||!j.ok)throw new Error("disconnect");document.getElementById("setStaffLineEnabled").checked=false;uiAlert("スタッフLINE連携を解除しました");await loadStaffLine();}catch(e){uiAlert("連携解除に失敗しました");}}
 async function changeStaffLineRole(id,role){try{const r=await api("/api/staff-line/staff-role",{id,role}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");renderStaffLineStaff(j.staff||[]);}catch(e){uiAlert(e.message==="last_admin"?"最後の管理者は変更できません。先に別の管理者を指定してください":"権限を変更できませんでした");await loadStaffLine();}}
 async function deleteStaffLineStaff(id){if(!await uiConfirm("このスタッフのLINE操作権限を解除しますか？"))return;try{const r=await api("/api/staff-line/staff-delete",{id}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"delete");renderStaffLineStaff(j.staff||[]);}catch(e){uiAlert(e.message==="last_admin"?"最後の管理者は解除できません":"登録を解除できませんでした");await loadStaffLine();}}
-async function runQualityPreview(){const input=document.getElementById("qualityPreviewInput"),out=document.getElementById("qualityPreviewResult"),btn=document.getElementById("qualityPreviewBtn"),inquiry=input.value.trim();if(!inquiry){uiAlert("テストする問い合わせ文を入力してください");return;}btn.disabled=true;btn.textContent="生成中…";out.style.display="block";out.textContent="返信案を生成しています…";try{const r=await api("/api/quality-preview",{inquiry,channel:document.getElementById("qualityPreviewChannel").value}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"failed");const label=({gpt:"GPT",gemini:"Gemini",claude:"Claude"})[j.engine]||j.engine;const refs=Array.isArray(j.learningRefs)?j.learningRefs:[];out.textContent=j.draft+"\\n\\n―― "+label+" / 確信率 "+(j.confidence||"不明")+(j.qualityIssues&&j.qualityIssues.length?" / 自動校正済み":"")+(refs.length?" / 過去対応 "+refs.length+"件参照":" / 過去対応の該当なし");}catch(e){out.textContent=e.message==="no_ai_key"?"AIキーが未設定のため生成できません。運営にAI接続設定を依頼してください。":e.message==="ai_failed"?"登録済みのAIキーを確認できませんでした。キーの失効・利用上限・モデル権限を運営側で確認してください。患者やLINEには送信されていません。":"生成できませんでした。時間をおいて再度お試しください。";}finally{btn.disabled=false;btn.textContent="返信案をテスト生成";}}
+async function runQualityPreview(){const input=document.getElementById("qualityPreviewInput"),out=document.getElementById("qualityPreviewResult"),btn=document.getElementById("qualityPreviewBtn"),inquiry=input.value.trim();if(!inquiry){uiAlert("テストする問い合わせ文を入力してください");return;}btn.disabled=true;btn.textContent="生成中…";out.style.display="block";out.textContent="返信案を生成しています…";try{const r=await api("/api/quality-preview",{inquiry,channel:document.getElementById("qualityPreviewChannel").value}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"failed");const label=({gpt:"GPT",gemini:"Gemini",claude:"Claude"})[j.engine]||j.engine;const refs=Array.isArray(j.learningRefs)?j.learningRefs:[];const g=j.grounding||{},v=j.validation||{};const audit=g.autoSendAllowed&&v.pass?" / 根拠監査OK":" / スタッフ確認: "+((g.reasons&&g.reasons[0])||v.reason||"根拠不足");out.textContent=j.draft+"\\n\\n―― "+label+" / 確信率 "+(j.confidence||"不明")+(j.qualityIssues&&j.qualityIssues.length?" / 自動校正済み":"")+(refs.length?" / 過去対応 "+refs.length+"件参照":" / 過去対応の該当なし")+audit;}catch(e){out.textContent=e.message==="no_ai_key"?"AIキーが未設定のため生成できません。運営にAI接続設定を依頼してください。":e.message==="ai_failed"?"登録済みのAIキーを確認できませんでした。キーの失効・利用上限・モデル権限を運営側で確認してください。患者やLINEには送信されていません。":"生成できませんでした。時間をおいて再度お試しください。";}finally{btn.disabled=false;btn.textContent="返信案をテスト生成";}}
 async function saveSet(){const autoReply=document.getElementById("setAuto").checked;const bookingActions=document.getElementById("setBookingActions").checked;const staffLineEnabled=document.getElementById("setStaffLineEnabled").checked;const staffLineReplyMode=document.getElementById("setStaffLineReplyMode").value;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{const r=await api("/api/settings",{autoReply,bookingActions,staffLineEnabled,staffLineReplyMode,level,tone,engine,autoDelayMin});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");uiAlert("設定を保存しました");closeSet();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"先に法人専用スタッフLINEと通知グループを接続してください":e.message==="no_ai_key"?"AIキーが未設定のため自動返信を有効にできません。運営へ接続設定を依頼してください":"保存に失敗しました");}}
 async function changeLoginId(){
   const next=await uiPrompt("新しいログインID（半角英数字3〜30文字。スタッフ全員のログインに使います）");if(!next)return;
