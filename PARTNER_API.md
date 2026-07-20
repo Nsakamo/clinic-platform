@@ -18,6 +18,7 @@ API を変える／足すときは、まず正本を更新し、右腕くん（`
 - `POST /api/partner/password-reset` … 登録済み管理者メールへ1時間・1回限りの再設定リンクを送信（パスワード非表示）
 - `PUT  /api/partner/account` … パスワード再設定用のアカウントメールを登録・更新
 - `POST /api/partner/send-line` … 患者へLINE送信
+- `POST /api/partner/outbound-events` … うけつけるんがLINE送信に成功した本文・送信時刻・補助コンテンツを右腕くん履歴へ冪等同期
 
 認証キー：`x-partner-key` == `ADMIN_SECRET`（= うけつけるん側の共有キー / `PLATFORM_SECRET`）。
 
@@ -31,6 +32,10 @@ API を変える／足すときは、まず正本を更新し、右腕くん（`
   患者の「はい」承認（二段階）はうけつけるん側が強制する。詳細は正本 docs/19 の B-2。
 
 詳細な各リクエスト/レスポンス形は正本（うけつけるん `docs/19`）を参照。
+
+stagingのうけつけるんがVercel Deployment Protection下にある場合は、Railway stagingだけに
+`PARTNER_VERCEL_BYPASS_SECRET` を設定する。すべての受信転送・予約照会・患者検索・連携リクエストへ
+`x-vercel-protection-bypass` としてサーバー側で付与される。保護自体は解除せず、値を画面やログへ出さない。
 
 ## 通知とスタッフ操作の責務
 

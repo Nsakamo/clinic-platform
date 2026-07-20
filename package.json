@@ -5,7 +5,8 @@
   "main": "migiude.js",
   "scripts": {
     "start": "node migiude.js",
-    "check": "node scripts/check-source.js"
+    "check": "node scripts/check-source.js",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=18"

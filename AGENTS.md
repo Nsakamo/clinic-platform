@@ -23,6 +23,6 @@
 
 ## セキュリティ
 
-- `PLATFORM_SECRET`、`CRED_KEY`、APIキー、LINEトークン、メールパスワード、Slack Webhook URLをコード・ログ・チャットへ出さない。
-- Slack Webhook URLは利用者が設定画面へ直接貼る。APIは設定済みかだけ返し、値を返さない。
+- `PLATFORM_SECRET`、`CRED_KEY`、APIキー、LINEトークン、メールパスワード、Slack Webhook URL・Bot Token・Signing Secretをコード・ログ・チャットへ出さない。
+- スタッフ承認通知は法人専用スタッフLINEを使う。患者向けLINEと同じチャネル、または他法人登録済みチャネルを許可しない。資格情報は再表示せず、Webhookはdestinationで法人を特定してからその法人のsecretで署名検証する。
 - 予約のキャンセル・日時変更は、現在の会話の本人確認済み患者と予約IDをサーバーで再照合し、スタッフの最終確認後だけ実行する。
