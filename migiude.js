@@ -494,6 +494,21 @@ function tenantFromReq(req) {
   return null;
 }
 function guard(req, res, next) { const t = tenantFromReq(req); if (!t) return res.status(401).json({ error: "auth" }); req.tenant = t; next(); }
+const inflightMutations = new Set();
+function oneMutationAtATime(operation, resource) {
+  return function (req, res, next) {
+    const tenant = req.tenant && req.tenant.slug || "unknown";
+    const target = typeof resource === "function" ? String(resource(req) || "") : "";
+    const key = tenant + ":" + operation + (target ? ":" + target : "");
+    if (inflightMutations.has(key)) return res.status(409).json({ ok: false, error: "already_processing" });
+    inflightMutations.add(key);
+    let released = false;
+    const release = () => { if (!released) { released = true; inflightMutations.delete(key); } };
+    res.once("finish", release);
+    res.once("close", release);
+    next();
+  };
+}
 function slugify(name) { const base = String(name || "clinic").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 20) || "clinic"; return base + "-" + crypto.randomBytes(2).toString("hex"); }
 
 function loginIdTaken(id, exceptSlug){
@@ -547,7 +562,7 @@ app.post("/api/login", async (req, res) => {
   setSess(res, t);
   res.json({ ok: true, slug: t.slug });
 });
-app.post("/api/change-loginid", guard, async (req, res) => {
+app.post("/api/change-loginid", guard, oneMutationAtATime("change-loginid"), async (req, res) => {
   const t = req.tenant;
   const next = String(req.body.next || "").trim();
   if (!/^[a-zA-Z0-9_-]{3,30}$/.test(next)) return res.status(400).json({ ok: false, error: "bad_id" });
@@ -557,7 +572,7 @@ app.post("/api/change-loginid", guard, async (req, res) => {
   res.json({ ok: true, loginId: next });
 });
 app.get("/api/account", guard, (req, res) => res.json(tenantAccount(req.tenant)));
-app.post("/api/account", guard, async (req, res) => {
+app.post("/api/account", guard, oneMutationAtATime("account"), async (req, res) => {
   const t = req.tenant;
   const email = normalizeEmail(req.body.accountEmail);
   if (!email) return res.status(400).json({ ok:false, error:"bad_email" });
@@ -574,7 +589,7 @@ app.post("/api/logout", (req, res) => {
   } catch (e) {}
   res.set("Set-Cookie", "sess=; Path=/; HttpOnly; Max-Age=0"); res.json({ ok: true });
 });
-app.post("/api/change-pass", guard, async (req, res) => {
+app.post("/api/change-pass", guard, oneMutationAtATime("change-pass"), async (req, res) => {
   const t = req.tenant;
   const cur = String(req.body.current || ""), next = String(req.body.next || "");
   if (!verifyPassword(cur, t.config.passHash).ok) return res.status(401).json({ ok: false, error: "wrong_current" });
@@ -2282,7 +2297,7 @@ app.get("/api/conn", guard, (req, res) => {
   });
 });
 // 追加アカウントの登録・削除（秘密情報は書き込み専用）
-app.post("/api/conn-add", guard, async (req, res) => {
+app.post("/api/conn-add", guard, oneMutationAtATime("connection"), async (req, res) => {
   const t = req.tenant; const conn = t.config.conn;
   const b = req.body || {};
   if (b.kind === "line") {
@@ -2311,7 +2326,7 @@ app.post("/api/conn-add", guard, async (req, res) => {
   try { await saveTenantConfig(t); } catch (e) { return res.status(500).json({ ok: false }); }
   res.json({ ok: true });
 });
-app.post("/api/conn-del", guard, async (req, res) => {
+app.post("/api/conn-del", guard, oneMutationAtATime("connection"), async (req, res) => {
   const t = req.tenant; const conn = t.config.conn;
   const kind = req.body.kind, i = +req.body.i;
   if (kind === "line" && Array.isArray(conn.lines) && conn.lines[i]) conn.lines.splice(i, 1);
@@ -2320,7 +2335,7 @@ app.post("/api/conn-del", guard, async (req, res) => {
   try { await saveTenantConfig(t); } catch (e) { return res.status(500).json({ ok: false }); }
   res.json({ ok: true });
 });
-app.post("/api/conn", guard, async (req, res) => {
+app.post("/api/conn", guard, oneMutationAtATime("connection"), async (req, res) => {
   const t = req.tenant; const conn = t.config.conn;
   const b = req.body || {};
   ["lineToken", "lineSecret", "smtpHost", "smtpUser", "smtpPass", "imapHost", "imapUser", "imapPass"].forEach(k => {
@@ -2403,7 +2418,7 @@ function staffLineStatus(t, req) {
   };
 }
 app.get("/api/staff-line", guard, (req, res) => res.json(staffLineStatus(req.tenant, req)));
-app.post("/api/staff-line/config", guard, async (req, res) => {
+app.post("/api/staff-line/config", guard, oneMutationAtATime("staff-line"), async (req, res) => {
   const t = req.tenant, conn = t.config.conn, b = req.body || {};
   if (!CRED_KEY) return res.status(503).json({ ok: false, error: "credential_encryption_not_configured" });
   const suppliedToken = String(b.token || "").trim(), suppliedSecret = String(b.secret || "").trim();
@@ -2440,7 +2455,7 @@ app.post("/api/staff-line/config", guard, async (req, res) => {
   try { await saveTenantConfig(t); } catch (e) { return res.status(500).json({ ok: false, error: "save" }); }
   res.json(Object.assign({ ok: true }, staffLineStatus(t, req)));
 });
-app.post("/api/staff-line/link-code", guard, async (req, res) => {
+app.post("/api/staff-line/link-code", guard, oneMutationAtATime("staff-line"), async (req, res) => {
   const t = req.tenant;
   if (!(C.staffLineToken(t) && C.staffLineSecret(t) && t.config.conn.staffLineBotId)) return res.status(400).json({ ok: false, error: "not_configured" });
   const code = "右腕-" + crypto.randomBytes(4).toString("hex").toUpperCase();
@@ -2448,7 +2463,7 @@ app.post("/api/staff-line/link-code", guard, async (req, res) => {
   try { await saveTenantConfig(t); } catch (e) { return res.status(500).json({ ok: false, error: "save" }); }
   res.json({ ok: true, code, expiresAt: t.config.staffLineLink.exp });
 });
-app.post("/api/staff-line/test", guard, async (req, res) => {
+app.post("/api/staff-line/test", guard, oneMutationAtATime("staff-line"), async (req, res) => {
   const t = req.tenant;
   if (!staffLineReady(t)) return res.status(400).json({ ok: false, error: "not_ready" });
   const link = publicConversationUrl({ id: "preview" }).replace(/\?conv=preview$/, "");
@@ -2456,7 +2471,7 @@ app.post("/api/staff-line/test", guard, async (req, res) => {
   const result = await staffLinePush(t, t.config.conn.staffLineGroupId, [staffLineText(text)]);
   res.status(result.ok ? 200 : 502).json(result);
 });
-app.post("/api/staff-line/resend-approval", guard, async (req, res) => {
+app.post("/api/staff-line/resend-approval", guard, oneMutationAtATime("staff-line-approval", req => req.body.id), async (req, res) => {
   const t = req.tenant, c = t.store[String(req.body.id || "")];
   if (!c) return res.status(404).json({ ok: false, error: "conversation_not_found" });
   const requestedDraft = String(req.body.draft || "").trim().slice(0, 5000);
@@ -2473,7 +2488,7 @@ app.post("/api/staff-line/resend-approval", guard, async (req, res) => {
     res.json({ ok: true, approvalId: c.staffLineApproval && c.staffLineApproval.id });
   } catch (e) { res.status(500).json({ ok: false, error: "resend_failed" }); }
 });
-app.post("/api/staff-line/staff-role", guard, async (req, res) => {
+app.post("/api/staff-line/staff-role", guard, oneMutationAtATime("staff-line-staff"), async (req, res) => {
   const t = req.tenant, id = String(req.body.id || ""), role = String(req.body.role || "");
   if (!["admin", "approver", "viewer"].includes(role)) return res.status(400).json({ ok: false, error: "invalid_role" });
   const staff = (t.config.staffLineStaff || []).find(s => s && s.id === id);
@@ -2483,7 +2498,7 @@ app.post("/api/staff-line/staff-role", guard, async (req, res) => {
   try { await saveTenantConfig(t); } catch (e) { return res.status(500).json({ ok: false, error: "save" }); }
   res.json({ ok: true, staff: staffLineStaffPublic(t) });
 });
-app.post("/api/staff-line/staff-delete", guard, async (req, res) => {
+app.post("/api/staff-line/staff-delete", guard, oneMutationAtATime("staff-line-staff"), async (req, res) => {
   const t = req.tenant, id = String(req.body.id || ""), staff = (t.config.staffLineStaff || []).find(s => s && s.id === id);
   if (!staff) return res.status(404).json({ ok: false, error: "not_found" });
   if (staff.role === "admin" && staff.active !== false && (t.config.staffLineStaff || []).filter(s => s && s.active !== false && s.role === "admin").length <= 1) return res.status(409).json({ ok: false, error: "last_admin" });
@@ -2491,14 +2506,14 @@ app.post("/api/staff-line/staff-delete", guard, async (req, res) => {
   try { await saveTenantConfig(t); } catch (e) { return res.status(500).json({ ok: false, error: "save" }); }
   res.json({ ok: true, staff: staffLineStaffPublic(t) });
 });
-app.post("/api/staff-line/disconnect", guard, async (req, res) => {
+app.post("/api/staff-line/disconnect", guard, oneMutationAtATime("staff-line"), async (req, res) => {
   const t = req.tenant; S(t).staffLineEnabled = false;
   ["staffLineToken", "staffLineSecret", "staffLineBotId", "staffLineName", "staffLineBasicId", "staffLineGroupId", "staffLineGroupName"].forEach(k => { delete t.config.conn[k]; });
   delete t.config.staffLineLink; t.config.staffLineStaff = [];
   try { await saveTenantConfig(t); } catch (e) { return res.status(500).json({ ok: false, error: "save" }); }
   res.json({ ok: true });
 });
-app.post("/api/settings", guard, async (req, res) => {
+app.post("/api/settings", guard, oneMutationAtATime("settings"), async (req, res) => {
   const t = req.tenant;
   if (req.body.autoReply === true && !activeAiEngine(t)) return res.status(409).json({ ok:false, error:"no_ai_key" });
   if (typeof req.body.autoReply === "boolean") S(t).autoReply = req.body.autoReply;
@@ -2517,7 +2532,7 @@ app.post("/api/settings", guard, async (req, res) => {
   res.json(Object.assign({ ok: true }, publicSettings(t)));
 });
 app.post("/api/done", guard, (req, res) => { const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" }); cancelAutoReply(t, c.id); c.status = "done"; c.flag = false; dbSave(t, c); res.json({ ok: true }); });
-app.post("/api/done-all", guard, (req, res) => { const t = req.tenant; let count = 0; Object.values(t.store).forEach(c => { if (c.status !== "done" || c.flag) { cancelAutoReply(t, c.id); c.status = "done"; c.flag = false; dbSave(t, c); count++; } }); res.json({ ok: true, count }); });
+app.post("/api/done-all", guard, oneMutationAtATime("done-all"), (req, res) => { const t = req.tenant; let count = 0; Object.values(t.store).forEach(c => { if (c.status !== "done" || c.flag) { cancelAutoReply(t, c.id); c.status = "done"; c.flag = false; dbSave(t, c); count++; } }); res.json({ ok: true, count }); });
 app.post("/api/tag", guard, (req, res) => { const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" }); c.flag = !c.flag; if (c.flag) { c.order = Math.max(0, ...Object.values(t.store).filter(x => x.flag).map(x => x.order || 0)) + 1; c.status = "todo"; } dbSave(t, c); res.json({ ok: true, flag: c.flag }); });
 
 // ルール蒸留トーストの「取り消す」用。学習直後のルールを1件削除する。
@@ -2538,7 +2553,7 @@ app.get("/api/learning-data", guard, (req, res) => {
   }));
   res.json({ ok: true, rules: rulesList(t).map(r => ({ id: r.id, title: r.title || "", content: r.content || "", updated: Number(r.updated || 0) })), prefs, examples, conflicts: learningConflicts(t, true), performance: learningPerformanceSummary(t) });
 });
-app.post("/api/rule-save", guard, async (req, res) => {
+app.post("/api/rule-save", guard, oneMutationAtATime("learning"), async (req, res) => {
   const t = req.tenant; const title = String(req.body.title || "").trim().slice(0, 100); const content = String(req.body.content || "").trim().slice(0, 2000);
   if (!title || !content) return res.status(400).json({ ok: false, error: "required" });
   try {
@@ -2548,11 +2563,11 @@ app.post("/api/rule-save", guard, async (req, res) => {
     res.json({ ok: true, rule });
   } catch (e) { res.status(500).json({ ok: false, error: "save" }); }
 });
-app.post("/api/rule-delete", guard, async (req, res) => {
+app.post("/api/rule-delete", guard, oneMutationAtATime("learning"), async (req, res) => {
   try { const ok = await ruleDelete(req.tenant, Number(req.body.id)); res.status(ok ? 200 : 404).json({ ok, error: ok ? undefined : "not_found" }); }
   catch (e) { res.status(500).json({ ok: false, error: "delete" }); }
 });
-app.post("/api/example-update", guard, async (req, res) => {
+app.post("/api/example-update", guard, oneMutationAtATime("learning"), async (req, res) => {
   const t = req.tenant; const id = Number(req.body.id); const ex = t.examples && t.examples[id];
   if (!ex) return res.status(404).json({ ok: false, error: "not_found" });
   const q = String(req.body.q || "").trim().slice(0, 600); const final = String(req.body.final || "").trim().slice(0, 1500); const instr = String(req.body.instr || "").trim().slice(0, 800);
@@ -2563,8 +2578,8 @@ app.post("/api/example-update", guard, async (req, res) => {
   catch (e) { return res.status(500).json({ ok: false, error: "save" }); }
   res.json({ ok: true, example: ex });
 });
-app.post("/api/example-delete", guard, async (req, res) => { const t = req.tenant; try { await exampleDelete(t, req.body.id); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false, error: "delete" }); } });
-app.post("/api/learning-conflict-resolve", guard, async (req, res) => {
+app.post("/api/example-delete", guard, oneMutationAtATime("learning"), async (req, res) => { const t = req.tenant; try { await exampleDelete(t, req.body.id); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false, error: "delete" }); } });
+app.post("/api/learning-conflict-resolve", guard, oneMutationAtATime("learning"), async (req, res) => {
   const t = req.tenant, id = String(req.body.id || ""), mode = String(req.body.mode || "");
   const item = learningConflicts(t, true).find(conflict => conflict.id === id);
   if (!item) return res.status(404).json({ ok: false, error: "not_found" });
@@ -2583,8 +2598,8 @@ app.post("/api/learning-conflict-resolve", guard, async (req, res) => {
     res.json({ ok: true, pending: learningConflicts(t, true).length });
   } catch (e) { res.status(500).json({ ok: false, error: "save" }); }
 });
-app.post("/api/pref-add", guard, (req, res) => { const t = req.tenant; const text = String(req.body.text || "").trim().slice(0, 200); if (!text) return res.json({ ok: false }); const cur = (Array.isArray(S(t).prefs)) ? S(t).prefs : (S(t).prefs = []); if (!cur.some(p => (typeof p === "string" ? p : p.text) === text)) { cur.push({ id: Date.now(), text }); while (cur.length > 40) cur.shift(); saveTenantConfig(t).catch(() => {}); } res.json({ ok: true, prefs: S(t).prefs }); });
-app.post("/api/pref-update", guard, async (req, res) => {
+app.post("/api/pref-add", guard, oneMutationAtATime("learning"), (req, res) => { const t = req.tenant; const text = String(req.body.text || "").trim().slice(0, 200); if (!text) return res.json({ ok: false }); const cur = (Array.isArray(S(t).prefs)) ? S(t).prefs : (S(t).prefs = []); if (!cur.some(p => (typeof p === "string" ? p : p.text) === text)) { cur.push({ id: Date.now(), text }); while (cur.length > 40) cur.shift(); saveTenantConfig(t).catch(() => {}); } res.json({ ok: true, prefs: S(t).prefs }); });
+app.post("/api/pref-update", guard, oneMutationAtATime("learning"), async (req, res) => {
   const t = req.tenant; const key = String(req.body.key || ""); const text = String(req.body.text || "").trim().slice(0, 200); const cur = Array.isArray(S(t).prefs) ? S(t).prefs : [];
   if (!text) return res.status(400).json({ ok: false, error: "required" });
   let i = key.startsWith("legacy:") ? Number(key.slice(7)) : cur.findIndex(p => p && typeof p === "object" && String(p.id) === key);
@@ -2593,7 +2608,7 @@ app.post("/api/pref-update", guard, async (req, res) => {
   try { await saveTenantConfig(t); } catch (e) { return res.status(500).json({ ok: false, error: "save" }); }
   res.json({ ok: true, prefs: S(t).prefs });
 });
-app.post("/api/pref-delete", guard, async (req, res) => {
+app.post("/api/pref-delete", guard, oneMutationAtATime("learning"), async (req, res) => {
   const t = req.tenant; const key = String(req.body.key != null ? req.body.key : req.body.id); const cur = Array.isArray(S(t).prefs) ? S(t).prefs : [];
   const i = key.startsWith("legacy:") ? Number(key.slice(7)) : cur.findIndex(p => p && typeof p === "object" && String(p.id) === key);
   if (Number.isInteger(i) && i >= 0 && i < cur.length) cur.splice(i, 1); S(t).prefs = cur;
@@ -2666,7 +2681,7 @@ app.get("/api/customer-unanswered", guard, async (req, res) => {
   if (!r.ok || !r.json) return res.json({ ok: false });
   res.json(r.json);
 });
-app.post("/api/customer-karte", guard, async (req, res) => {
+app.post("/api/customer-karte", guard, oneMutationAtATime("customer-karte", req => req.body.recordId || req.body.patientId || req.body.id), async (req, res) => {
   const t = req.tenant; const c = t.store[req.body.id];
   if (!c) return res.json({ ok: false, error: "no" });
   const action = req.body.action;
@@ -2677,7 +2692,7 @@ app.post("/api/customer-karte", guard, async (req, res) => {
   if (!r.json) return res.json({ ok: false });
   res.json(r.json);
 });
-app.post("/api/customer-appt-cancel", guard, async (req, res) => {
+app.post("/api/customer-appt-cancel", guard, oneMutationAtATime("appointment-cancel", req => req.body.appointmentId), async (req, res) => {
   const t = req.tenant; const c = t.store[req.body.id];
   if (!c) return res.json({ ok: false, error: "no" });
   const r = await partnerPost("/appointment-cancel", { slug: t.slug, appointmentId: req.body.appointmentId, reason: req.body.reason });
@@ -3184,12 +3199,12 @@ async function deleteLineRichMenu(account, id) {
   await fetch("https://api.line.me/v2/bot/richmenu/" + encodeURIComponent(String(id)), { method: "DELETE", headers: { "Authorization": "Bearer " + account.token } }).catch(() => {});
 }
 app.get("/api/rich-menu", guard, (req, res) => res.json(richMenuPublic(req.tenant)));
-app.post("/api/rich-menu/save", guard, async (req, res) => {
+app.post("/api/rich-menu/save", guard, oneMutationAtATime("rich-menu"), async (req, res) => {
   const t = req.tenant, saved = await saveRichMenuDraft(t, req.body);
   if (!saved.ok) return res.status(saved.status).json({ ok: false, error: saved.error });
   res.json(Object.assign({ ok: true }, richMenuPublic(t)));
 });
-app.post("/api/rich-menu/publish", guard, async (req, res) => {
+app.post("/api/rich-menu/publish", guard, oneMutationAtATime("rich-menu"), async (req, res) => {
   const t = req.tenant, saved = await saveRichMenuDraft(t, req.body);
   if (!saved.ok) return res.status(saved.status).json({ ok: false, error: saved.error });
   const draft = saved.draft, file = saved.file, account = richMenuAccount(t, draft.accountKey);
@@ -3212,7 +3227,7 @@ app.post("/api/rich-menu/publish", guard, async (req, res) => {
     return res.status(502).json({ ok: false, error: String(e.message || "line_publish").slice(0, 80) });
   }
 });
-app.post("/api/rich-menu/unpublish", guard, async (req, res) => {
+app.post("/api/rich-menu/unpublish", guard, oneMutationAtATime("rich-menu"), async (req, res) => {
   const t = req.tenant, published = t.config.richMenuPublished;
   if (!published || !published.richMenuId) return res.json(Object.assign({ ok: true }, richMenuPublic(t)));
   const account = richMenuAccount(t, published.accountKey);
@@ -3226,7 +3241,7 @@ app.post("/api/rich-menu/unpublish", guard, async (req, res) => {
     res.json(Object.assign({ ok: true }, richMenuPublic(t)));
   } catch (e) { res.status(502).json({ ok: false, error: "line_unreachable" }); }
 });
-app.post("/api/rich-menu/schedule", guard, async (req, res) => {
+app.post("/api/rich-menu/schedule", guard, oneMutationAtATime("rich-menu"), async (req, res) => {
   const t = req.tenant, saved = await saveRichMenuDraft(t, req.body);
   if (!saved.ok) return res.status(saved.status).json({ ok: false, error: saved.error });
   if (!req.body.startAt && !req.body.endAt) return res.status(400).json({ ok: false, error: "period_required" });
@@ -3262,7 +3277,7 @@ app.post("/api/rich-menu/schedule", guard, async (req, res) => {
     res.status(502).json({ ok: false, error: String(e.message || "schedule_save").slice(0, 80) });
   }
 });
-app.post("/api/rich-menu/schedule-cancel", guard, async (req, res) => {
+app.post("/api/rich-menu/schedule-cancel", guard, oneMutationAtATime("rich-menu"), async (req, res) => {
   const t = req.tenant, id = String(req.body.id || ""), schedules = Array.isArray(t.config.richMenuSchedules) ? t.config.richMenuSchedules : [];
   const item = schedules.find(s => s && s.id === id && ["scheduled", "active"].includes(s.status));
   if (!item) return res.status(404).json({ ok: false, error: "schedule_not_found" });
@@ -3398,7 +3413,7 @@ app.post("/api/alert-done", guard, async (req, res) => {
   if (pool) { try { await pool.query("UPDATE alerts SET done=true WHERE id=$1 AND tenant=$2", [a.id, t.slug]); } catch (e) {} }
   res.json({ ok: true });
 });
-app.post("/api/share", guard, async (req, res) => {
+app.post("/api/share", guard, oneMutationAtATime("clinic-share", req => req.body.id), async (req, res) => {
   const t = req.tenant;
   const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" });
   const note = String(req.body.note || "").slice(0, 300);
@@ -4107,12 +4122,12 @@ const LOGIN_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><
 <div style="font-size:13px;color:#6b7280;margin-bottom:18px;">ログイン</div>
 <input id="lid" placeholder="ログインID" autocapitalize="off" autofocus style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;">
 <input id="p" type="password" placeholder="パスワード" style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;" onkeydown="if(event.key==='Enter'&&!event.isComposing&&event.keyCode!==229)go()">
-<button onclick="go()" style="width:100%;padding:11px;border:none;border-radius:8px;background:#06c755;color:#fff;font-size:15px;font-weight:600;cursor:pointer;">ログイン</button>
+<button id="sb" onclick="go()" style="width:100%;padding:11px;border:none;border-radius:8px;background:#06c755;color:#fff;font-size:15px;font-weight:600;cursor:pointer;">ログイン</button>
 <div id="e" style="color:#dc2626;font-size:12px;margin-top:8px;min-height:14px;"></div>
 <div style="text-align:center;margin-top:6px;font-size:11px;color:#9ca3af;">ご利用開始をご希望の方は運営までお問い合わせください</div>
 <div style="text-align:center;margin-top:10px;font-size:12px;"><a href="/forgot" style="color:#06c755;text-decoration:none;">パスワードを忘れた方</a></div>
 <div style="text-align:center;margin-top:6px;font-size:11px;color:#9ca3af;">ログインIDが不明な場合は運営にお問い合わせください</div></div>
-<script>async function go(){const loginId=document.getElementById("lid").value.trim();const password=document.getElementById("p").value;if(!loginId){document.getElementById("e").textContent="ログインIDを入力してください";return;}const r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({loginId,password})});if(r.ok){location.reload();}else{document.getElementById("e").textContent="ログインIDかパスワードが違います";document.getElementById("p").value="";}}</script>
+<script>var busy=false;async function go(){if(busy)return;const loginId=document.getElementById("lid").value.trim();const password=document.getElementById("p").value,b=document.getElementById("sb");if(!loginId){document.getElementById("e").textContent="ログインIDを入力してください";return;}busy=true;b.disabled=true;b.textContent="◌ ログイン中…";try{const r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({loginId,password})});if(r.ok){location.reload();return;}document.getElementById("e").textContent="ログインIDかパスワードが違います";document.getElementById("p").value="";}catch(e){document.getElementById("e").textContent="通信に失敗しました";}finally{busy=false;b.disabled=false;b.textContent="ログイン";}}</script>
 </body></html>`;
 
 const FORGOT_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>パスワード再設定</title></head>
@@ -4125,7 +4140,7 @@ const FORGOT_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
 <button onclick="send()" id="sb" style="width:100%;padding:11px;border:none;border-radius:8px;background:#06c755;color:#fff;font-size:15px;font-weight:600;cursor:pointer;">再設定リンクを送る</button>
 <div id="msg" style="font-size:12px;margin-top:10px;min-height:14px;color:#374151;"></div>
 <div style="text-align:center;margin-top:12px;font-size:12px;"><a href="/" style="color:#06c755;text-decoration:none;">ログインに戻る</a></div></div>
-<script>async function send(){const loginId=document.getElementById("lid").value.trim(),email=document.getElementById("em").value.trim(),b=document.getElementById("sb"),m=document.getElementById("msg");if(!loginId||!email){m.textContent="ログインIDと登録メールアドレスを入力してください";return;}b.disabled=true;try{await fetch("/api/forgot",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({loginId,email})});}catch(e){}m.textContent="入力内容が登録情報と一致する場合、再設定リンクをお送りしました。届かない場合は迷惑メールをご確認のうえ、運営にお問い合わせください。";b.disabled=false;}</script>
+<script>var busy=false;async function send(){if(busy)return;const loginId=document.getElementById("lid").value.trim(),email=document.getElementById("em").value.trim(),b=document.getElementById("sb"),m=document.getElementById("msg");if(!loginId||!email){m.textContent="ログインIDと登録メールアドレスを入力してください";return;}busy=true;b.disabled=true;b.textContent="◌ 送信中…";try{await fetch("/api/forgot",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({loginId,email})});}catch(e){}m.textContent="入力内容が登録情報と一致する場合、再設定リンクをお送りしました。届かない場合は迷惑メールをご確認のうえ、運営にお問い合わせください。";busy=false;b.disabled=false;b.textContent="再設定リンクを送る";}</script>
 </body></html>`;
 
 const RESET_INVALID_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>パスワード再設定</title></head>
@@ -4143,7 +4158,7 @@ function RESET_PAGE(tok){ return `<!DOCTYPE html><html lang="ja"><head><meta cha
 <input id="p2" type="password" placeholder="もう一度入力" style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;" onkeydown="if(event.key==='Enter'&&!event.isComposing&&event.keyCode!==229)go()">
 <button onclick="go()" id="sb" style="width:100%;padding:11px;border:none;border-radius:8px;background:#06c755;color:#fff;font-size:15px;font-weight:600;cursor:pointer;">設定する</button>
 <div id="e" style="color:#dc2626;font-size:12px;margin-top:8px;min-height:14px;"></div></div>
-<script>var TOK=${JSON.stringify(tok)};async function go(){var p1=document.getElementById("p1").value,p2=document.getElementById("p2").value,e=document.getElementById("e");if(p1.length<8){e.textContent="8文字以上で入力してください";return;}if(p1!==p2){e.textContent="パスワードが一致しません";return;}var b=document.getElementById("sb");b.disabled=true;try{var r=await fetch("/api/reset",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:TOK,password:p1})});var j=await r.json();if(j.ok){document.body.innerHTML='<div style=\\'font-family:sans-serif;text-align:center;margin-top:25vh;color:#374151;\\'>パスワードを変更しました。<br><br><a href=\\'/\\' style=\\'color:#06c755;\\'>ログインへ</a></div>';}else{e.textContent=(j.error==='too_short'?'8文字以上で入力してください':(j.error==='expired'?'リンクの有効期限が切れています':'設定に失敗しました'));b.disabled=false;}}catch(err){e.textContent="設定に失敗しました";b.disabled=false;}}</script>
+<script>var TOK=${JSON.stringify(tok)},busy=false;async function go(){if(busy)return;var p1=document.getElementById("p1").value,p2=document.getElementById("p2").value,e=document.getElementById("e");if(p1.length<8){e.textContent="8文字以上で入力してください";return;}if(p1!==p2){e.textContent="パスワードが一致しません";return;}var b=document.getElementById("sb");busy=true;b.disabled=true;b.textContent="◌ 設定中…";try{var r=await fetch("/api/reset",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:TOK,password:p1})});var j=await r.json();if(j.ok){document.body.innerHTML='<div style=\\'font-family:sans-serif;text-align:center;margin-top:25vh;color:#374151;\\'>パスワードを変更しました。<br><br><a href=\\'/\\' style=\\'color:#06c755;\\'>ログインへ</a></div>';return;}e.textContent=(j.error==='too_short'?'8文字以上で入力してください':(j.error==='expired'?'リンクの有効期限が切れています':'設定に失敗しました'));}catch(err){e.textContent="設定に失敗しました";}finally{busy=false;b.disabled=false;b.textContent="設定する";}}</script>
 </body></html>`; }
 
 const SIGNUP_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>新規お申し込み</title></head>
@@ -4157,10 +4172,10 @@ const SIGNUP_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
 <input id="lid" autocapitalize="off" placeholder="例：hbclinic" style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;">
 <label style="font-size:12px;color:#374151;display:block;margin:0 0 3px;">ログインパスワード（8文字以上）</label>
 <input id="p" type="password" style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;" onkeydown="if(event.key==='Enter'&&!event.isComposing&&event.keyCode!==229)go()">
-<button onclick="go()" style="width:100%;padding:11px;border:none;border-radius:8px;background:#06c755;color:#fff;font-size:15px;font-weight:600;cursor:pointer;">アカウントを作成</button>
+<button id="sb" onclick="go()" style="width:100%;padding:11px;border:none;border-radius:8px;background:#06c755;color:#fff;font-size:15px;font-weight:600;cursor:pointer;">アカウントを作成</button>
 <div id="e" style="color:#dc2626;font-size:12px;margin-top:8px;min-height:14px;"></div>
 <div style="text-align:center;margin-top:6px;"><a href="/" style="font-size:12px;color:#6b7280;">既にアカウントをお持ちの方はこちら</a></div></div>
-<script>async function go(){const company=document.getElementById("company").value.trim();const loginId=document.getElementById("lid").value.trim();const password=document.getElementById("p").value;const e=document.getElementById("e");if(!company){e.textContent="会社名を入力してください";return;}if(!/^[a-zA-Z0-9_-]{3,30}$/.test(loginId)){e.textContent="ログインIDは半角英数字3〜30文字にしてください";return;}if(password.length<8){e.textContent="パスワードは8文字以上にしてください";return;}const r=await fetch("/api/signup",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({company,loginId,password})});let j={};try{j=await r.json();}catch(err){}if(j.ok){location.href="/";}else{e.textContent=j.error==="too_short"?"パスワードは8文字以上にしてください":j.error==="id_taken"?"このログインIDは既に使われています":j.error==="bad_id"?"ログインIDは半角英数字3〜30文字にしてください":"作成に失敗しました";}}</script>
+<script>var busy=false;async function go(){if(busy)return;const company=document.getElementById("company").value.trim();const loginId=document.getElementById("lid").value.trim();const password=document.getElementById("p").value;const e=document.getElementById("e"),b=document.getElementById("sb");if(!company){e.textContent="会社名を入力してください";return;}if(!/^[a-zA-Z0-9_-]{3,30}$/.test(loginId)){e.textContent="ログインIDは半角英数字3〜30文字にしてください";return;}if(password.length<8){e.textContent="パスワードは8文字以上にしてください";return;}busy=true;b.disabled=true;b.textContent="◌ 作成中…";try{const r=await fetch("/api/signup",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({company,loginId,password})});let j={};try{j=await r.json();}catch(err){}if(j.ok){location.href="/";return;}e.textContent=j.error==="too_short"?"パスワードは8文字以上にしてください":j.error==="id_taken"?"このログインIDは既に使われています":j.error==="bad_id"?"ログインIDは半角英数字3〜30文字にしてください":"作成に失敗しました";}catch(err){e.textContent="通信に失敗しました";}finally{busy=false;b.disabled=false;b.textContent="アカウントを作成";}}</script>
 </body></html>`;
 
 const BOARD_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>現場ボード</title>
@@ -4191,8 +4206,8 @@ h1{font-size:18px;margin:0;}
 function tick(){var d=new Date();document.getElementById("clock").textContent=d.toLocaleDateString("ja-JP",{month:"numeric",day:"numeric",weekday:"short"})+" "+String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");}
 tick();setInterval(tick,15000);
 function esc(s){return (s||"").replace(/[<>&]/g,function(c){return {"<":"&lt;",">":"&gt;","&":"&amp;"}[c];});}
-async function loadB(){try{var r=await fetch("/api/alerts");var arr=await r.json();var el=document.getElementById("cards");el.innerHTML=arr.map(function(a){var t=new Date(a.ts);var hm=String(t.getHours()).padStart(2,"0")+":"+String(t.getMinutes()).padStart(2,"0");return '<div class="card t'+esc(a.type)+'"><span class="chip">'+esc(a.type)+'</span><div class="sum">'+esc(a.summary)+'</div><div class="meta"><span>'+esc(a.name||"")+'　'+hm+'</span><button class="okbtn" onclick="doneA('+a.id+')">対応した</button></div></div>';}).join("");document.getElementById("empty").style.display=arr.length?"none":"block";}catch(e){}}
-async function doneA(id){await fetch("/api/alert-done",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:id})});loadB();}
+async function loadB(){try{var r=await fetch("/api/alerts");var arr=await r.json();var el=document.getElementById("cards");el.innerHTML=arr.map(function(a){var t=new Date(a.ts);var hm=String(t.getHours()).padStart(2,"0")+":"+String(t.getMinutes()).padStart(2,"0");return '<div class="card t'+esc(a.type)+'"><span class="chip">'+esc(a.type)+'</span><div class="sum">'+esc(a.summary)+'</div><div class="meta"><span>'+esc(a.name||"")+'　'+hm+'</span><button class="okbtn" onclick="doneA('+a.id+',this)">対応した</button></div></div>';}).join("");document.getElementById("empty").style.display=arr.length?"none":"block";}catch(e){}}
+var doneBusy={};async function doneA(id,b){if(doneBusy[id])return;doneBusy[id]=true;var old=b&&b.textContent;if(b){b.disabled=true;b.textContent="処理中…";}try{await fetch("/api/alert-done",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:id})});await loadB();}finally{delete doneBusy[id];if(b&&b.isConnected){b.disabled=false;b.textContent=old;}}}
 loadB();setInterval(loadB,8000);
 </script></body></html>`;
 
@@ -4483,7 +4498,7 @@ const PAGE = `<!DOCTYPE html>
     <div id="tools">
       <button class="tbtn migi" onclick="openAsst(null)">🤝 みぎうで君</button>
       <button class="tbtn" onclick="window.open('/board','_blank')">🏥 現場ボード</button>
-      <button class="tbtn" id="bellBtn" onclick="enablePush()">🔔 通知</button>
+      <button class="tbtn" id="bellBtn" onclick="busyEnablePush()">🔔 通知</button>
       <button class="tbtn" onclick="openSet()">⚙ 設定<span id="newModelDot" style="display:none;margin-left:3px;">🆕</span></button>
     </div>
     <input id="search" placeholder="検索" oninput="renderList()">
@@ -4500,7 +4515,7 @@ const PAGE = `<!DOCTYPE html>
     <button class="cbtn" onclick="dChip('もっと丁寧で温かい言い方にして')">丁寧に</button>
     <button class="cbtn" onclick="dChip('もっと柔らかい印象にして')">柔らかく</button>
   </div>
-  <div style="display:flex;gap:8px;padding:10px;border-top:1px solid var(--line);align-items:flex-end;"><textarea id="dText" placeholder="どう変えたいか入力…（例：予約確定メールに記載の院に来てと案内して）" onkeydown="if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing&&event.keyCode!==229){event.preventDefault();dSend();}"></textarea><button class="cbtn send" onclick="dSend()">送信</button></div>
+  <div style="display:flex;gap:8px;padding:10px;border-top:1px solid var(--line);align-items:flex-end;"><textarea id="dText" placeholder="どう変えたいか入力…（例：予約確定メールに記載の院に来てと案内して）" onkeydown="if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing&&event.keyCode!==229){event.preventDefault();dSend();}"></textarea><button id="dSendBtn" class="cbtn send" onclick="dSend()">送信</button></div>
 </div></div>
 <div id="setPop"><div class="settingsCard">
   <div class="settingsHeader"><h3>⚙ 設定</h3><button type="button" class="cbtn" onclick="closeSet()">閉じる</button></div>
@@ -4510,7 +4525,7 @@ const PAGE = `<!DOCTYPE html>
     <div id="accountLoginId" style="font-size:11px;color:#6b7280;margin-bottom:5px;">ログインID: 読み込み中…</div>
     <input type="email" id="setAccountEmail" autocomplete="email" placeholder="パスワード再設定用メールアドレス" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;">
     <div id="accountEmailStat" style="font-size:11px;color:#6b7280;margin-top:4px;">パスワード再設定メールの送信先です</div>
-    <button type="button" class="cbtn" style="margin-top:7px;" onclick="saveAccount()">アカウント情報を保存</button>
+    <button type="button" id="saveAccountBtn" class="cbtn" style="margin-top:7px;" onclick="saveAccount()">アカウント情報を保存</button>
   </div>
   <div class="settingsSection">
   <div class="settingsSectionTitle">🤖 自動対応</div>
@@ -4538,7 +4553,7 @@ const PAGE = `<!DOCTYPE html>
       <a href="https://developers.line.biz/console/" target="_blank" rel="noopener" style="display:inline-block;margin-top:6px;font-size:11px;color:#047857;">LINE Developersを開く ↗</a>
       <input type="password" id="setStaffLineToken" autocomplete="new-password" placeholder="チャネルアクセストークン（空欄なら現在の設定を保持）" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #a7f3d0;border-radius:8px;font-size:12px;margin-top:8px;">
       <input type="password" id="setStaffLineSecret" autocomplete="new-password" placeholder="チャネルシークレット（空欄なら現在の設定を保持）" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #a7f3d0;border-radius:8px;font-size:12px;margin-top:6px;">
-      <button type="button" class="cbtn send" onclick="saveStaffLineConfig()" style="margin-top:7px;">保存して接続確認</button>
+      <button type="button" id="staffLineSaveBtn" class="cbtn send" onclick="saveStaffLineConfig()" style="margin-top:7px;">保存して接続確認</button>
       <div id="staffLineBasicIdBox" style="display:none;margin-top:10px;padding:9px;border:1px solid #a7f3d0;border-radius:9px;background:#f0fdf4;">
         <div style="font-size:11px;font-weight:700;color:#166534;">LINEで友だち追加するときの検索ID</div>
         <div style="display:flex;gap:5px;margin-top:5px;"><input id="staffLineBasicId" readonly style="min-width:0;flex:1;padding:7px;border:1px solid #86efac;border-radius:8px;background:#fff;font-size:13px;font-weight:700;"><button type="button" class="cbtn" onclick="copyStaffLineBasicId()">コピー</button></div>
@@ -4621,13 +4636,13 @@ const PAGE = `<!DOCTYPE html>
       <input id="cImapPass" type="password" placeholder="受信パスワード（変更時のみ入力）" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;margin-bottom:6px;">
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;padding:4px 0;cursor:pointer;"><input type="checkbox" id="cEmailInternal" style="width:16px;height:16px;"> メール受信をこのアプリで直接監視する</label>
       <div style="font-size:11px;color:#6b7280;margin-bottom:8px;">⚠️ オンにする前に、Make等の旧メール監視を必ず停止してください（二重取り込み防止）</div>
-      <button class="cbtn" style="width:100%;" onclick="saveConn()">連携設定を保存</button>
+      <button id="saveConnBtn" class="cbtn" style="width:100%;" onclick="saveConn()">連携設定を保存</button>
       <div style="border-top:1px dashed #e5e7eb;margin-top:10px;padding-top:8px;">
         <div style="font-size:12px;font-weight:600;margin-bottom:4px;">➕ 追加アカウント（複数のLINE・メールを集約）</div>
         <div id="acctList" style="font-size:12px;color:#374151;"></div>
         <div style="display:flex;gap:6px;margin-top:6px;">
-          <button class="cbtn" onclick="addLineAcct()">＋LINE追加</button>
-          <button class="cbtn" onclick="addMailAcct()">＋メール追加</button>
+          <button id="addLineAcctBtn" class="cbtn" onclick="addLineAcct()">＋LINE追加</button>
+          <button id="addMailAcctBtn" class="cbtn" onclick="addMailAcct()">＋メール追加</button>
         </div>
         <div style="font-size:11px;color:#6b7280;margin-top:4px;">届いたアカウント宛に返信も自動で振り分けられます。LINE追加後は、そのチャネルのWebhook URLにこのアプリと同じURLを設定してください。</div>
       </div>
@@ -4635,16 +4650,16 @@ const PAGE = `<!DOCTYPE html>
   </div>
   <div class="settingsSection">
     <div style="font-size:13px;margin-bottom:6px;">✅ 一括操作</div>
-    <button class="cbtn" style="width:100%;" onclick="markAllDone()">すべてのチャットを対応済みにする</button>
+    <button id="markAllDoneBtn" class="cbtn" style="width:100%;" onclick="markAllDone()">すべてのチャットを対応済みにする</button>
     <div style="font-size:11px;color:#6b7280;margin-top:4px;">未対応・要対応をまとめて「対応済み」にします。元に戻すときは各チャットを個別に開いて操作してください。</div>
   </div>
   <div class="settingsSection">
     <div class="settingsSectionTitle">🔐 アカウント操作</div>
     <div class="settingsActions">
-    <button class="cbtn" style="width:100%;" onclick="changeLoginId()">🪪 ログインIDを変更</button>
-    <button class="cbtn" style="width:100%;" onclick="changePass()">🔑 ログインパスワードを変更</button>
+    <button id="changeLoginIdBtn" class="cbtn" style="width:100%;" onclick="changeLoginId()">🪪 ログインIDを変更</button>
+    <button id="changePassBtn" class="cbtn" style="width:100%;" onclick="changePass()">🔑 ログインパスワードを変更</button>
     <button class="cbtn" style="width:100%;" onclick="location.href='/api/backup'">💾 バックアップをダウンロード（会話・ルール・学習・設定）</button>
-    <button class="cbtn" style="width:100%;" onclick="doLogout()">↩ ログアウト</button>
+    <button id="logoutBtn" class="cbtn" style="width:100%;" onclick="doLogout()">↩ ログアウト</button>
     </div>
   </div>
   </div></div></div>
@@ -4653,8 +4668,8 @@ const PAGE = `<!DOCTYPE html>
 <div id="richMenuPop"><div class="rmCard">
   <div class="rmHeader"><div><h3>▦ 患者向けLINEリッチメニュー</h3><div style="font-size:11px;color:#64748b;margin-top:2px;">画像上をドラッグして、Aボタン・Bボタンなどのタップ範囲を作成します</div></div><button type="button" class="cbtn" onclick="closeRichMenu()">閉じる</button></div>
   <div class="rmToolbar">
-    <button type="button" class="cbtn" onclick="chooseRichMenuImage()">画像をアップロード</button>
-    <input id="rmImageInput" type="file" accept="image/jpeg,image/png" style="display:none;" onchange="loadRichMenuImage(this)">
+    <button type="button" id="rmImageBtn" class="cbtn" onclick="chooseRichMenuImage()">画像をアップロード</button>
+    <input id="rmImageInput" type="file" accept="image/jpeg,image/png" style="display:none;" onchange="busyLoadRichMenuImage(this)">
     <select id="rmSize" onchange="changeRichMenuSize()"><option value="large">大（2500×1686）</option><option value="small">小（2500×843）</option></select>
     <input id="rmName" maxlength="120" placeholder="メニュー名（管理用）" value="患者向けメニュー">
     <input id="rmChatBar" maxlength="14" placeholder="開閉バーの文字" value="メニュー">
@@ -4674,12 +4689,12 @@ const PAGE = `<!DOCTYPE html>
         <b style="font-size:13px;">表示期間</b>
         <div style="font-size:10.5px;color:#64748b;line-height:1.5;margin-top:3px;">開始を空欄にすると今すぐ開始、終了を空欄にすると無期限です。終了後は元の通常メニューへ戻ります。反映にはLINE側で最大1分ほどかかる場合があります。</div>
         <div class="rmScheduleGrid"><label>公開開始<input id="rmStartAt" type="datetime-local"></label><label>公開終了<input id="rmEndAt" type="datetime-local"></label></div>
-        <button type="button" class="cbtn send" style="width:100%;margin-top:7px;" onclick="scheduleRichMenu()">この期間で公開予約</button>
+        <button type="button" id="rmScheduleBtn" class="cbtn send" style="width:100%;margin-top:7px;" onclick="busyScheduleRichMenu()">この期間で公開予約</button>
         <div id="rmScheduleList"></div>
       </div>
     </div>
   </div>
-  <div class="rmFooter"><span id="rmStatus">読み込み前</span><div style="display:flex;gap:7px;flex-wrap:wrap;"><button type="button" id="rmUnpublishBtn" class="cbtn" style="display:none;color:#b91c1c;" onclick="unpublishRichMenu()">公開停止</button><button type="button" class="cbtn" onclick="saveRichMenu(false)">下書き保存</button><button type="button" class="cbtn send" onclick="saveRichMenu(true)">LINEへ公開</button></div></div>
+  <div class="rmFooter"><span id="rmStatus">読み込み前</span><div style="display:flex;gap:7px;flex-wrap:wrap;"><button type="button" id="rmUnpublishBtn" class="cbtn" style="display:none;color:#b91c1c;" onclick="busyUnpublishRichMenu()">公開停止</button><button type="button" id="rmSaveBtn" class="cbtn" onclick="busySaveRichMenu(false)">下書き保存</button><button type="button" id="rmPublishBtn" class="cbtn send" onclick="busySaveRichMenu(true)">LINEへ公開</button></div></div>
 </div></div>
 <div id="learnManagePop"><div class="learningCard">
   <div class="learningHeader">
@@ -4701,7 +4716,7 @@ const PAGE = `<!DOCTYPE html>
 <div id="asst"><div id="asstCard">
   <div id="asstHead"><span>🤝 みぎうで君（ルールブック編集）</span><button class="cbtn" onclick="closeAsst()">閉じる</button></div>
   <div id="asstMsgs"></div>
-  <div id="asstIn"><button class="cbtn" onclick="asstAttach()" title="価格表などの資料（画像・PDF・CSV）を読み込ませて一括学習">📎</button><textarea id="asstText" placeholder="例：発送質問には3営業日以内と答えて／今の料金ルールは？" onkeydown="if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing&&event.keyCode!==229){event.preventDefault();asstSend();}"></textarea><button class="cbtn send" onclick="asstSend()">送信</button></div>
+  <div id="asstIn"><button id="asstAttachBtn" class="cbtn" onclick="asstAttach()" title="価格表などの資料（画像・PDF・CSV）を読み込ませて一括学習">📎</button><textarea id="asstText" placeholder="例：発送質問には3営業日以内と答えて／今の料金ルールは？" onkeydown="if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing&&event.keyCode!==229){event.preventDefault();busyAsstSend();}"></textarea><button id="asstSendBtn" class="cbtn send" onclick="busyAsstSend()">送信</button></div>
 </div></div>
 <div id="learnToast" style="display:none;position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:75;background:#065f46;color:#fff;border-radius:10px;padding:8px 14px;font-size:12px;box-shadow:0 6px 20px rgba(0,0,0,.25);">✓ この対応を学習しました</div>
 <div id="conflictPop" style="position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:80;display:none;align-items:center;justify-content:center;"><div style="background:#fff;border-radius:14px;padding:18px;width:min(92vw,380px);max-height:86vh;overflow-y:auto;">
@@ -4712,9 +4727,9 @@ const PAGE = `<!DOCTYPE html>
   <div id="conflictNew" style="font-size:12px;background:#ede9fe;border-radius:8px;padding:8px;margin-bottom:12px;white-space:pre-wrap;"></div>
   <div style="font-size:12px;color:#374151;margin-bottom:10px;">今後はどちらを基準にしますか？</div>
   <div style="display:flex;flex-direction:column;gap:8px;">
-    <button class="cbtn send" style="width:100%;" onclick="resolveConflict('new')">今後は今回の回答を正解にする</button>
-    <button class="cbtn" style="width:100%;" onclick="resolveConflict('old')">今回は特例（前の回答を正解のまま残す）</button>
-    <button class="cbtn" style="width:100%;" onclick="resolveConflict('later')">どちらでもない・後で正しい回答を入力</button>
+    <button class="cbtn send" style="width:100%;" onclick="resolveConflict('new',this)">今後は今回の回答を正解にする</button>
+    <button class="cbtn" style="width:100%;" onclick="resolveConflict('old',this)">今回は特例（前の回答を正解のまま残す）</button>
+    <button class="cbtn" style="width:100%;" onclick="resolveConflict('later',this)">どちらでもない・後で正しい回答を入力</button>
   </div>
 </div></div>
 <script>
@@ -4723,6 +4738,15 @@ const roomsEl=document.getElementById("rooms"),chatEl=document.getElementById("c
 let initialConv="";try{initialConv=new URLSearchParams(location.search).get("conv")||"";}catch(e){}
 async function load(){ try{ const r=await fetch("/api/conversations"); DATA=await r.json(); }catch(e){} renderList(); if(initialConv&&!current){const target=DATA.find(x=>x.id===initialConv);if(target){const id=initialConv;initialConv="";openChat(id);try{history.replaceState(null,"",location.pathname);}catch(e){}}} if(current){ const c=DATA.find(x=>x.id===current); if(c) syncMsgs(c); } }
 function api(path,body){ return fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); }
+const uiBusyKeys=new Set();
+async function withBusy(key,btn,label,work){
+  if(uiBusyKeys.has(key))return;
+  uiBusyKeys.add(key);
+  const showLabel=!!(btn&&btn.tagName==="BUTTON"),old=showLabel?btn.innerHTML:"";
+  if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");if(showLabel)btn.innerHTML='<span class="spin" aria-hidden="true"></span>'+label;}
+  try{return await work();}
+  finally{uiBusyKeys.delete(key);if(btn&&btn.isConnected){btn.disabled=false;btn.removeAttribute("aria-busy");if(showLabel)btn.innerHTML=old;}}
+}
 /* ネイティブalert/confirm/promptの置き換え（ブラウザのイベントループを止めない自前モーダル。自動テスト・拡張機能対応） */
 function uiDlg(msg,kind,def){
  return new Promise(function(res){
@@ -4790,12 +4814,12 @@ function syncMsgs(c){const m=document.getElementById("msgs");if(!m)return;if(m.g
 function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)return; appEl.classList.add("chatopen");
   const bubbles=bubblesHtml(r);
   const staffReviewButton=r.staffLineReviewAvailable?'<button class="cbtn" id="staffReviewResend" onclick="resendStaffApproval()">'+(r.staffLineApproval?'📲 承認依頼を再送':'📲 スタッフLINEで確認')+'</button>':'';
-  chatEl.innerHTML='<div id="chatHead"><button id="backBtn" onclick="closeChat()">‹</button>'+av(r,30)+'<span id="chatName">'+esc(r.name)+'　<span style="font-size:11px;color:#6b7280;">'+(r.channel==="line"?"LINE":"メール")+((r.acct&&r.acct.name&&r.acct.name!=="メイン")?"・"+esc(r.acct.name):"")+'</span></span><button class="hbtn" onclick="shareClinic()">🏥 クリニックへ共有</button></div>'+
+  chatEl.innerHTML='<div id="chatHead"><button id="backBtn" onclick="closeChat()">‹</button>'+av(r,30)+'<span id="chatName">'+esc(r.name)+'　<span style="font-size:11px;color:#6b7280;">'+(r.channel==="line"?"LINE":"メール")+((r.acct&&r.acct.name&&r.acct.name!=="メイン")?"・"+esc(r.acct.name):"")+'</span></span><button id="shareClinicBtn" class="hbtn" onclick="shareClinic()">🏥 クリニックへ共有</button></div>'+
     '<div id="custTab" class="custTab" style="display:none;" onclick="cpExpand()">うけつけるん情報を表示 ⌄</div>'+
     '<div id="custPanel" class="custPanel">読み込み中…</div>'+
     '<div id="msgs">'+bubbles+'</div>'+
     '<div id="composer"><div id="aiLabel">✨ AI下書き（編集して送れます）</div><div id="learningUsed" style="display:'+(learningRefsText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:#6d28d9;margin:2px 0 5px;">'+esc(learningRefsText(r))+'</div><div id="groundingUsed" style="display:'+(groundingText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:'+(r.grounding&&r.grounding.autoSendAllowed&&r.validation&&r.validation.pass?'#047857':'#b45309')+';margin:2px 0 5px;">'+esc(groundingText(r))+'</div><div id="topicChips" style="display:none;"></div><div id="draftRow"><button id="attach" onclick="attach()" title="写真・動画を添付">📎</button><textarea id="draft" oninput="draftEdited()">'+esc(r.draft||"")+'</textarea></div>'+
-    '<div id="cbtns"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ AIで作り直す</button>'+staffReviewButton+'<button class="cbtn done" onclick="markDone()">対応済み</button><button class="cbtn send" onclick="sendMsg()">送信</button></div></div>';
+    '<div id="cbtns"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ AIで作り直す</button>'+staffReviewButton+'<button id="markDoneBtn" class="cbtn done" onclick="markDone()">対応済み</button><button class="cbtn send" onclick="sendMsg()">送信</button></div></div>';
   const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r); loadCustomer(id); if(!keep)renderList();
 }
 function closeChat(){appEl.classList.remove("chatopen");current=null;renderList();}
@@ -4809,13 +4833,14 @@ function cpCopy(btn,url){ copyText(url); if(btn){ var o=btn.textContent; btn.tex
 async function copyUnans(btn,apptId){
   if(!current||!apptId)return;
   var o=btn?btn.textContent:"";
-  if(btn) btn.textContent="取得中…";
+  if(btn&&btn.disabled)return;if(btn){btn.disabled=true;btn.textContent="取得中…";}
   try{
     var r=await fetch("/api/customer-unanswered?id="+encodeURIComponent(current)+"&apptId="+encodeURIComponent(apptId));
     var j=await r.json();
     if(j&&j.ok&&j.url){ copyText(j.url); if(btn){ btn.textContent="コピーしました"; setTimeout(function(){ try{btn.textContent=o;}catch(e){} },1500); } }
     else { if(btn) btn.textContent=o; uiAlert("URLを取得できませんでした"); }
   }catch(e){ if(btn) btn.textContent=o; uiAlert("URLを取得できませんでした"); }
+  finally{if(btn)btn.disabled=false;}
 }
 function cpGripHtml(){ return '<div data-cp="collapse" class="cpGrip"><span class="cpGripBar"></span><span class="cpMuted">▲ 隠す</span></div>'; }
 function renderCustomer(id,j){
@@ -5094,38 +5119,38 @@ function karteExpand(i){
   f.style.display=open?"none":"block";
   var p=document.getElementById("kePrev_"+i); if(p) p.style.display=open?"block":"none";
 }
-async function karteEditInline(recordId,i){
+async function karteEditInline(recordId,i,btn){
   if(!current||!recordId)return;
   var ta=document.getElementById("kEdit_"+i); if(!ta)return;
   var body=(ta.value||"").trim(); if(!body)return;
-  try{
+  await withBusy("karte-edit-"+recordId,btn,"保存中…",async()=>{try{
     var r=await api("/api/customer-karte",{id:current,action:"edit",recordId:recordId,body:body});
     var j=await r.json();
     if(j&&j.ok){ delete karteCache[current]; reloadKarte(); }
     else { uiAlert(j&&j.error==="not_editable"?"この記録は編集できません":"編集に失敗しました"); }
-  }catch(e){ uiAlert("編集に失敗しました"); }
+  }catch(e){ uiAlert("編集に失敗しました"); }});
 }
 function karteClick(e){
   var b=e.target&&e.target.closest?e.target.closest("[data-cp]"):null; if(!b)return;
   var act=b.getAttribute("data-cp"); var val=decodeURIComponent(b.getAttribute("data-val")||"");
   if(act==="karteclose") closeKarte();
-  else if(act==="karteadd") karteAdd();
+  else if(act==="karteadd") karteAdd(b);
   else if(act==="karteexpand") karteExpand(val);
-  else if(act==="karteeditinline") karteEditInline(val,b.getAttribute("data-i"));
+  else if(act==="karteeditinline") karteEditInline(val,b.getAttribute("data-i"),b);
   else if(act==="karteeditstart") karteEditStart(b.getAttribute("data-i"),val);
   else if(act==="karteeditcancel") karteEditCancel(b.getAttribute("data-i"),val);
   else if(act==="snipins") snipInsert(val,decodeURIComponent(b.getAttribute("data-tgt")||""),b);
 }
 function closeKarte(){ var ov=document.getElementById("karteOv"); if(ov) ov.style.display="none"; }
-async function karteAdd(){
+async function karteAdd(btn){
   var ta=document.getElementById("karteAddText"); if(!ta||!current)return;
   var body=(ta.value||"").trim(); if(!body)return;
-  try{
+  await withBusy("karte-add-"+current,btn,"保存中…",async()=>{try{
     var r=await api("/api/customer-karte",{id:current,action:"add",patientId:custPid,body:body});
     var j=await r.json();
     if(j&&j.ok){ delete karteCache[current]; reloadKarte(); } // 保存成功→キャッシュ無効化→再取得
     else { uiAlert("カルテの保存に失敗しました"); }
-  }catch(e){ uiAlert("カルテの保存に失敗しました"); }
+  }catch(e){ uiAlert("カルテの保存に失敗しました"); }});
 }
 async function karteEdit(recordId){
   if(!current||!recordId)return;
@@ -5139,16 +5164,16 @@ async function karteEdit(recordId){
     else { uiAlert(j&&j.error==="not_editable"?"この記録は編集できません":"編集に失敗しました"); }
   }catch(e){ uiAlert("編集に失敗しました"); }
 }
-async function doApptCancel(apptId){
+async function doApptCancel(apptId,btn){
   if(!current||!apptId)return;
   var reason=await uiPrompt("この予約をキャンセルします。理由（任意・患者に送る自動連絡に使われる場合があります）:","クリニック都合");
   if(reason===null)return;
-  try{
+  await withBusy("appt-cancel-"+apptId,btn,"取消中…",async()=>{try{
     var r=await api("/api/customer-appt-cancel",{id:current,appointmentId:apptId,reason:reason});
     var j=await r.json();
     if(j&&j.ok){ loadCustomer(current); }
     else { uiAlert(j&&j.error==="not_cancellable"?"この予約はキャンセルできません(期限切れ/過去/処理済み)":"キャンセルに失敗しました"); }
-  }catch(e){ uiAlert("キャンセルに失敗しました"); }
+  }catch(e){ uiAlert("キャンセルに失敗しました"); }});
 }
 function linkToggle(){ var b=document.getElementById("custLinkBox"); if(!b)return; b.style.display=(!b.style.display||b.style.display==="none")?"block":"none"; }
 function cpOpen(url){ try{ window.open(url,"_blank"); }catch(e){} }
@@ -5158,10 +5183,10 @@ function cpPanelClick(e){
   if(act==="copy") cpCopy(b,val);
   else if(act==="copyunans") copyUnans(b,val);
   else if(act==="open") cpOpen(val);
-  else if(act==="link") doLink(val);
-  else if(act==="cancel") doApptCancel(val);
+  else if(act==="link") doLink(val,b);
+  else if(act==="cancel") doApptCancel(val,b);
   else if(act==="karte") openKarte();
-  else if(act==="karteadd") karteAdd();
+  else if(act==="karteadd") karteAdd(b);
   else if(act==="karteedit") karteEdit(val);
   else if(act==="karteclose") closeKarte();
   else if(act==="collapse") cpCollapse();
@@ -5193,15 +5218,15 @@ async function custSearchGo(){
     }).join("");
   }catch(e){ box.innerHTML=""; }
 }
-async function doLink(pid){
+async function doLink(pid,btn){
   if(!current)return;
   if(!await uiConfirm("この顧客を現在のLINE会話に連携しますか？"))return;
-  try{
+  await withBusy("customer-link-"+current,btn,"連携中…",async()=>{try{
     var r=await api("/api/customer-link",{id:current,patientId:pid,action:"link"});
     var j=await r.json();
     if(j&&j.ok){ loadCustomer(current); }
     else { uiAlert(j&&j.error==="already_linked_other"?"このLINEは別の顧客に連携済みです":(j&&j.error==="not_line"?"LINE会話のみ連携できます":"連携に失敗しました")); }
-  }catch(e){ uiAlert("連携に失敗しました"); }
+  }catch(e){ uiAlert("連携に失敗しました"); }});
 }
 // ===== 質問チップ：返信する内容を選んで下書きを作り直す =====
 let selTopics=null;
@@ -5219,13 +5244,13 @@ function renderTopicChips(r){
 }
 function toggleTopic(i){ const r=DATA.find(x=>x.id===current); if(!r||!Array.isArray(r.topics))return; const tp=r.topics.filter(x=>x&&x.q); const q=tp[i]&&tp[i].q; if(q==null)return; if(!selTopics)selTopics=new Set(); if(selTopics.has(q))selTopics.delete(q); else selTopics.add(q); renderTopicChips(r); }
 async function redraftSelected(){ if(!current||!selTopics)return; const sel=[...selTopics]; if(!sel.length){uiAlert("返信する内容を1つ以上選んでください");return;} const btn=document.getElementById("redraftBtn"); if(btn){btn.disabled=true;btn.textContent="作成中…";} try{ const rr=await api("/api/redraft",{id:current,selected:sel}); const j=await rr.json(); if(j&&j.ok&&typeof j.draft==="string"){ const d=document.getElementById("draft"); if(d)d.value=j.draft; const cd=DATA.find(x=>x.id===current); if(cd){cd.draft=j.draft; if(Array.isArray(j.topics))cd.topics=j.topics;cd.learningRefs=Array.isArray(j.learningRefs)?j.learningRefs:[];cd.grounding=j.grounding||null;cd.validation=j.validation||null;renderLearningRefs(cd);renderGrounding(cd);} }else{ uiAlert("作り直しに失敗しました"); } }catch(e){ uiAlert("作り直しに失敗しました"); } if(btn){btn.disabled=false;btn.textContent="選んだ内容で下書きを作成";} }
-async function markDone(){const id=current;await api("/api/done",{id});await load();}
-async function markAllDone(){if(!await uiConfirm("すべてのチャットを「対応済み」に変更します。よろしいですか？"))return;try{const r=await api("/api/done-all",{});const j=await r.json();closeSet();if(current){closeChat();}await load();uiAlert((j.count||0)+"件を対応済みにしました");}catch(e){uiAlert("変更に失敗しました");}}
+async function markDone(){const id=current,btn=document.getElementById("markDoneBtn");await withBusy("done-"+id,btn,"処理中…",async()=>{try{await api("/api/done",{id});await load();}catch(e){uiAlert("変更に失敗しました");}});}
+async function markAllDone(){if(!await uiConfirm("すべてのチャットを「対応済み」に変更します。よろしいですか？"))return;const btn=document.getElementById("markAllDoneBtn");await withBusy("done-all",btn,"処理中…",async()=>{try{const r=await api("/api/done-all",{});const j=await r.json();closeSet();if(current){closeChat();}await load();uiAlert((j.count||0)+"件を対応済みにしました");}catch(e){uiAlert("変更に失敗しました");}});}
 async function sendMsg(){if(window.__sendBusy)return;const id=current;const t=document.getElementById("draft").value.trim();if(!t)return;window.__sendBusy=true;const _sb=document.querySelector("#cbtns .send");if(_sb){_sb.disabled=true;_sb.textContent="送信中…";}try{const cd0=DATA.find(x=>x.id===id);const orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim();const edited=(t!==orig);let instr="";try{if(dSessions&&dSessions[id]&&Array.isArray(dSessions[id].hist)){instr=dSessions[id].hist.filter(m=>m&&m.role==="user").map(m=>String(m.content||"")).join(" / ").slice(0,1500);}}catch(e){}const r=await api("/api/send",{id,text:t,instr:edited?instr:""});let j={};try{j=await r.json();}catch(e){}if(j.sent){const d0=document.getElementById("draft");if(d0)d0.value="";const cd=DATA.find(x=>x.id===id);if(cd)cd.draft="";if(j.conflict){showConflict(j.conflict);}else if(j.learnedRules&&j.learnedRules.length){showRuleToast(j.learnedRules);}else if(j.learnedId){showLearnToast(j.learnedId);}await load();}else{const m={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です"}[j.sendErr]||("送信失敗: "+(j.sendErr||"不明"));uiAlert(m+"\\n（下書きは消えていません）");}}finally{window.__sendBusy=false;const _sb2=document.querySelector("#cbtns .send");if(_sb2){_sb2.disabled=false;_sb2.textContent="送信";}}}
 async function resendStaffApproval(){if(!current)return;const b=document.getElementById("staffReviewResend"),draft=String(document.getElementById("draft")&&document.getElementById("draft").value||"").trim();if(!draft){uiAlert("先に患者様へ送る返信案を入力してください");return;}if(b){b.disabled=true;b.textContent="送信中…";}try{const r=await api("/api/staff-line/resend-approval",{id:current,draft}),j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error(j.error||"resend");uiAlert("スタッフLINEへ承認依頼を送りました");await load();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"スタッフLINE連携を設定・有効化してください":"承認依頼を送れませんでした");}finally{if(b){b.disabled=false;b.textContent="📲 スタッフLINEで確認";}}}
 function attach(){const inp=document.createElement("input");inp.type="file";inp.accept="image/*,video/*,application/pdf,.pdf,.doc,.docx,.xls,.xlsx";inp.onchange=async()=>{const f=inp.files[0];if(!f)return;if(f.size>10*1024*1024){uiAlert("10MB以下のファイルにしてください");return;}const btn=document.getElementById("attach");if(btn){btn.disabled=true;btn.textContent="⏳";}try{const b64=await new Promise((res,rej)=>{const rd=new FileReader();rd.onload=()=>res(String(rd.result).split(",")[1]);rd.onerror=rej;rd.readAsDataURL(f);});const up=await api("/api/upload",{name:f.name,mime:f.type||"application/octet-stream",data:b64});const uj=await up.json();if(!uj.ok)throw new Error(uj.error||"upload");const sr=await api("/api/send-file",{id:current,fileId:uj.fileId});const sj=await sr.json();if(!sj.sent)uiAlert("送信失敗: "+(sj.sendErr||"不明"));await load();}catch(e){uiAlert("ファイル送信に失敗しました: "+e.message);}if(btn){btn.disabled=false;btn.textContent="📎";}};inp.click();}
-async function shareClinic(){const note=await uiPrompt("現場に伝える内容を入力してください（空欄のままOKを押すと、お客様の直近メッセージをそのまま共有します）","");if(note===null)return;try{const r=await api("/api/share",{id:current,note:note||""});const j=await r.json();if(j.ok)uiAlert("現場ボードに共有しました");else uiAlert("共有に失敗しました");}catch(e){uiAlert("共有に失敗しました");}}
-async function toggleFlag(){if(!current)return;try{const r=await api("/api/tag",{id:current});const j=await r.json();const b=document.getElementById("flagBtn");if(b)b.textContent=j.flag?"⚑ 要対応を外す":"⚑ 要対応";const cd=DATA.find(x=>x.id===current);if(cd)cd.flag=j.flag;renderList();}catch(e){}}
+async function shareClinic(){const note=await uiPrompt("現場に伝える内容を入力してください（空欄のままOKを押すと、お客様の直近メッセージをそのまま共有します）","");if(note===null)return;const btn=document.getElementById("shareClinicBtn"),id=current;await withBusy("share-"+id,btn,"共有中…",async()=>{try{const r=await api("/api/share",{id,note:note||""});const j=await r.json();if(j.ok)uiAlert("現場ボードに共有しました");else uiAlert("共有に失敗しました");}catch(e){uiAlert("共有に失敗しました");}});}
+async function toggleFlag(){if(!current)return;const id=current,b=document.getElementById("flagBtn");let next=null;await withBusy("flag-"+id,b,"変更中…",async()=>{try{const r=await api("/api/tag",{id});const j=await r.json();next=!!j.flag;const cd=DATA.find(x=>x.id===id);if(cd)cd.flag=next;renderList();}catch(e){uiAlert("変更に失敗しました");}});if(b&&next!==null)b.textContent=next?"⚑ 要対応を外す":"⚑ 要対応";}
 // ---- AIで作り直す（会話型・下書きを会話で磨く。会話ごとにセッションを保持し再開可能）----
 let dHist=[],dLog=[],dSessions={};
 const dMsgsEl=document.getElementById("dMsgs");
@@ -5249,7 +5274,7 @@ function dBookingCard(info){const card=document.createElement("div");card.classN
   const row=document.createElement("div");row.style.cssText="display:flex;gap:7px;flex-wrap:wrap;";
   const run=document.createElement("button");run.textContent="対象を確認して実行";run.style.background="#dc2626";
   const stop=document.createElement("button");stop.textContent="実行しない";stop.style.background="#6b7280";
-  async function decide(approve){run.disabled=true;stop.disabled=true;run.textContent=approve?"実行中…":"取り消し中…";try{const r=await api("/api/staff-booking-confirm",{id:conversationId,requestId:info.requestId,approve});const j=await r.json();if(j.ok){dAdd("sysn",(j.done?"✅ ":"↩ ")+(j.text||"完了しました"));card.remove();await load();}else{dAdd("sysn","⚠ "+(j.text||staffBookingError(j.error)));run.disabled=false;stop.disabled=false;run.textContent="対象を確認して実行";}}catch(e){dAdd("sysn","通信エラーで結果を確認できません。うけつけるんの予約詳細を確認してください。");}}
+  async function decide(approve){run.disabled=true;stop.disabled=true;run.textContent=approve?"実行中…":"取り消し中…";try{const r=await api("/api/staff-booking-confirm",{id:conversationId,requestId:info.requestId,approve});const j=await r.json();if(j.ok){dAdd("sysn",(j.done?"✅ ":"↩ ")+(j.text||"完了しました"));card.remove();await load();}else{dAdd("sysn","⚠ "+(j.text||staffBookingError(j.error)));run.disabled=false;stop.disabled=false;run.textContent="対象を確認して実行";stop.textContent="実行しない";}}catch(e){dAdd("sysn","通信エラーで結果を確認できません。うけつけるんの予約詳細を確認してください。");run.disabled=false;stop.disabled=false;run.textContent="対象を確認して実行";stop.textContent="実行しない";}}
   run.onclick=()=>decide(true);stop.onclick=()=>decide(false);row.appendChild(run);row.appendChild(stop);card.appendChild(row);dMsgsEl.appendChild(card);dMsgsEl.scrollTop=dMsgsEl.scrollHeight;}
 function staffBookingError(code){return ({not_linked:"うけつけるん連携が有効ではありません。",patient_not_verified:"この会話の患者を安全に特定できないため操作できません。",appointment_mismatch:"現在の患者の予約と一致しないため停止しました。",not_changeable:"この予約は変更・キャンセルできません。",patient_confirmation_pending:"患者様への確認待ち手続きがあるため、先にそちらを完了してください。",staff_confirmation_pending:"別の予約操作が確認待ちです。先に表示中の確認カードを実行または取り消してください。",slot_taken:"指定枠はすでに埋まっています。",bad_date:"日付を確認してください。",bad_datetime:"変更先の日時を確認してください。",expired:"確認期限が切れました。もう一度指示してください。",result_unknown:"実行結果を確認できません。うけつけるんの予約詳細で確認してください。"})[code]||"予約システムで処理できませんでした。";}
 async function dHandleBookingAction(action){if(!action||!action.type)return;dAdd("sysn","うけつけるんで対象患者と最新の予約状態を確認しています…");try{const r=await api("/api/staff-booking-action",Object.assign({id:current},action));const j=await r.json();if(j.ok&&j.kind==="info")dAdd("ai",j.text||"確認できました");else if(j.ok&&j.kind==="confirm")dBookingCard(j);else{let msg=j.text||staffBookingError(j.error);if(j.alternatives&&j.alternatives.length)msg+="\\n空き候補: "+j.alternatives.map(x=>x.label).join(" / ");dAdd("sysn","⚠ "+msg);}}catch(e){dAdd("sysn","うけつけるんへ接続できませんでした。予約操作は行っていません。");}}
@@ -5282,7 +5307,7 @@ function slideClose(pid,cid){const p=document.getElementById(pid),c=document.get
 function closeDraftChat(){const app=document.getElementById("app");if(app)app.classList.remove("dopen");slideClose("dpanel","dCard");}
 function dChip(t){const x=document.getElementById("dText");x.value=t;dSend();}
 // GPT風ストリーミング送信。返事が文字単位で流れ、下書きカードもリアルタイムに埋まる。失敗時は従来API(JSON)へ自動フォールバック。
-async function dSend(){if(window.__dBusy)return;const x=document.getElementById("dText");const txt=x.value.trim();if(!txt)return;window.__dBusy=true;x.value="";
+async function dSend(){if(window.__dBusy)return;const x=document.getElementById("dText");const txt=x.value.trim();if(!txt)return;window.__dBusy=true;const btn=document.getElementById("dSendBtn"),old=btn&&btn.innerHTML;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>作成中…';}x.value="";
   dAdd("user",txt);dHist.push({role:"user",content:txt});
   const logEntry={type:"ai",text:""};dLog.push(logEntry);
   const aiEl=dRender("ai","…");
@@ -5334,7 +5359,7 @@ async function dSend(){if(window.__dBusy)return;const x=document.getElementById(
         if(j.action)await dHandleBookingAction(j.action);
       }else{aiEl.textContent="エラー: "+(j.error||"不明");logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";}
     }catch(e2){aiEl.textContent="通信エラーが発生しました";logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";}
-  }finally{window.__dBusy=false;}}
+  }finally{window.__dBusy=false;if(btn&&btn.isConnected){btn.disabled=false;btn.removeAttribute("aria-busy");btn.innerHTML=old;}}}
 // ---- みぎうで君 (rulebook editing chat) ----
 let asstHist=[],asstCtx=null;
 const asstEl=document.getElementById("asst"),asstMsgsEl=document.getElementById("asstMsgs");
@@ -5367,10 +5392,12 @@ async function asstCall(ph){
   }catch(e){if(ph)ph.remove();amAdd("sysn","通信エラーが発生しました");}}
 async function asstSend(){const t=document.getElementById("asstText");const txt=t.value.trim();if(!txt)return;t.value="";
   amAdd("user",txt);asstHist.push({role:"user",content:txt});
-  const ph=spinAdd(asstMsgsEl,"考え中…");asstCall(ph);}
+  const ph=spinAdd(asstMsgsEl,"考え中…");await asstCall(ph);}
+async function busyAsstSend(){return withBusy("assistant-send",document.getElementById("asstSendBtn"),"考え中…",asstSend);}
 function asstAttach(){const inp=document.createElement("input");inp.type="file";inp.accept="image/*,.pdf,.csv,.txt";
   inp.onchange=async()=>{const f=inp.files[0];if(!f)return;
     if(f.size>14*1024*1024){uiAlert("14MB以下のファイルにしてください");return;}
+    if(window.__asstAttachBusy)return;window.__asstAttachBusy=true;const attachBtn=document.getElementById("asstAttachBtn"),attachOld=attachBtn&&attachBtn.innerHTML;if(attachBtn){attachBtn.disabled=true;attachBtn.setAttribute("aria-busy","true");attachBtn.innerHTML='<span class="spin" aria-hidden="true"></span>';}
     amAdd("user","📎 "+f.name);const ph=spinAdd(asstMsgsEl,"資料を読み込んでいます…（少し時間がかかります）");
     try{
       const b64=await new Promise((res2,rej)=>{const rd=new FileReader();rd.onload=()=>res2(String(rd.result).split(",")[1]);rd.onerror=rej;rd.readAsDataURL(f);});
@@ -5390,12 +5417,12 @@ function asstAttach(){const inp=document.createElement("input");inp.type="file";
           asstMsgsEl.appendChild(all);asstMsgsEl.scrollTop=asstMsgsEl.scrollHeight;
         }
       }else amAdd("sysn","読み込み失敗: "+(j.error==="too_large"?"ファイルが大きすぎます":j.error==="unsupported"?"対応していない形式です（画像・PDF・CSV・テキストのみ）":(j.error||"不明")));
-    }catch(e){ph.remove();amAdd("sysn","読み込みに失敗しました");}};
+    }catch(e){ph.remove();amAdd("sysn","読み込みに失敗しました");}finally{window.__asstAttachBusy=false;if(attachBtn&&attachBtn.isConnected){attachBtn.disabled=false;attachBtn.removeAttribute("aria-busy");attachBtn.innerHTML=attachOld;}}};
   inp.click();}
 // 全体の返信方針（恒久ルール）の一覧描画・追加・削除
 function renderPrefs(prefs){const el=document.getElementById("prefList");if(!el)return;const a=Array.isArray(prefs)?prefs:[];if(!a.length){el.innerHTML='<span style="color:#9ca3af;">まだ記憶はありません。</span>';return;}el.innerHTML=a.map(p=>{const id=(p&&p.id!=null)?p.id:"";const tx=(typeof p==="string")?p:((p&&p.text)||"");return '<div style="display:flex;align-items:center;gap:6px;padding:3px 0;"><span style="flex:1;">・'+esc(tx)+'</span><button onclick="delPref('+JSON.stringify(id)+')" style="border:none;background:transparent;color:#dc2626;cursor:pointer;font-size:14px;">×</button></div>';}).join("");}
-async function addPref(){const inp=document.getElementById("prefInput");const text=(inp&&inp.value||"").trim();if(!text)return;try{const r=await api("/api/pref-add",{text});const j=await r.json();if(j.ok){if(inp)inp.value="";renderPrefs(j.prefs||[]);}}catch(e){uiAlert("追加に失敗しました");}}
-async function delPref(id){try{const r=await api("/api/pref-delete",{id});const j=await r.json();if(j.ok)renderPrefs(j.prefs||[]);}catch(e){}}
+async function addPref(){const inp=document.getElementById("prefInput");const value=(inp&&inp.value||"").trim();if(!value)return;await withBusy("legacy-pref-add",null,"",async()=>{try{const r=await api("/api/pref-add",{text:value});const j=await r.json();if(j.ok){if(inp)inp.value="";renderPrefs(j.prefs||[]);}}catch(e){uiAlert("追加に失敗しました");}});}
+async function delPref(id){await withBusy("legacy-pref-delete-"+id,null,"",async()=>{try{const r=await api("/api/pref-delete",{id});const j=await r.json();if(j.ok)renderPrefs(j.prefs||[]);}catch(e){uiAlert("削除に失敗しました");}});}
 // 店舗ルール・全体の返信方針・過去の対応・学習例を、保存先は分けたまま一画面で管理する。
 let LEARN={rules:[],prefs:[],examples:[],conflicts:[],performance:[]},learnTab="rules";
 function learnField(label,value,rows,readOnly){
@@ -5403,7 +5430,8 @@ function learnField(label,value,rows,readOnly){
   const el=rows?document.createElement("textarea"):document.createElement("input");if(!rows)el.type="text";el.value=value||"";if(rows)el.rows=rows;if(readOnly)el.readOnly=true;
   el.style.cssText="display:block;width:100%;box-sizing:border-box;margin-top:3px;padding:8px;border:1px solid #d1d5db;border-radius:8px;font:12px/1.55 inherit;resize:vertical;"+(readOnly?"background:#f8fafc;color:#64748b;":"");box.appendChild(el);return {box,el};
 }
-function learnButton(label,primary,fn){const b=document.createElement("button");b.type="button";b.className="cbtn"+(primary?" send":"");b.textContent=label;b.onclick=fn;return b;}
+let learnButtonSeq=0;
+function learnButton(label,primary,fn){const b=document.createElement("button"),key="learning-action-"+(++learnButtonSeq);b.type="button";b.className="cbtn"+(primary?" send":"");b.textContent=label;b.onclick=()=>withBusy(key,b,"処理中…",fn);return b;}
 function learnCard(){const d=document.createElement("div");d.style.cssText="border:1px solid #e5e7eb;border-radius:11px;padding:11px;margin-bottom:10px;background:#fff;";return d;}
 function setLearnStatus(text,bad){const e=document.getElementById("learnStatus");if(e){e.textContent=text||"";e.style.color=bad?"#dc2626":"#6b7280";}}
 async function reloadLearning(){
@@ -5465,7 +5493,7 @@ let learnToastTimer=null;
 function showLearnToast(id){ const b=document.getElementById("learnToast"); if(!b)return; b.innerHTML='✓ この対応を学習しました'+(id?' ・ <span style="text-decoration:underline;cursor:pointer;color:#a7f3d0;" onclick="undoLearn('+id+')">特例だった（学習しない）</span>':''); b.style.display="block"; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";}, id?6000:2500); }
 // ルール蒸留の結果トースト。何を覚えたかを具体的に見せる（addのみ取り消し可。updateは店舗ルール画面で編集）。
 function showRuleToast(rules){ const b=document.getElementById("learnToast"); if(!b||!rules||!rules.length)return; const r=rules[0]; const more=rules.length>1?(" 他"+(rules.length-1)+"件"):""; const undo=(r.action==="add")?' ・ <span style="text-decoration:underline;cursor:pointer;color:#a7f3d0;" onclick="undoRule('+r.id+')">取り消す</span>':'（既存ルールを更新）'; b.innerHTML='📚 ルールを学習：「'+esc(r.title)+'」'+more+undo; b.style.display="block"; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";}, 9000); }
-async function undoRule(id){ let ok=false; try{ const r=await api("/api/rule-undo",{id}); const j=await r.json(); ok=!!j.ok; }catch(e){} const b=document.getElementById("learnToast"); if(b){ b.innerHTML=ok?'ルールを取り消しました':'取り消せませんでした（設定→学習データ管理 から削除できます）'; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";},2500); } }
+async function undoRule(id){ return withBusy("undo-rule-"+id,null,"",async()=>{let ok=false; try{ const r=await api("/api/rule-undo",{id}); const j=await r.json(); ok=!!j.ok; }catch(e){} const b=document.getElementById("learnToast"); if(b){ b.innerHTML=ok?'ルールを取り消しました':'取り消せませんでした（設定→学習データ管理 から削除できます）'; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";},2500); }}); }
 
 // ---- 患者向けLINE リッチメニューエディター ----
 let RM={imageFileId:"",imageName:"",imageUrl:"",size:"large",name:"患者向けメニュー",chatBarText:"メニュー",accountKey:"",areas:[],published:null,schedules:[]},rmDraw=null,rmSelected="";
@@ -5493,17 +5521,22 @@ function rmPointerCancel(){rmDraw=null;renderRichAreas();}
 function richMenuPayload(){return{imageFileId:RM.imageFileId,imageName:RM.imageName,size:RM.size,name:document.getElementById("rmName").value.trim(),chatBarText:document.getElementById("rmChatBar").value.trim(),accountKey:document.getElementById("rmAccount").value,areas:RM.areas};}
 function applyRichMenuResponse(j){const d=j.draft||{};RM.imageFileId=d.imageFileId||RM.imageFileId;RM.imageUrl=d.imageUrl||RM.imageUrl;RM.imageName=d.imageName||RM.imageName;RM.size=d.size||RM.size;RM.areas=d.areas||RM.areas;RM.published=j.published||null;RM.schedules=Array.isArray(j.schedules)?j.schedules:RM.schedules;renderRichMenu();}
 function rmDateTime(ts){return ts?new Date(ts).toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"}):"無期限";}
-function renderRichSchedules(){const box=document.getElementById("rmScheduleList");if(!box)return;const all=(RM.schedules||[]).slice(0,10),labels={scheduled:"公開予約",active:"公開中",completed:"終了",cancelled:"取消"};if(!all.length){box.innerHTML='<div style="font-size:10.5px;color:#94a3b8;text-align:center;padding:12px 0 3px;">公開予約はありません</div>';return;}box.innerHTML=all.map(s=>{const can=["scheduled","active"].includes(s.status),err=s.lastError&&s.lastError!=="period_elapsed";return '<div class="rmScheduleItem '+(s.status==="active"?'active ':'')+(err?'error':'')+'"><div style="display:flex;justify-content:space-between;gap:5px;"><b>'+esc(s.name||"リッチメニュー")+'</b><span>'+esc(labels[s.status]||s.status)+'</span></div><div style="color:#64748b;">'+rmDateTime(s.startAt)+' 〜 '+rmDateTime(s.endAt)+'</div>'+(err?'<div style="color:#b91c1c;">自動切替を再試行しています</div>':'')+(can?'<button type="button" class="cbtn" style="width:100%;margin-top:5px;color:#b91c1c;" onclick="cancelRichMenuSchedule(&quot;'+esc(s.id)+'&quot;)">この予約を取り消す</button>':'')+'</div>';}).join("");}
+function renderRichSchedules(){const box=document.getElementById("rmScheduleList");if(!box)return;const all=(RM.schedules||[]).slice(0,10),labels={scheduled:"公開予約",active:"公開中",completed:"終了",cancelled:"取消"};if(!all.length){box.innerHTML='<div style="font-size:10.5px;color:#94a3b8;text-align:center;padding:12px 0 3px;">公開予約はありません</div>';return;}box.innerHTML=all.map(s=>{const can=["scheduled","active"].includes(s.status),err=s.lastError&&s.lastError!=="period_elapsed";return '<div class="rmScheduleItem '+(s.status==="active"?'active ':'')+(err?'error':'')+'"><div style="display:flex;justify-content:space-between;gap:5px;"><b>'+esc(s.name||"リッチメニュー")+'</b><span>'+esc(labels[s.status]||s.status)+'</span></div><div style="color:#64748b;">'+rmDateTime(s.startAt)+' 〜 '+rmDateTime(s.endAt)+'</div>'+(err?'<div style="color:#b91c1c;">自動切替を再試行しています</div>':'')+(can?'<button type="button" class="cbtn" style="width:100%;margin-top:5px;color:#b91c1c;" onclick="busyCancelRichMenuSchedule(&quot;'+esc(s.id)+'&quot;,this)">この予約を取り消す</button>':'')+'</div>';}).join("");}
 function validateRichMenuInputs(){if(!RM.imageFileId){uiAlert("画像をアップロードしてください");return false;}if(!RM.areas.length){uiAlert("ボタン範囲を1つ以上作成してください");return false;}const invalid=RM.areas.find(a=>!String(a.value||"").trim()||(a.type==="uri"&&!/^(https:\\/\\/|http:\\/\\/localhost(?::\\d+)?\\/|tel:|mailto:|line:\\/\\/)/i.test(a.value)));if(invalid){uiAlert("「"+invalid.label+"」のURLまたは動作内容を正しく入力してください");selectRichArea(invalid.id);return false;}return true;}
 async function saveRichMenu(publish){if(!RM.imageFileId){uiAlert("画像をアップロードしてください");return;}if(!RM.areas.length){uiAlert("ボタン範囲を1つ以上作成してください");return;}const invalid=RM.areas.find(a=>!String(a.value||"").trim()||(a.type==="uri"&&!/^(https:\\/\\/|http:\\/\\/localhost(?::\\d+)?\\/|tel:|mailto:|line:\\/\\/)/i.test(a.value)));if(invalid){uiAlert("「"+invalid.label+"」のURLまたは動作内容を正しく入力してください");selectRichArea(invalid.id);return;}if(publish&&!await uiConfirm("この内容を患者向けLINEの既定リッチメニューとして公開しますか？\\n現在公開中のメニューは新しい内容へ置き換わります。"))return;rmStatus(publish?"LINEへ公開しています…":"下書きを保存しています…");try{const r=await api(publish?"/api/rich-menu/publish":"/api/rich-menu/save",richMenuPayload()),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");const d=j.draft||{};RM.imageFileId=d.imageFileId||RM.imageFileId;RM.imageUrl=d.imageUrl||RM.imageUrl;RM.imageName=d.imageName||RM.imageName;RM.size=d.size||RM.size;RM.areas=d.areas||RM.areas;RM.published=j.published||null;renderRichMenu();rmStatus(publish?"LINEへ公開しました":"下書きを保存しました");if(publish)uiAlert("患者向けLINEへリッチメニューを公開しました");}catch(e){const m={line_not_configured:"先に患者向けLINEを接続してください",image_too_large:"画像がLINEの上限1MBを超えています",image_required:"画像をアップロードしてください",area_required:"ボタン範囲を作成してください",invalid_image:"画像データを確認できません"};rmStatus(m[e.message]||"保存・公開に失敗しました",true);uiAlert(m[e.message]||("LINEへ反映できませんでした（"+e.message+"）"));}}
 async function unpublishRichMenu(){if(!await uiConfirm("患者向けLINEから現在のリッチメニューを非表示にしますか？\\n下書きは残ります。"))return;rmStatus("公開を停止しています…");try{const r=await api("/api/rich-menu/unpublish",{}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"stop");RM.published=null;renderRichMenu();rmStatus("LINEでの公開を停止しました。下書きは残っています");}catch(e){rmStatus("公開を停止できませんでした",true);uiAlert("公開停止に失敗しました");}}
 async function scheduleRichMenu(){if(!validateRichMenuInputs())return;const sv=document.getElementById("rmStartAt").value,ev=document.getElementById("rmEndAt").value;if(!sv&&!ev){uiAlert("開始日時または終了日時を設定してください。無期限で今すぐ公開する場合は、下の「LINEへ公開」を使ってください");return;}const startAt=sv?new Date(sv).getTime():0,endAt=ev?new Date(ev).getTime():0;if((sv&&!startAt)||(ev&&!endAt)){uiAlert("表示期間を正しく入力してください");return;}if(endAt&&endAt<=Math.max(startAt||Date.now(),Date.now())+60000){uiAlert("終了日時は開始日時より後に設定してください");return;}if(!await uiConfirm("指定した期間だけこのリッチメニューを表示しますか？\\n終了後は現在の通常メニューへ自動で戻ります。"))return;rmStatus("LINEへ公開予約を登録しています…");try{const body=Object.assign(richMenuPayload(),{startAt,endAt}),r=await api("/api/rich-menu/schedule",body),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"schedule");applyRichMenuResponse(j);document.getElementById("rmStartAt").value="";document.getElementById("rmEndAt").value="";rmStatus(startAt&&startAt>Date.now()?"公開予約を登録しました":"期間公開を開始しました");uiAlert("表示期間を登録しました。終了後は元のメニューへ自動で戻ります");}catch(e){const m={schedule_overlap:"同じLINE公式アカウントの公開期間が重複しています",invalid_start:"開始日時は現在以降に設定してください",invalid_end:"終了日時は開始日時より後に設定してください",period_required:"開始日時または終了日時を設定してください",line_not_configured:"先に患者向けLINEを接続してください",image_too_large:"画像がLINEの上限1MBを超えています"};rmStatus(m[e.message]||"公開予約に失敗しました",true);uiAlert(m[e.message]||"公開予約を登録できませんでした");}}
 async function cancelRichMenuSchedule(id){if(!await uiConfirm("この公開予約を取り消しますか？\\n公開中の場合は元の通常メニューへ戻ります。"))return;rmStatus("公開予約を取り消しています…");try{const r=await api("/api/rich-menu/schedule-cancel",{id}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"cancel");applyRichMenuResponse(j);rmStatus("公開予約を取り消しました");}catch(e){rmStatus("公開予約を取り消せませんでした",true);uiAlert("LINEとの接続を確認して、もう一度お試しください");}}
-async function undoLearn(id){ try{ await api("/api/example-delete",{id}); }catch(e){} const b=document.getElementById("learnToast"); if(b){ b.innerHTML='↩ 学習を取り消しました（特例として記録しません）'; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";},2000); } }
+async function busyLoadRichMenuImage(input){return withBusy("rich-menu-image",document.getElementById("rmImageBtn"),"処理中…",()=>loadRichMenuImage(input));}
+async function busySaveRichMenu(publish){const btn=document.getElementById(publish?"rmPublishBtn":"rmSaveBtn");return withBusy("rich-menu-write",btn,publish?"公開中…":"保存中…",()=>saveRichMenu(publish));}
+async function busyUnpublishRichMenu(){return withBusy("rich-menu-write",document.getElementById("rmUnpublishBtn"),"停止中…",()=>unpublishRichMenu());}
+async function busyScheduleRichMenu(){return withBusy("rich-menu-write",document.getElementById("rmScheduleBtn"),"登録中…",()=>scheduleRichMenu());}
+async function busyCancelRichMenuSchedule(id,btn){return withBusy("rich-menu-write",btn,"取消中…",()=>cancelRichMenuSchedule(id));}
+async function undoLearn(id){ return withBusy("undo-learning-"+id,null,"",async()=>{try{ await api("/api/example-delete",{id}); }catch(e){} const b=document.getElementById("learnToast"); if(b){ b.innerHTML='↩ 学習を取り消しました（特例として記録しません）'; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";},2000); }}); }
 // 矛盾の確認：前の答えと今回の答えが食い違った時に出す。基準を選ぶと不要な方の対応例を削除。
 let conflictData=null;
 function showConflict(c){ conflictData=c; const o=document.getElementById("conflictOld"),n=document.getElementById("conflictNew"); if(o)o.textContent=c.oldFinal||""; if(n)n.textContent=c.newFinal||""; const p=document.getElementById("conflictPop"); if(p)p.style.display="flex"; }
-async function resolveConflict(mode){ const c=conflictData; conflictData=null; const p=document.getElementById("conflictPop"); if(p)p.style.display="none"; if(!c)return; try{ if(mode==="new"||mode==="old"){ await api("/api/learning-conflict-resolve",{id:c.id,mode}); } else if(mode==="later"){ learnTab="conflicts";openLearning(); } }catch(e){} }
+async function resolveConflict(mode,btn){ const c=conflictData;if(!c)return;if(mode==="later"){conflictData=null;const p=document.getElementById("conflictPop");if(p)p.style.display="none";learnTab="conflicts";openLearning();return;}await withBusy("resolve-conflict-"+c.id,btn,"更新中…",async()=>{try{const r=await api("/api/learning-conflict-resolve",{id:c.id,mode}),j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error("save");conflictData=null;const p=document.getElementById("conflictPop");if(p)p.style.display="none";}catch(e){uiAlert("学習内容を更新できませんでした");}}); }
 // 「どちらでもない」→ みぎうで君を開き、食い違った2案を背景に、正しい案内をチャットで決めてルール化する
 function openConflictChat(c){ openAsst(null); try{ asstHist.push({role:"user",content:"（背景）似た質問で過去の回答が食い違っていました。前の回答:「"+(c.oldFinal||"")+"」／今回の回答:「"+(c.newFinal||"")+"」。どちらも正解ではありません。これからスタッフが正しい案内を教えるので、それを既存ルールと矛盾しない形でルール化する提案をしてください。"}); }catch(e){} amAdd("sysn","過去の回答が食い違っていました。正しい案内を教えてください——内容をルールにします。"); }
 // ---- settings popup ----
@@ -5545,62 +5578,62 @@ async function loadStaffLine(){
     const box=document.getElementById("staffLineStaffBox");box.style.display=s.groupConnected?"block":"none";renderStaffLineStaff(s.staff||[]);
   }catch(e){document.getElementById("staffLineStat").textContent="スタッフLINE設定を読み込めませんでした";}
 }
-function renderStaffLineStaff(list){const el=document.getElementById("staffLineStaffList");if(!el)return;const active=(list||[]).filter(s=>s.active!==false);if(!active.length){el.innerHTML='<div style="font-size:11px;color:#6b7280;padding:7px 0;">登録スタッフはいません</div>';return;}el.innerHTML=active.map(s=>'<div class="staffLineStaffRow"><span>'+esc(s.name||"LINEスタッフ")+'</span><select onchange="changeStaffLineRole(&quot;'+esc(s.id)+'&quot;,this.value)" style="min-width:0;padding:6px;border:1px solid #d1d5db;border-radius:7px;font-size:11px;"><option value="admin"'+(s.role==="admin"?' selected':'')+'>管理者</option><option value="approver"'+(s.role==="approver"?' selected':'')+'>承認担当</option><option value="viewer"'+(s.role==="viewer"?' selected':'')+'>閲覧者</option></select><button type="button" class="cbtn" onclick="deleteStaffLineStaff(&quot;'+esc(s.id)+'&quot;)" style="padding:5px 8px;color:#b91c1c;">解除</button></div>').join("");}
+function renderStaffLineStaff(list){const el=document.getElementById("staffLineStaffList");if(!el)return;const active=(list||[]).filter(s=>s.active!==false);if(!active.length){el.innerHTML='<div style="font-size:11px;color:#6b7280;padding:7px 0;">登録スタッフはいません</div>';return;}el.innerHTML=active.map(s=>'<div class="staffLineStaffRow"><span>'+esc(s.name||"LINEスタッフ")+'</span><select onchange="changeStaffLineRole(&quot;'+esc(s.id)+'&quot;,this.value,this)" style="min-width:0;padding:6px;border:1px solid #d1d5db;border-radius:7px;font-size:11px;"><option value="admin"'+(s.role==="admin"?' selected':'')+'>管理者</option><option value="approver"'+(s.role==="approver"?' selected':'')+'>承認担当</option><option value="viewer"'+(s.role==="viewer"?' selected':'')+'>閲覧者</option></select><button type="button" class="cbtn" onclick="deleteStaffLineStaff(&quot;'+esc(s.id)+'&quot;,this)" style="padding:5px 8px;color:#b91c1c;">解除</button></div>').join("");}
 function renderAccts(c){const el=document.getElementById("acctList");if(!el)return;let h="";
-  (c.extraLines||[]).forEach((a,i)=>{h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;"><span>📱 '+esc(a.name)+'</span><button class="cbtn" onclick="delAcct(&quot;line&quot;,'+i+')">削除</button></div>';});
-  (c.extraMails||[]).forEach((a,i)=>{h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;"><span>✉ '+esc(a.name)+' <span style="color:#9ca3af;">'+esc(a.smtpUser)+'</span></span><button class="cbtn" onclick="delAcct(&quot;mail&quot;,'+i+')">削除</button></div>';});
+  (c.extraLines||[]).forEach((a,i)=>{h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;"><span>📱 '+esc(a.name)+'</span><button class="cbtn" onclick="delAcct(&quot;line&quot;,'+i+',this)">削除</button></div>';});
+  (c.extraMails||[]).forEach((a,i)=>{h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;"><span>✉ '+esc(a.name)+' <span style="color:#9ca3af;">'+esc(a.smtpUser)+'</span></span><button class="cbtn" onclick="delAcct(&quot;mail&quot;,'+i+',this)">削除</button></div>';});
   el.innerHTML=h||'<div style="color:#9ca3af;">追加アカウントはまだありません</div>';}
 async function addLineAcct(){
   const name=await uiPrompt("表示名（例：銀座7丁目院LINE）");if(!name)return;
   const token=await uiPrompt("チャネルアクセストークン（LINE Developersからコピー）");if(!token)return;
   const secret=await uiPrompt("チャネルシークレット");if(!secret)return;
-  try{const r=await api("/api/conn-add",{kind:"line",name,token:token.trim(),secret:secret.trim()});const j=await r.json();
+  const btn=document.getElementById("addLineAcctBtn");await withBusy("add-line-account",btn,"追加中…",async()=>{try{const r=await api("/api/conn-add",{kind:"line",name,token:token.trim(),secret:secret.trim()});const j=await r.json();
     if(j.ok){uiAlert("LINEアカウントを追加しました。\\nLINE Developersのそのチャネルに、このアプリと同じWebhook URLを設定してください。");openSet();}
     else uiAlert("追加失敗: "+(j.error==="bad_token"?"トークンが正しくありません":j.error||"不明"));
-  }catch(e){uiAlert("追加に失敗しました");}}
+  }catch(e){uiAlert("追加に失敗しました");}});}
 async function addMailAcct(){
   const name=await uiPrompt("表示名（例：本院メール）");if(!name)return;
   const u=await uiPrompt("メールアドレス");if(!u)return;
   const p=await uiPrompt("アプリパスワード（送受信共通）");if(!p)return;
   const host=await uiPrompt("SMTPホスト（Gmailなら空欄のままOK）","");if(host===null)return;
   const ihost=host?await uiPrompt("IMAPホスト","")||"":"";
-  try{const body={kind:"mail",name,smtpUser:u.trim(),smtpPass:p.trim()};if(host)body.smtpHost=host.trim();if(ihost)body.imapHost=ihost.trim();
+  const btn=document.getElementById("addMailAcctBtn");await withBusy("add-mail-account",btn,"追加中…",async()=>{try{const body={kind:"mail",name,smtpUser:u.trim(),smtpPass:p.trim()};if(host)body.smtpHost=host.trim();if(ihost)body.imapHost=ihost.trim();
     const r=await api("/api/conn-add",body);const j=await r.json();
     if(j.ok){uiAlert("メールアカウントを追加しました。受信監視も自動で始まります。");openSet();}
     else uiAlert("追加失敗: "+(j.error||"不明"));
-  }catch(e){uiAlert("追加に失敗しました");}}
-async function delAcct(kind,i){if(!await uiConfirm("この連携を削除しますか？（この連携で届く新着が止まります）"))return;
-  try{await api("/api/conn-del",{kind,i});}catch(e){}openSet();}
-async function saveConn(){const g=id=>document.getElementById(id).value.trim();const body={lineSecret:g("cLineSecret"),lineToken:g("cLineToken"),smtpHost:g("cSmtpHost"),smtpPort:g("cSmtpPort"),smtpUser:g("cSmtpUser"),smtpPass:g("cSmtpPass"),imapHost:g("cImapHost"),imapPort:g("cImapPort"),imapUser:g("cImapUser"),imapPass:g("cImapPass"),emailInternal:document.getElementById("cEmailInternal").checked};try{const r=await api("/api/conn",body);const j=await r.json();if(j.ok){uiAlert("連携設定を保存しました。\\nLINE: "+(j.lineConfigured?"設定済み":"未設定")+" / メール: "+(j.mailConfigured?"設定済み":"未設定")+" / メール直接監視: "+(j.emailInternal?"オン":"オフ"));["cLineSecret","cLineToken","cSmtpPass","cImapPass"].forEach(id=>document.getElementById(id).value="");}else uiAlert("保存に失敗しました");}catch(e){uiAlert("保存に失敗しました");}}
-async function saveAccount(){const accountEmail=document.getElementById("setAccountEmail").value.trim();try{const r=await api("/api/account",{accountEmail});const j=await r.json();if(j.ok){document.getElementById("accountEmailStat").textContent="再設定メールアドレス登録済み"+(j.account.resetEmailReady?"・メール送信可能":"・送信メール設定が必要");uiAlert("アカウント情報を保存しました");}else uiAlert(j.error==="bad_email"?"正しいメールアドレスを入力してください":"保存に失敗しました");}catch(e){uiAlert("保存に失敗しました");}}
+  }catch(e){uiAlert("追加に失敗しました");}});}
+async function delAcct(kind,i,btn){if(!await uiConfirm("この連携を削除しますか？（この連携で届く新着が止まります）"))return;
+  await withBusy("delete-account-"+kind+"-"+i,btn,"削除中…",async()=>{try{await api("/api/conn-del",{kind,i});await openSet();}catch(e){uiAlert("削除に失敗しました");}});}
+async function saveConn(){const g=id=>document.getElementById(id).value.trim();const body={lineSecret:g("cLineSecret"),lineToken:g("cLineToken"),smtpHost:g("cSmtpHost"),smtpPort:g("cSmtpPort"),smtpUser:g("cSmtpUser"),smtpPass:g("cSmtpPass"),imapHost:g("cImapHost"),imapPort:g("cImapPort"),imapUser:g("cImapUser"),imapPass:g("cImapPass"),emailInternal:document.getElementById("cEmailInternal").checked},btn=document.getElementById("saveConnBtn");await withBusy("save-connection",btn,"保存中…",async()=>{try{const r=await api("/api/conn",body);const j=await r.json();if(j.ok){uiAlert("連携設定を保存しました。\\nLINE: "+(j.lineConfigured?"設定済み":"未設定")+" / メール: "+(j.mailConfigured?"設定済み":"未設定")+" / メール直接監視: "+(j.emailInternal?"オン":"オフ"));["cLineSecret","cLineToken","cSmtpPass","cImapPass"].forEach(id=>document.getElementById(id).value="");}else uiAlert("保存に失敗しました");}catch(e){uiAlert("保存に失敗しました");}});}
+async function saveAccount(){const accountEmail=document.getElementById("setAccountEmail").value.trim(),btn=document.getElementById("saveAccountBtn");await withBusy("save-account",btn,"保存中…",async()=>{try{const r=await api("/api/account",{accountEmail});const j=await r.json();if(j.ok){document.getElementById("accountEmailStat").textContent="再設定メールアドレス登録済み"+(j.account.resetEmailReady?"・メール送信可能":"・送信メール設定が必要");uiAlert("アカウント情報を保存しました");}else uiAlert(j.error==="bad_email"?"正しいメールアドレスを入力してください":"保存に失敗しました");}catch(e){uiAlert("保存に失敗しました");}});}
 function closeSet(){document.getElementById("setPop").style.display="none";}
 function toggleStaffLineSetup(){const e=document.getElementById("staffLineSetup");e.style.display=e.style.display==="none"?"block":"none";}
 function copyStaffLineWebhook(){const v=document.getElementById("staffLineWebhook").value;if(!v)return;copyText(v);uiAlert("Webhook URLをコピーしました");}
 function copyStaffLineBasicId(){const id=document.getElementById("staffLineBasicId").value.trim();if(!id)return;copyText(id);uiAlert("友だち追加用IDをコピーしました");}
-async function saveStaffLineConfig(){const token=document.getElementById("setStaffLineToken").value.trim(),secret=document.getElementById("setStaffLineSecret").value.trim();try{const r=await api("/api/staff-line/config",{token,secret});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");uiAlert("LINE公式アカウントを確認しました。次にWebhook URLを登録し、グループ接続コードを送信してください。");await loadStaffLine();}catch(e){const m={credential_encryption_not_configured:"運営側の暗号化設定が未完了です。秘密情報は保存していません。",missing_credentials:"アクセストークンとチャネルシークレットを入力してください",invalid_token:"アクセストークンを確認できませんでした",secret_required_for_channel_change:"別のLINE公式アカウントへ切り替える場合は、そのアカウントのチャネルシークレットも入力してください",patient_line_channel_not_allowed:"患者向けLINEと同じチャネルは使えません。法人専用のスタッフLINEを作成してください",channel_already_registered:"このLINE公式アカウントは別法人に登録済みです",line_unreachable:"LINEへ接続できませんでした"};uiAlert(m[e.message]||"スタッフLINE設定を保存できませんでした");}}
-async function issueStaffLineCode(){try{const r=await api("/api/staff-line/link-code",{}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"issue");const e=document.getElementById("staffLineCode");e.style.display="block";e.innerHTML=esc(j.code)+'<div style="font-size:10.5px;font-weight:400;letter-spacing:0;color:#6b7280;margin-top:5px;">10分以内にスタッフ用LINEグループへそのまま送信してください</div>';copyText(j.code);uiAlert("接続コードを発行し、コピーしました。スタッフ用グループへ送信してください。");}catch(e){uiAlert("接続コードを発行できませんでした");}}
-async function testStaffLine(){try{const r=await api("/api/staff-line/test",{}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"test");uiAlert("スタッフ用LINEグループへテスト通知を送りました");}catch(e){uiAlert("テスト通知を送れませんでした。LINE DevelopersのWebhookとグループ接続を確認してください");}}
-async function disconnectStaffLine(){if(!await uiConfirm("右腕くんとスタッフLINEの連携を解除しますか？\\n通知・承認は停止し、登録スタッフも解除されます。"))return;try{const r=await api("/api/staff-line/disconnect",{}),j=await r.json();if(!r.ok||!j.ok)throw new Error("disconnect");document.getElementById("setStaffLineEnabled").checked=false;uiAlert("スタッフLINE連携を解除しました");await loadStaffLine();}catch(e){uiAlert("連携解除に失敗しました");}}
-async function changeStaffLineRole(id,role){try{const r=await api("/api/staff-line/staff-role",{id,role}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");renderStaffLineStaff(j.staff||[]);}catch(e){uiAlert(e.message==="last_admin"?"最後の管理者は変更できません。先に別の管理者を指定してください":"権限を変更できませんでした");await loadStaffLine();}}
-async function deleteStaffLineStaff(id){if(!await uiConfirm("このスタッフのLINE操作権限を解除しますか？"))return;try{const r=await api("/api/staff-line/staff-delete",{id}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"delete");renderStaffLineStaff(j.staff||[]);}catch(e){uiAlert(e.message==="last_admin"?"最後の管理者は解除できません":"登録を解除できませんでした");await loadStaffLine();}}
+async function saveStaffLineConfig(){const token=document.getElementById("setStaffLineToken").value.trim(),secret=document.getElementById("setStaffLineSecret").value.trim(),btn=document.getElementById("staffLineSaveBtn");await withBusy("staff-line-save",btn,"接続確認中…",async()=>{try{const r=await api("/api/staff-line/config",{token,secret});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");uiAlert("LINE公式アカウントを確認しました。次にWebhook URLを登録し、グループ接続コードを送信してください。");await loadStaffLine();}catch(e){const m={credential_encryption_not_configured:"運営側の暗号化設定が未完了です。秘密情報は保存していません。",missing_credentials:"アクセストークンとチャネルシークレットを入力してください",invalid_token:"アクセストークンを確認できませんでした",secret_required_for_channel_change:"別のLINE公式アカウントへ切り替える場合は、そのアカウントのチャネルシークレットも入力してください",patient_line_channel_not_allowed:"患者向けLINEと同じチャネルは使えません。法人専用のスタッフLINEを作成してください",channel_already_registered:"このLINE公式アカウントは別法人に登録済みです",line_unreachable:"LINEへ接続できませんでした"};uiAlert(m[e.message]||"スタッフLINE設定を保存できませんでした");}});}
+async function issueStaffLineCode(){const btn=document.getElementById("staffLineCodeBtn");await withBusy("staff-line-code",btn,"発行中…",async()=>{try{const r=await api("/api/staff-line/link-code",{}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"issue");const e=document.getElementById("staffLineCode");e.style.display="block";e.innerHTML=esc(j.code)+'<div style="font-size:10.5px;font-weight:400;letter-spacing:0;color:#6b7280;margin-top:5px;">10分以内にスタッフ用LINEグループへそのまま送信してください</div>';copyText(j.code);uiAlert("接続コードを発行し、コピーしました。スタッフ用グループへ送信してください。");}catch(e){uiAlert("接続コードを発行できませんでした");}});}
+async function testStaffLine(){const btn=document.getElementById("staffLineTestBtn");await withBusy("staff-line-test",btn,"送信中…",async()=>{try{const r=await api("/api/staff-line/test",{}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"test");uiAlert("スタッフ用LINEグループへテスト通知を送りました");}catch(e){uiAlert("テスト通知を送れませんでした。LINE DevelopersのWebhookとグループ接続を確認してください");}});}
+async function disconnectStaffLine(){if(!await uiConfirm("右腕くんとスタッフLINEの連携を解除しますか？\\n通知・承認は停止し、登録スタッフも解除されます。"))return;const btn=document.getElementById("staffLineDisconnectBtn");await withBusy("staff-line-disconnect",btn,"解除中…",async()=>{try{const r=await api("/api/staff-line/disconnect",{}),j=await r.json();if(!r.ok||!j.ok)throw new Error("disconnect");document.getElementById("setStaffLineEnabled").checked=false;uiAlert("スタッフLINE連携を解除しました");await loadStaffLine();}catch(e){uiAlert("連携解除に失敗しました");}});}
+async function changeStaffLineRole(id,role,select){await withBusy("staff-line-role-"+id,select,"変更中…",async()=>{try{const r=await api("/api/staff-line/staff-role",{id,role}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");renderStaffLineStaff(j.staff||[]);}catch(e){uiAlert(e.message==="last_admin"?"最後の管理者は変更できません。先に別の管理者を指定してください":"権限を変更できませんでした");await loadStaffLine();}});}
+async function deleteStaffLineStaff(id,btn){if(!await uiConfirm("このスタッフのLINE操作権限を解除しますか？"))return;await withBusy("staff-line-delete-"+id,btn,"解除中…",async()=>{try{const r=await api("/api/staff-line/staff-delete",{id}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"delete");renderStaffLineStaff(j.staff||[]);}catch(e){uiAlert(e.message==="last_admin"?"最後の管理者は解除できません":"登録を解除できませんでした");await loadStaffLine();}});}
 async function runQualityPreview(){const input=document.getElementById("qualityPreviewInput"),out=document.getElementById("qualityPreviewResult"),btn=document.getElementById("qualityPreviewBtn"),inquiry=input.value.trim();if(!inquiry){uiAlert("テストする問い合わせ文を入力してください");return;}btn.disabled=true;btn.textContent="生成中…";out.style.display="block";out.textContent="返信案を生成しています…";try{const r=await api("/api/quality-preview",{inquiry,channel:document.getElementById("qualityPreviewChannel").value}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"failed");const label=({gpt:"GPT",gemini:"Gemini",claude:"Claude"})[j.engine]||j.engine;const refs=Array.isArray(j.learningRefs)?j.learningRefs:[];const g=j.grounding||{},v=j.validation||{};const audit=g.autoSendAllowed&&v.pass?" / 根拠監査OK":" / スタッフ確認: "+((g.reasons&&g.reasons[0])||v.reason||"根拠不足");out.textContent=j.draft+"\\n\\n―― "+label+" / 確信率 "+(j.confidence||"不明")+(j.qualityIssues&&j.qualityIssues.length?" / 自動校正済み":"")+(refs.length?" / 過去対応 "+refs.length+"件参照":" / 過去対応の該当なし")+audit;}catch(e){out.textContent=e.message==="no_ai_key"?"AIキーが未設定のため生成できません。運営にAI接続設定を依頼してください。":e.message==="ai_failed"?"登録済みのAIキーを確認できませんでした。キーの失効・利用上限・モデル権限を運営側で確認してください。患者やLINEには送信されていません。":"生成できませんでした。時間をおいて再度お試しください。";}finally{btn.disabled=false;btn.textContent="返信案をテスト生成";}}
 let settingsSaveBusy=false;
 async function saveSet(){if(settingsSaveBusy)return;const btn=document.getElementById("saveSettingsBtn");settingsSaveBusy=true;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>保存中…';}const autoReply=document.getElementById("setAuto").checked;const bookingActions=document.getElementById("setBookingActions").checked;const staffLineEnabled=document.getElementById("setStaffLineEnabled").checked;const staffLineReplyMode=document.getElementById("setStaffLineReplyMode").value;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{const r=await api("/api/settings",{autoReply,bookingActions,staffLineEnabled,staffLineReplyMode,level,tone,engine,autoDelayMin});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");uiAlert("設定を保存しました");closeSet();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"先に法人専用スタッフLINEと通知グループを接続してください":e.message==="no_ai_key"?"AIキーが未設定のため自動返信を有効にできません。運営へ接続設定を依頼してください":"保存に失敗しました");}finally{settingsSaveBusy=false;if(btn){btn.disabled=false;btn.removeAttribute("aria-busy");btn.textContent="設定を保存";}}}
 async function changeLoginId(){
   const next=await uiPrompt("新しいログインID（半角英数字3〜30文字。スタッフ全員のログインに使います）");if(!next)return;
-  try{const r=await api("/api/change-loginid",{next:next.trim()});const j=await r.json();
+  const btn=document.getElementById("changeLoginIdBtn");await withBusy("change-login-id",btn,"変更中…",async()=>{try{const r=await api("/api/change-loginid",{next:next.trim()});const j=await r.json();
     if(j.ok)uiAlert("ログインIDを「"+j.loginId+"」に変更しました。スタッフに共有してください");
     else uiAlert(j.error==="id_taken"?"このIDは既に使われています":j.error==="bad_id"?"半角英数字3〜30文字にしてください":"変更に失敗しました");
-  }catch(e){uiAlert("変更に失敗しました");}}
+  }catch(e){uiAlert("変更に失敗しました");}});}
 async function changePass(){
   const cur=await uiPrompt("現在のパスワードを入力してください");if(cur===null)return;
   const np=await uiPrompt("新しいパスワード（8文字以上）を入力してください");if(np===null)return;
-  try{const r=await api("/api/change-pass",{current:cur,next:np});
+  const btn=document.getElementById("changePassBtn");await withBusy("change-password",btn,"変更中…",async()=>{try{const r=await api("/api/change-pass",{current:cur,next:np});
     if(r.ok){uiAlert("パスワードを変更しました。他のスタッフにも新しいパスワードを共有してください（各端末で次回ログインし直しが必要です）。");}
     else{const j=await r.json().catch(()=>({}));uiAlert(j.error==="wrong_current"?"現在のパスワードが違います":j.error==="too_short"?"8文字以上にしてください":"変更に失敗しました");}
-  }catch(e){uiAlert("変更に失敗しました");}
+  }catch(e){uiAlert("変更に失敗しました");}});
 }
-async function doLogout(){if(!await uiConfirm("ログアウトしますか？"))return;try{await api("/api/logout",{});}catch(e){}location.reload();}
+async function doLogout(){if(!await uiConfirm("ログアウトしますか？"))return;const btn=document.getElementById("logoutBtn");await withBusy("logout",btn,"ログアウト中…",async()=>{try{await api("/api/logout",{});}catch(e){}location.reload();});}
 // ---- push notifications ----
 if("serviceWorker" in navigator){navigator.serviceWorker.register("/sw.js").catch(()=>{});}
 function ub64(s){const p="=".repeat((4-s.length%4)%4);const b=(s+p).replace(/-/g,"+").replace(/_/g,"/");const r=atob(b);const a=new Uint8Array(r.length);for(let i=0;i<r.length;i++)a[i]=r.charCodeAt(i);return a;}
@@ -5620,6 +5653,7 @@ async function enablePush(){
     uiAlert("通知をオンにしました。新しい問い合わせが届くとこの端末に通知されます。");
   }catch(e){uiAlert("通知設定に失敗しました: "+e.message);}
 }
+async function busyEnablePush(){return withBusy("push-enable",document.getElementById("bellBtn"),"設定中…",enablePush);}
 async function refreshModelAlert(){
   try{
     const r=await fetch("/api/model-check"); const m=await r.json();

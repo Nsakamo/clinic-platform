@@ -108,3 +108,34 @@ test("設定保存中は進行表示と二重送信防止を行う", () => {
   assert.match(source, /<span class="spin" aria-hidden="true"><\/span>保存中…/);
   assert.match(source, /finally\{settingsSaveBusy=false/);
 });
+
+test("更新・送信・削除操作は共通の処理中表示と二重実行防止を使う", () => {
+  assert.match(source, /const uiBusyKeys=new Set\(\)/);
+  assert.match(source, /async function withBusy\(key,btn,label,work\)/);
+  assert.match(source, /uiBusyKeys\.has\(key\)/);
+  assert.match(source, /setAttribute\("aria-busy","true"\)/);
+  assert.match(source, /finally\{uiBusyKeys\.delete\(key\)/);
+  assert.match(source, /busySaveRichMenu/);
+  assert.match(source, /busyScheduleRichMenu/);
+  assert.match(source, /staff-line-test",btn,"送信中…"/);
+  assert.match(source, /karte-add-/);
+  assert.match(source, /appointment-cancel/);
+  assert.match(source, /busyAsstSend/);
+});
+
+test("重要な更新APIはサーバー側でも同時実行を拒否する", () => {
+  assert.match(source, /function oneMutationAtATime\(operation, resource\)/);
+  assert.match(source, /error: "already_processing"/);
+  assert.match(source, /rich-menu\/publish", guard, oneMutationAtATime\("rich-menu"\)/);
+  assert.match(source, /staff-line\/test", guard, oneMutationAtATime\("staff-line"\)/);
+  assert.match(source, /customer-appt-cancel", guard, oneMutationAtATime\("appointment-cancel"/);
+  assert.match(source, /api\/share", guard, oneMutationAtATime\("clinic-share"/);
+});
+
+test("ログインとパスワード再設定でも処理中表示と連打防止を行う", () => {
+  assert.match(source, /◌ ログイン中…/);
+  assert.match(source, /◌ 送信中…/);
+  assert.match(source, /◌ 設定中…/);
+  assert.match(source, /◌ 作成中…/);
+  assert.match(source, /var busy=false;async function go\(\)\{if\(busy\)return/);
+});
