@@ -72,6 +72,7 @@ function newTenant(slug, name, config) {
   if (typeof config.settings.autoDelayMin !== "number" || !isFinite(config.settings.autoDelayMin) || config.settings.autoDelayMin < 0) config.settings.autoDelayMin = 0;
   config.settings.autoDelayMin = Math.min(60, Math.round(config.settings.autoDelayMin)); // 自動返信までの待ち時間（分）。0=即時, 上限60
   if (!Array.isArray(config.settings.prefs)) config.settings.prefs = []; // スタッフの記憶（全返信に効く恒久ルール）
+  if (!Array.isArray(config.learningConflicts)) config.learningConflicts = []; // 過去回答と新回答の矛盾確認待ち
   if (typeof config.settings.bookingActions !== "boolean") config.settings.bookingActions = false; // 予約自動受付（うけつけるん連携でのキャンセル・変更・LINE連携）。既定OFF
   if (typeof config.settings.staffLineEnabled !== "boolean") config.settings.staffLineEnabled = false;
   if (!["review_all", "exceptions"].includes(config.settings.staffLineReplyMode)) config.settings.staffLineReplyMode = "exceptions";
@@ -639,7 +640,8 @@ function prefsBlock(t) {
   return a.map(p => (typeof p === "string" ? p : (p && p.text) || "")).filter(Boolean).map(s => "・" + s).join("\n");
 }
 function examplesRanked(t, query, k, context) {
-  const list = Object.values(t.examples || {});
+  const pendingIds = new Set(learningConflicts(t, true).flatMap(item => [Number(item.oldId), Number(item.newId)]));
+  const list = Object.values(t.examples || {}).filter(example => !pendingIds.has(Number(example.id)));
   if (!list.length) return [];
   return rankLearningExamples(list, { latest: query, context: context || query }, k || 4);
 }
@@ -652,7 +654,11 @@ function trustedLearningPrecedent(example) {
 }
 // 矛盾検知：今回の返信が、似た過去の対応例と「事実・方針」で食い違うかをAIで判定。食い違えば前の例を返す。
 async function checkConflict(t, q, newFinal, excludeId) {
-  const cand = examplesRanked(t, q, 3).filter(e => e.id !== excludeId);
+  // 新しい例を先に保存した後で検索するため、ランキング前に除外する。
+  // ランキング後に除外すると類似例の重複排除で古い回答まで消え、矛盾を見逃す。
+  const pendingIds = new Set(learningConflicts(t, true).flatMap(item => [Number(item.oldId), Number(item.newId)]));
+  const candidates = Object.values(t.examples || {}).filter(example => Number(example.id) !== Number(excludeId) && !pendingIds.has(Number(example.id)));
+  const cand = rankLearningExamples(candidates, { latest: q, context: q }, 3);
   if (!cand.length) return null;
   const old = cand[0];
   const sys = "2つの『お客様への返信』が、同じ種類の問い合わせに対して“事実・方針”で食い違うかだけを判定する。言い回し・丁寧さ・長さの違いは食い違いではない。料金・可否・日数・場所・有無・条件などの内容が矛盾する場合のみ conflict=true。質問の種類が違う場合や、単に情報が増えただけ・補足しただけの場合は false。出力はJSONのみ: {\"conflict\":true|false}";
@@ -664,6 +670,31 @@ async function checkConflict(t, q, newFinal, excludeId) {
     if (o && o.conflict === true) return { oldId: old.id, oldQ: old.q, oldFinal: old.final };
   } catch (e) {}
   return null;
+}
+function learningConflicts(t, pendingOnly) {
+  const list = Array.isArray(t.config.learningConflicts) ? t.config.learningConflicts : (t.config.learningConflicts = []);
+  return list.filter(item => item && (!pendingOnly || item.status === "pending")).sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
+}
+async function learningConflictAdd(t, data) {
+  if (!data || !data.oldId || !data.newId) return null;
+  const existing = learningConflicts(t, true).find(item => Number(item.oldId) === Number(data.oldId) && Number(item.newId) === Number(data.newId));
+  if (existing) return existing;
+  const item = {
+    id: "lc-" + Date.now().toString(36) + "-" + crypto.randomBytes(3).toString("hex"),
+    q: String(data.q || "").slice(0, 800), oldId: Number(data.oldId), oldFinal: String(data.oldFinal || "").slice(0, 1500),
+    newId: Number(data.newId), newFinal: String(data.newFinal || "").slice(0, 1500), source: String(data.source || "web").slice(0, 40),
+    status: "pending", createdAt: Date.now(), resolvedAt: 0, resolution: "",
+  };
+  t.config.learningConflicts.push(item);
+  while (t.config.learningConflicts.length > 100) t.config.learningConflicts.shift();
+  try { await saveTenantConfig(t); } catch (e) { console.error("learningConflictAdd:", e && e.message); }
+  return item;
+}
+async function exampleDelete(t, id) {
+  id = Number(id); if (!id || !(t.examples && t.examples[id])) return false;
+  delete t.examples[id];
+  if (pool) await pool.query("DELETE FROM examples WHERE tenant=$1 AND id=$2", [t.slug, id]);
+  return true;
 }
 // ===== ルール蒸留（自動ナレッジ化） =====
 // スタッフの返信・編集チャットの指示から「他の患者への返信にも再利用できる事実・規定」を抽出し、店舗ルールへ自動登録する。
@@ -748,8 +779,12 @@ async function learnStaffOutcome(t, c, opts) {
   const ex = await exampleAdd(t, { q, final: finalText, draft0, instr, source: opts.source || "web" });
   if (!ex) return { learnedId: null, conflict: null, learnedRules: [] };
   const changed = finalText !== draft0 || !!instr;
-  const distillP = changed ? distillRules(t, c, { q, final: finalText, draft0, instr }) : Promise.resolve([]);
-  const conflictP = changed ? checkConflict(t, q, finalText, ex.id) : Promise.resolve(null);
+  const conflictP = (changed ? checkConflict(t, q, finalText, ex.id) : Promise.resolve(null)).then(conflict => {
+    if (!conflict) return null;
+    return learningConflictAdd(t, { q, oldId: conflict.oldId, oldFinal: conflict.oldFinal, newId: ex.id, newFinal: finalText, source: opts.source || "web" });
+  });
+  // 矛盾があるのに新回答を先に正式ルールへ蒸留しない。人が正解を選ぶまで両案を保留する。
+  const distillP = changed ? conflictP.then(conflict => conflict ? [] : distillRules(t, c, { q, final: finalText, draft0, instr })) : Promise.resolve([]);
 
   if (opts.waitForAi === false) {
     distillP.catch((e) => console.error("learnStaffOutcome distill:", e && e.message));
@@ -2124,7 +2159,7 @@ app.post("/api/send", guard, async (req, res) => {
     const learned = await learnStaffOutcome(t, c, { q: q0, final: text, draft0, instr, source: "web", waitForAi: true });
     learnedId = learned.learnedId;
     learnedRules = learned.learnedRules || [];
-    if (learned.conflict) conflict = { oldId: learned.conflict.oldId, oldFinal: learned.conflict.oldFinal, newId: learnedId, newFinal: text };
+    if (learned.conflict) conflict = { id: learned.conflict.id, q: learned.conflict.q, oldId: learned.conflict.oldId, oldFinal: learned.conflict.oldFinal, newId: learned.conflict.newId, newFinal: learned.conflict.newFinal };
   }
   res.json({ ok: true, sent, sendErr, learnedId, conflict, learnedRules });
 });
@@ -2231,6 +2266,7 @@ function publicSettings(t) {
     publicUrlConfigured: !!publicConversationUrl({ id: "preview" }),
     engines: { claude: !!ANTHROPIC_KEY, gpt: !!process.env.OPENAI_KEY, gemini: !!process.env.GEMINI_KEY },
     activeEngine: activeAiEngine(t),
+    learningConflictsPending: learningConflicts(t, true).length,
     rules: { chars: rulesCharTotal(t), count: rulesList(t).length, budget: ruleBudget(t), budgets: RULE_BUDGETS }
   });
 }
@@ -2395,7 +2431,7 @@ app.get("/api/learning-data", guard, (req, res) => {
     id: e.id, q: e.q || "", final: e.final || "", draft0: e.draft0 || "", instr: e.instr || "", ts: e.ts || 0,
     source: e.source || "web", confirmedCount: Math.max(1, Number(e.confirmedCount || 1))
   }));
-  res.json({ ok: true, rules: rulesList(t).map(r => ({ id: r.id, title: r.title || "", content: r.content || "", updated: Number(r.updated || 0) })), prefs, examples });
+  res.json({ ok: true, rules: rulesList(t).map(r => ({ id: r.id, title: r.title || "", content: r.content || "", updated: Number(r.updated || 0) })), prefs, examples, conflicts: learningConflicts(t, true) });
 });
 app.post("/api/rule-save", guard, async (req, res) => {
   const t = req.tenant; const title = String(req.body.title || "").trim().slice(0, 100); const content = String(req.body.content || "").trim().slice(0, 2000);
@@ -2421,7 +2457,26 @@ app.post("/api/example-update", guard, async (req, res) => {
   catch (e) { return res.status(500).json({ ok: false, error: "save" }); }
   res.json({ ok: true, example: ex });
 });
-app.post("/api/example-delete", guard, (req, res) => { const t = req.tenant; const id = Number(req.body.id); if (t.examples && t.examples[id]) { delete t.examples[id]; if (pool) pool.query("DELETE FROM examples WHERE tenant=$1 AND id=$2", [t.slug, id]).catch(() => {}); } res.json({ ok: true }); });
+app.post("/api/example-delete", guard, async (req, res) => { const t = req.tenant; try { await exampleDelete(t, req.body.id); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false, error: "delete" }); } });
+app.post("/api/learning-conflict-resolve", guard, async (req, res) => {
+  const t = req.tenant, id = String(req.body.id || ""), mode = String(req.body.mode || "");
+  const item = learningConflicts(t, true).find(conflict => conflict.id === id);
+  if (!item) return res.status(404).json({ ok: false, error: "not_found" });
+  try {
+    let chosen = null;
+    if (mode === "new") { chosen = t.examples && t.examples[item.newId]; await exampleDelete(t, item.oldId); }
+    else if (mode === "old") { chosen = t.examples && t.examples[item.oldId]; await exampleDelete(t, item.newId); }
+    else if (mode === "custom") {
+      const final = String(req.body.final || "").trim().slice(0, 1500); if (!final) return res.status(400).json({ ok: false, error: "required" });
+      await exampleDelete(t, item.oldId); await exampleDelete(t, item.newId);
+      chosen = await exampleAdd(t, { q: item.q, final, draft0: item.newFinal, instr: "学習矛盾の確認でスタッフが正解を指定", source: "conflict_resolution" });
+    } else return res.status(400).json({ ok: false, error: "bad_mode" });
+    if (chosen) await distillRules(t, null, { q: item.q, final: chosen.final, draft0: mode === "custom" ? item.newFinal : "", instr: "学習矛盾の確認でこの回答を今後の正解として選択" });
+    item.status = "resolved"; item.resolution = mode; item.resolvedAt = Date.now();
+    await saveTenantConfig(t);
+    res.json({ ok: true, pending: learningConflicts(t, true).length });
+  } catch (e) { res.status(500).json({ ok: false, error: "save" }); }
+});
 app.post("/api/pref-add", guard, (req, res) => { const t = req.tenant; const text = String(req.body.text || "").trim().slice(0, 200); if (!text) return res.json({ ok: false }); const cur = (Array.isArray(S(t).prefs)) ? S(t).prefs : (S(t).prefs = []); if (!cur.some(p => (typeof p === "string" ? p : p.text) === text)) { cur.push({ id: Date.now(), text }); while (cur.length > 40) cur.shift(); saveTenantConfig(t).catch(() => {}); } res.json({ ok: true, prefs: S(t).prefs }); });
 app.post("/api/pref-update", guard, async (req, res) => {
   const t = req.tenant; const key = String(req.body.key || ""); const text = String(req.body.text || "").trim().slice(0, 200); const cur = Array.isArray(S(t).prefs) ? S(t).prefs : [];
@@ -4292,8 +4347,9 @@ const PAGE = `<!DOCTYPE html>
     .settingsCard .cbtn,.learningCard .cbtn{min-height:42px;}
     .learningHeader{padding:calc(12px + env(safe-area-inset-top)) 12px 10px;}
     .learningHeaderRow h3{font-size:15px;}
-    .learningToolbar{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));padding:9px 10px;gap:6px;}
+    .learningToolbar{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));padding:9px 10px;gap:6px;}
     .learningToolbar .learnTabBtn{padding:7px 3px;font-size:11px;white-space:normal;line-height:1.25;}
+    .learningToolbar #learnSearch{grid-column:1/-1;}
     #learnSearch{grid-column:1/-1;margin-left:0;max-width:none;width:100%;min-width:0;}
     #learnHelp{padding:8px 11px!important;}
     #learnList{padding:10px!important;min-height:0!important;}
@@ -4435,7 +4491,7 @@ const PAGE = `<!DOCTYPE html>
       <div style="font-size:13px;font-weight:600;">🧠 学習データ管理</div>
       <button type="button" class="cbtn" onclick="openLearning()">確認・編集</button>
     </div>
-    <div style="font-size:11px;color:#6b7280;margin-top:5px;line-height:1.55;">右腕くん画面またはスタッフLINEで確定して送った返信を学習し、似た問い合わせへ再利用します。LINE公式アカウント管理画面から直接送った返信は右腕くんへ届かないため学習できません。店舗ルール、スタッフの記憶、過去の対応例はここで確認・編集・削除できます。</div>
+    <div style="font-size:11px;color:#6b7280;margin-top:5px;line-height:1.55;">右腕くん画面またはスタッフLINEで確定して送った返信を学習し、似た問い合わせへ再利用します。LINE公式アカウント管理画面から直接送った返信は右腕くんへ届かないため学習できません。店舗ルール、スタッフの記憶、過去の対応例はここで確認・編集・削除できます。<span id="learningConflictSummary"></span></div>
   </div>
   <div class="settingsSection" style="border-color:#99f6e4;background:#f0fdfa;">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
@@ -4522,12 +4578,13 @@ const PAGE = `<!DOCTYPE html>
 <div id="learnManagePop"><div class="learningCard">
   <div class="learningHeader">
     <div class="learningHeaderRow"><h3>🧠 学習データ管理</h3><button type="button" class="cbtn" onclick="closeLearning()">閉じる</button></div>
-    <div style="font-size:11px;color:#6b7280;line-height:1.6;margin-top:6px;">3種類は役割が違います。<b>店舗ルール</b>は店舗の事実・規定、<b>スタッフの記憶</b>は全返信に常に適用する指示、<b>過去の対応例</b>は似た質問のときだけ参考にする実例です。</div>
+    <div style="font-size:11px;color:#6b7280;line-height:1.6;margin-top:6px;"><b>店舗ルール</b>は店舗の事実・規定、<b>スタッフの記憶</b>は全返信への指示、<b>過去の対応例</b>は似た質問へ再利用する実例です。回答が食い違った場合は<b>学習確認待ち</b>で今後の正解を決めます。</div>
   </div>
   <div class="learningToolbar">
     <button type="button" class="cbtn learnTabBtn" data-tab="rules" onclick="setLearningTab('rules')">📚 店舗ルール <span id="learnRulesCount"></span></button>
     <button type="button" class="cbtn learnTabBtn" data-tab="prefs" onclick="setLearningTab('prefs')">🧠 スタッフの記憶 <span id="learnPrefsCount"></span></button>
     <button type="button" class="cbtn learnTabBtn" data-tab="examples" onclick="setLearningTab('examples')">💬 過去の対応例 <span id="learnExamplesCount"></span></button>
+    <button type="button" class="cbtn learnTabBtn" data-tab="conflicts" onclick="setLearningTab('conflicts')">⚠ 学習確認待ち <span id="learnConflictsCount"></span></button>
     <input id="learnSearch" oninput="renderLearning()" placeholder="この種類を検索">
   </div>
   <div id="learnHelp" style="padding:9px 16px;background:#f8fafc;border-bottom:1px solid #e5e7eb;font-size:11px;color:#475569;line-height:1.55;"></div>
@@ -4548,9 +4605,9 @@ const PAGE = `<!DOCTYPE html>
   <div id="conflictNew" style="font-size:12px;background:#ede9fe;border-radius:8px;padding:8px;margin-bottom:12px;white-space:pre-wrap;"></div>
   <div style="font-size:12px;color:#374151;margin-bottom:10px;">今後はどちらを基準にしますか？</div>
   <div style="display:flex;flex-direction:column;gap:8px;">
-    <button class="cbtn send" style="width:100%;" onclick="resolveConflict('new')">今後は今回を基準にする（前の答えを消す）</button>
-    <button class="cbtn" style="width:100%;" onclick="resolveConflict('exception')">今回は特例（前の答えを残す・今回は学習しない）</button>
-    <button class="cbtn" style="width:100%;" onclick="resolveConflict('chat')">どちらでもない（チャットで正しい答えを決める）</button>
+    <button class="cbtn send" style="width:100%;" onclick="resolveConflict('new')">今後は今回の回答を正解にする</button>
+    <button class="cbtn" style="width:100%;" onclick="resolveConflict('old')">今回は特例（前の回答を正解のまま残す）</button>
+    <button class="cbtn" style="width:100%;" onclick="resolveConflict('later')">どちらでもない・後で正しい回答を入力</button>
   </div>
 </div></div>
 <script>
@@ -5233,7 +5290,7 @@ function renderPrefs(prefs){const el=document.getElementById("prefList");if(!el)
 async function addPref(){const inp=document.getElementById("prefInput");const text=(inp&&inp.value||"").trim();if(!text)return;try{const r=await api("/api/pref-add",{text});const j=await r.json();if(j.ok){if(inp)inp.value="";renderPrefs(j.prefs||[]);}}catch(e){uiAlert("追加に失敗しました");}}
 async function delPref(id){try{const r=await api("/api/pref-delete",{id});const j=await r.json();if(j.ok)renderPrefs(j.prefs||[]);}catch(e){}}
 // 店舗ルール・スタッフの記憶・過去の対応例を、保存先は分けたまま一画面で管理する。
-let LEARN={rules:[],prefs:[],examples:[]},learnTab="rules";
+let LEARN={rules:[],prefs:[],examples:[],conflicts:[]},learnTab="rules";
 function learnField(label,value,rows,readOnly){
   const box=document.createElement("label");box.style.cssText="display:block;margin-top:8px;font-size:11px;font-weight:600;color:#475569;";box.appendChild(document.createTextNode(label));
   const el=rows?document.createElement("textarea"):document.createElement("input");if(!rows)el.type="text";el.value=value||"";if(rows)el.rows=rows;if(readOnly)el.readOnly=true;
@@ -5244,7 +5301,7 @@ function learnCard(){const d=document.createElement("div");d.style.cssText="bord
 function setLearnStatus(text,bad){const e=document.getElementById("learnStatus");if(e){e.textContent=text||"";e.style.color=bad?"#dc2626":"#6b7280";}}
 async function reloadLearning(){
   setLearnStatus("読み込み中…");
-  try{const r=await fetch("/api/learning-data");const j=await r.json();if(!r.ok||!j.ok)throw new Error("load");LEARN={rules:j.rules||[],prefs:j.prefs||[],examples:j.examples||[]};renderLearning();setLearnStatus("");}
+  try{const r=await fetch("/api/learning-data");const j=await r.json();if(!r.ok||!j.ok)throw new Error("load");LEARN={rules:j.rules||[],prefs:j.prefs||[],examples:j.examples||[],conflicts:j.conflicts||[]};renderLearning();setLearnStatus("");}
   catch(e){setLearnStatus("学習データを読み込めませんでした",true);}
 }
 function openLearning(){document.getElementById("learnManagePop").style.display="flex";reloadLearning();}
@@ -5253,15 +5310,16 @@ function setLearningTab(tab){learnTab=tab;document.getElementById("learnSearch")
 function learningMatches(item,query){if(!query)return true;return Object.values(item||{}).some(v=>String(v||"").toLowerCase().includes(query));}
 function renderLearning(){
   const list=document.getElementById("learnList");if(!list)return;list.innerHTML="";
-  document.getElementById("learnRulesCount").textContent="("+LEARN.rules.length+")";document.getElementById("learnPrefsCount").textContent="("+LEARN.prefs.length+")";document.getElementById("learnExamplesCount").textContent="("+LEARN.examples.length+")";
+  document.getElementById("learnRulesCount").textContent="("+LEARN.rules.length+")";document.getElementById("learnPrefsCount").textContent="("+LEARN.prefs.length+")";document.getElementById("learnExamplesCount").textContent="("+LEARN.examples.length+")";document.getElementById("learnConflictsCount").textContent="("+LEARN.conflicts.length+")";
   document.querySelectorAll(".learnTabBtn").forEach(b=>{const on=b.dataset.tab===learnTab;b.style.background=on?"#ecfdf5":"#fff";b.style.borderColor=on?"#10b981":"#d1d5db";b.style.color=on?"#047857":"#374151";});
   const help=document.getElementById("learnHelp"),add=document.getElementById("learnAddBtn");
   if(learnTab==="rules"){help.textContent="店舗の料金・営業時間・対応可否などの事実や規定です。関連する質問への回答では最優先で使われます。";add.style.display="inline-block";add.textContent="＋店舗ルールを追加";}
   else if(learnTab==="prefs"){help.textContent="文体や案内方針など、すべての返信に毎回適用する指示です。患者固有の情報は登録しないでください。";add.style.display="inline-block";add.textContent="＋スタッフの記憶を追加";}
-  else{help.textContent="スタッフが実際に送った返信の実例です。似た問い合わせのときだけ参考にします。患者情報を含む場合があるため、不要な例は削除できます。";add.style.display="none";}
+  else if(learnTab==="examples"){help.textContent="スタッフが実際に送った返信の実例です。似た問い合わせのときに対応方法と文章を再利用します。患者情報を含む場合があるため、不要な例は削除できます。";add.style.display="none";}
+  else{help.textContent="似た質問への回答が前回と今回で食い違っています。今後どちらを正解にするか、または正しい回答を入力してください。決めるまで自動学習の基準にはしません。";add.style.display="none";}
   const q=(document.getElementById("learnSearch").value||"").trim().toLowerCase();const items=(LEARN[learnTab]||[]).filter(x=>learningMatches(x,q));
   if(!items.length){const e=document.createElement("div");e.style.cssText="text-align:center;color:#94a3b8;padding:42px 10px;font-size:13px;";e.textContent=q?"検索に一致するデータはありません":"まだデータはありません";list.appendChild(e);return;}
-  items.forEach(item=>{if(learnTab==="rules")renderLearnRule(list,item);else if(learnTab==="prefs")renderLearnPref(list,item);else renderLearnExample(list,item);});
+  items.forEach(item=>{if(learnTab==="rules")renderLearnRule(list,item);else if(learnTab==="prefs")renderLearnPref(list,item);else if(learnTab==="examples")renderLearnExample(list,item);else renderLearnConflict(list,item);});
 }
 function renderLearnRule(list,item){
   const card=learnCard(),title=learnField("見出し",item.title||"",0),content=learnField("ルール本文",item.content||"",4);card.appendChild(title.box);card.appendChild(content.box);
@@ -5279,6 +5337,15 @@ function renderLearnExample(list,item){
   const q=learnField("患者からの問い合わせ",item.q||"",3),final=learnField("スタッフが実際に送った返信",item.final||"",5),instr=learnField("返信作成時の修正指示（任意）",item.instr||"",2);card.appendChild(q.box);card.appendChild(final.box);card.appendChild(instr.box);
   if(item.draft0){const det=document.createElement("details");det.style.cssText="margin-top:8px;font-size:11px;color:#64748b;";const sum=document.createElement("summary");sum.textContent="元のAI下書きを確認（編集不可）";sum.style.cursor="pointer";det.appendChild(sum);const draft=learnField("",item.draft0,3,true);det.appendChild(draft.box);card.appendChild(det);}
   const row=document.createElement("div");row.style.cssText="display:flex;justify-content:flex-end;gap:7px;margin-top:9px;";row.appendChild(learnButton("削除",false,async()=>{if(!await uiConfirm("この過去の対応例を削除しますか？"))return;await learnMutate("/api/example-delete",{id:item.id},"削除しました");}));row.appendChild(learnButton("保存",true,async()=>{await learnMutate("/api/example-update",{id:item.id,q:q.el.value,final:final.el.value,instr:instr.el.value},"保存しました");}));card.appendChild(row);list.appendChild(card);
+}
+function renderLearnConflict(list,item){
+  const card=learnCard(),date=document.createElement("div");date.style.cssText="font-size:10px;color:#b45309;font-weight:600;";date.textContent="⚠ 確認待ち ・ "+(item.createdAt?new Date(item.createdAt).toLocaleString("ja-JP"):"日時不明");card.appendChild(date);
+  const q=learnField("患者からの問い合わせ",item.q||"",3,true),oldF=learnField("前の回答",item.oldFinal||"",4,true),newF=learnField("今回の回答",item.newFinal||"",4,true),custom=learnField("どちらでもない場合の正しい回答",item.newFinal||"",4,false);card.appendChild(q.box);card.appendChild(oldF.box);card.appendChild(newF.box);card.appendChild(custom.box);
+  const row=document.createElement("div");row.style.cssText="display:flex;justify-content:flex-end;gap:7px;margin-top:9px;flex-wrap:wrap;";row.appendChild(learnButton("前の回答を正解にする",false,()=>resolveLearningConflict(item.id,"old","")));row.appendChild(learnButton("今回の回答を正解にする",true,()=>resolveLearningConflict(item.id,"new","")));row.appendChild(learnButton("入力した回答を正解にする",true,()=>resolveLearningConflict(item.id,"custom",custom.el.value)));card.appendChild(row);list.appendChild(card);
+}
+async function resolveLearningConflict(id,mode,final){
+  if(mode==="custom"&&!String(final||"").trim()){uiAlert("今後使う正しい回答を入力してください");return;}
+  setLearnStatus("学習内容を更新しています…");try{const r=await api("/api/learning-conflict-resolve",{id,mode,final}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");await reloadLearning();setLearnStatus("今後の正解を更新しました");const s=document.getElementById("learningConflictSummary");if(s)s.textContent=j.pending?" ⚠ 学習確認待ち "+j.pending+"件":"";}catch(e){setLearnStatus("更新できませんでした",true);}
 }
 async function learnMutate(path,body,done){
   setLearnStatus("保存中…");try{const r=await api(path,body);const j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error(j.error||"save");await reloadLearning();setLearnStatus(done||"保存しました");setTimeout(()=>{const e=document.getElementById("learnStatus");if(e&&e.textContent===done)e.textContent="";},1800);}
@@ -5328,7 +5395,7 @@ async function undoLearn(id){ try{ await api("/api/example-delete",{id}); }catch
 // 矛盾の確認：前の答えと今回の答えが食い違った時に出す。基準を選ぶと不要な方の対応例を削除。
 let conflictData=null;
 function showConflict(c){ conflictData=c; const o=document.getElementById("conflictOld"),n=document.getElementById("conflictNew"); if(o)o.textContent=c.oldFinal||""; if(n)n.textContent=c.newFinal||""; const p=document.getElementById("conflictPop"); if(p)p.style.display="flex"; }
-async function resolveConflict(mode){ const c=conflictData; conflictData=null; const p=document.getElementById("conflictPop"); if(p)p.style.display="none"; if(!c)return; try{ if(mode==="new"){ await api("/api/example-delete",{id:c.oldId}); } else if(mode==="exception"){ await api("/api/example-delete",{id:c.newId}); } else if(mode==="chat"){ await api("/api/example-delete",{id:c.oldId}); await api("/api/example-delete",{id:c.newId}); openConflictChat(c); } }catch(e){} }
+async function resolveConflict(mode){ const c=conflictData; conflictData=null; const p=document.getElementById("conflictPop"); if(p)p.style.display="none"; if(!c)return; try{ if(mode==="new"||mode==="old"){ await api("/api/learning-conflict-resolve",{id:c.id,mode}); } else if(mode==="later"){ learnTab="conflicts";openLearning(); } }catch(e){} }
 // 「どちらでもない」→ みぎうで君を開き、食い違った2案を背景に、正しい案内をチャットで決めてルール化する
 function openConflictChat(c){ openAsst(null); try{ asstHist.push({role:"user",content:"（背景）似た質問で過去の回答が食い違っていました。前の回答:「"+(c.oldFinal||"")+"」／今回の回答:「"+(c.newFinal||"")+"」。どちらも正解ではありません。これからスタッフが正しい案内を教えるので、それを既存ルールと矛盾しない形でルール化する提案をしてください。"}); }catch(e){} amAdd("sysn","過去の回答が食い違っていました。正しい案内を教えてください——内容をルールにします。"); }
 // ---- settings popup ----
@@ -5353,7 +5420,7 @@ function renderRuleGauge(){
   }
 }
 async function openSet(){try{const ar=await fetch("/api/account");const a=await ar.json();document.getElementById("accountLoginId").textContent="ログインID: "+(a.loginId||"");document.getElementById("setAccountEmail").value=a.accountEmail||"";document.getElementById("accountEmailStat").textContent=(a.accountEmail?"再設定メールアドレス登録済み":"再設定メールアドレス未登録")+(a.resetEmailReady?"・メール送信可能":"・送信メール設定が必要");}catch(e){}
-  try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setBookingActions").checked=!!s.bookingActions;document.getElementById("setStaffLineEnabled").checked=!!s.staffLineEnabled;document.getElementById("setStaffLineReplyMode").value=s.staffLineReplyMode||"exceptions";document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"gemini";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);window.__rules=s.rules||null;renderRuleGauge();renderPrefs(s.prefs||[]);
+  try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setBookingActions").checked=!!s.bookingActions;document.getElementById("setStaffLineEnabled").checked=!!s.staffLineEnabled;document.getElementById("setStaffLineReplyMode").value=s.staffLineReplyMode||"exceptions";document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"gemini";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);window.__rules=s.rules||null;renderRuleGauge();renderPrefs(s.prefs||[]);const lcs=document.getElementById("learningConflictSummary");if(lcs)lcs.textContent=s.learningConflictsPending?" ⚠ 学習確認待ち "+s.learningConflictsPending+"件":"";
   if(s.engines){const n=document.getElementById("engineNote");const active=({gpt:"GPT",gemini:"Gemini",claude:"Claude"})[s.activeEngine]||"なし";n.textContent="設定状況: GPT"+(s.engines.gpt?"✓設定済み":"⚠キー未設定")+"・Gemini"+(s.engines.gemini?"✓設定済み":"⚠キー未設定")+"・Claude"+(s.engines.claude?"✓設定済み":"⚠キー未設定")+"。優先エンジン: "+active+"（✓はキーの登録を示します。実際の有効性は下の文章品質テストで確認してください。失敗時は次の設定済みAIへ自動切替します）。";}}catch(e){}
   refreshModelAlert();
   try{const cr=await fetch("/api/conn");const c=await cr.json();document.getElementById("connStat").textContent=(c.lineConfigured?"LINE✓ ":"LINE未 ")+(c.mailConfigured?"メール✓":"メール未");document.getElementById("cSmtpHost").value=c.smtpHost||"";document.getElementById("cSmtpPort").value=c.smtpPort||"";document.getElementById("cSmtpUser").value=c.smtpUser||"";document.getElementById("cImapHost").value=c.imapHost||"";document.getElementById("cImapPort").value=c.imapPort||"";document.getElementById("cImapUser").value=c.imapUser||"";document.getElementById("cEmailInternal").checked=!!c.emailInternal;renderAccts(c);}catch(e){}
