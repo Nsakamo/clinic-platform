@@ -71,7 +71,7 @@ function newTenant(slug, name, config) {
   if (typeof config.settings.tone !== "string") config.settings.tone = "";
   if (typeof config.settings.autoDelayMin !== "number" || !isFinite(config.settings.autoDelayMin) || config.settings.autoDelayMin < 0) config.settings.autoDelayMin = 0;
   config.settings.autoDelayMin = Math.min(60, Math.round(config.settings.autoDelayMin)); // 自動返信までの待ち時間（分）。0=即時, 上限60
-  if (!Array.isArray(config.settings.prefs)) config.settings.prefs = []; // スタッフの記憶（全返信に効く恒久ルール）
+  if (!Array.isArray(config.settings.prefs)) config.settings.prefs = []; // 全体の返信方針（全返信に効く恒久ルール）
   if (!Array.isArray(config.learningConflicts)) config.learningConflicts = []; // 過去回答と新回答の矛盾確認待ち
   if (typeof config.settings.bookingActions !== "boolean") config.settings.bookingActions = false; // 予約自動受付（うけつけるん連携でのキャンセル・変更・LINE連携）。既定OFF
   if (typeof config.settings.staffLineEnabled !== "boolean") config.settings.staffLineEnabled = false;
@@ -634,7 +634,7 @@ async function exampleAdd(t, obj) {
   while (ids.length > EXAMPLE_MAX) { const old = ids.shift(); delete t.examples[old]; if (pool) pool.query("DELETE FROM examples WHERE tenant=$1 AND id=$2", [t.slug, old]).catch(() => {}); }
   return ex;
 }
-// スタッフの記憶（恒久ルール）を生成プロンプト用のテキストに整形
+// 全体の返信方針（恒久ルール）を生成プロンプト用のテキストに整形
 function prefsBlock(t) {
   const a = (S(t).prefs && Array.isArray(S(t).prefs)) ? S(t).prefs : [];
   return a.map(p => (typeof p === "string" ? p : (p && p.text) || "")).filter(Boolean).map(s => "・" + s).join("\n");
@@ -652,7 +652,7 @@ function trustedLearningPrecedent(example) {
     || (!!String(example && example.draft0 || "").trim() && String(example.draft0).trim() !== String(example.final || "").trim());
   return score >= 0.55 || (score >= 0.32 && confirmations >= 2) || (score >= 0.38 && explicitlyCorrected);
 }
-// 矛盾検知：今回の返信が、似た過去の対応例と「事実・方針」で食い違うかをAIで判定。食い違えば前の例を返す。
+// 矛盾検知：今回の返信が、似た過去の対応・学習例と「事実・方針」で食い違うかをAIで判定。食い違えば前の例を返す。
 async function checkConflict(t, q, newFinal, excludeId) {
   // 新しい例を先に保存した後で検索するため、ランキング前に除外する。
   // ランキング後に除外すると類似例の重複排除で古い回答まで消え、矛盾を見逃す。
@@ -2740,7 +2740,7 @@ async function draftChatSaveRule(t, ruleObj) {
     return r ? { id: r.id, title: r.title } : null;
   } catch (e) { return null; }
 }
-// 恒久メモリ（スタッフの記憶）への保存
+// 恒久メモリ（全体の返信方針）への保存
 function draftChatSaveMemory(t, memTxt) {
   memTxt = String(memTxt || "").trim().slice(0, 200);
   if (!memTxt) return "";
@@ -4491,7 +4491,7 @@ const PAGE = `<!DOCTYPE html>
       <div style="font-size:13px;font-weight:600;">🧠 学習データ管理</div>
       <button type="button" class="cbtn" onclick="openLearning()">確認・編集</button>
     </div>
-    <div style="font-size:11px;color:#6b7280;margin-top:5px;line-height:1.55;">右腕くん画面またはスタッフLINEで確定して送った返信を学習し、似た問い合わせへ再利用します。LINE公式アカウント管理画面から直接送った返信は右腕くんへ届かないため学習できません。店舗ルール、スタッフの記憶、過去の対応例はここで確認・編集・削除できます。<span id="learningConflictSummary"></span></div>
+    <div style="font-size:11px;color:#6b7280;margin-top:5px;line-height:1.55;">右腕くん画面またはスタッフLINEで確定して送った返信を学習し、似た問い合わせへ再利用します。LINE公式アカウント管理画面から直接送った返信は右腕くんへ届かないため学習できません。店舗ルール、全体の返信方針、過去の対応・学習例はここで確認・編集・削除できます。<span id="learningConflictSummary"></span></div>
   </div>
   <div class="settingsSection" style="border-color:#99f6e4;background:#f0fdfa;">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
@@ -4578,12 +4578,12 @@ const PAGE = `<!DOCTYPE html>
 <div id="learnManagePop"><div class="learningCard">
   <div class="learningHeader">
     <div class="learningHeaderRow"><h3>🧠 学習データ管理</h3><button type="button" class="cbtn" onclick="closeLearning()">閉じる</button></div>
-    <div style="font-size:11px;color:#6b7280;line-height:1.6;margin-top:6px;"><b>店舗ルール</b>は店舗の事実・規定、<b>スタッフの記憶</b>は全返信への指示、<b>過去の対応例</b>は似た質問へ再利用する実例です。回答が食い違った場合は<b>学習確認待ち</b>で今後の正解を決めます。</div>
+    <div style="font-size:11px;color:#6b7280;line-height:1.6;margin-top:6px;"><b>店舗ルール</b>は店舗の事実・規定、<b>全体の返信方針</b>は全返信への共通指示、<b>過去の対応・学習例</b>は似た質問へ再利用する実例です。回答が食い違った場合は<b>学習確認待ち</b>で今後の正解を決めます。</div>
   </div>
   <div class="learningToolbar">
     <button type="button" class="cbtn learnTabBtn" data-tab="rules" onclick="setLearningTab('rules')">📚 店舗ルール <span id="learnRulesCount"></span></button>
-    <button type="button" class="cbtn learnTabBtn" data-tab="prefs" onclick="setLearningTab('prefs')">🧠 スタッフの記憶 <span id="learnPrefsCount"></span></button>
-    <button type="button" class="cbtn learnTabBtn" data-tab="examples" onclick="setLearningTab('examples')">💬 過去の対応例 <span id="learnExamplesCount"></span></button>
+    <button type="button" class="cbtn learnTabBtn" data-tab="prefs" onclick="setLearningTab('prefs')">🧠 全体の返信方針 <span id="learnPrefsCount"></span></button>
+    <button type="button" class="cbtn learnTabBtn" data-tab="examples" onclick="setLearningTab('examples')">💬 過去の対応・学習例 <span id="learnExamplesCount"></span></button>
     <button type="button" class="cbtn learnTabBtn" data-tab="conflicts" onclick="setLearningTab('conflicts')">⚠ 学習確認待ち <span id="learnConflictsCount"></span></button>
     <input id="learnSearch" oninput="renderLearning()" placeholder="この種類を検索">
   </div>
@@ -4673,7 +4673,7 @@ function renderList(){
 function esc(s){return (s||"").replace(/[<>&]/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]));}
 function mediaHtml(m){ var cls='b '+(m.from==="them"?"them":"us"); var src=m.mediaId?('/api/line-media/'+m.mediaId):(m.url||"https://placehold.co/300x220/e5e7eb/6b7280?text=%F0%9F%93%B7"); if(m.media==="image")return '<div class="'+cls+' media"><a href="'+src+'" target="_blank"><img class="ph" src="'+src+'"></a></div>'; if(m.media==="video")return (m.mediaId||m.url)?('<div class="'+cls+' media"><video class="ph" style="max-width:220px;border-radius:10px;" controls preload="metadata" src="'+src+'"></video></div>'):('<div class="'+cls+' media"><div class="vid">▶<span>動画</span></div></div>'); if(m.media==="file")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" style="text-decoration:none;">📄 '+esc(m.fileName||"ファイル")+'</a></div>'; if(m.media==="audio")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" style="text-decoration:none;">🎤 音声メッセージ</a></div>'; return ''; }
 function bubblesHtml(r){return r.msgs.map(m=>{const body=m.media?mediaHtml(m):('<div class="b '+(m.from==="them"?"them":"us")+'">'+esc(m.text)+'</div>');const tl=(m.time||"")+(m.auto?' <span style="color:#7c3aed;">🤖 自動返信</span>':"");return body+'<div class="btime" style="align-self:'+(m.from==="them"?"flex-start":"flex-end")+'">'+tl+'</div>';}).join("");}
-function learningRefsText(r){const refs=(r&&Array.isArray(r.learningRefs))?r.learningRefs:[];if(!refs.length)return "";return "🧠 過去の対応例 "+refs.length+"件を参照（"+refs.map(x=>"#"+x.id+" 類似"+x.score+"%"+(x.confirmedCount>1?"・確認"+x.confirmedCount+"回":"")).join(" / ")+"）";}
+function learningRefsText(r){const refs=(r&&Array.isArray(r.learningRefs))?r.learningRefs:[];if(!refs.length)return "";return "🧠 過去の対応・学習例 "+refs.length+"件を参照（"+refs.map(x=>"#"+x.id+" 類似"+x.score+"%"+(x.confirmedCount>1?"・確認"+x.confirmedCount+"回":"")).join(" / ")+"）";}
 function renderLearningRefs(r){const el=document.getElementById("learningUsed");if(!el)return;const text=learningRefsText(r);el.textContent=text;el.style.display=text?"block":"none";}
 function groundingText(r){if(!(r&&r.grounding))return "";const g=r.grounding,v=r.validation||{};if(g.autoSendAllowed&&v.pass)return "✓ 送信前の根拠監査済み"+(g.sources&&g.sources.length?"（"+g.sources.join("・")+"）":"");const reasons=Array.isArray(g.reasons)?g.reasons:[];return "⚠ スタッフ確認が必要"+(reasons.length?"："+reasons.join("／"):(v.reason?"："+v.reason:""));}
 function renderGrounding(r){const el=document.getElementById("groundingUsed");if(!el)return;const text=groundingText(r);el.textContent=text;el.style.display=text?"block":"none";el.style.color=(r&&r.grounding&&r.grounding.autoSendAllowed&&r.validation&&r.validation.pass)?"#047857":"#b45309";}
@@ -5285,11 +5285,11 @@ function asstAttach(){const inp=document.createElement("input");inp.type="file";
       }else amAdd("sysn","読み込み失敗: "+(j.error==="too_large"?"ファイルが大きすぎます":j.error==="unsupported"?"対応していない形式です（画像・PDF・CSV・テキストのみ）":(j.error||"不明")));
     }catch(e){ph.remove();amAdd("sysn","読み込みに失敗しました");}};
   inp.click();}
-// スタッフの記憶（恒久ルール）の一覧描画・追加・削除
+// 全体の返信方針（恒久ルール）の一覧描画・追加・削除
 function renderPrefs(prefs){const el=document.getElementById("prefList");if(!el)return;const a=Array.isArray(prefs)?prefs:[];if(!a.length){el.innerHTML='<span style="color:#9ca3af;">まだ記憶はありません。</span>';return;}el.innerHTML=a.map(p=>{const id=(p&&p.id!=null)?p.id:"";const tx=(typeof p==="string")?p:((p&&p.text)||"");return '<div style="display:flex;align-items:center;gap:6px;padding:3px 0;"><span style="flex:1;">・'+esc(tx)+'</span><button onclick="delPref('+JSON.stringify(id)+')" style="border:none;background:transparent;color:#dc2626;cursor:pointer;font-size:14px;">×</button></div>';}).join("");}
 async function addPref(){const inp=document.getElementById("prefInput");const text=(inp&&inp.value||"").trim();if(!text)return;try{const r=await api("/api/pref-add",{text});const j=await r.json();if(j.ok){if(inp)inp.value="";renderPrefs(j.prefs||[]);}}catch(e){uiAlert("追加に失敗しました");}}
 async function delPref(id){try{const r=await api("/api/pref-delete",{id});const j=await r.json();if(j.ok)renderPrefs(j.prefs||[]);}catch(e){}}
-// 店舗ルール・スタッフの記憶・過去の対応例を、保存先は分けたまま一画面で管理する。
+// 店舗ルール・全体の返信方針・過去の対応・学習例を、保存先は分けたまま一画面で管理する。
 let LEARN={rules:[],prefs:[],examples:[],conflicts:[]},learnTab="rules";
 function learnField(label,value,rows,readOnly){
   const box=document.createElement("label");box.style.cssText="display:block;margin-top:8px;font-size:11px;font-weight:600;color:#475569;";box.appendChild(document.createTextNode(label));
@@ -5314,7 +5314,7 @@ function renderLearning(){
   document.querySelectorAll(".learnTabBtn").forEach(b=>{const on=b.dataset.tab===learnTab;b.style.background=on?"#ecfdf5":"#fff";b.style.borderColor=on?"#10b981":"#d1d5db";b.style.color=on?"#047857":"#374151";});
   const help=document.getElementById("learnHelp"),add=document.getElementById("learnAddBtn");
   if(learnTab==="rules"){help.textContent="店舗の料金・営業時間・対応可否などの事実や規定です。関連する質問への回答では最優先で使われます。";add.style.display="inline-block";add.textContent="＋店舗ルールを追加";}
-  else if(learnTab==="prefs"){help.textContent="文体や案内方針など、すべての返信に毎回適用する指示です。患者固有の情報は登録しないでください。";add.style.display="inline-block";add.textContent="＋スタッフの記憶を追加";}
+  else if(learnTab==="prefs"){help.textContent="文体や案内方針など、すべての返信に毎回適用する共通指示です。患者固有の情報は登録しないでください。";add.style.display="inline-block";add.textContent="＋返信方針を追加";}
   else if(learnTab==="examples"){help.textContent="スタッフが実際に送った返信の実例です。似た問い合わせのときに対応方法と文章を再利用します。患者情報を含む場合があるため、不要な例は削除できます。";add.style.display="none";}
   else{help.textContent="似た質問への回答が前回と今回で食い違っています。今後どちらを正解にするか、または正しい回答を入力してください。決めるまで自動学習の基準にはしません。";add.style.display="none";}
   const q=(document.getElementById("learnSearch").value||"").trim().toLowerCase();const items=(LEARN[learnTab]||[]).filter(x=>learningMatches(x,q));
@@ -5329,14 +5329,14 @@ function renderLearnRule(list,item){
 }
 function renderLearnPref(list,item){
   const card=learnCard(),text=learnField("全返信に適用する指示",item.text||"",3);card.appendChild(text.box);const row=document.createElement("div");row.style.cssText="display:flex;justify-content:flex-end;gap:7px;margin-top:9px;";
-  if(item.key)row.appendChild(learnButton("削除",false,async()=>{if(!await uiConfirm("このスタッフの記憶を削除しますか？"))return;await learnMutate("/api/pref-delete",{key:item.key},"削除しました");}));
+  if(item.key)row.appendChild(learnButton("削除",false,async()=>{if(!await uiConfirm("この全体の返信方針を削除しますか？"))return;await learnMutate("/api/pref-delete",{key:item.key},"削除しました");}));
   row.appendChild(learnButton("保存",true,async()=>{await learnMutate(item.key?"/api/pref-update":"/api/pref-add",item.key?{key:item.key,text:text.el.value}:{text:text.el.value},"保存しました");}));card.appendChild(row);list.appendChild(card);
 }
 function renderLearnExample(list,item){
   const card=learnCard();const date=document.createElement("div");date.style.cssText="font-size:10px;color:#94a3b8;";const source=item.source==="staff_line"?"スタッフLINE承認":"右腕くん画面";date.textContent=(item.ts?new Date(item.ts).toLocaleString("ja-JP"):"日時不明")+" ・ "+source+" ・ スタッフ確認"+Math.max(1,Number(item.confirmedCount||1))+"回";card.appendChild(date);
   const q=learnField("患者からの問い合わせ",item.q||"",3),final=learnField("スタッフが実際に送った返信",item.final||"",5),instr=learnField("返信作成時の修正指示（任意）",item.instr||"",2);card.appendChild(q.box);card.appendChild(final.box);card.appendChild(instr.box);
   if(item.draft0){const det=document.createElement("details");det.style.cssText="margin-top:8px;font-size:11px;color:#64748b;";const sum=document.createElement("summary");sum.textContent="元のAI下書きを確認（編集不可）";sum.style.cursor="pointer";det.appendChild(sum);const draft=learnField("",item.draft0,3,true);det.appendChild(draft.box);card.appendChild(det);}
-  const row=document.createElement("div");row.style.cssText="display:flex;justify-content:flex-end;gap:7px;margin-top:9px;";row.appendChild(learnButton("削除",false,async()=>{if(!await uiConfirm("この過去の対応例を削除しますか？"))return;await learnMutate("/api/example-delete",{id:item.id},"削除しました");}));row.appendChild(learnButton("保存",true,async()=>{await learnMutate("/api/example-update",{id:item.id,q:q.el.value,final:final.el.value,instr:instr.el.value},"保存しました");}));card.appendChild(row);list.appendChild(card);
+  const row=document.createElement("div");row.style.cssText="display:flex;justify-content:flex-end;gap:7px;margin-top:9px;";row.appendChild(learnButton("削除",false,async()=>{if(!await uiConfirm("この過去の対応・学習例を削除しますか？"))return;await learnMutate("/api/example-delete",{id:item.id},"削除しました");}));row.appendChild(learnButton("保存",true,async()=>{await learnMutate("/api/example-update",{id:item.id,q:q.el.value,final:final.el.value,instr:instr.el.value},"保存しました");}));card.appendChild(row);list.appendChild(card);
 }
 function renderLearnConflict(list,item){
   const card=learnCard(),date=document.createElement("div");date.style.cssText="font-size:10px;color:#b45309;font-weight:600;";date.textContent="⚠ 確認待ち ・ "+(item.createdAt?new Date(item.createdAt).toLocaleString("ja-JP"):"日時不明");card.appendChild(date);

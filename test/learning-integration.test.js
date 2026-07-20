@@ -17,9 +17,9 @@ test("スタッフLINEの修正指示を学習へ引き渡す", () => {
   assert.match(source, /instr: editInstruction, source: "staff_line"/);
 });
 
-test("生成した返信に過去対応例の参照情報を残す", () => {
+test("生成した返信に過去の対応・学習例の参照情報を残す", () => {
   assert.match(source, /out\.learningRefs = exRel\.map/);
-  assert.match(source, /過去の対応例 "\+refs\.length\+"件を参照/);
+  assert.match(source, /過去の対応・学習例 "\+refs\.length\+"件を参照/);
 });
 
 test("staging画面は本番との取り違え防止バナーを表示する", () => {
