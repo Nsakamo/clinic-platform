@@ -132,6 +132,14 @@ test("重要な更新APIはサーバー側でも同時実行を拒否する", ()
   assert.match(source, /api\/share", guard, oneMutationAtATime\("clinic-share"/);
 });
 
+test("受け付けるん経由の初回LINE送信でも会話を作成して履歴を保存する", () => {
+  assert.match(source, /app\.post\("\/api\/partner\/send-line", pGuard/);
+  assert.match(source, /if\(!c\)\{[\s\S]{0,500}t\.store\[id\] = \{/);
+  assert.match(source, /c\.msgs\.push\(\{ from:"us", text, time:nowt\(\), sentAt, via:"partner" \}\)/);
+  assert.match(source, /historySaved=await dbSave\(t,c\)/);
+  assert.match(source, /res\.json\(\{ ok:true, history_saved:historySaved \}\)/);
+});
+
 test("ログインとパスワード再設定でも処理中表示と連打防止を行う", () => {
   assert.match(source, /◌ ログイン中…/);
   assert.match(source, /◌ 送信中…/);
