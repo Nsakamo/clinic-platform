@@ -4001,13 +4001,27 @@ app.post("/api/partner/send-line", pGuard, async (req,res)=>{
       body: JSON.stringify({ to: uid, messages:[{ type:"text", text }] }) });
     if(!resp.ok) return res.json({ ok:false, error:"line_" + resp.status });
   }catch(e){ return res.json({ ok:false, error:String(e.message||e).slice(0,80) }); }
-  // 会話履歴にも残す（既存会話があれば）
+  // 会話履歴にも必ず残す。患者からの受信がまだ無い初回送信でも、LINE userIdをキーに会話を作る。
+  // LINE送信後のため、履歴保存失敗を理由に再送して二重送信しない。失敗は応答とログで検知可能にする。
+  let historySaved = false;
   try{
-    const c = t.store["line:" + uid];
-    if(c){ const sentAt=Date.now(); c.msgs.push({ from:"us", text, time: nowt(), sentAt, via:"partner" }); c.time = nowt(); c.ts = sentAt; c.last = lastText(c); dbSave(t, c); }
-  }catch(e){}
+    const id = "line:" + uid;
+    let c = t.store[id];
+    if(!c){
+      c = t.store[id] = {
+        id, userId:uid, name:String(p.name||"LINEのお客様").trim().slice(0,120)||"LINEのお客様",
+        channel:"line", color:colorFor(id), status:"done", flag:false, msgs:[], draft:"", ts:0,
+        acct:{ type:"line", key:a.botId||"main" }
+      };
+    }
+    const sentAt=Date.now();
+    c.msgs=Array.isArray(c.msgs)?c.msgs:[];
+    c.msgs.push({ from:"us", text, time:nowt(), sentAt, via:"partner" });
+    c.time=nowt(); c.ts=sentAt; c.last=lastText(c);
+    historySaved=await dbSave(t,c);
+  }catch(e){ console.error("partner send-line history:", String(e&&e.message||e).slice(0,80)); }
   console.log("partner send-line:", t.slug, "uid=" + uid.slice(0,8) + "…");
-  res.json({ ok:true });
+  res.json({ ok:true, history_saved:historySaved });
 });
 app.get("/sso", (req,res)=>{
   const tok = String(req.query.t||"");
