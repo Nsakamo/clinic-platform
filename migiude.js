@@ -11,7 +11,7 @@ const express = require("express");
 const crypto = require("crypto");
 const { intentTokens, rankLearningExamples, sameLearningExample } = require("./lib/learning-retrieval");
 const { evaluateResponseGrounding } = require("./lib/response-grounding");
-const { compareConversations } = require("./lib/conversation-order");
+const { compareConversations, compareConversationsRecent } = require("./lib/conversation-order");
 const app = express();
 app.use(express.json({ limit: "16mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: false, limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
@@ -68,6 +68,7 @@ function newTenant(slug, name, config) {
   if (!config.settings || typeof config.settings !== "object") config.settings = { autoReply: false, level: "high", tone: "", autoDelayMin: 0, engine: "gemini" };
   if (!["claude", "gpt", "gemini"].includes(config.settings.engine)) config.settings.engine = "gemini"; // 文章作成の既定はGemini
   if (typeof config.settings.autoReply !== "boolean") config.settings.autoReply = false;
+  if (!["unanswered_first", "recent"].includes(config.settings.inboxOrder)) config.settings.inboxOrder = "unanswered_first";
   if (config.settings.level !== "high" && config.settings.level !== "medium") config.settings.level = "high";
   if (typeof config.settings.tone !== "string") config.settings.tone = "";
   if (typeof config.settings.autoDelayMin !== "number" || !isFinite(config.settings.autoDelayMin) || config.settings.autoDelayMin < 0) config.settings.autoDelayMin = 0;
@@ -2236,8 +2237,9 @@ app.get("/api/stats", guard, (req, res) => {
 
 app.get("/api/conversations", guard, (req, res) => {
   const staffLineReviewAvailable = !!(S(req.tenant).staffLineEnabled && staffLineReady(req.tenant));
-  const arr = Object.values(req.tenant.store).sort(compareConversations);
-  res.json(arr.map(c => Object.assign({}, c, { staffLineReviewAvailable })));
+  const inboxOrder = S(req.tenant).inboxOrder === "recent" ? "recent" : "unanswered_first";
+  const arr = Object.values(req.tenant.store).sort(inboxOrder === "recent" ? compareConversationsRecent : compareConversations);
+  res.json(arr.map(c => Object.assign({}, c, { staffLineReviewAvailable, inboxOrder })));
 });
 
 async function deliverText(t, c, text) {
@@ -2564,6 +2566,7 @@ app.post("/api/settings", guard, oneMutationAtATime("settings"), async (req, res
   if (req.body.autoReply === true && !activeAiEngine(t)) return res.status(409).json({ ok:false, error:"no_ai_key" });
   if (typeof req.body.autoReply === "boolean") S(t).autoReply = req.body.autoReply;
   if (typeof req.body.bookingActions === "boolean") S(t).bookingActions = req.body.bookingActions;
+  if (["unanswered_first", "recent"].includes(req.body.inboxOrder)) S(t).inboxOrder = req.body.inboxOrder;
   const nextStaffLineMode = ["review_all", "exceptions"].includes(req.body.staffLineReplyMode) ? req.body.staffLineReplyMode : S(t).staffLineReplyMode;
   if (typeof req.body.staffLineEnabled === "boolean") {
     if (req.body.staffLineEnabled && !staffLineReady(t)) return res.status(400).json({ ok: false, error: "staff_line_not_ready" });
@@ -4592,6 +4595,14 @@ const PAGE = `<!DOCTYPE html>
     <button type="button" id="saveAccountBtn" class="cbtn" style="margin-top:7px;" onclick="saveAccount()">アカウント情報を保存</button>
   </div>
   <div class="settingsSection">
+    <div class="settingsSectionTitle">📥 受信トレイの並び順</div>
+    <select id="setInboxOrder" style="width:100%;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;">
+      <option value="unanswered_first">未対応を上にまとめる（おすすめ）</option>
+      <option value="recent">従来どおりの新着順</option>
+    </select>
+    <div style="font-size:11px;color:#6b7280;margin-top:5px;line-height:1.55;">「未対応を上にまとめる」では、要対応・未対応の後に対応済みを表示します。「新着順」では従来どおり、要対応を先頭にして受信日時順で表示します。</div>
+  </div>
+  <div class="settingsSection">
   <div class="settingsSectionTitle">🤖 自動対応</div>
   <label class="settingsCheck"><input type="checkbox" id="setAuto"> 自動返信を有効にする</label>
   <label class="settingsCheck"><input type="checkbox" id="setBookingActions"> 予約の自動受付（確認・変更・キャンセル）</label>
@@ -4867,9 +4878,9 @@ function av(r,sz){ const s=sz||40; const bg=r.pic?("background-image:url("+r.pic
 function renderList(){
   document.getElementById("cnt").textContent="未対応 "+DATA.filter(r=>r.status!=="done").length+"件";
   roomsEl.innerHTML="";
-  const rows=filt(),counts={todo:rows.filter(r=>r.status!=="done").length,done:rows.filter(r=>r.status==="done").length};let activeGroup="";
+  const rows=filt(),grouped=!(DATA[0]&&DATA[0].inboxOrder==="recent"),counts={todo:rows.filter(r=>r.status!=="done").length,done:rows.filter(r=>r.status==="done").length};let activeGroup="";
   rows.forEach(r=>{ const group=r.status==="done"?"done":"todo";
-    if(group!==activeGroup){activeGroup=group;const h=document.createElement("div");h.className="roomGroup "+group;h.setAttribute("role","heading");h.setAttribute("aria-level","2");h.innerHTML='<span>'+(group==="todo"?"● 未対応":"✓ 対応済み")+'</span><span class="roomGroupCount">'+counts[group]+'件</span>';roomsEl.appendChild(h);}
+    if(grouped&&group!==activeGroup){activeGroup=group;const h=document.createElement("div");h.className="roomGroup "+group;h.setAttribute("role","heading");h.setAttribute("aria-level","2");h.innerHTML='<span>'+(group==="todo"?"● 未対応":"✓ 対応済み")+'</span><span class="roomGroupCount">'+counts[group]+'件</span>';roomsEl.appendChild(h);}
     const d=document.createElement("div");
     d.className="room"+(current===r.id?" active":"")+(r.flag?" flag":"");
     const acctBadge=(r.acct&&r.acct.name&&r.acct.name!=="メイン")?' <span class="badge">'+esc(r.acct.name)+'</span>':'';
@@ -5638,7 +5649,7 @@ function renderRuleGauge(){
   }
 }
 async function openSet(){try{const ar=await fetch("/api/account");const a=await ar.json();document.getElementById("accountLoginId").textContent="ログインID: "+(a.loginId||"");document.getElementById("setAccountEmail").value=a.accountEmail||"";document.getElementById("accountEmailStat").textContent=(a.accountEmail?"再設定メールアドレス登録済み":"再設定メールアドレス未登録")+(a.resetEmailReady?"・メール送信可能":"・送信メール設定が必要");}catch(e){}
-  try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setBookingActions").checked=!!s.bookingActions;document.getElementById("setStaffLineEnabled").checked=!!s.staffLineEnabled;document.getElementById("setStaffLineReplyMode").value=s.staffLineReplyMode||"exceptions";document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"gemini";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);window.__rules=s.rules||null;renderRuleGauge();renderPrefs(s.prefs||[]);const lcs=document.getElementById("learningConflictSummary");if(lcs)lcs.textContent=s.learningConflictsPending?" ⚠ 学習確認待ち "+s.learningConflictsPending+"件":"";const las=document.getElementById("learningAutomationSummary"),la=s.learningAutomation||{};if(las)las.textContent=la.ready?" ✅ 自動対応候補 "+la.ready+"種類":" 学習実績を蓄積中";
+  try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setBookingActions").checked=!!s.bookingActions;document.getElementById("setInboxOrder").value=s.inboxOrder||"unanswered_first";document.getElementById("setStaffLineEnabled").checked=!!s.staffLineEnabled;document.getElementById("setStaffLineReplyMode").value=s.staffLineReplyMode||"exceptions";document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"gemini";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);window.__rules=s.rules||null;renderRuleGauge();renderPrefs(s.prefs||[]);const lcs=document.getElementById("learningConflictSummary");if(lcs)lcs.textContent=s.learningConflictsPending?" ⚠ 学習確認待ち "+s.learningConflictsPending+"件":"";const las=document.getElementById("learningAutomationSummary"),la=s.learningAutomation||{};if(las)las.textContent=la.ready?" ✅ 自動対応候補 "+la.ready+"種類":" 学習実績を蓄積中";
   if(s.engines){const n=document.getElementById("engineNote");const active=({gpt:"GPT",gemini:"Gemini",claude:"Claude"})[s.activeEngine]||"なし";n.textContent="設定状況: GPT"+(s.engines.gpt?"✓設定済み":"⚠キー未設定")+"・Gemini"+(s.engines.gemini?"✓設定済み":"⚠キー未設定")+"・Claude"+(s.engines.claude?"✓設定済み":"⚠キー未設定")+"。優先エンジン: "+active+"（✓はキーの登録を示します。実際の有効性は下の文章品質テストで確認してください。失敗時は次の設定済みAIへ自動切替します）。";}}catch(e){}
   refreshModelAlert();
   try{const cr=await fetch("/api/conn");const c=await cr.json();document.getElementById("connStat").textContent=(c.lineConfigured?"LINE✓ ":"LINE未 ")+(c.mailConfigured?"メール✓":"メール未");document.getElementById("cSmtpHost").value=c.smtpHost||"";document.getElementById("cSmtpPort").value=c.smtpPort||"";document.getElementById("cSmtpUser").value=c.smtpUser||"";document.getElementById("cImapHost").value=c.imapHost||"";document.getElementById("cImapPort").value=c.imapPort||"";document.getElementById("cImapUser").value=c.imapUser||"";document.getElementById("cEmailInternal").checked=!!c.emailInternal;renderAccts(c);}catch(e){}
@@ -5706,7 +5717,7 @@ async function changeStaffLineRole(id,role,select){await withBusy("staff-line-ro
 async function deleteStaffLineStaff(id,btn){if(!await uiConfirm("このスタッフのLINE操作権限を解除しますか？"))return;await withBusy("staff-line-delete-"+id,btn,"解除中…",async()=>{try{const r=await api("/api/staff-line/staff-delete",{id}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"delete");renderStaffLineStaff(j.staff||[]);}catch(e){uiAlert(e.message==="last_admin"?"最後の管理者は解除できません":"登録を解除できませんでした");await loadStaffLine();}});}
 async function runQualityPreview(){const input=document.getElementById("qualityPreviewInput"),out=document.getElementById("qualityPreviewResult"),btn=document.getElementById("qualityPreviewBtn"),inquiry=input.value.trim();if(!inquiry){uiAlert("テストする問い合わせ文を入力してください");return;}btn.disabled=true;btn.textContent="生成中…";out.style.display="block";out.textContent="返信案を生成しています…";try{const r=await api("/api/quality-preview",{inquiry,channel:document.getElementById("qualityPreviewChannel").value}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"failed");const label=({gpt:"GPT",gemini:"Gemini",claude:"Claude"})[j.engine]||j.engine;const refs=Array.isArray(j.learningRefs)?j.learningRefs:[];const g=j.grounding||{},v=j.validation||{};const audit=g.autoSendAllowed&&v.pass?" / 根拠監査OK":" / スタッフ確認: "+((g.reasons&&g.reasons[0])||v.reason||"根拠不足");out.textContent=j.draft+"\\n\\n―― "+label+" / 確信率 "+(j.confidence||"不明")+(j.qualityIssues&&j.qualityIssues.length?" / 自動校正済み":"")+(refs.length?" / 過去対応 "+refs.length+"件参照":" / 過去対応の該当なし")+audit;}catch(e){out.textContent=e.message==="no_ai_key"?"AIキーが未設定のため生成できません。運営にAI接続設定を依頼してください。":e.message==="ai_failed"?"登録済みのAIキーを確認できませんでした。キーの失効・利用上限・モデル権限を運営側で確認してください。患者やLINEには送信されていません。":"生成できませんでした。時間をおいて再度お試しください。";}finally{btn.disabled=false;btn.textContent="返信案をテスト生成";}}
 let settingsSaveBusy=false;
-async function saveSet(){if(settingsSaveBusy)return;const btn=document.getElementById("saveSettingsBtn");settingsSaveBusy=true;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>保存中…';}const autoReply=document.getElementById("setAuto").checked;const bookingActions=document.getElementById("setBookingActions").checked;const staffLineEnabled=document.getElementById("setStaffLineEnabled").checked;const staffLineReplyMode=document.getElementById("setStaffLineReplyMode").value;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{const r=await api("/api/settings",{autoReply,bookingActions,staffLineEnabled,staffLineReplyMode,level,tone,engine,autoDelayMin});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");uiAlert("設定を保存しました");closeSet();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"先に法人専用スタッフLINEと通知グループを接続してください":e.message==="no_ai_key"?"AIキーが未設定のため自動返信を有効にできません。運営へ接続設定を依頼してください":"保存に失敗しました");}finally{settingsSaveBusy=false;if(btn){btn.disabled=false;btn.removeAttribute("aria-busy");btn.textContent="設定を保存";}}}
+async function saveSet(){if(settingsSaveBusy)return;const btn=document.getElementById("saveSettingsBtn");settingsSaveBusy=true;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>保存中…';}const autoReply=document.getElementById("setAuto").checked;const bookingActions=document.getElementById("setBookingActions").checked;const inboxOrder=document.getElementById("setInboxOrder").value;const staffLineEnabled=document.getElementById("setStaffLineEnabled").checked;const staffLineReplyMode=document.getElementById("setStaffLineReplyMode").value;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{const r=await api("/api/settings",{autoReply,bookingActions,inboxOrder,staffLineEnabled,staffLineReplyMode,level,tone,engine,autoDelayMin});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");await load();uiAlert("設定を保存しました");closeSet();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"先に法人専用スタッフLINEと通知グループを接続してください":e.message==="no_ai_key"?"AIキーが未設定のため自動返信を有効にできません。運営へ接続設定を依頼してください":"保存に失敗しました");}finally{settingsSaveBusy=false;if(btn){btn.disabled=false;btn.removeAttribute("aria-busy");btn.textContent="設定を保存";}}}
 async function changeLoginId(){
   const next=await uiPrompt("新しいログインID（半角英数字3〜30文字。スタッフ全員のログインに使います）");if(!next)return;
   const btn=document.getElementById("changeLoginIdBtn");await withBusy("change-login-id",btn,"変更中…",async()=>{try{const r=await api("/api/change-loginid",{next:next.trim()});const j=await r.json();
