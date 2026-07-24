@@ -11,6 +11,7 @@ const express = require("express");
 const crypto = require("crypto");
 const { intentTokens, rankLearningExamples, sameLearningExample } = require("./lib/learning-retrieval");
 const { evaluateResponseGrounding } = require("./lib/response-grounding");
+const { compareConversations } = require("./lib/conversation-order");
 const app = express();
 app.use(express.json({ limit: "16mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: false, limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
@@ -2235,11 +2236,7 @@ app.get("/api/stats", guard, (req, res) => {
 
 app.get("/api/conversations", guard, (req, res) => {
   const staffLineReviewAvailable = !!(S(req.tenant).staffLineEnabled && staffLineReady(req.tenant));
-  const arr = Object.values(req.tenant.store).sort((a, b) => {
-    if (a.flag && !b.flag) return -1; if (!a.flag && b.flag) return 1;
-    if (a.flag && b.flag) return (a.order || 0) - (b.order || 0);
-    return (b.ts || 0) - (a.ts || 0);
-  });
+  const arr = Object.values(req.tenant.store).sort(compareConversations);
   res.json(arr.map(c => Object.assign({}, c, { staffLineReviewAvailable })));
 });
 
@@ -4298,6 +4295,10 @@ const PAGE = `<!DOCTYPE html>
   .tbtn.migi{border-color:#ddd6fe;background:#f5f3ff;color:#6d28d9;font-weight:600;}
   #search{margin:10px 12px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;}
   #rooms{flex:1;overflow-y:auto;}
+  .roomGroup{display:flex;align-items:center;justify-content:space-between;padding:7px 12px;border-bottom:1px solid var(--line);font-size:11px;font-weight:700;letter-spacing:.02em;}
+  .roomGroup.todo{background:#eff6ff;color:#1d4ed8;}
+  .roomGroup.done{background:#f8fafc;color:#64748b;border-top:1px solid #d1d5db;}
+  .roomGroupCount{font-variant-numeric:tabular-nums;font-weight:600;}
   .room{display:flex;align-items:center;gap:10px;padding:11px 12px;border-bottom:1px solid var(--line);cursor:pointer;}
   .room:hover{background:#f9fafb;}.room.active{background:#eef2ff;}.room.flag{background:#fef2f2;}
   .avatar{width:40px;height:40px;border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:14px;color:#fff;position:relative;background-size:cover;background-position:center;}
@@ -4866,7 +4867,10 @@ function av(r,sz){ const s=sz||40; const bg=r.pic?("background-image:url("+r.pic
 function renderList(){
   document.getElementById("cnt").textContent="未対応 "+DATA.filter(r=>r.status!=="done").length+"件";
   roomsEl.innerHTML="";
-  filt().forEach(r=>{ const d=document.createElement("div");
+  const rows=filt(),counts={todo:rows.filter(r=>r.status!=="done").length,done:rows.filter(r=>r.status==="done").length};let activeGroup="";
+  rows.forEach(r=>{ const group=r.status==="done"?"done":"todo";
+    if(group!==activeGroup){activeGroup=group;const h=document.createElement("div");h.className="roomGroup "+group;h.setAttribute("role","heading");h.setAttribute("aria-level","2");h.innerHTML='<span>'+(group==="todo"?"● 未対応":"✓ 対応済み")+'</span><span class="roomGroupCount">'+counts[group]+'件</span>';roomsEl.appendChild(h);}
+    const d=document.createElement("div");
     d.className="room"+(current===r.id?" active":"")+(r.flag?" flag":"");
     const acctBadge=(r.acct&&r.acct.name&&r.acct.name!=="メイン")?' <span class="badge">'+esc(r.acct.name)+'</span>':'';
     d.innerHTML=av(r)+'<div class="rmid"><div class="rtop"><span class="rname">'+esc(r.name)+acctBadge+'</span><span class="rtime">'+tlabel(r)+'</span></div><div class="rlast">'+esc(r.last||"")+'</div></div><div class="stat">'+statIcon(r)+'</div>';
