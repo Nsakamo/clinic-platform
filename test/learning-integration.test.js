@@ -117,6 +117,18 @@ test("下書きに使用した全体方針・店舗ルール・過去対応を�
   assert.match(source, /店舗ルール "\+rules/);
 });
 
+test("スマホで患者返信と右腕くん相談を色と送信先表示で区別する", () => {
+  assert.match(source, /患者への返信を編集中/);
+  assert.match(source, /この入力欄の内容は患者へ送信されます/);
+  assert.match(source, /患者へ送信/);
+  assert.match(source, /右腕くんに相談中/);
+  assert.match(source, /ここでの入力は患者には送信されません/);
+  assert.match(source, /右腕くんへ相談/);
+  assert.match(source, /#composer\{background:#f0fdf4/);
+  assert.match(source, /#dCard\{[\s\S]{0,300}background:#f5f3ff/);
+  assert.match(source, /#dHead\{[\s\S]{0,300}background:#6d28d9/);
+});
+
 test("問い合わせ種類ごとの承認実績が不足する間は変動する事実を自動送信しない", () => {
   assert.match(source, /function recordLearningPerformance/);
   assert.match(source, /total >= 5 && p\.unchanged >= 3/);

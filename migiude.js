@@ -4489,7 +4489,9 @@ const PAGE = `<!DOCTYPE html>
   .vid{width:200px;height:120px;border-radius:10px;background:#111827;display:flex;align-items:center;justify-content:center;color:#fff;font-size:30px;position:relative;}.vid span{position:absolute;bottom:6px;right:8px;font-size:11px;}
   .btime{font-size:10px;color:var(--muted);margin:2px 4px;}
   #composer{background:var(--panel);border-top:1px solid var(--line);padding:10px 12px;}
-  #aiLabel{font-size:11px;color:var(--info);margin-bottom:5px;}
+  #aiLabel{display:flex;align-items:center;gap:7px;margin-bottom:7px;color:#047857;}
+  #aiLabel .patientModeTitle{font-size:12px;font-weight:800;}
+  #aiLabel .patientModeNote{font-size:10px;color:#64748b;}
   #draftRow{display:flex;gap:8px;align-items:flex-end;}
   #attach{flex-shrink:0;width:38px;height:38px;border:1px solid var(--line);border-radius:9px;background:#fff;cursor:pointer;font-size:18px;}
   #draft{flex:1;min-height:110px;max-height:300px;border:1px solid #d1d5db;border-radius:10px;padding:9px 11px;font-size:13px;line-height:1.5;font-family:inherit;resize:vertical;transition:min-height .15s ease;}
@@ -4519,17 +4521,27 @@ const PAGE = `<!DOCTYPE html>
   @keyframes spin{to{transform:rotate(360deg);}}
   /* 編集チャットはモーダルではなく「横並びドロワー」：開いていても左の患者とのやり取りは見える・スクロールできる */
   #dpanel{position:fixed;inset:0;background:transparent;z-index:72;display:none;pointer-events:none;}
-  #dCard{position:absolute;right:0;top:0;bottom:0;width:min(96vw,430px);background:#fff;display:flex;flex-direction:column;overflow:hidden;box-shadow:-4px 0 24px rgba(0,0,0,.15);animation:slideinX .28s cubic-bezier(.22,.9,.36,1);pointer-events:auto;border-left:1px solid var(--line);}
+  #dCard{position:absolute;right:0;top:0;bottom:0;width:min(96vw,430px);background:#f5f3ff;display:flex;flex-direction:column;overflow:hidden;box-shadow:-4px 0 24px rgba(76,29,149,.24);animation:slideinX .28s cubic-bezier(.22,.9,.36,1);pointer-events:auto;border-left:1px solid #c4b5fd;}
+  #dHead{padding:11px 13px;border-bottom:1px solid #5b21b6;display:flex;align-items:center;justify-content:space-between;gap:9px;background:#6d28d9;color:#fff;}
+  #dHead .dModeTitle{font-weight:800;font-size:14px;}
+  #dHead .dModeNote{font-size:10.5px;margin-top:2px;color:#ede9fe;}
+  #dHead .cbtn{border-color:#ddd6fe;background:#fff;color:#5b21b6;font-weight:700;}
   @media(min-width:761px){
     #chat{transition:margin-right .28s cubic-bezier(.22,.9,.36,1);}
     #app.dopen #chat{margin-right:430px;} /* ドロワー分だけ会話エリアを詰めて、隠れる部分をなくす */
   }
-  #dMsgs{flex:1;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:8px;background:#f8fafc;}
+  #dMsgs{flex:1;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:8px;background:#faf5ff;}
   #dChips{padding:6px 10px 0;display:flex;gap:6px;flex-wrap:wrap;}
+  #dChips .cbtn{border-color:#c4b5fd;background:#fff;color:#5b21b6;}
   #dText{flex:1;border:1px solid #d1d5db;border-radius:10px;padding:10px 12px;font-size:14px;font-family:inherit;min-height:110px;max-height:240px;resize:vertical;}
+  #dComposer{display:flex;gap:8px;padding:10px;border-top:1px solid #c4b5fd;align-items:flex-end;background:#ede9fe;}
+  .cbtn.dsend{background:#6d28d9;border-color:#6d28d9;color:#fff;font-weight:700;white-space:nowrap;padding-left:10px;padding-right:10px;}
+  .cbtn.dsend:disabled{background:#a78bfa;border-color:#a78bfa;}
   @media(max-width:760px){
     #asstCard{left:0;right:0;top:auto;bottom:0;width:auto;height:80vh;border-radius:16px 16px 0 0;box-shadow:0 -4px 24px rgba(0,0,0,.18);animation:slideinY .28s cubic-bezier(.22,.9,.36,1);}
-    #dCard{left:0;right:0;top:auto;bottom:0;width:auto;height:84vh;border-radius:16px 16px 0 0;box-shadow:0 -4px 24px rgba(0,0,0,.18);animation:slideinY .28s cubic-bezier(.22,.9,.36,1);}
+    #dpanel{background:rgba(46,16,101,.24);}
+    #dCard{left:0;right:0;top:auto;bottom:0;width:auto;height:84vh;border-radius:16px 16px 0 0;box-shadow:0 -4px 24px rgba(76,29,149,.28);animation:slideinY .28s cubic-bezier(.22,.9,.36,1);border-left:0;border-top:2px solid #8b5cf6;}
+    #dHead{padding:12px 12px 10px;border-radius:14px 14px 0 0;}
     #dText,#asstText{font-size:16px;min-height:56px;transition:min-height .15s;}
     #dText:focus,#asstText:focus{min-height:150px;}
   }
@@ -4604,6 +4616,10 @@ const PAGE = `<!DOCTYPE html>
   .rmFooter{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;padding:10px 14px;background:#fff;border-top:1px solid var(--line);}
   #rmStatus{font-size:11px;color:#64748b;}
   @media(max-width:760px){#list{width:100%;}#chat{display:none;position:absolute;inset:0;}#app.chatopen #list{display:none;}#app.chatopen #chat{display:flex;}#backBtn{display:block;}
+    #composer{background:#f0fdf4;border-top:2px solid #86efac;}
+    #aiLabel{align-items:flex-start;flex-direction:column;gap:1px;padding:7px 9px;background:#dcfce7;border:1px solid #86efac;border-radius:9px;}
+    #aiLabel .patientModeTitle{font-size:13px;}
+    #aiLabel .patientModeNote{font-size:10.5px;color:#166534;}
     #draft{min-height:44px;}#draft:focus{min-height:140px;}
     #draft,#search,#popInput,#asstText,#setTone{font-size:16px;}
     #setPop,#learnManagePop,#richMenuPop{padding:0;align-items:stretch;background:#fff;}
@@ -4662,14 +4678,14 @@ const PAGE = `<!DOCTYPE html>
 </div>
 <div id="menu"></div>
 <div id="dpanel"><div id="dCard">
-  <div style="padding:11px 13px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:14px;"><span>✨ AIで作り直す（会話で調整）</span><button class="cbtn" onclick="closeDraftChat()">閉じる</button></div>
+  <div id="dHead"><div><div class="dModeTitle">🤝 右腕くんに相談中</div><div class="dModeNote">ここでの入力は患者には送信されません</div></div><button class="cbtn" onclick="closeDraftChat()">患者画面に戻る</button></div>
   <div id="dMsgs"></div>
   <div id="dChips">
     <button class="cbtn" onclick="dChip('もっと簡潔に短くして')">簡潔に</button>
     <button class="cbtn" onclick="dChip('もっと丁寧で温かい言い方にして')">丁寧に</button>
     <button class="cbtn" onclick="dChip('もっと柔らかい印象にして')">柔らかく</button>
   </div>
-  <div style="display:flex;gap:8px;padding:10px;border-top:1px solid var(--line);align-items:flex-end;"><textarea id="dText" placeholder="どう変えたいか入力…（例：予約確定メールに記載の院に来てと案内して）" onkeydown="if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing&&event.keyCode!==229){event.preventDefault();dSend();}"></textarea><button id="dSendBtn" class="cbtn send" onclick="dSend()">送信</button></div>
+  <div id="dComposer"><textarea id="dText" placeholder="右腕くんへの指示を入力…（例：もっと簡潔にして）" onkeydown="if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing&&event.keyCode!==229){event.preventDefault();dSend();}"></textarea><button id="dSendBtn" class="cbtn dsend" onclick="dSend()">右腕くんへ相談</button></div>
 </div></div>
 <div id="setPop"><div class="settingsCard">
   <div class="settingsHeader"><h3>⚙ 設定</h3><button type="button" class="cbtn" onclick="closeSet()">閉じる</button></div>
@@ -5016,8 +5032,8 @@ function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)ret
     '<div id="custTab" class="custTab" style="display:none;" onclick="cpExpand()">うけつけるん情報を表示 ⌄</div>'+
     '<div id="custPanel" class="custPanel">読み込み中…</div>'+
     '<div id="msgs">'+bubbles+'</div>'+
-    '<div id="composer"><div id="aiLabel">✨ AI下書き（編集して送れます）</div><div id="learningUsed" style="display:'+(learningRefsText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:#6d28d9;margin:2px 0 5px;">'+esc(learningRefsText(r))+'</div><div id="groundingUsed" style="display:'+(groundingText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:'+(r.grounding&&r.grounding.autoSendAllowed&&r.validation&&r.validation.pass?'#047857':'#b45309')+';margin:2px 0 5px;">'+esc(groundingText(r))+'</div><div id="topicChips" style="display:none;"></div><div id="draftRow"><button id="attach" onclick="attach()" title="写真・動画を添付">📎</button><textarea id="draft" oninput="draftEdited()">'+esc(r.draft||"")+'</textarea></div>'+
-    '<div id="cbtns"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ AIで作り直す</button>'+staffReviewButton+'<button id="markDoneBtn" class="cbtn done" onclick="markDone()">対応済み</button><button class="cbtn send" onclick="sendMsg()">送信</button></div></div>';
+    '<div id="composer"><div id="aiLabel"><span class="patientModeTitle">🟢 患者への返信を編集中</span><span class="patientModeNote">この入力欄の内容は患者へ送信されます</span></div><div id="learningUsed" style="display:'+(learningRefsText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:#6d28d9;margin:2px 0 5px;">'+esc(learningRefsText(r))+'</div><div id="groundingUsed" style="display:'+(groundingText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:'+(r.grounding&&r.grounding.autoSendAllowed&&r.validation&&r.validation.pass?'#047857':'#b45309')+';margin:2px 0 5px;">'+esc(groundingText(r))+'</div><div id="topicChips" style="display:none;"></div><div id="draftRow"><button id="attach" onclick="attach()" title="写真・動画を添付">📎</button><textarea id="draft" oninput="draftEdited()">'+esc(r.draft||"")+'</textarea></div>'+
+    '<div id="cbtns"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ 右腕くんに相談</button>'+staffReviewButton+'<button id="markDoneBtn" class="cbtn done" onclick="markDone()">対応済み</button><button class="cbtn send" onclick="sendMsg()">患者へ送信</button></div></div>';
   const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r); loadCustomer(id); if(!keep)renderList();
 }
 function closeChat(){appEl.classList.remove("chatopen");current=null;renderList();}
@@ -5472,7 +5488,7 @@ function openRuleLearning(){
   closeLearningScope();openAsst(ctx);
 }
 function showLearnResult(message){const b=document.getElementById("learnToast");if(!b)return;b.textContent="✓ "+message;b.style.display="block";clearTimeout(learnToastTimer);learnToastTimer=setTimeout(()=>{b.style.display="none";},4500);}
-async function sendMsg(){if(window.__sendBusy)return;const id=current;const t=document.getElementById("draft").value.trim();if(!t)return;window.__sendBusy=true;const _sb=document.querySelector("#cbtns .send");if(_sb){_sb.disabled=true;_sb.textContent="送信中…";}try{const cd0=DATA.find(x=>x.id===id);const orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim();const edited=(t!==orig);let instr="",learningText="";try{if(dSessions&&dSessions[id]){if(Array.isArray(dSessions[id].hist))instr=dSessions[id].hist.filter(m=>m&&m.role==="user").map(m=>String(m.content||"")).join(" / ").slice(0,1500);learningText=String(dSessions[id].memory||"").slice(0,800);}}catch(e){}const r=await api("/api/send",{id,text:t,instr:edited?instr:"",learningText:edited?learningText:""});let j={};try{j=await r.json();}catch(e){}if(j.sent){const d0=document.getElementById("draft");if(d0)d0.value="";const cd=DATA.find(x=>x.id===id);if(cd)cd.draft="";if(j.conflict){showConflict(j.conflict);}else if(j.learningReview){showLearningScope(j.learningReview);}else if(j.learnedRules&&j.learnedRules.length){showRuleToast(j.learnedRules);}else if(j.learnedId){showLearnToast(j.learnedId);}await load();}else{const m={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です"}[j.sendErr]||("送信失敗: "+(j.sendErr||"不明"));uiAlert(m+"\\n（下書きは消えていません）");}}finally{window.__sendBusy=false;const _sb2=document.querySelector("#cbtns .send");if(_sb2){_sb2.disabled=false;_sb2.textContent="送信";}}}
+async function sendMsg(){if(window.__sendBusy)return;const id=current;const t=document.getElementById("draft").value.trim();if(!t)return;window.__sendBusy=true;const _sb=document.querySelector("#cbtns .send");if(_sb){_sb.disabled=true;_sb.textContent="患者へ送信中…";}try{const cd0=DATA.find(x=>x.id===id);const orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim();const edited=(t!==orig);let instr="",learningText="";try{if(dSessions&&dSessions[id]){if(Array.isArray(dSessions[id].hist))instr=dSessions[id].hist.filter(m=>m&&m.role==="user").map(m=>String(m.content||"")).join(" / ").slice(0,1500);learningText=String(dSessions[id].memory||"").slice(0,800);}}catch(e){}const r=await api("/api/send",{id,text:t,instr:edited?instr:"",learningText:edited?learningText:""});let j={};try{j=await r.json();}catch(e){}if(j.sent){const d0=document.getElementById("draft");if(d0)d0.value="";const cd=DATA.find(x=>x.id===id);if(cd)cd.draft="";if(j.conflict){showConflict(j.conflict);}else if(j.learningReview){showLearningScope(j.learningReview);}else if(j.learnedRules&&j.learnedRules.length){showRuleToast(j.learnedRules);}else if(j.learnedId){showLearnToast(j.learnedId);}await load();}else{const m={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です"}[j.sendErr]||("送信失敗: "+(j.sendErr||"不明"));uiAlert(m+"\\n（下書きは消えていません）");}}finally{window.__sendBusy=false;const _sb2=document.querySelector("#cbtns .send");if(_sb2){_sb2.disabled=false;_sb2.textContent="患者へ送信";}}}
 async function resendStaffApproval(){if(!current)return;const b=document.getElementById("staffReviewResend"),draft=String(document.getElementById("draft")&&document.getElementById("draft").value||"").trim();if(!draft){uiAlert("先に患者様へ送る返信案を入力してください");return;}if(b){b.disabled=true;b.textContent="送信中…";}try{const r=await api("/api/staff-line/resend-approval",{id:current,draft}),j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error(j.error||"resend");uiAlert("スタッフLINEへ承認依頼を送りました");await load();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"スタッフLINE連携を設定・有効化してください":"承認依頼を送れませんでした");}finally{if(b){b.disabled=false;b.textContent="📲 スタッフLINEで確認";}}}
 function attach(){const inp=document.createElement("input");inp.type="file";inp.accept="image/*,video/*,application/pdf,.pdf,.doc,.docx,.xls,.xlsx";inp.onchange=async()=>{const f=inp.files[0];if(!f)return;if(f.size>10*1024*1024){uiAlert("10MB以下のファイルにしてください");return;}const btn=document.getElementById("attach");if(btn){btn.disabled=true;btn.textContent="⏳";}try{const b64=await new Promise((res,rej)=>{const rd=new FileReader();rd.onload=()=>res(String(rd.result).split(",")[1]);rd.onerror=rej;rd.readAsDataURL(f);});const up=await api("/api/upload",{name:f.name,mime:f.type||"application/octet-stream",data:b64});const uj=await up.json();if(!uj.ok)throw new Error(uj.error||"upload");const sr=await api("/api/send-file",{id:current,fileId:uj.fileId});const sj=await sr.json();if(!sj.sent)uiAlert("送信失敗: "+(sj.sendErr||"不明"));await load();}catch(e){uiAlert("ファイル送信に失敗しました: "+e.message);}if(btn){btn.disabled=false;btn.textContent="📎";}};inp.click();}
 async function shareClinic(){const note=await uiPrompt("現場に伝える内容を入力してください（空欄のままOKを押すと、お客様の直近メッセージをそのまま共有します）","");if(note===null)return;const btn=document.getElementById("shareClinicBtn"),id=current;await withBusy("share-"+id,btn,"共有中…",async()=>{try{const r=await api("/api/share",{id,note:note||""});const j=await r.json();if(j.ok)uiAlert("現場ボードに共有しました");else uiAlert("共有に失敗しました");}catch(e){uiAlert("共有に失敗しました");}});}
