@@ -19,7 +19,7 @@ test("スタッフLINEの修正指示を学習へ引き渡す", () => {
 
 test("生成した返信に過去の対応・学習例の参照情報を残す", () => {
   assert.match(source, /out\.learningRefs = exRel\.map/);
-  assert.match(source, /過去の対応・学習例 "\+refs\.length\+"件を参照/);
+  assert.match(source, /過去対応 "\+refs\.map/);
 });
 
 test("staging画面は本番との取り違え防止バナーを表示する", () => {
@@ -91,6 +91,30 @@ test("スタッフの修正過程を構造化した判断メモリとして保�
   assert.match(source, /exampleLearningMetaUpdate\(t, opts\.exampleId, memory\)/);
   assert.match(source, /learningMetaSearchText\(example\)/);
   assert.match(source, /学習した判断:/);
+});
+
+test("Web送信後はAI任せにせずスタッフが学習の適用範囲を確定する", () => {
+  assert.match(source, /function learningScopeSuggestion/);
+  assert.match(source, /reviewScope: true/);
+  assert.match(source, /app\.post\("\/api\/learning-scope", guard/);
+  assert.match(source, /\["none", "patient", "similar", "all"\]/);
+  assert.match(source, /今回の修正をどう学習しますか？/);
+  assert.match(source, /今回だけ[\s\S]{0,300}この患者だけ[\s\S]{0,300}同じ問い合わせ[\s\S]{0,300}今後の全返信/);
+  assert.match(source, /店舗ルールの追加・更新・削除として確認/);
+});
+
+test("文章作成中の学習候補は送信後の確認前に恒久保存しない", () => {
+  assert.match(source, /文章作成中は学習候補の抽出だけ行う/);
+  assert.match(source, /学習候補：「"\+meta\.memory/);
+  assert.match(source, /店舗ルール候補：「"\+meta\.rule\.title/);
+  assert.match(source, /learningText:edited\?learningText:""/);
+});
+
+test("下書きに使用した全体方針・店舗ルール・過去対応を表示する", () => {
+  assert.match(source, /out\.learningUsage = \{/);
+  assert.match(source, /この下書きに使用：/);
+  assert.match(source, /全体方針 "\+prefs\.length/);
+  assert.match(source, /店舗ルール "\+rules/);
 });
 
 test("問い合わせ種類ごとの承認実績が不足する間は変動する事実を自動送信しない", () => {
