@@ -17,6 +17,13 @@ test("予約送信を保存・取消・失敗後再送できる", () => {
   assert.match(source, /item\.status = "failed"/);
 });
 
+test("予約確認は長い本文を再表示せず操作ボタンを隠さない", () => {
+  assert.doesNotMatch(source, /id="scheduledMessagePreview"/);
+  assert.doesNotMatch(source, /scheduledMessagePreview"\)\.textContent/);
+  assert.match(source, /id="scheduledMessageMeta"/);
+  assert.match(source, /入力中の本文/);
+});
+
 test("予約送信は再起動時に不明な送信を自動再送せず二重送信を防ぐ", () => {
   assert.match(source, /item\.status === "sending"/);
   assert.match(source, /item\.lastError = "delivery_status_unknown"/);

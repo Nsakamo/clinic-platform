@@ -5167,7 +5167,7 @@ const PAGE = `<!DOCTYPE html>
 <div id="scheduledMessagePop" style="position:fixed;inset:0;background:rgba(15,23,42,.48);z-index:84;display:none;align-items:center;justify-content:center;padding:14px;">
   <div style="background:#fff;border-radius:16px;width:min(94vw,430px);box-shadow:0 20px 50px rgba(0,0,0,.25);overflow:hidden;">
     <div style="padding:15px 17px 10px;border-bottom:1px solid #e5e7eb;"><h3 style="margin:0 0 5px;font-size:16px;">🕒 メッセージの予約送信</h3><div style="font-size:11px;color:#64748b;line-height:1.55;">指定した日時に、現在の本文と添付ファイルを患者へ送信します。</div></div>
-    <div style="padding:15px 17px;"><label style="display:block;font-size:12px;font-weight:700;color:#334155;">送信日時<input id="scheduledMessageAt" type="datetime-local" style="display:block;box-sizing:border-box;width:100%;min-height:44px;margin-top:6px;padding:8px;border:1px solid #93c5fd;border-radius:9px;background:#fff;font-size:16px;"></label><div id="scheduledMessagePreview" style="margin-top:11px;padding:9px;border:1px solid #dbeafe;border-radius:9px;background:#eff6ff;font-size:11px;color:#475569;line-height:1.55;white-space:pre-wrap;word-break:break-word;"></div></div>
+    <div style="padding:15px 17px;"><label style="display:block;font-size:12px;font-weight:700;color:#334155;">送信日時<input id="scheduledMessageAt" type="datetime-local" style="display:block;box-sizing:border-box;width:100%;min-height:44px;margin-top:6px;padding:8px;border:1px solid #93c5fd;border-radius:9px;background:#fff;font-size:16px;"></label><div id="scheduledMessageMeta" style="margin-top:11px;padding:9px;border:1px solid #dbeafe;border-radius:9px;background:#eff6ff;font-size:11px;color:#475569;line-height:1.55;">入力中の本文をこのまま予約します</div></div>
     <div style="padding:10px 17px 14px;border-top:1px solid #e5e7eb;display:flex;gap:8px;justify-content:flex-end;"><button type="button" class="cbtn" onclick="closeScheduledMessage()">戻る</button><button type="button" id="scheduledMessageSave" class="cbtn send" onclick="saveScheduledMessage()">この日時で予約</button></div>
   </div>
 </div>
@@ -5778,7 +5778,7 @@ function openScheduledMessage(){
   const learning=draftLearningPayload(id,text);scheduledMessageDraft={id,text,files,instr:learning.instr,learningText:learning.learningText};
   const at=new Date(Date.now()+10*60000);at.setSeconds(0,0);at.setMinutes(Math.ceil(at.getMinutes()/5)*5);
   document.getElementById("scheduledMessageAt").value=localDateTimeValue(at);
-  document.getElementById("scheduledMessagePreview").textContent=(text||"（本文なし）")+(files.length?"\\n\\n添付 "+files.length+"件："+files.map(file=>file.name).join("、"):"");
+  document.getElementById("scheduledMessageMeta").textContent=(text?"入力中の本文":"本文なし")+(files.length?"・添付 "+files.length+"件":"")+"をこのまま予約します";
   document.getElementById("scheduledMessagePop").style.display="flex";
 }
 function closeScheduledMessage(){document.getElementById("scheduledMessagePop").style.display="none";scheduledMessageDraft=null;}
