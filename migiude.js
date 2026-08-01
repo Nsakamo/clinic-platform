@@ -12,6 +12,7 @@ const crypto = require("crypto");
 const { intentTokens, rankLearningExamples, sameLearningExample } = require("./lib/learning-retrieval");
 const { evaluateResponseGrounding } = require("./lib/response-grounding");
 const { compareConversations, compareConversationsRecent } = require("./lib/conversation-order");
+const { MAX_ATTACHMENTS, normalizeFileIds, normalizeScheduledMessageInput, pruneScheduledMessages } = require("./lib/scheduled-message");
 const app = express();
 app.use(express.json({ limit: "16mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: false, limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
@@ -80,11 +81,22 @@ function newTenant(slug, name, config) {
   if (typeof config.settings.staffLineEnabled !== "boolean") config.settings.staffLineEnabled = false;
   if (!["review_all", "exceptions"].includes(config.settings.staffLineReplyMode)) config.settings.staffLineReplyMode = "exceptions";
   if (!Array.isArray(config.staffLineStaff)) config.staffLineStaff = [];
+  if (!Array.isArray(config.scheduledMessages)) config.scheduledMessages = [];
+  let scheduledRecovered = false;
+  config.scheduledMessages.forEach((item) => {
+    if (item && item.status === "sending") {
+      item.status = "failed";
+      item.lastError = "delivery_status_unknown";
+      item.completedAt = Date.now();
+      scheduledRecovered = true;
+    }
+  });
+  config.scheduledMessages = pruneScheduledMessages(config.scheduledMessages);
   // 廃止したSlack資格情報・設定は起動時にDBからも削除する。
   let purgedSlack = false;
   ["slackWebhook", "slackBotToken", "slackConnectionType", "slackTeamId", "slackTeamName", "slackChannelId", "slackChannelName"].forEach(k => { if (k in config.conn) { delete config.conn[k]; purgedSlack = true; } });
   ["slackEnabled", "slackReplyMode"].forEach(k => { if (k in config.settings) { delete config.settings[k]; purgedSlack = true; } });
-  return { slug, name: name || slug, config, store: {}, rules: {}, ruleSeq: 1, examples: {}, exampleSeq: 1, alerts: [], alertSeq: 1, push: {}, _purgedSlack: purgedSlack };
+  return { slug, name: name || slug, config, store: {}, rules: {}, ruleSeq: 1, examples: {}, exampleSeq: 1, alerts: [], alertSeq: 1, push: {}, _purgedSlack: purgedSlack, _scheduledRecovered: scheduledRecovered };
 }
 async function saveTenantConfig(t) {
   try { encryptConnSecrets(t.config.conn); } catch (e) { console.error("encryptConnSecrets:", e.message); } // 保存直前にメール/LINE資格情報を暗号化（CRED_KEY未設定なら平文のまま）
@@ -156,8 +168,8 @@ async function dbInit() {
     t.alerts.forEach(a => { if (a.id >= t.alertSeq) t.alertSeq = a.id + 1; });
     const ps = await pool.query("SELECT sub FROM push_subs WHERE tenant=$1", [slug]);
     ps.rows.forEach(x => { t.push[x.sub.endpoint] = x.sub; });
-    if (t._purgedSlack) { try { await saveTenantConfig(t); } catch (e) { console.error("Slack config purge:", e.message); } }
-    delete t._purgedSlack;
+    if (t._purgedSlack || t._scheduledRecovered) { try { await saveTenantConfig(t); } catch (e) { console.error("Tenant config recovery:", e.message); } }
+    delete t._purgedSlack; delete t._scheduledRecovered;
   }
   console.log("loaded " + Object.keys(TEN).length + " tenants");
 }
@@ -2276,7 +2288,7 @@ app.get("/api/conversations", guard, (req, res) => {
   const staffLineReviewAvailable = !!(S(req.tenant).staffLineEnabled && staffLineReady(req.tenant));
   const inboxOrder = S(req.tenant).inboxOrder === "recent" ? "recent" : "unanswered_first";
   const arr = Object.values(req.tenant.store).sort(inboxOrder === "recent" ? compareConversationsRecent : compareConversations);
-  res.json(arr.map(c => Object.assign({}, c, { staffLineReviewAvailable, inboxOrder })));
+  res.json(arr.map(c => Object.assign({}, c, { staffLineReviewAvailable, inboxOrder, scheduledMessages: scheduledForConversation(req.tenant, c.id) })));
 });
 
 async function deliverText(t, c, text) {
@@ -2311,23 +2323,102 @@ async function deliverText(t, c, text) {
   return { sent, sendErr };
 }
 
+function messagePublicBase(req) {
+  const configured = String(PUBLIC_BASE_URL || "").trim().replace(/\/$/, "");
+  if (/^https:\/\//i.test(configured)) return configured;
+  const host = String(req && (req.headers["x-forwarded-host"] || req.headers.host) || "").split(",")[0].trim();
+  return /^[A-Za-z0-9.-]+(?::\d+)?$/.test(host) ? "https://" + host : "";
+}
+function messageAttachmentAllowed(file) {
+  const mime = String(file && file.mime || "").toLowerCase();
+  const name = String(file && file.name || "").toLowerCase();
+  return /^(image\/(jpeg|png|gif|webp)|video\/(mp4|quicktime)|application\/(pdf|msword|vnd\.ms-excel|vnd\.openxmlformats-officedocument\.(wordprocessingml\.document|spreadsheetml\.sheet))|text\/(plain|csv))$/.test(mime)
+    || /\.(jpe?g|png|gif|webp|mp4|mov|pdf|doc|docx|xls|xlsx|txt|csv)$/.test(name);
+}
+async function loadMessageFiles(t, fileIds) {
+  const files = [];
+  const raw = Array.isArray(fileIds) ? fileIds : [];
+  if (raw.length > MAX_ATTACHMENTS) return { ok: false, error: "too_many_files" };
+  if (raw.some(id => !/^[0-9a-f]{32}$/i.test(String(id || "")))) return { ok: false, error: "no_file" };
+  for (const id of normalizeFileIds(raw)) {
+    const file = await loadTenantFile(t, id);
+    if (!file || !messageAttachmentAllowed(file)) return { ok: false, error: file ? "unsupported_file" : "no_file" };
+    files.push({ id, name: String(file.name || "ファイル").slice(0, 200), mime: String(file.mime || "application/octet-stream"), data: file.data });
+  }
+  return { ok: true, files };
+}
+async function deliverMessageBundle(t, c, text, files, baseUrl) {
+  let sent = false, sendErr = null;
+  const to = c.userId || (c.id.split(":")[1] || "");
+  if (c.channel === "line") {
+    const accts = lineAccounts(t);
+    const key = c.acct && c.acct.type === "line" ? c.acct.key : null;
+    const account = (key ? accts.find(x => (x.botId || "main") === key || (key === "main" && x.main)) : null) || accts[0];
+    if (account && to && (text || files.length)) {
+      if (files.length && !/^https:\/\//i.test(baseUrl)) return { sent: false, sendErr: "public_url_missing" };
+      const messages = [];
+      if (text) messages.push({ type: "text", text });
+      files.forEach((file) => {
+        const url = baseUrl + "/files/" + file.id;
+        if (/^image\/(jpeg|png)$/i.test(file.mime)) messages.push({ type: "image", originalContentUrl: url, previewImageUrl: url });
+        else messages.push({ type: "text", text: "資料をお送りいたします。\n📄 " + file.name + "\n" + url });
+      });
+      try {
+        const response = await fetch("https://api.line.me/v2/bot/message/push", { method: "POST", headers: { "Content-Type": "application/json", "Authorization": "Bearer " + account.token }, body: JSON.stringify({ to, messages }) });
+        sent = response.ok; if (!response.ok) sendErr = "LINE_" + response.status;
+      } catch (e) { sendErr = String(e.message || e).slice(0, 80); }
+    } else { sendErr = "no_send_config"; }
+  } else if (c.channel === "mail") {
+    const accts = mailAccounts(t);
+    const key = c.acct && c.acct.type === "mail" ? c.acct.key : null;
+    const account = (key ? accts.find(x => x.smtpUser === key) : null) || accts[0];
+    if (account && to && (text || files.length)) {
+      try {
+        const nodemailer = require("nodemailer");
+        const transport = nodemailer.createTransport({ host: account.smtpHost, port: account.smtpPort, secure: account.smtpPort === 465, auth: { user: account.smtpUser, pass: account.smtpPass } });
+        const subject = c.subject ? (/^re:/i.test(c.subject) ? c.subject : "Re: " + c.subject) : "お問い合わせについて（" + (t.name || "クリニック") + "）";
+        await transport.sendMail({
+          from: (t.name || "クリニック") + " <" + account.smtpUser + ">", to, subject,
+          text: text || "資料をお送りいたします。添付ファイルをご確認ください。",
+          attachments: files.map(file => ({ filename: file.name, content: file.data, contentType: file.mime }))
+        });
+        sent = true;
+      } catch (e) { sendErr = String(e.message || e).slice(0, 100); }
+    } else { sendErr = "mail_send_pending"; }
+  } else { sendErr = "no_send_config"; }
+  return { sent, sendErr };
+}
+function appendDeliveredBundle(c, text, files, baseUrl, extra) {
+  const common = extra && typeof extra === "object" ? extra : {};
+  if (text) c.msgs.push(Object.assign({ from: "us", text, time: nowt() }, common));
+  files.forEach((file) => {
+    const image = /^image\//i.test(file.mime);
+    c.msgs.push(Object.assign({ from: "us", media: image ? "image" : "file", url: baseUrl + "/files/" + file.id, fileName: file.name, time: nowt() }, common));
+  });
+}
+
 const sendLocks = new Set(); // 二重送信ガード（法人＋会話単位の実行中ロック）
 app.post("/api/send", guard, async (req, res) => {
   const t = req.tenant;
   const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" });
+  const text = String(req.body.text || "").trim().slice(0, 5000);
+  const loaded = await loadMessageFiles(t, req.body.fileIds);
+  if (!loaded.ok) return res.status(400).json({ ok: false, sent: false, sendErr: loaded.error });
+  const files = loaded.files;
+  if (!text && !files.length) return res.status(400).json({ error: "empty" });
   cancelAutoReply(t, c.id); // スタッフが手動返信したので保留中の自動返信は取り消す
-  const text = (req.body.text || "").trim(); if (!text) return res.status(400).json({ error: "empty" });
-  // 二重押し対策1: 同じ会話への送信が実行中なら受け付けない（1通目の結果に相乗り）
+  // 二重押し対策1: 同じ会話への送信が実行中なら本文・添付を消さずに待たせる。
   const sendLockKey = t.slug + "::" + c.id;
-  if (sendLocks.has(sendLockKey)) return res.json({ ok: true, sent: true, dup: true });
+  if (sendLocks.has(sendLockKey)) return res.status(409).json({ ok: false, sent: false, sendErr: "already_processing" });
   // 二重押し対策2: 直近60秒以内に同一本文を送信済みなら再送しない
   const lastUs = (c.msgs || []).slice().reverse().find((m) => m && m.from === "us");
-  if (lastUs && String(lastUs.text || "").trim() === text && Date.now() - (c.ts || 0) < 60000) {
+  if (!files.length && lastUs && String(lastUs.text || "").trim() === text && Date.now() - (c.ts || 0) < 60000) {
     return res.json({ ok: true, sent: true, dup: true });
   }
   sendLocks.add(sendLockKey);
   let sent = false, sendErr = null;
-  try { ({ sent, sendErr } = await deliverText(t, c, text)); }
+  const baseUrl = messagePublicBase(req);
+  try { ({ sent, sendErr } = await deliverMessageBundle(t, c, text, files, baseUrl)); }
   finally { sendLocks.delete(sendLockKey); }
   let learnedId = null, conflict = null, learnedRules = [], learningReview = null;
   if (sent) {
@@ -2335,15 +2426,87 @@ app.post("/api/send", guard, async (req, res) => {
     const q0 = recentCustomerQuestion(c);
     const instr = String(req.body.instr || "").trim();
     const reviewText = String(req.body.learningText || "").trim().slice(0, 800);
-    c.msgs.push({ from: "us", text, learningRefs: c.learningRefs || [], time: nowt() }); c.draft = ""; c.draft0 = ""; c.learningRefs = []; c.status = "done"; c.flag = false; c.lastAuto = false; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
+    appendDeliveredBundle(c, text, files, baseUrl, { learningRefs: c.learningRefs || [] }); c.draft = ""; c.draft0 = ""; c.learningRefs = []; c.status = "done"; c.flag = false; c.lastAuto = false; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
     statBump(t, "staff");
-    const learned = await learnStaffOutcome(t, c, { q: q0, final: text, draft0, instr, reviewText, source: "web", waitForAi: true, reviewScope: true });
-    learnedId = learned.learnedId;
-    learnedRules = learned.learnedRules || [];
-    learningReview = learned.learningReview || null;
-    if (learned.conflict) conflict = { id: learned.conflict.id, q: learned.conflict.q, oldId: learned.conflict.oldId, oldFinal: learned.conflict.oldFinal, newId: learned.conflict.newId, newFinal: learned.conflict.newFinal };
+    if (text) {
+      const learned = await learnStaffOutcome(t, c, { q: q0, final: text, draft0, instr, reviewText, source: "web", waitForAi: true, reviewScope: true });
+      learnedId = learned.learnedId;
+      learnedRules = learned.learnedRules || [];
+      learningReview = learned.learningReview || null;
+      if (learned.conflict) conflict = { id: learned.conflict.id, q: learned.conflict.q, oldId: learned.conflict.oldId, oldFinal: learned.conflict.oldFinal, newId: learned.conflict.newId, newFinal: learned.conflict.newFinal };
+    }
   }
   res.json({ ok: true, sent, sendErr, learnedId, conflict, learnedRules, learningReview });
+});
+
+function scheduledMessages(t) {
+  if (!Array.isArray(t.config.scheduledMessages)) t.config.scheduledMessages = [];
+  return t.config.scheduledMessages;
+}
+function publicScheduledMessage(item) {
+  return {
+    id: String(item.id || ""), conversationId: String(item.conversationId || ""), text: String(item.text || ""),
+    sendAt: Number(item.sendAt || 0), status: String(item.status || "scheduled"), createdAt: Number(item.createdAt || 0),
+    completedAt: Number(item.completedAt || 0), lastError: String(item.lastError || ""),
+    attachments: (Array.isArray(item.attachments) ? item.attachments : []).map(file => ({ id: String(file.id || ""), name: String(file.name || "ファイル"), mime: String(file.mime || "application/octet-stream") }))
+  };
+}
+function scheduledForConversation(t, conversationId) {
+  return scheduledMessages(t)
+    .filter(item => item && item.conversationId === conversationId && ["scheduled", "sending", "failed"].includes(item.status))
+    .sort((a, b) => Number(a.sendAt || 0) - Number(b.sendAt || 0))
+    .slice(0, 20)
+    .map(publicScheduledMessage);
+}
+
+app.post("/api/scheduled-message", guard, oneMutationAtATime("scheduled-message", req => req.body.id), async (req, res) => {
+  const t = req.tenant, c = t.store[String(req.body.id || "")];
+  if (!c) return res.status(404).json({ ok: false, error: "no_conv" });
+  const normalized = normalizeScheduledMessageInput(req.body, Date.now());
+  if (!normalized.ok) return res.status(400).json(normalized);
+  const loaded = await loadMessageFiles(t, normalized.fileIds);
+  if (!loaded.ok) return res.status(400).json({ ok: false, error: loaded.error });
+  const baseUrl = messagePublicBase(req);
+  if (loaded.files.length && !/^https:\/\//i.test(baseUrl)) return res.status(400).json({ ok: false, error: "public_url_missing" });
+  const active = scheduledMessages(t).filter(item => item && ["scheduled", "sending"].includes(item.status));
+  if (active.length >= 100) return res.status(409).json({ ok: false, error: "schedule_limit" });
+  const duplicate = active.find(item => item.conversationId === c.id && item.text === normalized.text && Math.abs(Number(item.sendAt || 0) - normalized.sendAt) < 1000 && JSON.stringify(item.fileIds || []) === JSON.stringify(normalized.fileIds));
+  if (duplicate) return res.json({ ok: true, duplicate: true, scheduled: publicScheduledMessage(duplicate) });
+  cancelAutoReply(t, c.id);
+  const item = {
+    id: crypto.randomUUID(), conversationId: c.id, text: normalized.text, fileIds: normalized.fileIds,
+    attachments: loaded.files.map(file => ({ id: file.id, name: file.name, mime: file.mime })),
+    sendAt: normalized.sendAt, status: "scheduled", createdAt: Date.now(), updatedAt: Date.now(), baseUrl,
+    question: recentCustomerQuestion(c), draft0: String(c.draft0 || "").trim().slice(0, 1500),
+    instr: String(req.body.instr || "").trim().slice(0, 800), learningText: String(req.body.learningText || "").trim().slice(0, 800),
+    learningRefs: Array.isArray(c.learningRefs) ? c.learningRefs : []
+  };
+  const list = scheduledMessages(t); list.push(item); t.config.scheduledMessages = pruneScheduledMessages(list);
+  try { await saveTenantConfig(t); }
+  catch (e) { const index = list.indexOf(item); if (index >= 0) list.splice(index, 1); return res.status(500).json({ ok: false, error: "save" }); }
+  c.draft = ""; c.draft0 = ""; c.learningRefs = []; await dbSave(t, c);
+  res.json({ ok: true, scheduled: publicScheduledMessage(item) });
+});
+
+app.post("/api/scheduled-message-cancel", guard, oneMutationAtATime("scheduled-message", req => req.body.scheduleId), async (req, res) => {
+  const t = req.tenant, item = scheduledMessages(t).find(row => row && row.id === String(req.body.scheduleId || ""));
+  if (!item) return res.status(404).json({ ok: false, error: "not_found" });
+  if (item.status === "sending") return res.status(409).json({ ok: false, error: "sending" });
+  if (!["scheduled", "failed"].includes(item.status)) return res.status(409).json({ ok: false, error: "already_finished" });
+  const previous = { status: item.status, completedAt: item.completedAt, updatedAt: item.updatedAt };
+  item.status = "cancelled"; item.completedAt = Date.now(); item.updatedAt = Date.now();
+  try { await saveTenantConfig(t); } catch (e) { Object.assign(item, previous); return res.status(500).json({ ok: false, error: "save" }); }
+  res.json({ ok: true });
+});
+
+app.post("/api/scheduled-message-retry", guard, oneMutationAtATime("scheduled-message", req => req.body.scheduleId), async (req, res) => {
+  const t = req.tenant, item = scheduledMessages(t).find(row => row && row.id === String(req.body.scheduleId || ""));
+  if (!item) return res.status(404).json({ ok: false, error: "not_found" });
+  if (item.status !== "failed") return res.status(409).json({ ok: false, error: "not_failed" });
+  const previous = { status: item.status, sendAt: item.sendAt, updatedAt: item.updatedAt, completedAt: item.completedAt, lastError: item.lastError, errorNotifiedAt: item.errorNotifiedAt, attempts: item.attempts };
+  item.status = "scheduled"; item.sendAt = Date.now() + 5000; item.updatedAt = Date.now(); item.completedAt = 0; item.lastError = ""; item.errorNotifiedAt = 0; item.attempts = Number(item.attempts || 0) + 1;
+  try { await saveTenantConfig(t); } catch (e) { Object.assign(item, previous); return res.status(500).json({ ok: false, error: "save" }); }
+  res.json({ ok: true, scheduled: publicScheduledMessage(item) });
 });
 
 // connection settings (secrets are write-only: never echoed back)
@@ -3198,7 +3361,10 @@ app.post("/api/upload", guard, async (req, res) => {
   if (buf.length > 10 * 1024 * 1024) return res.status(400).json({ error: "too_large" });
   const id = crypto.randomBytes(16).toString("hex");
   FILES[id] = { tenant: t.slug, name, mime, data: buf };
-  if (pool) { try { await pool.query("INSERT INTO files (id,tenant,name,mime,data,ts) VALUES ($1,$2,$3,$4,$5,$6)", [id, t.slug, name, mime, buf, Date.now()]); } catch (e) {} }
+  if (pool) {
+    try { await pool.query("INSERT INTO files (id,tenant,name,mime,data,ts) VALUES ($1,$2,$3,$4,$5,$6)", [id, t.slug, name, mime, buf, Date.now()]); }
+    catch (e) { delete FILES[id]; return res.status(500).json({ ok: false, error: "save" }); }
+  }
   res.json({ ok: true, fileId: id });
 });
 
@@ -3483,6 +3649,59 @@ async function processRichMenuSchedulesForTenant(t) {
 }
 async function processAllRichMenuSchedules() {
   for (const t of Object.values(TEN)) await processRichMenuSchedulesForTenant(t);
+}
+
+const scheduledDeliveryLocks = new Set();
+async function scheduledMessageFailure(t, item, error) {
+  item.status = "failed"; item.lastError = String(error || "send_failed").slice(0, 100); item.completedAt = Date.now(); item.updatedAt = Date.now();
+  try { await saveTenantConfig(t); } catch (_) {}
+  if (!item.errorNotifiedAt) {
+    item.errorNotifiedAt = Date.now();
+    try { await alertAdd(t, "システム", "予約メッセージを送信できませんでした。受信トレイで再送または取消を確認してください。", ""); } catch (_) {}
+    try { await saveTenantConfig(t); } catch (_) {}
+  }
+}
+async function processScheduledMessagesForTenant(t) {
+  if (!t || scheduledDeliveryLocks.has(t.slug)) return;
+  scheduledDeliveryLocks.add(t.slug);
+  try {
+    const now = Date.now();
+    const due = scheduledMessages(t).filter(item => item && item.status === "scheduled" && Number(item.sendAt || 0) <= now).sort((a, b) => Number(a.sendAt || 0) - Number(b.sendAt || 0));
+    for (const item of due) {
+      if (item.status !== "scheduled") continue;
+      const c = t.store[item.conversationId];
+      if (!c) { await scheduledMessageFailure(t, item, "no_conv"); continue; }
+      const lockKey = t.slug + "::" + c.id;
+      if (sendLocks.has(lockKey)) continue;
+      sendLocks.add(lockKey);
+      try {
+        item.status = "sending"; item.startedAt = Date.now(); item.updatedAt = Date.now(); item.lastError = "";
+        await saveTenantConfig(t);
+        const loaded = await loadMessageFiles(t, item.fileIds);
+        if (!loaded.ok) { await scheduledMessageFailure(t, item, loaded.error); continue; }
+        const delivered = await deliverMessageBundle(t, c, String(item.text || ""), loaded.files, String(item.baseUrl || PUBLIC_BASE_URL || "").replace(/\/$/, ""));
+        if (!delivered.sent) { await scheduledMessageFailure(t, item, delivered.sendErr || "send_failed"); continue; }
+        appendDeliveredBundle(c, String(item.text || ""), loaded.files, String(item.baseUrl || PUBLIC_BASE_URL || "").replace(/\/$/, ""), { scheduled: true, scheduledAt: item.sendAt, learningRefs: item.learningRefs || [] });
+        c.status = "done"; c.flag = false; c.lastAuto = false; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c);
+        const historySaved = await dbSave(t, c);
+        item.status = "sent"; item.completedAt = Date.now(); item.updatedAt = Date.now(); item.lastError = historySaved ? "" : "history_save_failed";
+        await saveTenantConfig(t);
+        statBump(t, "staff");
+        if (!historySaved) {
+          try { await alertAdd(t, "システム", "予約メッセージは送信済みですが、履歴保存を確認できませんでした。二重送信せず管理者へ確認してください。", ""); } catch (_) {}
+        }
+        if (item.text) {
+          learnStaffOutcome(t, c, { q: item.question, final: item.text, draft0: item.draft0, instr: item.instr, reviewText: item.learningText, source: "web", waitForAi: false, reviewScope: true }).catch(e => console.error("scheduled learning:", e && e.message));
+        }
+      } catch (e) {
+        await scheduledMessageFailure(t, item, e && e.message || "send_failed");
+      } finally { sendLocks.delete(lockKey); }
+    }
+    t.config.scheduledMessages = pruneScheduledMessages(scheduledMessages(t));
+  } finally { scheduledDeliveryLocks.delete(t.slug); }
+}
+async function processAllScheduledMessages() {
+  for (const t of Object.values(TEN)) await processScheduledMessagesForTenant(t);
 }
 // 公開URL（LINEの画像送信等はセッション無しで取得する）。idは128bitランダム。
 // ログイン中のテナントが他テナントのファイルidを開いた場合は404（tenant check）
@@ -4257,6 +4476,7 @@ app.get("/board", (req, res) => { res.set("Content-Type", "text/html; charset=ut
   try { await pushInit(); } catch (e) { console.error("pushInit failed:", e.message); }
   setInterval(() => { pollAll().catch(() => {}); }, 60000); setTimeout(() => { pollAll().catch(() => {}); }, 8000);
   setInterval(() => { processAllRichMenuSchedules().catch(() => {}); }, 30000); setTimeout(() => { processAllRichMenuSchedules().catch(() => {}); }, 5000);
+  setInterval(() => { processAllScheduledMessages().catch(() => {}); }, 15000); setTimeout(() => { processAllScheduledMessages().catch(() => {}); }, 3000);
   setTimeout(() => { Object.values(TEN).forEach(t => ensureLineBotId(t).catch(() => {})); }, 3000);
   const server = app.listen(PORT, () => console.log("clinic-inbox platform listening on " + PORT));
   // Railwayの前段プロキシよりNodeが先にkeep-alive接続を切ると、切断直後のPOST(LINE Webhook等)が
@@ -4495,9 +4715,23 @@ const PAGE = `<!DOCTYPE html>
   #draftRow{display:flex;gap:8px;align-items:flex-end;}
   #attach{flex-shrink:0;width:38px;height:38px;border:1px solid var(--line);border-radius:9px;background:#fff;cursor:pointer;font-size:18px;}
   #draft{flex:1;min-height:110px;max-height:300px;border:1px solid #d1d5db;border-radius:10px;padding:9px 11px;font-size:13px;line-height:1.5;font-family:inherit;resize:vertical;transition:min-height .15s ease;}
+  #pendingAttachments{display:flex;gap:7px;overflow-x:auto;margin:0 0 7px;padding-bottom:2px;}
+  .pendingAttachment{position:relative;display:flex;align-items:center;gap:7px;min-width:0;max-width:220px;padding:6px 28px 6px 7px;border:1px solid #bbf7d0;border-radius:9px;background:#f0fdf4;font-size:11px;color:#166534;}
+  .pendingAttachment img{width:34px;height:34px;object-fit:cover;border-radius:6px;background:#fff;}
+  .pendingAttachment .pendingFileIcon{width:34px;height:34px;display:flex;align-items:center;justify-content:center;border-radius:6px;background:#fff;font-size:18px;}
+  .pendingAttachment .pendingName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .pendingAttachment button{position:absolute;right:5px;top:50%;transform:translateY(-50%);width:20px;height:20px;border:0;border-radius:50%;background:#dcfce7;color:#166534;cursor:pointer;padding:0;}
+  #scheduledList{display:flex;flex-direction:column;gap:6px;margin:0 0 8px;}
+  .scheduledMessage{border:1px solid #bfdbfe;border-radius:9px;background:#eff6ff;padding:7px 9px;font-size:11px;color:#1e3a8a;line-height:1.45;}
+  .scheduledMessage.failed{border-color:#fecaca;background:#fef2f2;color:#991b1b;}
+  .scheduledMessageTop{display:flex;align-items:center;justify-content:space-between;gap:8px;font-weight:700;}
+  .scheduledMessageText{margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#475569;}
+  .scheduledMessageActions{display:flex;gap:5px;margin-top:5px;}
+  .scheduledMessageActions button{border:1px solid currentColor;border-radius:7px;background:#fff;padding:4px 8px;color:inherit;font-size:11px;cursor:pointer;}
   #cbtns{display:flex;gap:8px;margin-top:8px;justify-content:flex-end;flex-wrap:wrap;}
   .cbtn{font-size:13px;padding:7px 14px;border-radius:9px;border:1px solid var(--line);background:#fff;cursor:pointer;}
   .cbtn.send{background:var(--line-green);border-color:var(--line-green);color:#fff;font-weight:600;}
+  .cbtn.schedule{background:#eff6ff;border-color:#93c5fd;color:#1d4ed8;font-weight:700;}
   .cbtn.ai{background:#eff6ff;border-color:#bfdbfe;color:#1d4ed8;}.cbtn.done{background:#ecfdf5;border-color:#a7f3d0;color:#047857;}
   #empty{flex:1;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:14px;}
   #menu{position:fixed;z-index:50;background:#fff;border:1px solid var(--line);border-radius:10px;padding:5px;display:none;box-shadow:0 6px 24px rgba(0,0,0,.12);}
@@ -4621,6 +4855,7 @@ const PAGE = `<!DOCTYPE html>
     #aiLabel .patientModeTitle{font-size:13px;}
     #aiLabel .patientModeNote{font-size:10.5px;color:#166534;}
     #draft{min-height:44px;}#draft:focus{min-height:140px;}
+    #cbtns .cbtn{min-height:42px;}
     #draft,#search,#popInput,#asstText,#setTone{font-size:16px;}
     #setPop,#learnManagePop,#richMenuPop{padding:0;align-items:stretch;background:#fff;}
     .settingsCard,.learningCard{width:100vw;max-height:none;height:100vh;height:100dvh;border-radius:0;box-shadow:none;}
@@ -4929,6 +5164,13 @@ const PAGE = `<!DOCTYPE html>
     <div style="padding:10px 18px 14px;display:flex;justify-content:flex-end;border-top:1px solid #e5e7eb;"><button type="button" class="cbtn" onclick="closeLearningScope()">閉じる（対応例として保存済み）</button></div>
   </div>
 </div>
+<div id="scheduledMessagePop" style="position:fixed;inset:0;background:rgba(15,23,42,.48);z-index:84;display:none;align-items:center;justify-content:center;padding:14px;">
+  <div style="background:#fff;border-radius:16px;width:min(94vw,430px);box-shadow:0 20px 50px rgba(0,0,0,.25);overflow:hidden;">
+    <div style="padding:15px 17px 10px;border-bottom:1px solid #e5e7eb;"><h3 style="margin:0 0 5px;font-size:16px;">🕒 メッセージの予約送信</h3><div style="font-size:11px;color:#64748b;line-height:1.55;">指定した日時に、現在の本文と添付ファイルを患者へ送信します。</div></div>
+    <div style="padding:15px 17px;"><label style="display:block;font-size:12px;font-weight:700;color:#334155;">送信日時<input id="scheduledMessageAt" type="datetime-local" style="display:block;box-sizing:border-box;width:100%;min-height:44px;margin-top:6px;padding:8px;border:1px solid #93c5fd;border-radius:9px;background:#fff;font-size:16px;"></label><div id="scheduledMessagePreview" style="margin-top:11px;padding:9px;border:1px solid #dbeafe;border-radius:9px;background:#eff6ff;font-size:11px;color:#475569;line-height:1.55;white-space:pre-wrap;word-break:break-word;"></div></div>
+    <div style="padding:10px 17px 14px;border-top:1px solid #e5e7eb;display:flex;gap:8px;justify-content:flex-end;"><button type="button" class="cbtn" onclick="closeScheduledMessage()">戻る</button><button type="button" id="scheduledMessageSave" class="cbtn send" onclick="saveScheduledMessage()">この日時で予約</button></div>
+  </div>
+</div>
 <div id="learnToast" style="display:none;position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:75;background:#065f46;color:#fff;border-radius:10px;padding:8px 14px;font-size:12px;box-shadow:0 6px 20px rgba(0,0,0,.25);">✓ この対応を学習しました</div>
 <div id="conflictPop" style="position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:80;display:none;align-items:center;justify-content:center;"><div style="background:#fff;border-radius:14px;padding:18px;width:min(92vw,380px);max-height:86vh;overflow-y:auto;">
   <h3 style="margin:0 0 8px;font-size:15px;">⚠️ 前と答えが食い違っています</h3>
@@ -4947,7 +5189,7 @@ const PAGE = `<!DOCTYPE html>
 let DATA=[];let current=null;
 const roomsEl=document.getElementById("rooms"),chatEl=document.getElementById("chat"),appEl=document.getElementById("app");
 let initialConv="";try{initialConv=new URLSearchParams(location.search).get("conv")||"";}catch(e){}
-async function load(){ try{ const r=await fetch("/api/conversations"); DATA=await r.json(); }catch(e){} renderList(); if(initialConv&&!current){const target=DATA.find(x=>x.id===initialConv);if(target){const id=initialConv;initialConv="";openChat(id);try{history.replaceState(null,"",location.pathname);}catch(e){}}} if(current){ const c=DATA.find(x=>x.id===current); if(c) syncMsgs(c); } }
+async function load(){ try{ const r=await fetch("/api/conversations"); DATA=await r.json(); }catch(e){} renderList(); if(initialConv&&!current){const target=DATA.find(x=>x.id===initialConv);if(target){const id=initialConv;initialConv="";openChat(id);try{history.replaceState(null,"",location.pathname);}catch(e){}}} if(current){ const c=DATA.find(x=>x.id===current); if(c){syncMsgs(c);renderScheduledMessages(c);} } }
 function api(path,body){ return fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); }
 const uiBusyKeys=new Set();
 async function withBusy(key,btn,label,work){
@@ -5017,7 +5259,7 @@ function renderList(){
 }
 function esc(s){return (s||"").replace(/[<>&]/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]));}
 function mediaHtml(m){ var cls='b '+(m.from==="them"?"them":"us"); var src=m.mediaId?('/api/line-media/'+m.mediaId):(m.url||"https://placehold.co/300x220/e5e7eb/6b7280?text=%F0%9F%93%B7"); if(m.media==="image")return '<div class="'+cls+' media"><a href="'+src+'" target="_blank"><img class="ph" src="'+src+'"></a></div>'; if(m.media==="video")return (m.mediaId||m.url)?('<div class="'+cls+' media"><video class="ph" style="max-width:220px;border-radius:10px;" controls preload="metadata" src="'+src+'"></video></div>'):('<div class="'+cls+' media"><div class="vid">▶<span>動画</span></div></div>'); if(m.media==="file")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" style="text-decoration:none;">📄 '+esc(m.fileName||"ファイル")+'</a></div>'; if(m.media==="audio")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" style="text-decoration:none;">🎤 音声メッセージ</a></div>'; return ''; }
-function bubblesHtml(r){return r.msgs.map(m=>{const body=m.media?mediaHtml(m):('<div class="b '+(m.from==="them"?"them":"us")+'">'+esc(m.text)+'</div>');const tl=(m.time||"")+(m.auto?' <span style="color:#7c3aed;">🤖 自動返信</span>':"");return body+'<div class="btime" style="align-self:'+(m.from==="them"?"flex-start":"flex-end")+'">'+tl+'</div>';}).join("");}
+function bubblesHtml(r){return r.msgs.map(m=>{const body=m.media?mediaHtml(m):('<div class="b '+(m.from==="them"?"them":"us")+'">'+esc(m.text)+'</div>');const tl=(m.time||"")+(m.auto?' <span style="color:#7c3aed;">🤖 自動返信</span>':"")+(m.scheduled?' <span style="color:#1d4ed8;">🕒 予約送信</span>':"");return body+'<div class="btime" style="align-self:'+(m.from==="them"?"flex-start":"flex-end")+'">'+tl+'</div>';}).join("");}
 function learningRefsText(r){if(!r)return "";const usage=r.learningUsage||{},refs=Array.isArray(r.learningRefs)?r.learningRefs:[],rules=Array.isArray(usage.rules)?usage.rules:[],prefs=Array.isArray(usage.prefs)?usage.prefs:[];const parts=[];if(prefs.length)parts.push("全体方針 "+prefs.length+"件");if(rules.length)parts.push("店舗ルール "+rules.slice(0,3).map(x=>"#"+x.id+" "+x.title).join("・")+(rules.length>3?"ほか"+(rules.length-3)+"件":""));if(refs.length)parts.push("過去対応 "+refs.map(x=>"#"+x.id+" 類似"+x.score+"%"+(x.confirmedCount>1?"・確認"+x.confirmedCount+"回":"")).join(" / "));return parts.length?"🧠 この下書きに使用："+parts.join(" ｜ "):"";}
 function renderLearningRefs(r){const el=document.getElementById("learningUsed");if(!el)return;const text=learningRefsText(r);el.textContent=text;el.style.display=text?"block":"none";}
 function groundingText(r){if(!(r&&r.grounding))return "";const g=r.grounding,v=r.validation||{};if(g.autoSendAllowed&&v.pass)return "✓ 送信前の根拠監査済み"+(g.sources&&g.sources.length?"（"+g.sources.join("・")+"）":"");const reasons=Array.isArray(g.reasons)?g.reasons:[];return "⚠ スタッフ確認が必要"+(reasons.length?"："+reasons.join("／"):(v.reason?"："+v.reason:""));}
@@ -5032,9 +5274,9 @@ function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)ret
     '<div id="custTab" class="custTab" style="display:none;" onclick="cpExpand()">うけつけるん情報を表示 ⌄</div>'+
     '<div id="custPanel" class="custPanel">読み込み中…</div>'+
     '<div id="msgs">'+bubbles+'</div>'+
-    '<div id="composer"><div id="aiLabel"><span class="patientModeTitle">🟢 患者への返信を編集中</span><span class="patientModeNote">この入力欄の内容は患者へ送信されます</span></div><div id="learningUsed" style="display:'+(learningRefsText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:#6d28d9;margin:2px 0 5px;">'+esc(learningRefsText(r))+'</div><div id="groundingUsed" style="display:'+(groundingText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:'+(r.grounding&&r.grounding.autoSendAllowed&&r.validation&&r.validation.pass?'#047857':'#b45309')+';margin:2px 0 5px;">'+esc(groundingText(r))+'</div><div id="topicChips" style="display:none;"></div><div id="draftRow"><button id="attach" onclick="attach()" title="写真・動画を添付">📎</button><textarea id="draft" oninput="draftEdited()">'+esc(r.draft||"")+'</textarea></div>'+
-    '<div id="cbtns"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ 右腕くんに相談</button>'+staffReviewButton+'<button id="markDoneBtn" class="cbtn done" onclick="markDone()">対応済み</button><button class="cbtn send" onclick="sendMsg()">患者へ送信</button></div></div>';
-  const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r); loadCustomer(id); if(!keep)renderList();
+    '<div id="composer"><div id="aiLabel"><span class="patientModeTitle">🟢 患者への返信を編集中</span><span class="patientModeNote">この入力欄の内容は患者へ送信されます</span></div><div id="learningUsed" style="display:'+(learningRefsText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:#6d28d9;margin:2px 0 5px;">'+esc(learningRefsText(r))+'</div><div id="groundingUsed" style="display:'+(groundingText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:'+(r.grounding&&r.grounding.autoSendAllowed&&r.validation&&r.validation.pass?'#047857':'#b45309')+';margin:2px 0 5px;">'+esc(groundingText(r))+'</div><div id="topicChips" style="display:none;"></div><div id="scheduledList"></div><div id="pendingAttachments"></div><div id="draftRow"><button id="attach" onclick="attach()" title="画像・ファイルを追加">📎</button><textarea id="draft" oninput="draftEdited()" onpaste="handleDraftPaste(event)" placeholder="患者へのメッセージ。画像やファイルもここへ貼り付けできます">'+esc(r.draft||"")+'</textarea></div>'+
+    '<div id="cbtns"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ 右腕くんに相談</button>'+staffReviewButton+'<button id="markDoneBtn" class="cbtn done" onclick="markDone()">対応済み</button><button class="cbtn schedule" onclick="openScheduledMessage()">🕒 予約送信</button><button class="cbtn send" onclick="sendMsg()">患者へ送信</button></div></div>';
+  const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r);renderPendingAttachments();renderScheduledMessages(r); loadCustomer(id); if(!keep)renderList();
 }
 function closeChat(){appEl.classList.remove("chatopen");current=null;renderList();}
 // ===== うけつけるん 顧客情報パネル =====
@@ -5488,9 +5730,77 @@ function openRuleLearning(){
   closeLearningScope();openAsst(ctx);
 }
 function showLearnResult(message){const b=document.getElementById("learnToast");if(!b)return;b.textContent="✓ "+message;b.style.display="block";clearTimeout(learnToastTimer);learnToastTimer=setTimeout(()=>{b.style.display="none";},4500);}
-async function sendMsg(){if(window.__sendBusy)return;const id=current;const t=document.getElementById("draft").value.trim();if(!t)return;window.__sendBusy=true;const _sb=document.querySelector("#cbtns .send");if(_sb){_sb.disabled=true;_sb.textContent="患者へ送信中…";}try{const cd0=DATA.find(x=>x.id===id);const orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim();const edited=(t!==orig);let instr="",learningText="";try{if(dSessions&&dSessions[id]){if(Array.isArray(dSessions[id].hist))instr=dSessions[id].hist.filter(m=>m&&m.role==="user").map(m=>String(m.content||"")).join(" / ").slice(0,1500);learningText=String(dSessions[id].memory||"").slice(0,800);}}catch(e){}const r=await api("/api/send",{id,text:t,instr:edited?instr:"",learningText:edited?learningText:""});let j={};try{j=await r.json();}catch(e){}if(j.sent){const d0=document.getElementById("draft");if(d0)d0.value="";const cd=DATA.find(x=>x.id===id);if(cd)cd.draft="";if(j.conflict){showConflict(j.conflict);}else if(j.learningReview){showLearningScope(j.learningReview);}else if(j.learnedRules&&j.learnedRules.length){showRuleToast(j.learnedRules);}else if(j.learnedId){showLearnToast(j.learnedId);}await load();}else{const m={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です"}[j.sendErr]||("送信失敗: "+(j.sendErr||"不明"));uiAlert(m+"\\n（下書きは消えていません）");}}finally{window.__sendBusy=false;const _sb2=document.querySelector("#cbtns .send");if(_sb2){_sb2.disabled=false;_sb2.textContent="患者へ送信";}}}
+const pendingAttachmentsByConversation={};
+function pendingAttachments(id){id=id||current;if(!id)return[];if(!Array.isArray(pendingAttachmentsByConversation[id]))pendingAttachmentsByConversation[id]=[];return pendingAttachmentsByConversation[id];}
+function messageFileAccepted(file){const mime=String(file&&file.type||"").toLowerCase(),name=String(file&&file.name||"").toLowerCase(),mimes=["image/jpeg","image/png","image/gif","image/webp","video/mp4","video/quicktime","application/pdf","application/msword","application/vnd.ms-excel","application/vnd.openxmlformats-officedocument.wordprocessingml.document","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet","text/plain","text/csv"],extensions=[".jpg",".jpeg",".png",".gif",".webp",".mp4",".mov",".pdf",".doc",".docx",".xls",".xlsx",".txt",".csv"];return mimes.includes(mime)||extensions.some(ext=>name.endsWith(ext));}
+function defaultPastedFileName(file,index){if(file&&file.name)return file.name;const ext=String(file&&file.type||"").split("/")[1]||"bin";return "clipboard-"+new Date().toISOString().replace(/[:.]/g,"-")+"-"+(index+1)+"."+ext;}
+function fileBase64(file){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result||"").split(",")[1]||"");reader.onerror=reject;reader.readAsDataURL(file);});}
+async function uploadComposerFiles(inputFiles){
+  const id=current;if(!id||window.__composerUploadBusy)return;
+  const existing=pendingAttachments(id),files=Array.from(inputFiles||[]).slice(0,Math.max(0,4-existing.length));
+  if(!files.length){uiAlert(existing.length>=4?"添付は1回の送信につき4件までです":"画像またはファイルを確認できませんでした");return;}
+  window.__composerUploadBusy=true;const btn=document.getElementById("attach"),old=btn&&btn.textContent;if(btn){btn.disabled=true;btn.textContent="⏳";}
+  try{
+    for(let i=0;i<files.length;i++){
+      const file=files[i];
+      if(file.size>10*1024*1024){uiAlert("10MB以下のファイルにしてください: "+(file.name||"貼り付けデータ"));continue;}
+      if(!messageFileAccepted(file)){uiAlert("このファイル形式は添付できません: "+(file.name||file.type||"不明"));continue;}
+      const name=defaultPastedFileName(file,i),data=await fileBase64(file),response=await api("/api/upload",{name,mime:file.type||"application/octet-stream",data}),json=await response.json();
+      if(!response.ok||!json.ok)throw new Error(json.error||"upload");
+      pendingAttachments(id).push({id:json.fileId,name,mime:file.type||"application/octet-stream"});
+      if(current===id)renderPendingAttachments();
+    }
+  }catch(e){uiAlert("ファイルを準備できませんでした。もう一度お試しください");}
+  finally{window.__composerUploadBusy=false;if(btn&&btn.isConnected){btn.disabled=false;btn.textContent=old||"📎";}}
+}
+function handleDraftPaste(event){
+  const data=event&&event.clipboardData;if(!data)return;
+  const files=[];
+  Array.from(data.items||[]).forEach(item=>{if(item&&item.kind==="file"){const file=item.getAsFile();if(file)files.push(file);}});
+  if(!files.length)Array.from(data.files||[]).forEach(file=>files.push(file));
+  if(files.length){event.preventDefault();uploadComposerFiles(files);}
+}
+function renderPendingAttachments(){
+  const box=document.getElementById("pendingAttachments");if(!box)return;const files=pendingAttachments(current);
+  box.innerHTML=files.map((file,index)=>'<div class="pendingAttachment">'+(String(file.mime||"").startsWith("image/")?'<img src="/files/'+encodeURIComponent(file.id)+'" alt="">':'<span class="pendingFileIcon">📄</span>')+'<span class="pendingName">'+esc(file.name)+'</span><button type="button" aria-label="添付を外す" onclick="removePendingAttachment('+index+')">×</button></div>').join("");
+  box.style.display=files.length?"flex":"none";
+}
+function removePendingAttachment(index){pendingAttachments(current).splice(index,1);renderPendingAttachments();}
+function attach(){const input=document.createElement("input");input.type="file";input.multiple=true;input.accept="image/*,video/mp4,video/quicktime,application/pdf,.pdf,.doc,.docx,.xls,.xlsx,.txt,.csv";input.onchange=()=>uploadComposerFiles(input.files);input.click();}
+function draftLearningPayload(id,text){const cd0=DATA.find(x=>x.id===id),orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim(),edited=(text!==orig);let instr="",learningText="";try{if(dSessions&&dSessions[id]){if(Array.isArray(dSessions[id].hist))instr=dSessions[id].hist.filter(m=>m&&m.role==="user").map(m=>String(m.content||"")).join(" / ").slice(0,1500);learningText=String(dSessions[id].memory||"").slice(0,800);}}catch(e){}return{instr:edited?instr:"",learningText:edited?learningText:""};}
+async function sendMsg(){if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="患者へ送信中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText});let json={};try{json=await response.json();}catch(e){}if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";if(json.conflict){showConflict(json.conflict);}else if(json.learningReview){showLearningScope(json.learningReview);}else if(json.learnedRules&&json.learnedRules.length){showRuleToast(json.learnedRules);}else if(json.learnedId){showLearnToast(json.learnedId);}await load();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
+let scheduledMessageDraft=null;
+function localDateTimeValue(date){const pad=n=>String(n).padStart(2,"0");return date.getFullYear()+"-"+pad(date.getMonth()+1)+"-"+pad(date.getDate())+"T"+pad(date.getHours())+":"+pad(date.getMinutes());}
+function openScheduledMessage(){
+  if(window.__composerUploadBusy){uiAlert("添付の準備が終わってから予約してください");return;}
+  const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id).slice();
+  if(!text&&!files.length){uiAlert("予約する本文または添付ファイルを追加してください");return;}
+  const learning=draftLearningPayload(id,text);scheduledMessageDraft={id,text,files,instr:learning.instr,learningText:learning.learningText};
+  const at=new Date(Date.now()+10*60000);at.setSeconds(0,0);at.setMinutes(Math.ceil(at.getMinutes()/5)*5);
+  document.getElementById("scheduledMessageAt").value=localDateTimeValue(at);
+  document.getElementById("scheduledMessagePreview").textContent=(text||"（本文なし）")+(files.length?"\\n\\n添付 "+files.length+"件："+files.map(file=>file.name).join("、"):"");
+  document.getElementById("scheduledMessagePop").style.display="flex";
+}
+function closeScheduledMessage(){document.getElementById("scheduledMessagePop").style.display="none";scheduledMessageDraft=null;}
+async function saveScheduledMessage(){
+  const data=scheduledMessageDraft,input=document.getElementById("scheduledMessageAt"),button=document.getElementById("scheduledMessageSave");if(!data)return;
+  const sendAt=new Date(input.value).getTime();if(!sendAt||sendAt<Date.now()+5000){uiAlert("現在より後の送信日時を指定してください");return;}
+  await withBusy("scheduled-message-"+data.id,button,"予約中…",async()=>{try{
+    const response=await api("/api/scheduled-message",{id:data.id,text:data.text,fileIds:data.files.map(file=>file.id),sendAt,instr:data.instr,learningText:data.learningText}),json=await response.json();
+    if(!response.ok||!json.ok)throw new Error(json.error||"schedule");
+    pendingAttachmentsByConversation[data.id]=[];if(current===data.id){const draft=document.getElementById("draft");if(draft)draft.value="";renderPendingAttachments();}
+    closeScheduledMessage();await load();uiAlert("送信予約を登録しました。送信前なら会話画面から取り消せます");
+  }catch(e){const messages={invalid_time:"送信日時は現在より後、1年以内で指定してください",schedule_limit:"送信予約が上限に達しています",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話の予約処理中です。少し待ってもう一度お試しください"};uiAlert(messages[e.message]||"送信予約を登録できませんでした");}});
+}
+function scheduledErrorText(code){return({LINE_400:"LINEで送信できませんでした",LINE_401:"LINE接続設定を確認してください",mail_send_pending:"メール送信設定を確認してください",no_send_config:"送信設定が未完了です",no_file:"添付ファイルを確認できませんでした",unsupported_file:"添付できないファイル形式です",public_url_missing:"添付ファイルの公開URL設定が未完了です",delivery_status_unknown:"送信中にサーバーが再起動しました。患者側の履歴を確認してから再送してください"})[code]||"送信できませんでした";}
+function renderScheduledMessages(conversation){
+  const box=document.getElementById("scheduledList");if(!box)return;const rows=Array.isArray(conversation&&conversation.scheduledMessages)?conversation.scheduledMessages:[];
+  box.innerHTML=rows.map(item=>{const failed=item.status==="failed",sending=item.status==="sending",label=failed?"⚠ 予約送信エラー":(sending?"⏳ 送信処理中":"🕒 "+new Date(item.sendAt).toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"})+"に送信予定"),files=Array.isArray(item.attachments)?item.attachments:[],summary=String(item.text||"").replaceAll("\\n"," ").replaceAll("\\r"," ").replaceAll("\\t"," ").slice(0,100)||(files.length?"添付ファイル "+files.length+"件":"");return '<div class="scheduledMessage'+(failed?' failed':'')+'"><div class="scheduledMessageTop"><span>'+esc(label)+'</span><span>'+(files.length?'📎'+files.length:'')+'</span></div><div class="scheduledMessageText">'+esc(summary)+'</div>'+(failed?'<div style="margin-top:3px;">'+esc(scheduledErrorText(item.lastError))+'</div>':'')+(!sending?'<div class="scheduledMessageActions">'+(failed?'<button type="button" onclick="retryScheduledMessage(&quot;'+esc(item.id)+'&quot;,this)">今すぐ再送</button>':'')+'<button type="button" onclick="cancelScheduledMessage(&quot;'+esc(item.id)+'&quot;,this)">予約を取り消す</button></div>':'')+'</div>';}).join("");
+  box.style.display=rows.length?"flex":"none";
+}
+async function cancelScheduledMessage(scheduleId,button){if(!await uiConfirm("この送信予約を取り消しますか？"))return;await withBusy("scheduled-cancel-"+scheduleId,button,"取消中…",async()=>{try{const response=await api("/api/scheduled-message-cancel",{scheduleId}),json=await response.json();if(!response.ok||!json.ok)throw new Error(json.error||"cancel");await load();}catch(e){uiAlert(e.message==="sending"?"現在送信処理中のため取り消せません":"送信予約を取り消せませんでした");}});}
+async function retryScheduledMessage(scheduleId,button){if(!await uiConfirm("患者側の履歴を確認しましたか？\\n同じ内容が届いていないことを確認したうえで再送してください。"))return;await withBusy("scheduled-retry-"+scheduleId,button,"再送中…",async()=>{try{const response=await api("/api/scheduled-message-retry",{scheduleId}),json=await response.json();if(!response.ok||!json.ok)throw new Error(json.error||"retry");await load();uiAlert("再送を開始しました");}catch(e){uiAlert("再送を開始できませんでした");}});}
 async function resendStaffApproval(){if(!current)return;const b=document.getElementById("staffReviewResend"),draft=String(document.getElementById("draft")&&document.getElementById("draft").value||"").trim();if(!draft){uiAlert("先に患者様へ送る返信案を入力してください");return;}if(b){b.disabled=true;b.textContent="送信中…";}try{const r=await api("/api/staff-line/resend-approval",{id:current,draft}),j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error(j.error||"resend");uiAlert("スタッフLINEへ承認依頼を送りました");await load();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"スタッフLINE連携を設定・有効化してください":"承認依頼を送れませんでした");}finally{if(b){b.disabled=false;b.textContent="📲 スタッフLINEで確認";}}}
-function attach(){const inp=document.createElement("input");inp.type="file";inp.accept="image/*,video/*,application/pdf,.pdf,.doc,.docx,.xls,.xlsx";inp.onchange=async()=>{const f=inp.files[0];if(!f)return;if(f.size>10*1024*1024){uiAlert("10MB以下のファイルにしてください");return;}const btn=document.getElementById("attach");if(btn){btn.disabled=true;btn.textContent="⏳";}try{const b64=await new Promise((res,rej)=>{const rd=new FileReader();rd.onload=()=>res(String(rd.result).split(",")[1]);rd.onerror=rej;rd.readAsDataURL(f);});const up=await api("/api/upload",{name:f.name,mime:f.type||"application/octet-stream",data:b64});const uj=await up.json();if(!uj.ok)throw new Error(uj.error||"upload");const sr=await api("/api/send-file",{id:current,fileId:uj.fileId});const sj=await sr.json();if(!sj.sent)uiAlert("送信失敗: "+(sj.sendErr||"不明"));await load();}catch(e){uiAlert("ファイル送信に失敗しました: "+e.message);}if(btn){btn.disabled=false;btn.textContent="📎";}};inp.click();}
 async function shareClinic(){const note=await uiPrompt("現場に伝える内容を入力してください（空欄のままOKを押すと、お客様の直近メッセージをそのまま共有します）","");if(note===null)return;const btn=document.getElementById("shareClinicBtn"),id=current;await withBusy("share-"+id,btn,"共有中…",async()=>{try{const r=await api("/api/share",{id,note:note||""});const j=await r.json();if(j.ok)uiAlert("現場ボードに共有しました");else uiAlert("共有に失敗しました");}catch(e){uiAlert("共有に失敗しました");}});}
 async function toggleFlag(){if(!current)return;const id=current,b=document.getElementById("flagBtn");let next=null;await withBusy("flag-"+id,b,"変更中…",async()=>{try{const r=await api("/api/tag",{id});const j=await r.json();next=!!j.flag;const cd=DATA.find(x=>x.id===id);if(cd)cd.flag=next;renderList();}catch(e){uiAlert("変更に失敗しました");}});if(b&&next!==null)b.textContent=next?"⚑ 要対応を外す":"⚑ 要対応";}
 // ---- AIで作り直す（会話型・下書きを会話で磨く。会話ごとにセッションを保持し再開可能）----
