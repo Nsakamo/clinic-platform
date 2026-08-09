@@ -129,6 +129,24 @@ test("スマホで患者返信と右腕くん相談を色と送信先表示で�
   assert.match(source, /#dHead\{[\s\S]{0,300}background:#6d28d9/);
 });
 
+test("スマホのEnterは改行に使い、送信は明示ボタンだけで行う", () => {
+  assert.doesNotMatch(source, /textarea id="dText"[^>]*onkeydown/);
+  assert.doesNotMatch(source, /textarea id="asstText"[^>]*onkeydown/);
+  assert.match(source, /Enter＝改行　相談は下のボタン/);
+  assert.match(source, /Enter＝改行　送信はボタンのみ/);
+  assert.match(source, /id="dSendBtn"[\s\S]{0,120}onclick="dSend\(\)"/);
+  assert.match(source, /id="asstSendBtn"[\s\S]{0,120}onclick="busyAsstSend\(\)"/);
+});
+
+test("スマホの返信操作は補助操作と送信操作の二段レイアウトになる", () => {
+  assert.match(source, /class="composerSecondary"/);
+  assert.match(source, /class="composerPrimary"/);
+  assert.match(source, /\.composerSecondary\{display:grid;grid-template-columns:/);
+  assert.match(source, /\.composerPrimary\{display:grid;grid-template-columns:/);
+  assert.match(source, /\.composerPrimary \.cbtn\{[^}]*min-height:50px/);
+  assert.match(source, /\.cbtn\.dsend\{[^}]*width:100%[^}]*min-height:52px/);
+});
+
 test("問い合わせ種類ごとの承認実績が不足する間は変動する事実を自動送信しない", () => {
   assert.match(source, /function recordLearningPerformance/);
   assert.match(source, /total >= 5 && p\.unchanged >= 3/);

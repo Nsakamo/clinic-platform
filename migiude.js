@@ -4729,6 +4729,8 @@ const PAGE = `<!DOCTYPE html>
   .scheduledMessageActions{display:flex;gap:5px;margin-top:5px;}
   .scheduledMessageActions button{border:1px solid currentColor;border-radius:7px;background:#fff;padding:4px 8px;color:inherit;font-size:11px;cursor:pointer;}
   #cbtns{display:flex;gap:8px;margin-top:8px;justify-content:flex-end;flex-wrap:wrap;}
+  .composerSecondary,.composerPrimary{display:contents;}
+  .enterHint{display:none;}
   .cbtn{font-size:13px;padding:7px 14px;border-radius:9px;border:1px solid var(--line);background:#fff;cursor:pointer;}
   .cbtn.send{background:var(--line-green);border-color:var(--line-green);color:#fff;font-weight:600;}
   .cbtn.schedule{background:#eff6ff;border-color:#93c5fd;color:#1d4ed8;font-weight:700;}
@@ -4767,7 +4769,8 @@ const PAGE = `<!DOCTYPE html>
   #dMsgs{flex:1;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:8px;background:#faf5ff;}
   #dChips{padding:6px 10px 0;display:flex;gap:6px;flex-wrap:wrap;}
   #dChips .cbtn{border-color:#c4b5fd;background:#fff;color:#5b21b6;}
-  #dText{flex:1;border:1px solid #d1d5db;border-radius:10px;padding:10px 12px;font-size:14px;font-family:inherit;min-height:110px;max-height:240px;resize:vertical;}
+  .dInputWrap{flex:1;min-width:0;}
+  #dText{display:block;width:100%;border:1px solid #d1d5db;border-radius:10px;padding:10px 12px;font-size:14px;font-family:inherit;min-height:110px;max-height:240px;resize:vertical;}
   #dComposer{display:flex;gap:8px;padding:10px;border-top:1px solid #c4b5fd;align-items:flex-end;background:#ede9fe;}
   .cbtn.dsend{background:#6d28d9;border-color:#6d28d9;color:#fff;font-weight:700;white-space:nowrap;padding-left:10px;padding-right:10px;}
   .cbtn.dsend:disabled{background:#a78bfa;border-color:#a78bfa;}
@@ -4776,8 +4779,12 @@ const PAGE = `<!DOCTYPE html>
     #dpanel{background:rgba(46,16,101,.24);}
     #dCard{left:0;right:0;top:auto;bottom:0;width:auto;height:84vh;border-radius:16px 16px 0 0;box-shadow:0 -4px 24px rgba(76,29,149,.28);animation:slideinY .28s cubic-bezier(.22,.9,.36,1);border-left:0;border-top:2px solid #8b5cf6;}
     #dHead{padding:12px 12px 10px;border-radius:14px 14px 0 0;}
-    #dText,#asstText{font-size:16px;min-height:56px;transition:min-height .15s;}
-    #dText:focus,#asstText:focus{min-height:150px;}
+    #dHead .cbtn{min-height:44px;}
+    #dChips .cbtn{min-height:44px;padding:8px 16px;}
+    #dComposer{display:grid;grid-template-columns:1fr;align-items:stretch;padding:10px calc(10px + env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) calc(10px + env(safe-area-inset-left));}
+    #dText,#asstText{font-size:16px;min-height:84px;transition:min-height .15s;}
+    #dText:focus,#asstText:focus{min-height:128px;}
+    .cbtn.dsend{width:100%;min-height:52px;font-size:15px;}
   }
   #asstHead{padding:11px 13px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:14px;gap:8px;}
   #asstMsgs{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:8px;background:#f8fafc;}
@@ -4855,7 +4862,19 @@ const PAGE = `<!DOCTYPE html>
     #aiLabel .patientModeTitle{font-size:13px;}
     #aiLabel .patientModeNote{font-size:10.5px;color:#166534;}
     #draft{min-height:44px;}#draft:focus{min-height:140px;}
-    #cbtns .cbtn{min-height:42px;}
+    .enterHint{display:block;margin:5px 2px 0;font-size:10.5px;line-height:1.4;color:#64748b;}
+    #cbtns{display:block;margin-top:8px;}
+    .composerSecondary{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.35fr) minmax(0,1fr);gap:8px;}
+    .composerPrimary{display:grid;grid-template-columns:minmax(0,.82fr) minmax(0,1.25fr);gap:8px;margin-top:8px;}
+    .composerSecondary .cbtn{min-width:0;min-height:44px;padding:7px 6px;font-size:12px;white-space:nowrap;}
+    .composerSecondary #staffReviewResend{grid-column:1/-1;}
+    .composerPrimary .cbtn{width:100%;min-width:0;min-height:50px;padding:8px 7px;font-size:13px;white-space:nowrap;}
+    .composerPrimary .send{font-size:14px;font-weight:800;}
+    #asstIn{display:grid;grid-template-columns:48px minmax(0,1fr);align-items:stretch;padding:10px calc(10px + env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) calc(10px + env(safe-area-inset-left));}
+    #asstText{grid-column:1/-1;width:100%;}
+    #asstIn .enterHint{grid-column:1/-1;grid-row:2;margin:0 2px;}
+    #asstAttachBtn{grid-column:1;grid-row:3;min-height:48px;padding:7px;}
+    #asstSendBtn{grid-column:2;grid-row:3;width:100%;min-height:48px;font-size:14px;font-weight:800;}
     #draft,#search,#popInput,#asstText,#setTone{font-size:16px;}
     #setPop,#learnManagePop,#richMenuPop{padding:0;align-items:stretch;background:#fff;}
     .settingsCard,.learningCard{width:100vw;max-height:none;height:100vh;height:100dvh;border-radius:0;box-shadow:none;}
@@ -4920,7 +4939,7 @@ const PAGE = `<!DOCTYPE html>
     <button class="cbtn" onclick="dChip('もっと丁寧で温かい言い方にして')">丁寧に</button>
     <button class="cbtn" onclick="dChip('もっと柔らかい印象にして')">柔らかく</button>
   </div>
-  <div id="dComposer"><textarea id="dText" placeholder="右腕くんへの指示を入力…（例：もっと簡潔にして）" onkeydown="if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing&&event.keyCode!==229){event.preventDefault();dSend();}"></textarea><button id="dSendBtn" class="cbtn dsend" onclick="dSend()">右腕くんへ相談</button></div>
+  <div id="dComposer"><div class="dInputWrap"><textarea id="dText" placeholder="右腕くんへの指示を入力…（例：もっと簡潔にして）"></textarea><div class="enterHint">Enter＝改行　相談は下のボタン</div></div><button id="dSendBtn" class="cbtn dsend" onclick="dSend()">右腕くんへ相談</button></div>
 </div></div>
 <div id="setPop"><div class="settingsCard">
   <div class="settingsHeader"><h3>⚙ 設定</h3><button type="button" class="cbtn" onclick="closeSet()">閉じる</button></div>
@@ -5139,7 +5158,7 @@ const PAGE = `<!DOCTYPE html>
 <div id="asst"><div id="asstCard">
   <div id="asstHead"><span>🤝 みぎうで君（ルールブック編集）</span><button class="cbtn" onclick="closeAsst()">閉じる</button></div>
   <div id="asstMsgs"></div>
-  <div id="asstIn"><button id="asstAttachBtn" class="cbtn" onclick="asstAttach()" title="価格表などの資料（画像・PDF・CSV）を読み込ませて一括学習">📎</button><textarea id="asstText" placeholder="例：発送質問には3営業日以内と答えて／今の料金ルールは？" onkeydown="if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing&&event.keyCode!==229){event.preventDefault();busyAsstSend();}"></textarea><button id="asstSendBtn" class="cbtn send" onclick="busyAsstSend()">送信</button></div>
+  <div id="asstIn"><button id="asstAttachBtn" class="cbtn" onclick="asstAttach()" title="価格表などの資料（画像・PDF・CSV）を読み込ませて一括学習">📎</button><textarea id="asstText" placeholder="例：発送質問には3営業日以内と答えて／今の料金ルールは？"></textarea><div class="enterHint">Enter＝改行　送信は下のボタン</div><button id="asstSendBtn" class="cbtn send" onclick="busyAsstSend()">送信</button></div>
 </div></div>
 <div id="learningScopePop" style="position:fixed;inset:0;background:rgba(15,23,42,.48);z-index:82;display:none;align-items:center;justify-content:center;padding:14px;">
   <div style="background:#fff;border-radius:16px;width:min(94vw,520px);max-height:90vh;overflow-y:auto;box-shadow:0 20px 50px rgba(0,0,0,.25);">
@@ -5274,8 +5293,8 @@ function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)ret
     '<div id="custTab" class="custTab" style="display:none;" onclick="cpExpand()">うけつけるん情報を表示 ⌄</div>'+
     '<div id="custPanel" class="custPanel">読み込み中…</div>'+
     '<div id="msgs">'+bubbles+'</div>'+
-    '<div id="composer"><div id="aiLabel"><span class="patientModeTitle">🟢 患者への返信を編集中</span><span class="patientModeNote">この入力欄の内容は患者へ送信されます</span></div><div id="learningUsed" style="display:'+(learningRefsText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:#6d28d9;margin:2px 0 5px;">'+esc(learningRefsText(r))+'</div><div id="groundingUsed" style="display:'+(groundingText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:'+(r.grounding&&r.grounding.autoSendAllowed&&r.validation&&r.validation.pass?'#047857':'#b45309')+';margin:2px 0 5px;">'+esc(groundingText(r))+'</div><div id="topicChips" style="display:none;"></div><div id="scheduledList"></div><div id="pendingAttachments"></div><div id="draftRow"><button id="attach" onclick="attach()" title="画像・ファイルを追加">📎</button><textarea id="draft" oninput="draftEdited()" onpaste="handleDraftPaste(event)" placeholder="患者へのメッセージ。画像やファイルもここへ貼り付けできます">'+esc(r.draft||"")+'</textarea></div>'+
-    '<div id="cbtns"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ 右腕くんに相談</button>'+staffReviewButton+'<button id="markDoneBtn" class="cbtn done" onclick="markDone()">対応済み</button><button class="cbtn schedule" onclick="openScheduledMessage()">🕒 予約送信</button><button class="cbtn send" onclick="sendMsg()">患者へ送信</button></div></div>';
+    '<div id="composer"><div id="aiLabel"><span class="patientModeTitle">🟢 患者への返信を編集中</span><span class="patientModeNote">この入力欄の内容は患者へ送信されます</span></div><div id="learningUsed" style="display:'+(learningRefsText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:#6d28d9;margin:2px 0 5px;">'+esc(learningRefsText(r))+'</div><div id="groundingUsed" style="display:'+(groundingText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:'+(r.grounding&&r.grounding.autoSendAllowed&&r.validation&&r.validation.pass?'#047857':'#b45309')+';margin:2px 0 5px;">'+esc(groundingText(r))+'</div><div id="topicChips" style="display:none;"></div><div id="scheduledList"></div><div id="pendingAttachments"></div><div id="draftRow"><button id="attach" onclick="attach()" title="画像・ファイルを追加">📎</button><textarea id="draft" oninput="draftEdited()" onpaste="handleDraftPaste(event)" placeholder="患者へのメッセージ。画像やファイルもここへ貼り付けできます">'+esc(r.draft||"")+'</textarea></div><div class="enterHint">Enter＝改行　送信はボタンのみ</div>'+
+    '<div id="cbtns"><div class="composerSecondary"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ 右腕くんに相談</button>'+staffReviewButton+'<button id="markDoneBtn" class="cbtn done" onclick="markDone()">対応済み</button></div><div class="composerPrimary"><button class="cbtn schedule" onclick="openScheduledMessage()">🕒 予約送信</button><button class="cbtn send" onclick="sendMsg()">患者へ送信</button></div></div></div>';
   const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r);renderPendingAttachments();renderScheduledMessages(r); loadCustomer(id); if(!keep)renderList();
 }
 function closeChat(){appEl.classList.remove("chatopen");current=null;renderList();}
