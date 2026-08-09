@@ -19,7 +19,7 @@ test("スタッフLINEの修正指示を学習へ引き渡す", () => {
 
 test("生成した返信に過去の対応・学習例の参照情報を残す", () => {
   assert.match(source, /out\.learningRefs = exRel\.map/);
-  assert.match(source, /過去対応 "\+refs\.map/);
+  assert.match(source, /learningRefs: c\.learningRefs \|\| \[\]/);
 });
 
 test("staging画面は本番との取り違え防止バナーを表示する", () => {
@@ -110,11 +110,11 @@ test("文章作成中の学習候補は送信後の確認前に恒久保存し�
   assert.match(source, /learningText:edited\?learningText:""/);
 });
 
-test("下書きに使用した全体方針・店舗ルール・過去対応を表示する", () => {
+test("下書きに使用した学習情報は内部保持し、患者返信欄には詳細を表示しない", () => {
   assert.match(source, /out\.learningUsage = \{/);
-  assert.match(source, /この下書きに使用：/);
-  assert.match(source, /全体方針 "\+prefs\.length/);
-  assert.match(source, /店舗ルール "\+rules/);
+  assert.match(source, /cd\.learningUsage=j\.learningUsage\|\|null/);
+  assert.doesNotMatch(source, /この下書きに使用：/);
+  assert.doesNotMatch(source, /id="learningUsed"/);
 });
 
 test("スマホで患者返信と右腕くん相談を色と送信先表示で区別する", () => {
