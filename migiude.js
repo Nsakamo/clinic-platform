@@ -13,6 +13,7 @@ const { intentTokens, rankLearningExamples, sameLearningExample } = require("./l
 const { evaluateResponseGrounding } = require("./lib/response-grounding");
 const { compareConversations, compareConversationsRecent } = require("./lib/conversation-order");
 const { MAX_ATTACHMENTS, normalizeFileIds, normalizeScheduledMessageInput, pruneScheduledMessages } = require("./lib/scheduled-message");
+const { lineWebhookEventId, lineWebhookRetryDelay, isProcessableLineEvent } = require("./lib/line-webhook-queue");
 const app = express();
 app.use(express.json({ limit: "16mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: false, limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
@@ -53,7 +54,7 @@ const RESET_SMTP = {
 // ---------- Postgres ----------
 let pool = null;
 if (process.env.DATABASE_URL) {
-  try { const { Pool } = require("pg"); pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: false, max: 6 }); }
+  try { const { Pool } = require("pg"); pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: false, max: 6, connectionTimeoutMillis: 1000 }); }
   catch (e) { console.error("pg init failed:", e.message); pool = null; }
 }
 
@@ -152,12 +153,15 @@ async function dbInit() {
   await pool.query("CREATE TABLE IF NOT EXISTS files (id text primary key, tenant text, name text, mime text, data bytea, ts bigint)");
   await pool.query("CREATE TABLE IF NOT EXISTS push_subs (tenant text, endpoint text primary key, sub jsonb)");
   await pool.query("CREATE TABLE IF NOT EXISTS kv (k text primary key, v jsonb)");
+  await pool.query("CREATE TABLE IF NOT EXISTS line_webhook_events (event_id text not null, tenant text not null, account_key text not null, destination text not null default '', payload jsonb not null, status text not null default 'pending', attempts int not null default 0, available_at bigint not null, created_at bigint not null, updated_at bigint not null, last_error text, PRIMARY KEY(tenant,event_id))");
+  await pool.query("CREATE INDEX IF NOT EXISTS line_webhook_events_pending_idx ON line_webhook_events(status,available_at)");
+  await pool.query("UPDATE line_webhook_events SET status='pending', available_at=$1, updated_at=$1, last_error='recovered_after_restart' WHERE status='processing'", [Date.now()]);
   const r = await pool.query("SELECT slug,name,config FROM tenants");
   r.rows.forEach(row => { TEN[row.slug] = newTenant(row.slug, row.name, row.config || {}); });
   for (const slug of Object.keys(TEN)) {
     const t = TEN[slug];
     const cv = await pool.query("SELECT data FROM convos WHERE tenant=$1 ORDER BY ts DESC LIMIT 1000", [slug]);
-    cv.rows.forEach(x => { const c = x.data; if (c && c.id) t.store[c.id] = c; });
+    cv.rows.forEach(x => { const c = x.data; if (c && c.id) { c._rev = Number(c._rev || c.ts || 0); t.store[c.id] = c; t._convRev = Math.max(Number(t._convRev || 0), c._rev); } });
     const ru = await pool.query("SELECT id,title,content,updated FROM rules WHERE tenant=$1 ORDER BY id", [slug]);
     ru.rows.forEach(x => { t.rules[x.id] = { id: x.id, title: x.title, content: x.content, updated: Number(x.updated || 0) }; if (x.id >= t.ruleSeq) t.ruleSeq = x.id + 1; });
     const ex = await pool.query("SELECT id,q,final,draft0,instr,ts,source,confirmed_count,learning_meta FROM examples WHERE tenant=$1 ORDER BY id DESC LIMIT 500", [slug]);
@@ -174,7 +178,10 @@ async function dbInit() {
   console.log("loaded " + Object.keys(TEN).length + " tenants");
 }
 function dbSave(t, c) {
-  if (!pool || !c) return Promise.resolve(false);
+  if (!c) return Promise.resolve(false);
+  t._convRev = Math.max(Date.now(), Number(t._convRev || 0) + 1);
+  c._rev = t._convRev;
+  if (!pool) return Promise.resolve(false);
   return pool.query("INSERT INTO convos (tenant,id,ts,data) VALUES ($1,$2,$3,$4) ON CONFLICT (tenant,id) DO UPDATE SET ts=EXCLUDED.ts, data=EXCLUDED.data",
     [t.slug, c.id, c.ts || 0, c]).then(() => true).catch(e => { console.error("dbSave:", e.message); return false; });
 }
@@ -1040,7 +1047,20 @@ function seedTenant(t) {
   samples.forEach(s => { s.last = lastText(s); s.ts = tsFromTime(s.time) - 86400000; t.store[s.id] = s; dbSave(t, s); });
 }
 
-app.get("/health", (req, res) => res.json({ ok: true, tenants: Object.keys(TEN).length, db: !!pool }));
+app.get("/health", (req, res) => res.json({ ok: true }));
+app.get("/health/live", (req, res) => res.json({ ok: true }));
+app.get("/health/ready", async (req, res) => {
+  if (!pool) return res.status(503).json({ ok: false, db: false });
+  let timer;
+  try {
+    await Promise.race([
+      pool.query("SELECT 1"),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("db_timeout")), 1500); }),
+    ]);
+    res.json({ ok: true, db: true });
+  } catch (_) { res.status(503).json({ ok: false, db: false }); }
+  finally { if (timer) clearTimeout(timer); }
+});
 
 // ===== AIエンジン切り替え（返信文の生成のみ） =====
 // 選択中エンジンが未設定・一時障害でも、設定済みの別エンジンへ安全にフォールバックする。
@@ -1980,8 +2000,79 @@ async function ensureLineBotId(t) {
 // ===== LINE inbound webhook（全テナント共通URL。destination(botId)→署名でテナント×アカウントを特定） =====
 async function lineProfile(uid, token) {
   if (!token) return {};
-  try { const r = await fetch("https://api.line.me/v2/bot/profile/" + uid, { headers: { "Authorization": "Bearer " + token } }); if (r.ok) { const j = await r.json(); return { name: j.displayName, pic: j.pictureUrl }; } } catch (e) {}
+  try { const r = await fetch("https://api.line.me/v2/bot/profile/" + uid, { headers: { "Authorization": "Bearer " + token }, signal: AbortSignal.timeout(5000) }); if (r.ok) { const j = await r.json(); return { name: j.displayName, pic: j.pictureUrl }; } } catch (e) {}
   return {};
+}
+function lineAccountQueueKey(acct) {
+  if (acct && acct.botId) return "bot:" + String(acct.botId);
+  if (acct && acct.main) return "main";
+  return "token:" + sha(String(acct && acct.token || "")).slice(0, 24);
+}
+function queuedLineAccount(t, accountKey, destination) {
+  const all = lineAccounts(t);
+  return all.find(a => destination && a.botId === destination)
+    || all.find(a => lineAccountQueueKey(a) === accountKey)
+    || null;
+}
+async function enqueueLineWebhookEvents(t, acct, destination, events) {
+  const processable = (events || []).filter(isProcessableLineEvent);
+  if (!processable.length) return { queued: 0, durable: !!pool };
+  if (!pool) return { queued: 0, durable: false, direct: processable };
+  const client = await pool.connect(), now = Date.now();
+  let queued = 0;
+  try {
+    await client.query("BEGIN");
+    for (let index = 0; index < processable.length; index++) {
+      const ev = processable[index];
+      const eventId = lineWebhookEventId(destination, ev);
+      const orderedAt = now + index;
+      const r = await client.query("INSERT INTO line_webhook_events (event_id,tenant,account_key,destination,payload,status,attempts,available_at,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,'pending',0,$6,$6,$6) ON CONFLICT (tenant,event_id) DO NOTHING", [eventId, t.slug, lineAccountQueueKey(acct), String(destination || ""), ev, orderedAt]);
+      queued += r.rowCount || 0;
+    }
+    await client.query("COMMIT");
+    return { queued, durable: true };
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    throw e;
+  } finally { client.release(); }
+}
+async function processQueuedLinePayload(t, acct, ev) {
+  if (!isProcessableLineEvent(ev)) return;
+  const uid = String(ev.source.userId || "");
+  const prof = await lineProfile(uid, acct.token);
+  const mt = ev.message.type;
+  let text = "", media = null, mediaId = null, fileName = null;
+  if (mt === "text") text = ev.message.text || "";
+  else if (mt === "image" || mt === "video" || mt === "audio") { media = mt; mediaId = ev.message.id; }
+  else if (mt === "file") { media = "file"; mediaId = ev.message.id; fileName = ev.message.fileName || "ファイル"; }
+  await handleInbound(t, { channel: "line", uid, name: prof.name, pic: prof.pic, text, media, mediaId, fileName, acct: { type: "line", key: acct.botId || "main", name: acct.name } });
+}
+let lineWebhookQueueRunning = false;
+async function processLineWebhookQueue() {
+  if (!pool || lineWebhookQueueRunning) return;
+  lineWebhookQueueRunning = true;
+  try {
+    for (let n = 0; n < 25; n++) {
+      const now = Date.now();
+      const claimed = await pool.query("WITH next AS (SELECT tenant,event_id FROM line_webhook_events WHERE status='pending' AND available_at<=$1 ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE line_webhook_events e SET status='processing',attempts=e.attempts+1,updated_at=$1 FROM next WHERE e.tenant=next.tenant AND e.event_id=next.event_id RETURNING e.*", [now]);
+      const job = claimed.rows[0];
+      if (!job) break;
+      try {
+        const t = TEN[job.tenant];
+        if (!t || t.config.suspended) throw new Error("tenant_unavailable");
+        const acct = queuedLineAccount(t, String(job.account_key || ""), String(job.destination || ""));
+        if (!acct || !acct.token) throw new Error("line_account_unavailable");
+        await processQueuedLinePayload(t, acct, job.payload);
+        await pool.query("UPDATE line_webhook_events SET status='done',updated_at=$3,last_error=null WHERE tenant=$1 AND event_id=$2", [job.tenant, job.event_id, Date.now()]);
+      } catch (e) {
+        const attempts = Number(job.attempts || 1), dead = attempts >= 10, next = Date.now() + lineWebhookRetryDelay(attempts);
+        await pool.query("UPDATE line_webhook_events SET status=$3,available_at=$4,updated_at=$5,last_error=$6 WHERE tenant=$1 AND event_id=$2", [job.tenant, job.event_id, dead ? "dead" : "pending", next, Date.now(), String(e && e.message || "processing_failed").slice(0, 300)]);
+        console.error("line webhook queue:", String(e && e.message || e).slice(0, 160));
+        if (dead && TEN[job.tenant]) alertAdd(TEN[job.tenant], "LINE受信処理失敗", "LINEから受信したメッセージを10回処理できませんでした。運営へご連絡ください。", "システム").catch(() => {});
+      }
+    }
+  } catch (e) { console.error("line webhook queue runner:", String(e && e.message || e).slice(0, 160)); }
+  finally { lineWebhookQueueRunning = false; }
 }
 app.post("/webhook/line", async (req, res) => {
   const dest = String((req.body && req.body.destination) || "");
@@ -2015,22 +2106,13 @@ app.post("/webhook/line", async (req, res) => {
     else { const raw = (conn.lines || []).find(x => decField(x.token) === acct.token); if (raw) raw.botId = dest; }
     acct.botId = dest; saveTenantConfig(t).catch(() => {});
   }
-  res.status(200).end();
   const events = (req.body && req.body.events) || [];
-  for (const ev of events) {
-    try {
-      if (ev.type !== "message" || !ev.message) continue;
-      const uid = ev.source && ev.source.userId; if (!uid) continue;
-      const prof = await lineProfile(uid, acct.token);
-      const mt = ev.message.type;
-      let text = "", media = null, mediaId = null, fileName = null;
-      if (mt === "text") text = ev.message.text || "";
-      else if (mt === "image" || mt === "video" || mt === "audio") { media = mt; mediaId = ev.message.id; }
-      else if (mt === "file") { media = "file"; mediaId = ev.message.id; fileName = ev.message.fileName || "ファイル"; }
-      else continue;
-      await handleInbound(t, { channel: "line", uid, name: prof.name, pic: prof.pic, text, media, mediaId, fileName, acct: { type: "line", key: acct.botId || "main", name: acct.name } });
-    } catch (e) { console.error("line webhook:", e.message); }
-  }
+  let queued;
+  try { queued = await enqueueLineWebhookEvents(t, acct, dest, events); }
+  catch (e) { console.error("line webhook enqueue:", String(e && e.message || e).slice(0, 160)); return res.status(503).end(); }
+  res.status(200).end();
+  if (queued.durable) setImmediate(() => { processLineWebhookQueue().catch(() => {}); });
+  else for (const ev of (queued.direct || [])) processQueuedLinePayload(t, acct, ev).catch(e => console.error("line webhook:", e.message));
 });
 
 // ===== 法人専用スタッフLINE webhook =====
@@ -2290,6 +2372,22 @@ app.get("/api/conversations", guard, (req, res) => {
   const arr = Object.values(req.tenant.store).sort(inboxOrder === "recent" ? compareConversationsRecent : compareConversations);
   res.json(arr.map(c => Object.assign({}, c, { staffLineReviewAvailable, inboxOrder, scheduledMessages: scheduledForConversation(req.tenant, c.id) })));
 });
+app.get("/api/conversation-updates", guard, (req, res) => {
+  const t = req.tenant;
+  const since = Math.max(0, Number(req.query.since || 0) || 0);
+  const staffLineReviewAvailable = !!(S(t).staffLineEnabled && staffLineReady(t));
+  const inboxOrder = S(t).inboxOrder === "recent" ? "recent" : "unanswered_first";
+  const arr = Object.values(t.store).sort(inboxOrder === "recent" ? compareConversationsRecent : compareConversations);
+  const updates = arr.filter(c => Number(c._rev || c.ts || 0) > since)
+    .map(c => Object.assign({}, c, { staffLineReviewAvailable, inboxOrder, scheduledMessages: scheduledForConversation(t, c.id) }));
+  res.json({
+    ok: true,
+    version: Math.max(Number(t._convRev || 0), ...arr.map(c => Number(c._rev || c.ts || 0))),
+    updates,
+    order: arr.map(c => c.id),
+    meta: { staffLineReviewAvailable, inboxOrder },
+  });
+});
 
 async function deliverText(t, c, text) {
   let sent = false, sendErr = null;
@@ -2496,6 +2594,7 @@ app.post("/api/scheduled-message-cancel", guard, oneMutationAtATime("scheduled-m
   const previous = { status: item.status, completedAt: item.completedAt, updatedAt: item.updatedAt };
   item.status = "cancelled"; item.completedAt = Date.now(); item.updatedAt = Date.now();
   try { await saveTenantConfig(t); } catch (e) { Object.assign(item, previous); return res.status(500).json({ ok: false, error: "save" }); }
+  if (t.store[item.conversationId]) await dbSave(t, t.store[item.conversationId]);
   res.json({ ok: true });
 });
 
@@ -2506,6 +2605,7 @@ app.post("/api/scheduled-message-retry", guard, oneMutationAtATime("scheduled-me
   const previous = { status: item.status, sendAt: item.sendAt, updatedAt: item.updatedAt, completedAt: item.completedAt, lastError: item.lastError, errorNotifiedAt: item.errorNotifiedAt, attempts: item.attempts };
   item.status = "scheduled"; item.sendAt = Date.now() + 5000; item.updatedAt = Date.now(); item.completedAt = 0; item.lastError = ""; item.errorNotifiedAt = 0; item.attempts = Number(item.attempts || 0) + 1;
   try { await saveTenantConfig(t); } catch (e) { Object.assign(item, previous); return res.status(500).json({ ok: false, error: "save" }); }
+  if (t.store[item.conversationId]) await dbSave(t, t.store[item.conversationId]);
   res.json({ ok: true, scheduled: publicScheduledMessage(item) });
 });
 
@@ -4476,6 +4576,8 @@ app.get("/board", (req, res) => { res.set("Content-Type", "text/html; charset=ut
   try { await pushInit(); } catch (e) { console.error("pushInit failed:", e.message); }
   setInterval(() => { pollAll().catch(() => {}); }, 60000); setTimeout(() => { pollAll().catch(() => {}); }, 8000);
   setInterval(() => { processAllRichMenuSchedules().catch(() => {}); }, 30000); setTimeout(() => { processAllRichMenuSchedules().catch(() => {}); }, 5000);
+  setInterval(() => { processLineWebhookQueue().catch(() => {}); }, 5000); setTimeout(() => { processLineWebhookQueue().catch(() => {}); }, 1000);
+  setInterval(() => { if (pool) pool.query("DELETE FROM line_webhook_events WHERE (status='done' AND updated_at<$1) OR (status='dead' AND updated_at<$2)", [Date.now() - 30 * 86400000, Date.now() - 90 * 86400000]).catch(() => {}); }, 6 * 60 * 60 * 1000);
   setInterval(() => { processAllScheduledMessages().catch(() => {}); }, 15000); setTimeout(() => { processAllScheduledMessages().catch(() => {}); }, 3000);
   setTimeout(() => { Object.values(TEN).forEach(t => ensureLineBotId(t).catch(() => {})); }, 3000);
   const server = app.listen(PORT, () => console.log("clinic-inbox platform listening on " + PORT));
@@ -5205,10 +5307,10 @@ const PAGE = `<!DOCTYPE html>
   </div>
 </div></div>
 <script>
-let DATA=[];let current=null;
+let DATA=[];let DATA_REV=0;let DATA_READY=false;let current=null;
 const roomsEl=document.getElementById("rooms"),chatEl=document.getElementById("chat"),appEl=document.getElementById("app");
 let initialConv="";try{initialConv=new URLSearchParams(location.search).get("conv")||"";}catch(e){}
-async function load(){ try{ const r=await fetch("/api/conversations"); DATA=await r.json(); }catch(e){} renderList(); if(initialConv&&!current){const target=DATA.find(x=>x.id===initialConv);if(target){const id=initialConv;initialConv="";openChat(id);try{history.replaceState(null,"",location.pathname);}catch(e){}}} if(current){ const c=DATA.find(x=>x.id===current); if(c){syncMsgs(c);renderScheduledMessages(c);} } }
+async function load(){ try{ const r=await fetch(DATA_READY?("/api/conversation-updates?since="+encodeURIComponent(DATA_REV)):"/api/conversations");const j=await r.json();if(Array.isArray(j)){DATA=j;DATA_REV=DATA.reduce((m,c)=>Math.max(m,Number(c&&c._rev||c&&c.ts||0)),0);DATA_READY=true;}else if(j&&j.ok){const byId=new Map(DATA.map(c=>[c.id,c]));(j.updates||[]).forEach(c=>byId.set(c.id,c));const meta=j.meta||{};byId.forEach(c=>{c.staffLineReviewAvailable=!!meta.staffLineReviewAvailable;c.inboxOrder=meta.inboxOrder||c.inboxOrder;});const ordered=[];(j.order||[]).forEach(id=>{const c=byId.get(id);if(c){ordered.push(c);byId.delete(id);}});DATA=ordered.concat([...byId.values()]);DATA_REV=Math.max(DATA_REV,Number(j.version||0));DATA_READY=true;} }catch(e){} renderList(); if(initialConv&&!current){const target=DATA.find(x=>x.id===initialConv);if(target){const id=initialConv;initialConv="";openChat(id);try{history.replaceState(null,"",location.pathname);}catch(e){}}} if(current){ const c=DATA.find(x=>x.id===current); if(c){syncMsgs(c);renderScheduledMessages(c);} } }
 function api(path,body){ return fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); }
 const uiBusyKeys=new Set();
 async function withBusy(key,btn,label,work){
