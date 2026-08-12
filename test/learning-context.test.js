@@ -28,6 +28,9 @@ test("AIの学習提案を適用状況・確認・回答方針の形へ整える
   assert.match(text, /【回答方針】/);
   assert.match(text, /【引き継がない情報】/);
   assert.match(text, /未確認なら断定しない/);
+  assert.match(text, /【適用する状況】\n・外部サイト/);
+  assert.match(text, /\n\n【確認すること】\n・本人情報/);
+  assert.match(text, /・予約内容を照合する/);
   assert.doesNotMatch(text, /\[object Object\]/);
 });
 

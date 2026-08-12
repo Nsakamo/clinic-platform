@@ -5,11 +5,12 @@ const path = require("node:path");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
 
-test("学習案の検証中は全画面の進行表示で別会話への誤操作を防ぐ", () => {
-  assert.match(source, /id="learningProgress"[\s\S]{0,500}回答と学習内容を検証中/);
-  assert.match(source, /window\.__sendBusy=true;showLearningProgress\(\)/);
-  assert.match(source, /hideLearningProgress\(\);if\(json\.sent\)/);
-  assert.match(source, /#learningProgress\{[^}]*position:fixed[^}]*z-index:95[^}]*pointer-events:auto/);
+test("患者への送信後は学習をバックグラウンドで続け、元の会話だけへ確認を返す", () => {
+  assert.match(source, /queueStaffLearning\(t, c/);
+  assert.match(source, /app\.get\("\/api\/learning-jobs"/);
+  assert.match(source, /学習案はバックグラウンドで整理中です/);
+  assert.match(source, /current!==id\)return;shownLearningJobs\.add/);
+  assert.doesNotMatch(source, /window\.__sendBusy=true;showLearningProgress\(\)/);
 });
 
 test("右腕くんへの未送信入力を会話IDごとに保持する", () => {
