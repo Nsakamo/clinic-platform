@@ -93,14 +93,15 @@ test("スタッフの修正過程を構造化した判断メモリとして保�
   assert.match(source, /学習した判断:/);
 });
 
-test("Web送信後はAI任せにせずスタッフが学習の適用範囲を確定する", () => {
-  assert.match(source, /function learningScopeSuggestion/);
+test("Web送信後はスタッフが学習するかを2択で決め、AIが用途別に整理する", () => {
   assert.match(source, /reviewScope: true/);
   assert.match(source, /app\.post\("\/api\/learning-scope", guard/);
-  assert.match(source, /\["none", "patient", "similar", "all"\]/);
-  assert.match(source, /今回の修正をどう学習しますか？/);
-  assert.match(source, /今回だけ[\s\S]{0,300}この患者だけ[\s\S]{0,300}同じ問い合わせ[\s\S]{0,300}今後の全返信/);
-  assert.match(source, /店舗ルールの追加・更新・削除として確認/);
+  assert.match(source, /\["none", "learn", "patient", "similar", "all"\]/);
+  assert.match(source, /今回の対応を学習しますか？/);
+  assert.match(source, /学習する[\s\S]{0,300}学習しない/);
+  assert.match(source, /AIのone_off判定だけで捨てない/);
+  assert.match(source, /learningChat:learning\.learningChat/);
+  assert.match(source, /右腕くんとの修正チャット/);
 });
 
 test("文章作成中の学習候補は送信後の確認前に恒久保存しない", () => {
