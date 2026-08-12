@@ -16,6 +16,7 @@ const { MAX_ATTACHMENTS, normalizeFileIds, normalizeScheduledMessageInput, prune
 const { lineWebhookEventId, lineWebhookRetryDelay, isProcessableLineEvent } = require("./lib/line-webhook-queue");
 const { normalizeAiRoutes, resolveAiRoute, publicModelCatalog } = require("./lib/ai-model-router");
 const { contextualLearningFallback, formatLearningProposal } = require("./lib/learning-context");
+const { selectConversationContext } = require("./lib/conversation-context");
 const app = express();
 app.use(express.json({ limit: "16mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: false, limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
@@ -80,6 +81,7 @@ function newTenant(slug, name, config) {
   if (!Array.isArray(config.settings.prefs)) config.settings.prefs = []; // 全体の返信方針（全返信に効く恒久ルール）
   config.settings.aiRoutes = normalizeAiRoutes(config.settings.aiRoutes, configuredExtraOpenAiModels());
   if (!Array.isArray(config.learningConflicts)) config.learningConflicts = []; // 過去回答と新回答の矛盾確認待ち
+  if (!Array.isArray(config.learningJobs)) config.learningJobs = []; // 送信後にバックグラウンドで整理する学習確認
   if (!config.learningPerformance || typeof config.learningPerformance !== "object" || Array.isArray(config.learningPerformance)) config.learningPerformance = {}; // 問い合わせ種類ごとの承認・修正実績
   if (typeof config.settings.bookingActions !== "boolean") config.settings.bookingActions = false; // 予約自動受付（うけつけるん連携でのキャンセル・変更・LINE連携）。既定OFF
   if (typeof config.settings.staffLineEnabled !== "boolean") config.settings.staffLineEnabled = false;
@@ -770,7 +772,7 @@ function prefsBlock(t) {
   return a.map(p => (typeof p === "string" ? p : (p && p.text) || "")).filter(Boolean).map(s => "・" + s).join("\n");
 }
 function examplesRanked(t, query, k, context) {
-  const pendingIds = new Set(learningConflicts(t, true).flatMap(item => [Number(item.oldId), Number(item.newId)]));
+  const pendingIds = new Set(learningConflicts(t, true).flatMap(item => item.kind === "rule" ? [Number(item.newId)] : [Number(item.oldId), Number(item.newId)]));
   // 構造化した問い合わせ意図・判断・検索語も検索対象にし、表現が違う質問から同じ対応を取り出す。
   const list = Object.values(t.examples || {}).filter(example => !pendingIds.has(Number(example.id))).map(example => Object.assign({}, example, { originalQ: example.q, q: learningMetaSearchText(example) }));
   if (!list.length) return [];
@@ -787,7 +789,7 @@ function trustedLearningPrecedent(example) {
 async function checkConflict(t, q, newFinal, excludeId) {
   // 新しい例を先に保存した後で検索するため、ランキング前に除外する。
   // ランキング後に除外すると類似例の重複排除で古い回答まで消え、矛盾を見逃す。
-  const pendingIds = new Set(learningConflicts(t, true).flatMap(item => [Number(item.oldId), Number(item.newId)]));
+  const pendingIds = new Set(learningConflicts(t, true).flatMap(item => item.kind === "rule" ? [Number(item.newId)] : [Number(item.oldId), Number(item.newId)]));
   const candidates = Object.values(t.examples || {}).filter(example => Number(example.id) !== Number(excludeId) && !pendingIds.has(Number(example.id))).map(example => Object.assign({}, example, { originalQ: example.q, q: learningMetaSearchText(example) }));
   const cand = rankLearningExamples(candidates, { latest: q, context: q }, 3);
   if (!cand.length) return null;
@@ -808,10 +810,12 @@ function learningConflicts(t, pendingOnly) {
 }
 async function learningConflictAdd(t, data) {
   if (!data || !data.oldId || !data.newId) return null;
-  const existing = learningConflicts(t, true).find(item => Number(item.oldId) === Number(data.oldId) && Number(item.newId) === Number(data.newId));
+  const kind = data.kind === "rule" ? "rule" : "example";
+  const existing = learningConflicts(t, true).find(item => (item.kind || "example") === kind && Number(item.oldId) === Number(data.oldId) && Number(item.newId) === Number(data.newId));
   if (existing) return existing;
   const item = {
     id: "lc-" + Date.now().toString(36) + "-" + crypto.randomBytes(3).toString("hex"),
+    kind: data.kind === "rule" ? "rule" : "example", oldRuleId: data.kind === "rule" ? Number(data.oldRuleId || data.oldId) : 0,
     q: String(data.q || "").slice(0, 800), oldId: Number(data.oldId), oldFinal: String(data.oldFinal || "").slice(0, 1500),
     newId: Number(data.newId), newFinal: String(data.newFinal || "").slice(0, 1500), source: String(data.source || "web").slice(0, 40),
     status: "pending", createdAt: Date.now(), resolvedAt: 0, resolution: "",
@@ -820,6 +824,12 @@ async function learningConflictAdd(t, data) {
   while (t.config.learningConflicts.length > 100) t.config.learningConflicts.shift();
   try { await saveTenantConfig(t); } catch (e) { console.error("learningConflictAdd:", e && e.message); }
   return item;
+}
+function publicLearningConflict(item) {
+  return item ? {
+    id: item.id, kind: item.kind || "example", q: item.q, oldId: item.oldId, oldRuleId: item.oldRuleId || 0,
+    oldFinal: item.oldFinal, newId: item.newId, newFinal: item.newFinal,
+  } : null;
 }
 async function exampleDelete(t, id) {
   id = Number(id); if (!id || !(t.examples && t.examples[id])) return false;
@@ -921,7 +931,7 @@ function learningReviewPayload(ex, opts) {
     final: String(opts && opts.final || "").slice(0, 1500),
     draft0: String(opts && opts.draft0 || "").slice(0, 1500),
     instr: instr.slice(0, 800),
-    text: text.slice(0, 800),
+    text: text.slice(0, 2400),
     suggestedScope: learningScopeSuggestion(instr),
   };
 }
@@ -950,9 +960,7 @@ async function proposeContextualLearningText(t, input) {
 // 「送信しない」で対応終了した問い合わせを、次の新着への未回答質問として再利用しない。
 // 会話履歴自体は監査・閲覧用に残し、AIへ渡す作業中の文脈だけを区切る。
 function activeConversationMessages(c) {
-  const msgs = c && Array.isArray(c.msgs) ? c.msgs : [];
-  const start = Math.min(msgs.length, Math.max(0, Number(c && c.handledThroughIndex) || 0));
-  return msgs.slice(start);
+  return selectConversationContext(c, { maxCurrent: 30, maxOlder: 12 }).current;
 }
 
 // Web画面・スタッフLINEのどちらから送っても、同じ経路で「人が確認した返信」を学習する。
@@ -1000,6 +1008,96 @@ async function learnStaffOutcome(t, c, opts) {
   ]).catch(() => ({ learnedRules: [], conflict: null }));
   const contextualReview = learningReview ? Object.assign({}, learningReview, { text: completed.proposal || learningReview.text }) : null;
   return { learnedId: ex.id, conflict: completed.conflict, learnedRules: completed.learnedRules, reused: !!ex.reused, learningReview: contextualReview };
+}
+
+function learningJobs(t) {
+  const jobs = Array.isArray(t.config.learningJobs) ? t.config.learningJobs : (t.config.learningJobs = []);
+  return jobs.filter(Boolean);
+}
+function publicLearningJob(job) {
+  return {
+    id: String(job.id || ""), conversationId: String(job.conversationId || ""), status: String(job.status || "processing"),
+    createdAt: Number(job.createdAt || 0), updatedAt: Number(job.updatedAt || 0), resultType: String(job.resultType || ""),
+    learningReview: job.learningReview || null, conflict: job.conflict || null, error: String(job.error || ""),
+  };
+}
+function finishLearningJob(t, id) {
+  const job = learningJobs(t).find(item => item.id === String(id || ""));
+  if (job) { job.status = "done"; job.updatedAt = Date.now(); }
+  return job;
+}
+function finishLearningJobFor(t, id, exampleId, conflictId) {
+  const direct = finishLearningJob(t, id);
+  if (direct) return direct;
+  const job = learningJobs(t).find(item => item.status !== "done" && (
+    (conflictId && item.conflict && item.conflict.id === conflictId) ||
+    (exampleId && Number(item.exampleId) === Number(exampleId))
+  ));
+  if (job) { job.status = "done"; job.updatedAt = Date.now(); }
+  return job;
+}
+async function checkFormalRuleConflict(t, q, proposal, newId, source) {
+  const related = rulesSearch(t, q + " " + proposal, 6);
+  if (!related.length) return null;
+  const system = "新しい学習案が、現在の正式ルールと直接矛盾するかだけを判定する。情報の追加、詳しい説明、言い回しの違いは矛盾ではない。料金・可否・期限・場所・必須条件・手順が両立しない場合だけ conflict=true。JSONのみ: {\"conflict\":true|false,\"ruleId\":数値}";
+  const user = "【正式ルール】\n" + related.map(r => "[ID:" + r.id + "] " + r.title + ": " + r.content).join("\n") + "\n\n【新しい学習案】\n" + proposal;
+  try {
+    const raw = await aiChat(t, system, [{ role: "user", content: user.slice(0, 10000) }], 180, "critical");
+    const match = String(raw || "").match(/\{[\s\S]*\}/), out = match ? JSON.parse(match[0]) : {};
+    const rule = related.find(item => Number(item.id) === Number(out.ruleId));
+    if (out.conflict === true && rule) return learningConflictAdd(t, {
+      kind: "rule", q, oldId: rule.id, oldRuleId: rule.id, oldFinal: rule.title + "\n" + rule.content,
+      newId, newFinal: proposal, source,
+    });
+  } catch (e) { console.error("formal rule conflict:", e && e.message); }
+  return null;
+}
+const runningLearningJobs = new Set();
+async function processLearningJob(t, jobId) {
+  const key = t.slug + "::" + jobId;
+  if (runningLearningJobs.has(key)) return;
+  const job = learningJobs(t).find(item => item.id === jobId && item.status === "processing");
+  if (!job) return;
+  runningLearningJobs.add(key);
+  try {
+    const p = job.payload || {}, ex = t.examples && t.examples[Number(job.exampleId)];
+    if (!ex) throw new Error("example_not_found");
+    const proposal = await proposeContextualLearningText(t, p);
+    const review = Object.assign({}, job.learningReview || {}, { text: proposal });
+    const exampleConflict = p.changed ? await checkConflict(t, p.q, p.final, ex.id) : null;
+    let conflict = exampleConflict ? await learningConflictAdd(t, {
+      kind: "example", q: p.q, oldId: exampleConflict.oldId, oldFinal: exampleConflict.oldFinal,
+      newId: ex.id, newFinal: p.final, source: p.source,
+    }) : null;
+    if (!conflict) conflict = await checkFormalRuleConflict(t, p.q, proposal, ex.id, p.source);
+    try { await recordLearningPerformance(t, p.q, !!p.changed, !!conflict); } catch (e) { console.error("learning performance:", e && e.message); }
+    job.status = "ready"; job.resultType = conflict ? "conflict" : "review"; job.learningReview = conflict ? null : review;
+    job.conflict = conflict ? publicLearningConflict(conflict) : null; job.payload = null; job.updatedAt = Date.now();
+  } catch (e) {
+    job.status = "ready"; job.resultType = "review"; job.error = String(e && e.message || e).slice(0, 120); job.payload = null; job.updatedAt = Date.now();
+  } finally {
+    runningLearningJobs.delete(key);
+    while (t.config.learningJobs.length > 80) t.config.learningJobs.shift();
+    await saveTenantConfig(t).catch(e => console.error("learning job save:", e && e.message));
+  }
+}
+async function queueStaffLearning(t, c, opts) {
+  const q = String(opts.q || recentCustomerQuestion(c)).trim(), final = String(opts.final || "").trim();
+  if (!q || !final) return null;
+  const draft0 = String(opts.draft0 || "").trim(), instr = String(opts.instr || "").trim(), learningChat = sanitizeLearningChat(opts.learningChat);
+  const ex = await exampleAdd(t, { q, final, draft0, instr, learningChat, source: opts.source || "web" });
+  if (!ex) return null;
+  const review = learningReviewPayload(ex, { q, final, draft0, instr, reviewText: opts.reviewText, conversationId: c && c.id });
+  if (!review) return { learnedId: ex.id, job: null };
+  const now = Date.now(), job = {
+    id: "lj-" + now.toString(36) + "-" + crypto.randomBytes(3).toString("hex"), conversationId: String(c && c.id || ""),
+    exampleId: ex.id, status: "processing", resultType: "", createdAt: now, updatedAt: now, learningReview: review, conflict: null,
+    payload: { q, final, draft0, instr, learningChat, reviewText: opts.reviewText, source: opts.source || "web", changed: final !== draft0 || !!instr },
+  };
+  learningJobs(t).push(job); while (t.config.learningJobs.length > 80) t.config.learningJobs.shift();
+  await saveTenantConfig(t);
+  setImmediate(() => processLearningJob(t, job.id));
+  return { learnedId: ex.id, job: publicLearningJob(job) };
 }
 // 2つのテキストがほぼ同内容か（bigram重なり率）。ルールの二重登録ガード用。
 function similarEnough(a, b) {
@@ -1904,7 +2002,9 @@ async function handleInbound(t, opts) {
   if (opts.pic) c.pic = opts.pic;
   if (opts.acct) c.acct = opts.acct; // どの連携アカウント（LINEチャネル/メールアドレス）経由か
   const med = ["image", "video", "file", "audio"].includes(opts.media) ? opts.media : null;
-  c.msgs.push({ from: "them", text: opts.text || "", media: med, mediaId: med ? (opts.mediaId || null) : null, fileName: med === "file" ? (opts.fileName || "ファイル") : undefined, time: nowt() });
+  const previousMessage = c.msgs[c.msgs.length - 1];
+  if (previousMessage && !previousMessage.at && Number(c.ts || 0) > 0) previousMessage.at = Number(c.ts);
+  c.msgs.push({ from: "them", text: opts.text || "", media: med, mediaId: med ? (opts.mediaId || null) : null, fileName: med === "file" ? (opts.fileName || "ファイル") : undefined, time: nowt(), at: recvAt });
   statBump(t, "in");
   if (opts.subject) c.subject = String(opts.subject).slice(0, 300);
   c.status = "todo"; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
@@ -2533,10 +2633,11 @@ async function deliverMessageBundle(t, c, text, files, baseUrl) {
 }
 function appendDeliveredBundle(c, text, files, baseUrl, extra) {
   const common = extra && typeof extra === "object" ? extra : {};
-  if (text) c.msgs.push(Object.assign({ from: "us", text, time: nowt() }, common));
+  const deliveredAt = Date.now();
+  if (text) c.msgs.push(Object.assign({ from: "us", text, time: nowt(), at: deliveredAt }, common));
   files.forEach((file) => {
     const image = /^image\//i.test(file.mime);
-    c.msgs.push(Object.assign({ from: "us", media: image ? "image" : "file", url: baseUrl + "/files/" + file.id, fileName: file.name, time: nowt() }, common));
+    c.msgs.push(Object.assign({ from: "us", media: image ? "image" : "file", url: baseUrl + "/files/" + file.id, fileName: file.name, time: nowt(), at: deliveredAt }, common));
   });
 }
 
@@ -2563,7 +2664,7 @@ app.post("/api/send", guard, async (req, res) => {
   const baseUrl = messagePublicBase(req);
   try { ({ sent, sendErr } = await deliverMessageBundle(t, c, text, files, baseUrl)); }
   finally { sendLocks.delete(sendLockKey); }
-  let learnedId = null, conflict = null, learnedRules = [], learningReview = null;
+  let learnedId = null, learningJob = null;
   if (sent) {
     const draft0 = String(c.draft0 || "").trim(); // 学習判定用に、消す前のAI初回下書きを確保
     const q0 = recentCustomerQuestion(c);
@@ -2573,14 +2674,12 @@ app.post("/api/send", guard, async (req, res) => {
     appendDeliveredBundle(c, text, files, baseUrl, { learningRefs: c.learningRefs || [] }); c.draft = ""; c.draft0 = ""; c.learningRefs = []; c.status = "done"; c.flag = false; c.lastAuto = false; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
     statBump(t, "staff");
     if (text) {
-      const learned = await learnStaffOutcome(t, c, { q: q0, final: text, draft0, instr, learningChat, reviewText, source: "web", waitForAi: true, reviewScope: true });
-      learnedId = learned.learnedId;
-      learnedRules = learned.learnedRules || [];
-      learningReview = learned.learningReview || null;
-      if (learned.conflict) conflict = { id: learned.conflict.id, q: learned.conflict.q, oldId: learned.conflict.oldId, oldFinal: learned.conflict.oldFinal, newId: learned.conflict.newId, newFinal: learned.conflict.newFinal };
+      const queued = await queueStaffLearning(t, c, { q: q0, final: text, draft0, instr, learningChat, reviewText, source: "web" });
+      learnedId = queued && queued.learnedId;
+      learningJob = queued && queued.job;
     }
   }
-  res.json({ ok: true, sent, sendErr, learnedId, conflict, learnedRules, learningReview });
+  res.json({ ok: true, sent, sendErr, learnedId, learningJob });
 });
 
 function scheduledMessages(t) {
@@ -2991,17 +3090,23 @@ app.post("/api/example-update", guard, oneMutationAtATime("learning"), async (re
   res.json({ ok: true, example: ex });
 });
 app.post("/api/example-delete", guard, oneMutationAtATime("learning"), async (req, res) => { const t = req.tenant; try { await exampleDelete(t, req.body.id); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false, error: "delete" }); } });
+app.get("/api/learning-jobs", guard, (req, res) => {
+  const t = req.tenant;
+  learningJobs(t).filter(job => job.status === "processing").forEach(job => setImmediate(() => processLearningJob(t, job.id)));
+  res.json({ ok: true, jobs: learningJobs(t).filter(job => job.status !== "done").slice(-30).map(publicLearningJob) });
+});
 // 送信後の学習確認。AIの自動判定ではなく、スタッフが選んだ適用範囲を正本として保存する。
 app.post("/api/learning-scope", guard, oneMutationAtATime("learning"), async (req, res) => {
   const t = req.tenant, id = Number(req.body.exampleId), scope = String(req.body.scope || "");
   const ex = t.examples && t.examples[id];
   if (!ex) return res.status(404).json({ ok: false, error: "not_found" });
   if (!["none", "learn", "patient", "similar", "all"].includes(scope)) return res.status(400).json({ ok: false, error: "bad_scope" });
-  const text = String(req.body.text || ex.instr || "").trim().slice(0, 800);
+  const text = String(req.body.text || ex.instr || "").trim().slice(0, 2400);
   if (scope !== "none" && !text) return res.status(400).json({ ok: false, error: "required" });
   try {
     if (scope === "none") {
       await exampleDelete(t, id);
+      finishLearningJobFor(t, req.body.learningJobId, id, ""); await saveTenantConfig(t);
       return res.json({ ok: true, scope, message: "今回は学習しません" });
     }
     if (scope === "learn") {
@@ -3011,6 +3116,7 @@ app.post("/api/learning-scope", guard, oneMutationAtATime("learning"), async (re
       await exampleLearningMetaUpdate(t, id, meta);
       const c = t.store[String(req.body.conversationId || "")] || null;
       const learnedRules = await distillRules(t, c, { q: ex.q, final: ex.final, draft0: ex.draft0, instr: ex.instr, learningChat: ex.learningChat, exampleId: ex.id });
+      finishLearningJobFor(t, req.body.learningJobId, id, ""); await saveTenantConfig(t);
       return res.json({ ok: true, scope, learnedRules, message: learnedRules.length ? "対応例と修正チャットを学習し、店舗ルールも整理しました" : "対応例と修正チャットを今後の回答へ学習しました" });
     }
     if (scope === "patient") {
@@ -3046,15 +3152,25 @@ app.post("/api/learning-conflict-resolve", guard, oneMutationAtATime("learning")
   if (!item) return res.status(404).json({ ok: false, error: "not_found" });
   try {
     let chosen = null;
-    if (mode === "new") { chosen = t.examples && t.examples[item.newId]; await exampleDelete(t, item.oldId); }
+    if (item.kind === "rule") {
+      const rule = t.rules && t.rules[Number(item.oldRuleId || item.oldId)];
+      if (!rule) return res.status(404).json({ ok: false, error: "rule_not_found" });
+      if (mode === "new") { await ruleUpdate(t, rule.id, rule.title, item.newFinal); chosen = t.examples && t.examples[item.newId]; }
+      else if (mode === "old") { await exampleDelete(t, item.newId); }
+      else if (mode === "custom") {
+        const final = String(req.body.final || "").trim().slice(0, 2000); if (!final) return res.status(400).json({ ok: false, error: "required" });
+        await ruleUpdate(t, rule.id, rule.title, final); chosen = t.examples && t.examples[item.newId];
+      } else return res.status(400).json({ ok: false, error: "bad_mode" });
+    } else if (mode === "new") { chosen = t.examples && t.examples[item.newId]; await exampleDelete(t, item.oldId); }
     else if (mode === "old") { chosen = t.examples && t.examples[item.oldId]; await exampleDelete(t, item.newId); }
     else if (mode === "custom") {
       const final = String(req.body.final || "").trim().slice(0, 1500); if (!final) return res.status(400).json({ ok: false, error: "required" });
       await exampleDelete(t, item.oldId); await exampleDelete(t, item.newId);
       chosen = await exampleAdd(t, { q: item.q, final, draft0: item.newFinal, instr: "学習矛盾の確認でスタッフが正解を指定", source: "conflict_resolution" });
     } else return res.status(400).json({ ok: false, error: "bad_mode" });
-    if (chosen) await distillRules(t, null, { q: item.q, final: chosen.final, draft0: mode === "custom" ? item.newFinal : "", instr: "学習矛盾の確認でこの回答を今後の正解として選択", exampleId: chosen.id });
+    if (chosen && item.kind !== "rule") await distillRules(t, null, { q: item.q, final: chosen.final, draft0: mode === "custom" ? item.newFinal : "", instr: "学習矛盾の確認でこの回答を今後の正解として選択", exampleId: chosen.id });
     item.status = "resolved"; item.resolution = mode; item.resolvedAt = Date.now();
+    finishLearningJobFor(t, req.body.learningJobId, 0, item.id);
     await saveTenantConfig(t);
     res.json({ ok: true, pending: learningConflicts(t, true).length });
   } catch (e) { res.status(500).json({ ok: false, error: "save" }); }
@@ -3252,8 +3368,11 @@ async function draftChatPrep(t, body) {
     break;
   }
   if (!edits.length || edits[edits.length - 1].role !== "user") return { error: "empty" };
-  const conv = c.msgs.slice(-20).map(m => (m.from === "them" ? "お客様" : "クリニック") + ": " + (m.text || (m.media ? "［" + m.media + "］" : ""))).join("\n").slice(0, 6000);
-  const lastQ = c.msgs.filter(m => m.from === "them").slice(-1).map(m => m.text || "").join("");
+  const context = selectConversationContext(c, { maxCurrent: 20, maxOlder: 10 });
+  const line = m => (m.from === "them" ? "お客様" : "クリニック") + ": " + (m.text || (m.media ? "［" + m.media + "］" : ""));
+  const conv = context.current.map(line).join("\n").slice(0, 6000);
+  const olderConv = context.olderRelevant.map(line).join("\n").slice(0, 3000);
+  const lastQ = context.current.filter(m => m.from === "them").slice(-1).map(m => m.text || "").join("");
   const editTxt = edits.map(e => e.content).join(" ");
   const rel = rulesRanked(t, (lastQ + " " + editTxt).slice(0, 1500));
   const rulesTxt = rel.length ? rulesBlock(rel, ruleBudget(t)) : "";
@@ -3265,7 +3384,8 @@ async function draftChatPrep(t, body) {
   }
   const base = "あなたは「" + (t.name || "クリニック") + "」の受付スタッフの返信作成アシスタントです。"
     + "スタッフと会話しながら、お客様への返信下書きを一緒に磨き上げます。あなたと会話しているのはスタッフで、下書きを送る相手はお客様です。"
-    + "\n\n【お客様との会話履歴（この最新メッセージへの返信を作っている。必ず全体を読み込み、文脈を正確に踏まえること）】\n" + conv
+    + "\n\n【現在の話題（この最新メッセージへの返信に使う主な会話）】\n" + conv
+    + (olderConv ? "\n\n【過去の関連説明（最新メッセージが参照している場合だけ補助的に使う）】\n" + olderConv + "\n過去側で完了した質問には改めて回答せず、現在の話題に必要な事実だけ引き継ぐ。" : "")
     + "\n\n本日は" + today + "です。キャンセル料など日付が関わる案内は、本日と予約日の差から判断する。憶測で日付を決めない。"
     + "医療判断・診断はしない。断定的表現や絵文字は使わない。" + sig
     + (rulesTxt ? "\n\n【店舗ルール（料金・規定・対応可否はここに従い、推測で答えない）】\n" + rulesTxt : "")
@@ -5369,20 +5489,21 @@ const PAGE = `<!DOCTYPE html>
 </div>
 <div id="learnToast" style="display:none;position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:75;background:#065f46;color:#fff;border-radius:10px;padding:8px 14px;font-size:12px;box-shadow:0 6px 20px rgba(0,0,0,.25);">✓ この対応を学習しました</div>
 <div id="conflictPop" style="position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:80;display:none;align-items:center;justify-content:center;"><div style="background:#fff;border-radius:14px;padding:18px;width:min(92vw,380px);max-height:86vh;overflow-y:auto;">
-  <h3 style="margin:0 0 8px;font-size:15px;">⚠️ 前と答えが食い違っています</h3>
-  <div style="font-size:12px;color:#374151;margin-bottom:4px;">似た質問に、前はこう答えていました：</div>
+  <h3 id="conflictTitle" style="margin:0 0 8px;font-size:15px;">⚠️ 前と答えが食い違っています</h3>
+  <div id="conflictOldLabel" style="font-size:12px;color:#374151;margin-bottom:4px;">似た質問に、前はこう答えていました：</div>
   <div id="conflictOld" style="font-size:12px;background:#f3f4f6;border-radius:8px;padding:8px;margin-bottom:8px;white-space:pre-wrap;"></div>
-  <div style="font-size:12px;color:#374151;margin-bottom:4px;">今回はこう答えました：</div>
+  <div id="conflictNewLabel" style="font-size:12px;color:#374151;margin-bottom:4px;">今回はこう答えました：</div>
   <div id="conflictNew" style="font-size:12px;background:#ede9fe;border-radius:8px;padding:8px;margin-bottom:12px;white-space:pre-wrap;"></div>
   <div style="font-size:12px;color:#374151;margin-bottom:10px;">今後はどちらを基準にしますか？</div>
   <div style="display:flex;flex-direction:column;gap:8px;">
-    <button class="cbtn send" style="width:100%;" onclick="resolveConflict('new',this)">今後は今回の回答を正解にする</button>
-    <button class="cbtn" style="width:100%;" onclick="resolveConflict('old',this)">今回は特例（前の回答を正解のまま残す）</button>
+    <button id="conflictNewButton" class="cbtn send" style="width:100%;" onclick="resolveConflict('new',this)">今後は今回の回答を正解にする</button>
+    <button id="conflictOldButton" class="cbtn" style="width:100%;" onclick="resolveConflict('old',this)">今回は特例（前の回答を正解のまま残す）</button>
     <button class="cbtn" style="width:100%;" onclick="resolveConflict('later',this)">どちらでもない・後で正しい回答を入力</button>
   </div>
 </div></div>
 <script>
 let DATA=[];let DATA_REV=0;let DATA_READY=false;let current=null;
+const learningJobsByConversation={},shownLearningJobs=new Set();
 const roomsEl=document.getElementById("rooms"),chatEl=document.getElementById("chat"),appEl=document.getElementById("app");
 let initialConv="";try{initialConv=new URLSearchParams(location.search).get("conv")||"";}catch(e){}
 async function load(){ try{ const r=await fetch(DATA_READY?("/api/conversation-updates?since="+encodeURIComponent(DATA_REV)):"/api/conversations");const j=await r.json();if(Array.isArray(j)){DATA=j;DATA_REV=DATA.reduce((m,c)=>Math.max(m,Number(c&&c._rev||c&&c.ts||0)),0);DATA_READY=true;}else if(j&&j.ok){const byId=new Map(DATA.map(c=>[c.id,c]));(j.updates||[]).forEach(c=>byId.set(c.id,c));const meta=j.meta||{};byId.forEach(c=>{c.staffLineReviewAvailable=!!meta.staffLineReviewAvailable;c.inboxOrder=meta.inboxOrder||c.inboxOrder;});const ordered=[];(j.order||[]).forEach(id=>{const c=byId.get(id);if(c){ordered.push(c);byId.delete(id);}});DATA=ordered.concat([...byId.values()]);DATA_REV=Math.max(DATA_REV,Number(j.version||0));DATA_READY=true;} }catch(e){} renderList(); if(initialConv&&!current){const target=DATA.find(x=>x.id===initialConv);if(target){const id=initialConv;initialConv="";openChat(id);try{history.replaceState(null,"",location.pathname);}catch(e){}}} if(current){ const c=DATA.find(x=>x.id===current); if(c){syncMsgs(c);renderScheduledMessages(c);} } }
@@ -5448,7 +5569,8 @@ function renderList(){
     const d=document.createElement("div");
     d.className="room"+(current===r.id?" active":"")+(r.flag?" flag":"");
     const acctBadge=(r.acct&&r.acct.name&&r.acct.name!=="メイン")?' <span class="badge">'+esc(r.acct.name)+'</span>':'';
-    d.innerHTML=av(r)+'<div class="rmid"><div class="rtop"><span class="rname">'+esc(r.name)+acctBadge+'</span><span class="rtime">'+tlabel(r)+'</span></div><div class="rlast">'+esc(r.last||"")+'</div></div><div class="stat">'+statIcon(r)+'</div>';
+    const learningJob=learningJobsByConversation[r.id],learningBadge=learningJob?('<span style="font-size:10px;color:'+(learningJob.status==="ready"?'#6d28d9':'#64748b')+';white-space:nowrap;">'+(learningJob.status==="ready"?'🧠 学習確認':'… 学習整理中')+'</span>'):'';
+    d.innerHTML=av(r)+'<div class="rmid"><div class="rtop"><span class="rname">'+esc(r.name)+acctBadge+'</span><span class="rtime">'+tlabel(r)+'</span></div><div class="rlast">'+esc(r.last||"")+'</div>'+learningBadge+'</div><div class="stat">'+statIcon(r)+'</div>';
     d.onclick=()=>openChat(r.id);
     roomsEl.appendChild(d);
   });
@@ -5470,7 +5592,7 @@ function openChat(id,keep){if(window.__dBusy&&current&&current!==id){uiAlert("�
     '<div id="msgs">'+bubbles+'</div>'+
     '<div id="composer"><div id="aiLabel"><span class="patientModeTitle">🟢 患者への返信を編集中</span><span class="patientModeNote">この入力欄の内容は患者へ送信されます</span></div><div id="groundingUsed" style="display:'+(groundingText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:'+(r.grounding&&r.grounding.autoSendAllowed&&r.validation&&r.validation.pass?'#047857':'#b45309')+';margin:2px 0 5px;">'+esc(groundingText(r))+'</div><div id="topicChips" style="display:none;"></div><div id="scheduledList"></div><div id="pendingAttachments"></div><div id="draftRow"><button id="attach" onclick="attach()" title="画像・ファイルを追加">📎</button><textarea id="draft" oninput="draftEdited()" onpaste="handleDraftPaste(event)" placeholder="患者へのメッセージ。画像やファイルもここへ貼り付けできます">'+esc(r.draft||"")+'</textarea></div><div class="enterHint">Enter＝改行　送信はボタンのみ</div>'+
     '<div id="cbtns"><div class="composerSecondary"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ 右腕くんに相談</button>'+staffReviewButton+'<button id="markDoneBtn" class="cbtn done" onclick="markDone()">対応済み</button></div><div class="composerPrimary"><button class="cbtn schedule" onclick="openScheduledMessage()">🕒 予約送信</button><button class="cbtn send" onclick="sendMsg()">患者へ送信</button></div></div></div>';
-  const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r);renderPendingAttachments();renderScheduledMessages(r); loadCustomer(id); if(!keep)renderList();
+  const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r);renderPendingAttachments();renderScheduledMessages(r); loadCustomer(id); if(!keep)renderList(); showReadyLearningFor(id);
 }
 function closeChat(){hideDraftChatForConversationSwitch();appEl.classList.remove("chatopen");current=null;renderList();}
 // ===== うけつけるん 顧客情報パネル =====
@@ -5912,7 +6034,7 @@ async function saveLearningScope(scope,btn){
   const text=(document.getElementById("learningScopeText").value||"").trim();
   if(scope!=="none"&&!text){uiAlert("今後守る内容を入力してください");return;}
   await withBusy("learning-scope-"+data.exampleId,btn,"保存中…",async()=>{try{
-    const r=await api("/api/learning-scope",{exampleId:data.exampleId,conversationId:data.conversationId,scope,text}),j=await r.json();
+    const r=await api("/api/learning-scope",{exampleId:data.exampleId,conversationId:data.conversationId,learningJobId:data.learningJobId,scope,text}),j=await r.json();
     if(!r.ok||!j.ok)throw new Error(j.error||"save");
     closeLearningScope();showLearnResult(j.message||"学習内容を保存しました");
   }catch(e){uiAlert("学習内容を保存できませんでした。設定→学習データ管理から確認してください。");}});
@@ -5964,7 +6086,9 @@ function attach(){const input=document.createElement("input");input.type="file";
 function draftLearningPayload(id,text){const cd0=DATA.find(x=>x.id===id),orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim(),edited=(text!==orig);let instr="",learningText="",learningChat=[];try{if(dSessions&&dSessions[id]){if(Array.isArray(dSessions[id].hist)){learningChat=dSessions[id].hist.filter(m=>m&&["user","assistant"].includes(m.role)).slice(-20).map(m=>({role:m.role,content:String(m.content||"").slice(0,3000)}));instr=learningChat.filter(m=>m.role==="user").map(m=>m.content).join(" / ").slice(0,1500);}learningText=String(dSessions[id].memory||"").slice(0,800);}}catch(e){}return{instr:edited?instr:"",learningText:edited?learningText:"",learningChat:edited?learningChat:[]};}
 function showLearningProgress(){const p=document.getElementById("learningProgress");if(p)p.style.display="flex";}
 function hideLearningProgress(){const p=document.getElementById("learningProgress");if(p)p.style.display="none";}
-async function sendMsg(){if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;showLearningProgress();const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="検証中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat});let json={};try{json=await response.json();}catch(e){}hideLearningProgress();if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";if(json.conflict){showConflict(json.conflict);}else if(json.learningReview){showLearningScope(json.learningReview);}else if(json.learnedRules&&json.learnedRules.length){showRuleToast(json.learnedRules);}else if(json.learnedId){showLearnToast(json.learnedId);}await load();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{hideLearningProgress();window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
+function showReadyLearningFor(id){const job=learningJobsByConversation[id];if(!job||job.status!=="ready"||shownLearningJobs.has(job.id)||current!==id)return;shownLearningJobs.add(job.id);if(job.resultType==="conflict"&&job.conflict){showConflict(Object.assign({},job.conflict,{learningJobId:job.id}));}else if(job.learningReview){showLearningScope(Object.assign({},job.learningReview,{learningJobId:job.id}));}}
+async function pollLearningJobs(){try{const r=await fetch("/api/learning-jobs"),j=await r.json();if(!r.ok||!j.ok)return;Object.keys(learningJobsByConversation).forEach(k=>delete learningJobsByConversation[k]);(j.jobs||[]).forEach(job=>{const old=learningJobsByConversation[job.conversationId];if(!old||Number(job.updatedAt)>=Number(old.updatedAt))learningJobsByConversation[job.conversationId]=job;});renderList();if(current)showReadyLearningFor(current);}catch(e){}}
+async function sendMsg(){if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="患者へ送信中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat});let json={};try{json=await response.json();}catch(e){}if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";if(json.learningJob){learningJobsByConversation[id]=json.learningJob;showLearnResult("送信しました。学習案はバックグラウンドで整理中です");}await load();pollLearningJobs();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
 let scheduledMessageDraft=null;
 function localDateTimeValue(date){const pad=n=>String(n).padStart(2,"0");return date.getFullYear()+"-"+pad(date.getMonth()+1)+"-"+pad(date.getDate())+"T"+pad(date.getHours())+":"+pad(date.getMinutes());}
 function openScheduledMessage(){
@@ -6291,8 +6415,8 @@ async function busyCancelRichMenuSchedule(id,btn){return withBusy("rich-menu-wri
 async function undoLearn(id){ return withBusy("undo-learning-"+id,null,"",async()=>{try{ await api("/api/example-delete",{id}); }catch(e){} const b=document.getElementById("learnToast"); if(b){ b.innerHTML='↩ 学習を取り消しました（特例として記録しません）'; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";},2000); }}); }
 // 矛盾の確認：前の答えと今回の答えが食い違った時に出す。基準を選ぶと不要な方の対応例を削除。
 let conflictData=null;
-function showConflict(c){ conflictData=c; const o=document.getElementById("conflictOld"),n=document.getElementById("conflictNew"); if(o)o.textContent=c.oldFinal||""; if(n)n.textContent=c.newFinal||""; const p=document.getElementById("conflictPop"); if(p)p.style.display="flex"; }
-async function resolveConflict(mode,btn){ const c=conflictData;if(!c)return;if(mode==="later"){conflictData=null;const p=document.getElementById("conflictPop");if(p)p.style.display="none";learnTab="conflicts";openLearning();return;}await withBusy("resolve-conflict-"+c.id,btn,"更新中…",async()=>{try{const r=await api("/api/learning-conflict-resolve",{id:c.id,mode}),j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error("save");conflictData=null;const p=document.getElementById("conflictPop");if(p)p.style.display="none";}catch(e){uiAlert("学習内容を更新できませんでした");}}); }
+function showConflict(c){ conflictData=c;const rule=c.kind==="rule",o=document.getElementById("conflictOld"),n=document.getElementById("conflictNew"),title=document.getElementById("conflictTitle"),ol=document.getElementById("conflictOldLabel"),nl=document.getElementById("conflictNewLabel"),ob=document.getElementById("conflictOldButton"),nb=document.getElementById("conflictNewButton");if(title)title.textContent=rule?"⚠️ 正式ルールと新しい学習案が矛盾しています":"⚠️ 前と答えが食い違っています";if(ol)ol.textContent=rule?"現在の正式ルール：":"似た質問に、前はこう答えていました：";if(nl)nl.textContent=rule?"今回の新しい学習案：":"今回はこう答えました：";if(ob)ob.textContent=rule?"正式ルールを残し、今回の学習はしない":"今回は特例（前の回答を正解のまま残す）";if(nb)nb.textContent=rule?"正式ルールを新しい学習案へ更新":"今後は今回の回答を正解にする";if(o)o.textContent=c.oldFinal||"";if(n)n.textContent=c.newFinal||"";const p=document.getElementById("conflictPop");if(p)p.style.display="flex";}
+async function resolveConflict(mode,btn){ const c=conflictData;if(!c)return;if(mode==="later"){conflictData=null;const p=document.getElementById("conflictPop");if(p)p.style.display="none";learnTab="conflicts";openLearning();return;}await withBusy("resolve-conflict-"+c.id,btn,"更新中…",async()=>{try{const r=await api("/api/learning-conflict-resolve",{id:c.id,learningJobId:c.learningJobId,mode}),j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error("save");conflictData=null;const p=document.getElementById("conflictPop");if(p)p.style.display="none";pollLearningJobs();}catch(e){uiAlert("学習内容を更新できませんでした");}}); }
 // 「どちらでもない」→ みぎうで君を開き、食い違った2案を背景に、正しい案内をチャットで決めてルール化する
 function openConflictChat(c){ openAsst(null); try{ asstHist.push({role:"user",content:"（背景）似た質問で過去の回答が食い違っていました。前の回答:「"+(c.oldFinal||"")+"」／今回の回答:「"+(c.newFinal||"")+"」。どちらも正解ではありません。これからスタッフが正しい案内を教えるので、それを既存ルールと矛盾しない形でルール化する提案をしてください。"}); }catch(e){} amAdd("sysn","過去の回答が食い違っていました。正しい案内を教えてください——内容をルールにします。"); }
 // ---- settings popup ----
@@ -6437,7 +6561,7 @@ async function refreshModelAlert(){
 }
 // 自動化ダッシュボード帯（直近7日の自動対応状況）。起動時＋5分ごとに更新。
 async function loadStats(){try{const r=await fetch("/api/stats");const j=await r.json();if(!j||!j.ok)return;const w=j.week||{};const el=document.getElementById("statsBar");if(!el)return;const rate=(w.autoRate==null)?"—":(w.autoRate+"%");el.innerHTML="📊 直近7日：問い合わせ <b>"+(w.in||0)+"</b> 件 ・ AI自動返信率 <b>"+rate+"</b>（"+(w.auto||0)+"件）・ スタッフ返信 <b>"+(w.staff||0)+"</b> 件 ・ 学習ルール <b>+"+(w.rules||0)+"</b> 件";el.style.display="block";}catch(e){}}
-load(); setInterval(load, 6000); refreshModelAlert(); loadStats(); setInterval(loadStats, 300000);
+load(); setInterval(load, 6000); pollLearningJobs(); setInterval(pollLearningJobs, 2500); refreshModelAlert(); loadStats(); setInterval(loadStats, 300000);
 </script>
 </body>
 </html>`;

@@ -81,7 +81,8 @@ test("矛盾した回答を永続的な学習確認待ちへ保存して解決�
   assert.match(source, /pendingIds\.has\(Number\(example\.id\)\)/);
   assert.match(source, /filter\(example => Number\(example\.id\) !== Number\(excludeId\)/);
   assert.match(source, /outcomeP\.then\(conflict => conflict \? \[\] : distillRules/);
-  assert.match(source, /if \(chosen\) await distillRules/);
+  assert.match(source, /if \(chosen && item\.kind !== "rule"\) await distillRules/);
+  assert.match(source, /checkFormalRuleConflict/);
 });
 
 test("スタッフの修正過程を構造化した判断メモリとして保存して再利用する", () => {
