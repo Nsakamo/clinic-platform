@@ -4927,6 +4927,11 @@ const PAGE = `<!DOCTYPE html>
   .amcard button:disabled{background:#d1d5db;cursor:default;}
   .spin{display:inline-block;width:13px;height:13px;border:2px solid #ddd6fe;border-top-color:#7c3aed;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:7px;}
   @keyframes spin{to{transform:rotate(360deg);}}
+  #learningProgress{position:fixed;inset:0;z-index:95;display:none;align-items:center;justify-content:center;background:rgba(15,23,42,.52);padding:18px;pointer-events:auto;}
+  .learningProgressCard{width:min(88vw,390px);padding:24px 20px;background:#fff;border-radius:16px;box-shadow:0 20px 55px rgba(0,0,0,.28);text-align:center;}
+  .learningProgressSpinner{width:38px;height:38px;margin:0 auto 13px;border:4px solid #ddd6fe;border-top-color:#7c3aed;border-radius:50%;animation:spin .75s linear infinite;}
+  .learningProgressTitle{font-size:16px;font-weight:800;color:#312e81;}
+  .learningProgressNote{margin-top:7px;font-size:12px;line-height:1.65;color:#64748b;}
   /* 編集チャットはモーダルではなく「横並びドロワー」：開いていても左の患者とのやり取りは見える・スクロールできる */
   #dpanel{position:fixed;inset:0;background:transparent;z-index:72;display:none;pointer-events:none;}
   #dCard{position:absolute;right:0;top:0;bottom:0;width:min(96vw,430px);background:#f5f3ff;display:flex;flex-direction:column;overflow:hidden;box-shadow:-4px 0 24px rgba(76,29,149,.24);animation:slideinX .28s cubic-bezier(.22,.9,.36,1);pointer-events:auto;border-left:1px solid #c4b5fd;}
@@ -5103,6 +5108,7 @@ const PAGE = `<!DOCTYPE html>
   <div id="chat"><div id="empty">左の一覧から会話を選んでください</div></div>
 </div>
 <div id="menu"></div>
+<div id="learningProgress" role="status" aria-live="polite" aria-busy="true"><div class="learningProgressCard"><div class="learningProgressSpinner" aria-hidden="true"></div><div class="learningProgressTitle">回答と学習内容を検証中</div><div class="learningProgressNote">会話全体から「どんな状況で、何を確認し、どう回答するか」を整理しています。<br>完了するまでこの画面でお待ちください。</div></div></div>
 <div id="dpanel"><div id="dCard">
   <div id="dHead"><div><div class="dModeTitle">🤝 右腕くんに相談中</div><div class="dModeNote">ここでの入力は患者には送信されません</div></div><button class="cbtn" onclick="closeDraftChat()">患者画面に戻る</button></div>
   <div id="dMsgs"></div>
@@ -5111,7 +5117,7 @@ const PAGE = `<!DOCTYPE html>
     <button class="cbtn" onclick="dChip('もっと丁寧で温かい言い方にして')">丁寧に</button>
     <button class="cbtn" onclick="dChip('もっと柔らかい印象にして')">柔らかく</button>
   </div>
-  <div id="dComposer"><div class="dInputWrap"><textarea id="dText" placeholder="右腕くんへの指示を入力…（例：もっと簡潔にして）"></textarea><div class="enterHint">Enter＝改行　相談は下のボタン</div></div><button id="dSendBtn" class="cbtn dsend" onclick="dSend()">右腕くんへ相談</button></div>
+  <div id="dComposer"><div class="dInputWrap"><textarea id="dText" oninput="rememberDraftChatInput()" placeholder="右腕くんへの指示を入力…（例：もっと簡潔にして）"></textarea><div class="enterHint">Enter＝改行　相談は下のボタン</div></div><button id="dSendBtn" class="cbtn dsend" onclick="dSend()">右腕くんへ相談</button></div>
 </div></div>
 <div id="setPop"><div class="settingsCard">
   <div class="settingsHeader"><h3>⚙ 設定</h3><button type="button" class="cbtn" onclick="closeSet()">閉じる</button></div>
@@ -5455,7 +5461,7 @@ function renderGrounding(r){const el=document.getElementById("groundingUsed");if
 let draftEditTimer=null;
 function draftEdited(){const d=document.getElementById("draft"),r=DATA.find(x=>x.id===current);if(!d||!r)return;r.draft=d.value;r.grounding={autoSendAllowed:false,reasons:["スタッフが下書きを編集したため手動送信します"],sources:["スタッフ編集"]};r.validation={pass:false,skipped:true,reason:"編集後の文章は自動送信しません"};renderGrounding(r);clearTimeout(draftEditTimer);const id=current,text=d.value;draftEditTimer=setTimeout(()=>api("/api/draft-edited",{id,draft:text}).catch(()=>{}),350);}
 function syncMsgs(c){const m=document.getElementById("msgs");if(!m)return;if(m.getAttribute("data-count")!==String(c.msgs.length)){m.innerHTML=bubblesHtml(c);m.setAttribute("data-count",String(c.msgs.length));m.scrollTop=m.scrollHeight;}}
-function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)return; appEl.classList.add("chatopen");
+function openChat(id,keep){if(window.__dBusy&&current&&current!==id){uiAlert("右腕くんが回答を作成中です。完了してから別の会話を開いてください");return;}if(current&&current!==id)hideDraftChatForConversationSwitch();current=id;const r=DATA.find(x=>x.id===id);if(!r)return; appEl.classList.add("chatopen");
   const bubbles=bubblesHtml(r);
   const staffReviewButton=r.staffLineReviewAvailable?'<button class="cbtn" id="staffReviewResend" onclick="resendStaffApproval()">'+(r.staffLineApproval?'📲 承認依頼を再送':'📲 スタッフLINEで確認')+'</button>':'';
   chatEl.innerHTML='<div id="chatHead"><button id="backBtn" onclick="closeChat()">‹</button>'+av(r,30)+'<span id="chatName">'+esc(r.name)+'　<span style="font-size:11px;color:#6b7280;">'+(r.channel==="line"?"LINE":"メール")+((r.acct&&r.acct.name&&r.acct.name!=="メイン")?"・"+esc(r.acct.name):"")+'</span></span><button id="shareClinicBtn" class="hbtn" onclick="shareClinic()">🏥 クリニックへ共有</button></div>'+
@@ -5466,7 +5472,7 @@ function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)ret
     '<div id="cbtns"><div class="composerSecondary"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ 右腕くんに相談</button>'+staffReviewButton+'<button id="markDoneBtn" class="cbtn done" onclick="markDone()">対応済み</button></div><div class="composerPrimary"><button class="cbtn schedule" onclick="openScheduledMessage()">🕒 予約送信</button><button class="cbtn send" onclick="sendMsg()">患者へ送信</button></div></div></div>';
   const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r);renderPendingAttachments();renderScheduledMessages(r); loadCustomer(id); if(!keep)renderList();
 }
-function closeChat(){appEl.classList.remove("chatopen");current=null;renderList();}
+function closeChat(){hideDraftChatForConversationSwitch();appEl.classList.remove("chatopen");current=null;renderList();}
 // ===== うけつけるん 顧客情報パネル =====
 var custPid=null; var karteEntries={};
 var custCache={}; var karteCache={}; // 会話ごとのコンテキスト/カルテのメモリキャッシュ（体感1秒以下）
@@ -5956,7 +5962,9 @@ function renderPendingAttachments(){
 function removePendingAttachment(index){pendingAttachments(current).splice(index,1);renderPendingAttachments();}
 function attach(){const input=document.createElement("input");input.type="file";input.multiple=true;input.accept="image/*,video/mp4,video/quicktime,application/pdf,.pdf,.doc,.docx,.xls,.xlsx,.txt,.csv";input.onchange=()=>uploadComposerFiles(input.files);input.click();}
 function draftLearningPayload(id,text){const cd0=DATA.find(x=>x.id===id),orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim(),edited=(text!==orig);let instr="",learningText="",learningChat=[];try{if(dSessions&&dSessions[id]){if(Array.isArray(dSessions[id].hist)){learningChat=dSessions[id].hist.filter(m=>m&&["user","assistant"].includes(m.role)).slice(-20).map(m=>({role:m.role,content:String(m.content||"").slice(0,3000)}));instr=learningChat.filter(m=>m.role==="user").map(m=>m.content).join(" / ").slice(0,1500);}learningText=String(dSessions[id].memory||"").slice(0,800);}}catch(e){}return{instr:edited?instr:"",learningText:edited?learningText:"",learningChat:edited?learningChat:[]};}
-async function sendMsg(){if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="患者へ送信中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat});let json={};try{json=await response.json();}catch(e){}if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";if(json.conflict){showConflict(json.conflict);}else if(json.learningReview){showLearningScope(json.learningReview);}else if(json.learnedRules&&json.learnedRules.length){showRuleToast(json.learnedRules);}else if(json.learnedId){showLearnToast(json.learnedId);}await load();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
+function showLearningProgress(){const p=document.getElementById("learningProgress");if(p)p.style.display="flex";}
+function hideLearningProgress(){const p=document.getElementById("learningProgress");if(p)p.style.display="none";}
+async function sendMsg(){if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;showLearningProgress();const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="検証中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat});let json={};try{json=await response.json();}catch(e){}hideLearningProgress();if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";if(json.conflict){showConflict(json.conflict);}else if(json.learningReview){showLearningScope(json.learningReview);}else if(json.learnedRules&&json.learnedRules.length){showRuleToast(json.learnedRules);}else if(json.learnedId){showLearnToast(json.learnedId);}await load();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{hideLearningProgress();window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
 let scheduledMessageDraft=null;
 function localDateTimeValue(date){const pad=n=>String(n).padStart(2,"0");return date.getFullYear()+"-"+pad(date.getMonth()+1)+"-"+pad(date.getDate())+"T"+pad(date.getHours())+":"+pad(date.getMinutes());}
 function openScheduledMessage(){
@@ -5992,8 +6000,14 @@ async function resendStaffApproval(){if(!current)return;const b=document.getElem
 async function shareClinic(){const note=await uiPrompt("現場に伝える内容を入力してください（空欄のままOKを押すと、お客様の直近メッセージをそのまま共有します）","");if(note===null)return;const btn=document.getElementById("shareClinicBtn"),id=current;await withBusy("share-"+id,btn,"共有中…",async()=>{try{const r=await api("/api/share",{id,note:note||""});const j=await r.json();if(j.ok)uiAlert("現場ボードに共有しました");else uiAlert("共有に失敗しました");}catch(e){uiAlert("共有に失敗しました");}});}
 async function toggleFlag(){if(!current)return;const id=current,b=document.getElementById("flagBtn");let next=null;await withBusy("flag-"+id,b,"変更中…",async()=>{try{const r=await api("/api/tag",{id});const j=await r.json();next=!!j.flag;const cd=DATA.find(x=>x.id===id);if(cd)cd.flag=next;renderList();}catch(e){uiAlert("変更に失敗しました");}});if(b&&next!==null)b.textContent=next?"⚑ 要対応を外す":"⚑ 要対応";}
 // ---- AIで作り直す（会話型・下書きを会話で磨く。会話ごとにセッションを保持し再開可能）----
-let dHist=[],dLog=[],dSessions={};
+let dHist=[],dLog=[],dSessions={},dComposerDrafts={},dComposerOwner="";
 const dMsgsEl=document.getElementById("dMsgs");
+function rememberDraftChatInput(){const x=document.getElementById("dText");if(x&&dComposerOwner)dComposerDrafts[dComposerOwner]=x.value;}
+function hideDraftChatForConversationSwitch(){
+  rememberDraftChatInput();dComposerOwner="";
+  const panel=document.getElementById("dpanel"),app=document.getElementById("app");
+  if(panel)panel.style.display="none";if(app)app.classList.remove("dopen");
+}
 function dRender(role,text){const d=document.createElement("div");d.className="am "+role;d.textContent=text;dMsgsEl.appendChild(d);dMsgsEl.scrollTop=dMsgsEl.scrollHeight;return d;}
 function dAdd(role,text){dLog.push({type:role,text});return dRender(role,text);}
 function dDraftCard(entry){const card=document.createElement("div");card.className="amcard";
@@ -6019,6 +6033,7 @@ function dBookingCard(info){const card=document.createElement("div");card.classN
 function staffBookingError(code){return ({not_linked:"うけつけるん連携が有効ではありません。",patient_not_verified:"この会話の患者を安全に特定できないため操作できません。",appointment_mismatch:"現在の患者の予約と一致しないため停止しました。",not_changeable:"この予約は変更・キャンセルできません。",patient_confirmation_pending:"患者様への確認待ち手続きがあるため、先にそちらを完了してください。",staff_confirmation_pending:"別の予約操作が確認待ちです。先に表示中の確認カードを実行または取り消してください。",slot_taken:"指定枠はすでに埋まっています。",bad_date:"日付を確認してください。",bad_datetime:"変更先の日時を確認してください。",expired:"確認期限が切れました。もう一度指示してください。",result_unknown:"実行結果を確認できません。うけつけるんの予約詳細で確認してください。"})[code]||"予約システムで処理できませんでした。";}
 async function dHandleBookingAction(action){if(!action||!action.type)return;dAdd("sysn","うけつけるんで対象患者と最新の予約状態を確認しています…");try{const r=await api("/api/staff-booking-action",Object.assign({id:current},action));const j=await r.json();if(j.ok&&j.kind==="info")dAdd("ai",j.text||"確認できました");else if(j.ok&&j.kind==="confirm")dBookingCard(j);else{let msg=j.text||staffBookingError(j.error);if(j.alternatives&&j.alternatives.length)msg+="\\n空き候補: "+j.alternatives.map(x=>x.label).join(" / ");dAdd("sysn","⚠ "+msg);}}catch(e){dAdd("sysn","うけつけるんへ接続できませんでした。予約操作は行っていません。");}}
 function openDraftChat(){if(!current)return;const openId=current;const c=DATA.find(x=>x.id===openId);if(!c)return;
+  rememberDraftChatInput();dComposerOwner=openId;
   dMsgsEl.innerHTML="";
   const s=dSessions[current];
   if(s&&s.ts===c.ts){ // 会話に動きがなければ前回の続きから再開
@@ -6036,6 +6051,7 @@ function openDraftChat(){if(!current)return;const openId=current;const c=DATA.fi
       dAdd("ai","まだ下書きがありません。どんな返信にしたいか教えてください。お客様との会話は読み込み済みです。");
     }
   }
+  const composer=document.getElementById("dText");if(composer)composer.value=dComposerDrafts[openId]||"";
   document.getElementById("dpanel").style.display="block";
   const app=document.getElementById("app");if(app)app.classList.add("dopen"); // 会話エリアをドロワー分だけ詰める（横並び表示）
   fetch("/api/staff-booking-pending?id="+encodeURIComponent(openId)).then(r=>r.json()).then(j=>{if(current===openId&&j&&j.pending)dBookingCard(j.pending);}).catch(()=>{});
@@ -6044,10 +6060,10 @@ function slideClose(pid,cid){const p=document.getElementById(pid),c=document.get
   const mob=window.matchMedia("(max-width:760px)").matches;
   c.style.animation=(mob?"slideoutY":"slideoutX")+" .22s ease forwards";
   setTimeout(()=>{p.style.display="none";c.style.animation="";},220);}
-function closeDraftChat(){const app=document.getElementById("app");if(app)app.classList.remove("dopen");slideClose("dpanel","dCard");}
-function dChip(t){const x=document.getElementById("dText");x.value=t;dSend();}
+function closeDraftChat(){rememberDraftChatInput();const app=document.getElementById("app");if(app)app.classList.remove("dopen");slideClose("dpanel","dCard");}
+function dChip(t){const x=document.getElementById("dText");x.value=t;rememberDraftChatInput();dSend();}
 // GPT風ストリーミング送信。返事が文字単位で流れ、下書きカードもリアルタイムに埋まる。失敗時は従来API(JSON)へ自動フォールバック。
-async function dSend(){if(window.__dBusy)return;const x=document.getElementById("dText");const txt=x.value.trim();if(!txt)return;window.__dBusy=true;const btn=document.getElementById("dSendBtn"),old=btn&&btn.innerHTML;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>作成中…';}x.value="";
+async function dSend(){if(window.__dBusy)return;const x=document.getElementById("dText");const txt=x.value.trim();if(!txt)return;window.__dBusy=true;const btn=document.getElementById("dSendBtn"),old=btn&&btn.innerHTML;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>作成中…';}x.value="";if(dComposerOwner)dComposerDrafts[dComposerOwner]="";
   dAdd("user",txt);dHist.push({role:"user",content:txt});
   const logEntry={type:"ai",text:""};dLog.push(logEntry);
   const aiEl=dRender("ai","…");
