@@ -99,6 +99,9 @@ test("Web送信後はスタッフが学習するかを2択で決め、AIが用�
   assert.match(source, /\["none", "learn", "patient", "similar", "all"\]/);
   assert.match(source, /今回の対応を学習しますか？/);
   assert.match(source, /学習する[\s\S]{0,300}学習しない/);
+  assert.match(source, /proposeContextualLearningText/);
+  assert.match(source, /会話全体から整理した学習案/);
+  assert.doesNotMatch(source, /患者への送信後に、今回だけ／患者だけ／同じ問い合わせ／全返信から適用範囲を選べます/);
   assert.match(source, /AIのone_off判定だけで捨てない/);
   assert.match(source, /learningChat:learning\.learningChat/);
   assert.match(source, /右腕くんとの修正チャット/);

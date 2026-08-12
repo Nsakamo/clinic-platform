@@ -15,6 +15,7 @@ const { compareConversations, compareConversationsRecent } = require("./lib/conv
 const { MAX_ATTACHMENTS, normalizeFileIds, normalizeScheduledMessageInput, pruneScheduledMessages } = require("./lib/scheduled-message");
 const { lineWebhookEventId, lineWebhookRetryDelay, isProcessableLineEvent } = require("./lib/line-webhook-queue");
 const { normalizeAiRoutes, resolveAiRoute, publicModelCatalog } = require("./lib/ai-model-router");
+const { contextualLearningFallback, formatLearningProposal } = require("./lib/learning-context");
 const app = express();
 app.use(express.json({ limit: "16mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: false, limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
@@ -910,7 +911,9 @@ function learningReviewPayload(ex, opts) {
   const instr = String(opts && opts.instr || "").trim();
   const changed = String(opts && opts.final || "").trim() !== String(opts && opts.draft0 || "").trim() || !!instr;
   if (!changed) return null;
-  const text = String(opts && opts.reviewText || "").trim() || instr || "この種類の問い合わせでは、スタッフが実際に送った回答内容と案内順序を今後の基準にする";
+  // 「大丈夫」「短く」などの短い修正指示を、そのまま独立した学習ルールとして表示・保存しない。
+  // 問い合わせと最終回答を含む文脈から、適用条件・確認事項・回答方針へ組み直す。
+  const text = contextualLearningFallback({ q: opts && opts.q, final: opts && opts.final, instr, reviewText: opts && opts.reviewText });
   return {
     exampleId: Number(ex.id),
     conversationId: String(opts && opts.conversationId || ""),
@@ -921,6 +924,27 @@ function learningReviewPayload(ex, opts) {
     text: text.slice(0, 800),
     suggestedScope: learningScopeSuggestion(instr),
   };
+}
+
+async function proposeContextualLearningText(t, input) {
+  const fallback = contextualLearningFallback(input);
+  const system = "あなたはクリニック受付AIの学習設計者です。スタッフの短い修正語だけを覚えず、患者の問い合わせ、元の下書き、修正チャット、実際に送った最終返信の流れを読み、次回再利用できる判断手順へ一般化してください。予約確認では、確認できていない予約を『問題ない』と断定するルールにしてはいけません。患者固有の氏名・会員ID・電話番号・予約日時は一般ルールへ入れず、必要なら『提示された本人確認情報』『予約日時』のように一般化します。今回限りの特例も一般化しません。必ずJSONのみで {\"situation\":\"どんな状況で使うか\",\"checks\":\"回答前に何を確認するか\",\"response\":\"確認結果ごとにどう回答するか\",\"exclusions\":\"他患者へ引き継がない情報\"} を返してください。";
+  const payload = {
+    inquiry: String(input && input.q || "").slice(0, 1200),
+    originalDraft: String(input && input.draft0 || "").slice(0, 1800),
+    correctionChat: sanitizeLearningChat(input && input.learningChat).slice(-12),
+    staffInstruction: String(input && input.instr || "").slice(0, 800),
+    finalReply: String(input && input.final || "").slice(0, 1800),
+    existingCandidate: String(input && input.reviewText || "").slice(0, 800),
+  };
+  try {
+    const raw = await aiChat(t, system, [{ role: "user", content: JSON.stringify(payload) }], 1200, "learning");
+    const match = String(raw || "").match(/\{[\s\S]*\}/);
+    return formatLearningProposal(match ? JSON.parse(match[0]) : null, fallback);
+  } catch (e) {
+    console.error("learning proposal:", String(e && e.message || e).slice(0, 80));
+    return fallback;
+  }
 }
 
 // 「送信しない」で対応終了した問い合わせを、次の新着への未回答質問として再利用しない。
@@ -948,6 +972,9 @@ async function learnStaffOutcome(t, c, opts) {
   const learningReview = opts.reviewScope === true ? learningReviewPayload(ex, {
     q, final: finalText, draft0, instr, reviewText: opts.reviewText, conversationId: c && c.id
   }) : null;
+  const proposalP = learningReview && opts.waitForAi !== false
+    ? proposeContextualLearningText(t, { q, final: finalText, draft0, instr, reviewText: opts.reviewText, learningChat })
+    : Promise.resolve(learningReview && learningReview.text || "");
   const conflictP = (changed ? checkConflict(t, q, finalText, ex.id) : Promise.resolve(null)).then(conflict => {
     if (!conflict) return null;
     return learningConflictAdd(t, { q, oldId: conflict.oldId, oldFinal: conflict.oldFinal, newId: ex.id, newFinal: finalText, source: opts.source || "web" });
@@ -968,10 +995,11 @@ async function learnStaffOutcome(t, c, opts) {
   }
 
   const completed = await Promise.race([
-    Promise.all([distillP, outcomeP]).then(([learnedRules, conflict]) => ({ learnedRules, conflict })),
-    new Promise((resolve) => setTimeout(() => resolve({ learnedRules: [], conflict: null }), 6000)),
+    Promise.all([distillP, outcomeP, proposalP]).then(([learnedRules, conflict, proposal]) => ({ learnedRules, conflict, proposal })),
+    new Promise((resolve) => setTimeout(() => resolve({ learnedRules: [], conflict: null, proposal: learningReview && learningReview.text || "" }), 8000)),
   ]).catch(() => ({ learnedRules: [], conflict: null }));
-  return { learnedId: ex.id, conflict: completed.conflict, learnedRules: completed.learnedRules, reused: !!ex.reused, learningReview };
+  const contextualReview = learningReview ? Object.assign({}, learningReview, { text: completed.proposal || learningReview.text }) : null;
+  return { learnedId: ex.id, conflict: completed.conflict, learnedRules: completed.learnedRules, reused: !!ex.reused, learningReview: contextualReview };
 }
 // 2つのテキストがほぼ同内容か（bigram重なり率）。ルールの二重登録ガード用。
 function similarEnough(a, b) {
@@ -5313,8 +5341,8 @@ const PAGE = `<!DOCTYPE html>
       <div style="font-size:11px;color:#64748b;line-height:1.55;">学習するを選ぶと、修正チャットを含む一連のやり取りを読み、患者固有・今回限り・共通方針・店舗ルールを右腕くんが自動で整理します。</div>
     </div>
     <div style="padding:14px 18px;">
-      <label style="display:block;font-size:11px;font-weight:700;color:#475569;">学習する内容
-        <textarea id="learningScopeText" rows="4" style="display:block;width:100%;margin-top:5px;padding:9px;border:1px solid #cbd5e1;border-radius:9px;font:12px/1.6 inherit;resize:vertical;" placeholder="今後の回答で守る内容を入力"></textarea>
+      <label style="display:block;font-size:11px;font-weight:700;color:#475569;">会話全体から整理した学習案（必要なら修正できます）
+        <textarea id="learningScopeText" rows="10" style="display:block;width:100%;margin-top:5px;padding:9px;border:1px solid #cbd5e1;border-radius:9px;font:12px/1.6 inherit;resize:vertical;" placeholder="適用する状況・確認すること・回答方針を整理しています"></textarea>
       </label>
       <div id="learningScopeHint" style="font-size:11px;color:#6d28d9;margin:7px 0 11px;">保存後も設定→学習データ管理から更新・削除できます。</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
@@ -6053,7 +6081,7 @@ async function dSend(){if(window.__dBusy)return;const x=document.getElementById(
     if(meta.ok===false||(!fin.reply&&!fin.draft))throw new Error("stream_empty");
     if(fin.reply&&meta.engine){aiEl.textContent=fin.reply+" 〔"+meta.engine+"で作成〕";logEntry.text=aiEl.textContent;}
     dHist.push({role:"assistant",content:(fin.draft||fin.reply||"").slice(0,4000)});
-    if(meta.memory){if(dSessions[current])dSessions[current].memory=meta.memory;dAdd("sysn","🧠 学習候補：「"+meta.memory+"」（患者への送信後に、今回だけ／患者だけ／同じ問い合わせ／全返信から適用範囲を選べます）");}
+    if(meta.memory){if(dSessions[current])dSessions[current].memory=meta.memory;dAdd("sysn","🧠 学習候補：「"+meta.memory+"」（患者への送信後に、会話全体から判断手順へ整理して学習するか選べます）");}
     if(meta.rule){if(dSessions[current])dSessions[current].rule=meta.rule;dAdd("sysn","📚 店舗ルール候補：「"+meta.rule.title+"」（患者への送信後に内容を確認して反映できます）");}
     if(meta.action)await dHandleBookingAction(meta.action);
   }catch(e){
@@ -6066,7 +6094,7 @@ async function dSend(){if(window.__dBusy)return;const x=document.getElementById(
         aiEl.textContent=j.reply||"できました";logEntry.text=aiEl.textContent;
         if(!cardEntry)dNewCard(j.draft);else{cardEntry.draft=j.draft;const cEl=cardEntry._el?cardEntry._el.querySelector(".c"):null;if(cEl)cEl.textContent=j.draft;}
         dHist.push({role:"assistant",content:j.draft});
-        if(j.memory){if(dSessions[current])dSessions[current].memory=j.memory;dAdd("sysn","🧠 学習候補：「"+j.memory+"」（患者への送信後に適用範囲を選べます）");}
+        if(j.memory){if(dSessions[current])dSessions[current].memory=j.memory;dAdd("sysn","🧠 学習候補：「"+j.memory+"」（患者への送信後に、会話全体から判断手順へ整理して学習するか選べます）");}
         if(j.rule){if(dSessions[current])dSessions[current].rule=j.rule;dAdd("sysn","📚 店舗ルール候補：「"+j.rule.title+"」（患者への送信後に内容を確認して反映できます）");}
         if(j.action)await dHandleBookingAction(j.action);
       }else{aiEl.textContent="エラー: "+(j.error||"不明");logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";}
