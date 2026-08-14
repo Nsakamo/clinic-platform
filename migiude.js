@@ -906,8 +906,6 @@ function recentCustomerQuestion(c) {
     .join(" ")
     .slice(0, 600);
 }
-
-// スタッフの修正をAIの推測だけで恒久化せず、送信後に適用範囲を選べる確認データへ整える。
 // 明示語は初期選択の提案にだけ使い、最終決定はスタッフが行う。
 function learningScopeSuggestion(instr) {
   const text = String(instr || "");
@@ -916,6 +914,7 @@ function learningScopeSuggestion(instr) {
   if (/(今後|以後|常に|毎回|すべての返信|全返信)/.test(text)) return "all";
   return "similar";
 }
+// スタッフの修正をAIの推測だけで恒久化せず、送信後に適用範囲を選べる確認データへ整える。
 function learningReviewPayload(ex, opts) {
   if (!ex) return null;
   const instr = String(opts && opts.instr || "").trim();
@@ -2884,6 +2883,14 @@ function publicSettings(t) {
   });
 }
 app.get("/api/settings", guard, (req, res) => res.json(publicSettings(req.tenant)));
+app.get("/api/learning-pending-count", guard, (req, res) => {
+  const jobs = learningJobs(req.tenant).filter(job => job.status === "ready");
+  res.json({
+    ok: true,
+    decisions: jobs.filter(job => job.resultType === "review").length,
+    conflicts: learningConflicts(req.tenant, true).length,
+  });
+});
 // 設定・ルール・学習例を反映した文章を、患者へ送らずに確認する品質テスト。
 app.post("/api/quality-preview", guard, async (req,res)=>{
   const t=req.tenant, inquiry=String(req.body.inquiry||"").trim().slice(0,1200), channel=req.body.channel==="mail"?"mail":"line";
@@ -4891,6 +4898,9 @@ const PAGE = `<!DOCTYPE html>
   #app{display:flex;height:100vh;height:100dvh;overflow:hidden;}
   #list{width:320px;flex-shrink:0;background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;}
   #listHead{padding:12px 14px 6px;font-weight:600;display:flex;align-items:center;justify-content:space-between;}
+  #listHeadMeta{display:flex;align-items:center;gap:7px;}
+  #learningPendingBadge{display:none;border:1px solid #f59e0b;background:#fffbeb;color:#92400e;border-radius:999px;padding:4px 8px;font-size:10.5px;font-weight:800;cursor:pointer;white-space:nowrap;}
+  #learningPendingBadge.hasConflict{border-color:#ef4444;background:#fef2f2;color:#b91c1c;}
   #tools{display:flex;gap:6px;padding:4px 12px 10px;border-bottom:1px solid var(--line);}
   .tbtn{flex:1;font-size:11px;padding:7px 2px;border:1px solid var(--line);background:#fff;border-radius:9px;cursor:pointer;white-space:nowrap;color:var(--text);}
   .tbtn:hover{background:#f9fafb;}
@@ -5214,7 +5224,7 @@ const PAGE = `<!DOCTYPE html>
 <body>
 <div id="app">
   <div id="list">
-    <div id="listHead"><span>📥 受信トレイ</span><span class="badge" id="cnt"></span></div>
+    <div id="listHead"><span>📥 受信トレイ</span><span id="listHeadMeta"><button type="button" id="learningPendingBadge" onclick="openLearningPending()"></button><span class="badge" id="cnt"></span></span></div>
     <div id="statsBar" style="display:none;padding:6px 12px;font-size:11px;color:#6b7280;background:#f8fafc;border-bottom:1px solid var(--line);line-height:1.7;"></div>
     <div id="tools">
       <button class="tbtn migi" onclick="openAsst(null)">🤝 みぎうで君</button>
@@ -5506,6 +5516,10 @@ let DATA=[];let DATA_REV=0;let DATA_READY=false;let current=null;
 const learningJobsByConversation={},shownLearningJobs=new Set();
 const roomsEl=document.getElementById("rooms"),chatEl=document.getElementById("chat"),appEl=document.getElementById("app");
 let initialConv="";try{initialConv=new URLSearchParams(location.search).get("conv")||"";}catch(e){}
+let learningPendingCounts={decisions:0,conflicts:0},learningBadgeBusy=false;
+function renderLearningPendingBadge(){const b=document.getElementById("learningPendingBadge");if(!b)return;const decisions=Number(learningPendingCounts.decisions||0),conflicts=Number(learningPendingCounts.conflicts||0),total=decisions+conflicts;b.style.display=total?"inline-block":"none";b.textContent=total?"🧠 学習確認 "+total+"件":"";b.classList.toggle("hasConflict",conflicts>0);b.title=(decisions?"学習判断待ち "+decisions+"件":"")+(decisions&&conflicts?"／":"")+(conflicts?"矛盾の確認 "+conflicts+"件":"");}
+async function refreshLearningBadge(){if(learningBadgeBusy)return;learningBadgeBusy=true;try{const r=await fetch("/api/learning-pending-count"),j=await r.json();if(r.ok&&j.ok){learningPendingCounts={decisions:Number(j.decisions||0),conflicts:Number(j.conflicts||0)};renderLearningPendingBadge();}}catch(e){}finally{learningBadgeBusy=false;}}
+async function openLearningPending(){if(learningPendingCounts.decisions>0){await pollLearningJobs();const job=Object.values(learningJobsByConversation).find(item=>item&&item.status==="ready"&&item.resultType==="review"&&item.learningReview);if(job){if(current!==job.conversationId)openChat(job.conversationId);shownLearningJobs.add(job.id);showLearningScope(Object.assign({},job.learningReview,{learningJobId:job.id}));return;}}learnTab="conflicts";openLearning();}
 async function load(){ try{ const r=await fetch(DATA_READY?("/api/conversation-updates?since="+encodeURIComponent(DATA_REV)):"/api/conversations");const j=await r.json();if(Array.isArray(j)){DATA=j;DATA_REV=DATA.reduce((m,c)=>Math.max(m,Number(c&&c._rev||c&&c.ts||0)),0);DATA_READY=true;}else if(j&&j.ok){const byId=new Map(DATA.map(c=>[c.id,c]));(j.updates||[]).forEach(c=>byId.set(c.id,c));const meta=j.meta||{};byId.forEach(c=>{c.staffLineReviewAvailable=!!meta.staffLineReviewAvailable;c.inboxOrder=meta.inboxOrder||c.inboxOrder;});const ordered=[];(j.order||[]).forEach(id=>{const c=byId.get(id);if(c){ordered.push(c);byId.delete(id);}});DATA=ordered.concat([...byId.values()]);DATA_REV=Math.max(DATA_REV,Number(j.version||0));DATA_READY=true;} }catch(e){} renderList(); if(initialConv&&!current){const target=DATA.find(x=>x.id===initialConv);if(target){const id=initialConv;initialConv="";openChat(id);try{history.replaceState(null,"",location.pathname);}catch(e){}}} if(current){ const c=DATA.find(x=>x.id===current); if(c){syncMsgs(c);renderScheduledMessages(c);} } }
 function api(path,body){ return fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); }
 const uiBusyKeys=new Set();
@@ -6026,7 +6040,7 @@ function showLearningScope(data){
   if(tx)tx.value=learningScopeData.text||learningScopeData.instr||"";
   if(hint)hint.textContent="保存後も設定→学習データ管理から更新・削除できます。";
   document.querySelectorAll("[data-learning-scope]").forEach(b=>{b.style.boxShadow="none";});
-  if(p)p.style.display="flex";
+  if(p)p.style.display="flex";refreshLearningBadge();
 }
 function closeLearningScope(){const p=document.getElementById("learningScopePop");if(p)p.style.display="none";learningScopeData=null;}
 async function saveLearningScope(scope,btn){
@@ -6036,7 +6050,7 @@ async function saveLearningScope(scope,btn){
   await withBusy("learning-scope-"+data.exampleId,btn,"保存中…",async()=>{try{
     const r=await api("/api/learning-scope",{exampleId:data.exampleId,conversationId:data.conversationId,learningJobId:data.learningJobId,scope,text}),j=await r.json();
     if(!r.ok||!j.ok)throw new Error(j.error||"save");
-    closeLearningScope();showLearnResult(j.message||"学習内容を保存しました");
+    closeLearningScope();showLearnResult(j.message||"学習内容を保存しました");refreshLearningBadge();
   }catch(e){uiAlert("学習内容を保存できませんでした。設定→学習データ管理から確認してください。");}});
 }
 function openRuleLearning(){
@@ -6316,7 +6330,7 @@ function learnCard(){const d=document.createElement("div");d.style.cssText="bord
 function setLearnStatus(text,bad){const e=document.getElementById("learnStatus");if(e){e.textContent=text||"";e.style.color=bad?"#dc2626":"#6b7280";}}
 async function reloadLearning(){
   setLearnStatus("読み込み中…");
-  try{const r=await fetch("/api/learning-data");const j=await r.json();if(!r.ok||!j.ok)throw new Error("load");LEARN={rules:j.rules||[],prefs:j.prefs||[],examples:j.examples||[],conflicts:j.conflicts||[],performance:j.performance||[]};renderLearning();setLearnStatus("");}
+  try{const r=await fetch("/api/learning-data");const j=await r.json();if(!r.ok||!j.ok)throw new Error("load");LEARN={rules:j.rules||[],prefs:j.prefs||[],examples:j.examples||[],conflicts:j.conflicts||[],performance:j.performance||[]};learningPendingCounts.conflicts=LEARN.conflicts.length;renderLearningPendingBadge();renderLearning();setLearnStatus("");}
   catch(e){setLearnStatus("学習データを読み込めませんでした",true);}
 }
 function openLearning(){document.getElementById("learnManagePop").style.display="flex";reloadLearning();}
@@ -6361,7 +6375,7 @@ function renderLearnConflict(list,item){
 }
 async function resolveLearningConflict(id,mode,final){
   if(mode==="custom"&&!String(final||"").trim()){uiAlert("今後使う正しい回答を入力してください");return;}
-  setLearnStatus("学習内容を更新しています…");try{const r=await api("/api/learning-conflict-resolve",{id,mode,final}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");await reloadLearning();setLearnStatus("今後の正解を更新しました");const s=document.getElementById("learningConflictSummary");if(s)s.textContent=j.pending?" ⚠ 学習確認待ち "+j.pending+"件":"";}catch(e){setLearnStatus("更新できませんでした",true);}
+  setLearnStatus("学習内容を更新しています…");try{const r=await api("/api/learning-conflict-resolve",{id,mode,final}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");await reloadLearning();setLearnStatus("今後の正解を更新しました");const s=document.getElementById("learningConflictSummary");if(s)s.textContent=j.pending?" ⚠ 矛盾の確認 "+j.pending+"件":"";}catch(e){setLearnStatus("更新できませんでした",true);}
 }
 async function learnMutate(path,body,done){
   setLearnStatus("保存中…");try{const r=await api(path,body);const j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error(j.error||"save");await reloadLearning();setLearnStatus(done||"保存しました");setTimeout(()=>{const e=document.getElementById("learnStatus");if(e&&e.textContent===done)e.textContent="";},1800);}
@@ -6561,7 +6575,7 @@ async function refreshModelAlert(){
 }
 // 自動化ダッシュボード帯（直近7日の自動対応状況）。起動時＋5分ごとに更新。
 async function loadStats(){try{const r=await fetch("/api/stats");const j=await r.json();if(!j||!j.ok)return;const w=j.week||{};const el=document.getElementById("statsBar");if(!el)return;const rate=(w.autoRate==null)?"—":(w.autoRate+"%");el.innerHTML="📊 直近7日：問い合わせ <b>"+(w.in||0)+"</b> 件 ・ AI自動返信率 <b>"+rate+"</b>（"+(w.auto||0)+"件）・ スタッフ返信 <b>"+(w.staff||0)+"</b> 件 ・ 学習ルール <b>+"+(w.rules||0)+"</b> 件";el.style.display="block";}catch(e){}}
-load(); setInterval(load, 6000); pollLearningJobs(); setInterval(pollLearningJobs, 2500); refreshModelAlert(); loadStats(); setInterval(loadStats, 300000);
+load(); setInterval(load, 6000); pollLearningJobs(); setInterval(pollLearningJobs, 2500); refreshLearningBadge(); setInterval(refreshLearningBadge,15000); refreshModelAlert(); loadStats(); setInterval(loadStats, 300000);
 </script>
 </body>
 </html>`;

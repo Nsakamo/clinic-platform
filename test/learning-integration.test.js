@@ -108,6 +108,18 @@ test("Web送信後はスタッフが学習するかを2択で決め、AIが用�
   assert.match(source, /右腕くんとの修正チャット/);
 });
 
+test("受信画面に未処理の学習確認件数を常時表示し、学習案または矛盾確認へ移動する", () => {
+  assert.match(source, /app\.get\("\/api\/learning-pending-count", guard/);
+  assert.match(source, /job\.status === "ready"/);
+  assert.match(source, /job\.resultType === "review"/);
+  assert.match(source, /id="learningPendingBadge"/);
+  assert.match(source, /🧠 学習確認 "\+total\+"件/);
+  assert.match(source, /async function openLearningPending\(\)/);
+  assert.match(source, /showLearningScope\(Object\.assign/);
+  assert.match(source, /learnTab="conflicts";openLearning\(\)/);
+  assert.match(source, /setInterval\(refreshLearningBadge,15000\)/);
+});
+
 test("文章作成中の学習候補は送信後の確認前に恒久保存しない", () => {
   assert.match(source, /文章作成中は学習候補の抽出だけ行う/);
   assert.match(source, /学習候補：「"\+meta\.memory/);
