@@ -81,7 +81,8 @@ test("矛盾した回答を永続的な学習確認待ちへ保存して解決�
   assert.match(source, /pendingIds\.has\(Number\(example\.id\)\)/);
   assert.match(source, /filter\(example => Number\(example\.id\) !== Number\(excludeId\)/);
   assert.match(source, /outcomeP\.then\(conflict => conflict \? \[\] : distillRules/);
-  assert.match(source, /if \(chosen\) await distillRules/);
+  assert.match(source, /if \(chosen && item\.kind !== "rule"\) await distillRules/);
+  assert.match(source, /checkFormalRuleConflict/);
 });
 
 test("スタッフの修正過程を構造化した判断メモリとして保存して再利用する", () => {
@@ -93,34 +94,29 @@ test("スタッフの修正過程を構造化した判断メモリとして保�
   assert.match(source, /学習した判断:/);
 });
 
-test("Web送信後は学習する・しないの2択で確定し、保留内容を永続化する", () => {
+test("Web送信後はスタッフが学習するかを2択で決め、AIが用途別に整理する", () => {
   assert.match(source, /reviewScope: true/);
-  assert.match(source, /config\.learningDecisions/);
-  assert.match(source, /learningDecisionAdd\(t, ex, learningReview\)/);
   assert.match(source, /app\.post\("\/api\/learning-scope", guard/);
-  assert.match(source, /\["none", "learn"\]/);
+  assert.match(source, /\["none", "learn", "patient", "similar", "all"\]/);
   assert.match(source, /今回の対応を学習しますか？/);
   assert.match(source, /学習する[\s\S]{0,300}学習しない/);
-  assert.doesNotMatch(source, /今回だけ[\s\S]{0,300}この患者だけ[\s\S]{0,300}同じ問い合わせ[\s\S]{0,300}今後の全返信/);
-  assert.match(source, /data-tab="decisions"/);
-  assert.match(source, /学習判断待ち/);
-  assert.match(source, /function learningConversationContext/);
-  assert.match(source, /【今回の話題に関する直近の会話】/);
-  assert.match(source, /opts\.reviewScope === true && ex\.reused/);
+  assert.match(source, /proposeContextualLearningText/);
+  assert.match(source, /会話全体から整理した学習案/);
+  assert.doesNotMatch(source, /患者への送信後に、今回だけ／患者だけ／同じ問い合わせ／全返信から適用範囲を選べます/);
+  assert.match(source, /AIのone_off判定だけで捨てない/);
+  assert.match(source, /learningChat:learning\.learningChat/);
+  assert.match(source, /右腕くんとの修正チャット/);
 });
 
-test("学習判断待ちと矛盾中の対応例は下書き生成から除外する", () => {
-  assert.match(source, /learningDecisions\(t, true\)\.map\(item => Number\(item\.exampleId\)\)/);
-  assert.match(source, /applyRules: false/);
-  assert.match(source, /既存内容と食い違う場合は自動上書きせず/);
-});
-
-test("受信画面に未処理の学習確認件数を常時表示し、該当タブへ直接移動する", () => {
+test("受信画面に未処理の学習確認件数を常時表示し、学習案または矛盾確認へ移動する", () => {
   assert.match(source, /app\.get\("\/api\/learning-pending-count", guard/);
+  assert.match(source, /job\.status === "ready"/);
+  assert.match(source, /job\.resultType === "review"/);
   assert.match(source, /id="learningPendingBadge"/);
   assert.match(source, /🧠 学習確認 "\+total\+"件/);
-  assert.match(source, /function openLearningPending\(\)/);
-  assert.match(source, /learningPendingCounts\.decisions>0\?"decisions":"conflicts"/);
+  assert.match(source, /async function openLearningPending\(\)/);
+  assert.match(source, /showLearningScope\(Object\.assign/);
+  assert.match(source, /learnTab="conflicts";openLearning\(\)/);
   assert.match(source, /setInterval\(refreshLearningBadge,15000\)/);
 });
 

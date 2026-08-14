@@ -14,6 +14,9 @@ const { evaluateResponseGrounding } = require("./lib/response-grounding");
 const { compareConversations, compareConversationsRecent } = require("./lib/conversation-order");
 const { MAX_ATTACHMENTS, normalizeFileIds, normalizeScheduledMessageInput, pruneScheduledMessages } = require("./lib/scheduled-message");
 const { lineWebhookEventId, lineWebhookRetryDelay, isProcessableLineEvent } = require("./lib/line-webhook-queue");
+const { normalizeAiRoutes, resolveAiRoute, publicModelCatalog } = require("./lib/ai-model-router");
+const { contextualLearningFallback, formatLearningProposal } = require("./lib/learning-context");
+const { selectConversationContext } = require("./lib/conversation-context");
 const app = express();
 app.use(express.json({ limit: "16mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: false, limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
@@ -67,8 +70,8 @@ const TEN = {};
 function newTenant(slug, name, config) {
   config = config || {};
   if (!config.conn || typeof config.conn !== "object") config.conn = {};
-  if (!config.settings || typeof config.settings !== "object") config.settings = { autoReply: false, level: "high", tone: "", autoDelayMin: 0, engine: "gemini" };
-  if (!["claude", "gpt", "gemini"].includes(config.settings.engine)) config.settings.engine = "gemini"; // 文章作成の既定はGemini
+  if (!config.settings || typeof config.settings !== "object") config.settings = { autoReply: false, level: "high", tone: "", autoDelayMin: 0, engine: "gpt" };
+  if (!["claude", "gpt", "gemini"].includes(config.settings.engine)) config.settings.engine = "gpt"; // 文章作成の既定はGPT-5.6用途別ルーター
   if (typeof config.settings.autoReply !== "boolean") config.settings.autoReply = false;
   if (!["unanswered_first", "recent"].includes(config.settings.inboxOrder)) config.settings.inboxOrder = "unanswered_first";
   if (config.settings.level !== "high" && config.settings.level !== "medium") config.settings.level = "high";
@@ -76,7 +79,9 @@ function newTenant(slug, name, config) {
   if (typeof config.settings.autoDelayMin !== "number" || !isFinite(config.settings.autoDelayMin) || config.settings.autoDelayMin < 0) config.settings.autoDelayMin = 0;
   config.settings.autoDelayMin = Math.min(60, Math.round(config.settings.autoDelayMin)); // 自動返信までの待ち時間（分）。0=即時, 上限60
   if (!Array.isArray(config.settings.prefs)) config.settings.prefs = []; // 全体の返信方針（全返信に効く恒久ルール）
+  config.settings.aiRoutes = normalizeAiRoutes(config.settings.aiRoutes, configuredExtraOpenAiModels());
   if (!Array.isArray(config.learningConflicts)) config.learningConflicts = []; // 過去回答と新回答の矛盾確認待ち
+  if (!Array.isArray(config.learningJobs)) config.learningJobs = []; // 送信後にバックグラウンドで整理する学習確認
   if (!config.learningPerformance || typeof config.learningPerformance !== "object" || Array.isArray(config.learningPerformance)) config.learningPerformance = {}; // 問い合わせ種類ごとの承認・修正実績
   if (typeof config.settings.bookingActions !== "boolean") config.settings.bookingActions = false; // 予約自動受付（うけつけるん連携でのキャンセル・変更・LINE連携）。既定OFF
   if (typeof config.settings.staffLineEnabled !== "boolean") config.settings.staffLineEnabled = false;
@@ -149,6 +154,7 @@ async function dbInit() {
   await pool.query("ALTER TABLE examples ADD COLUMN IF NOT EXISTS source text DEFAULT 'web'");
   await pool.query("ALTER TABLE examples ADD COLUMN IF NOT EXISTS confirmed_count int DEFAULT 1");
   await pool.query("ALTER TABLE examples ADD COLUMN IF NOT EXISTS learning_meta jsonb DEFAULT '{}'::jsonb");
+  await pool.query("ALTER TABLE examples ADD COLUMN IF NOT EXISTS learning_chat jsonb DEFAULT '[]'::jsonb");
   await pool.query("CREATE TABLE IF NOT EXISTS alerts (id serial primary key, tenant text, type text, summary text, name text, ts bigint, done boolean default false)");
   await pool.query("CREATE TABLE IF NOT EXISTS files (id text primary key, tenant text, name text, mime text, data bytea, ts bigint)");
   await pool.query("CREATE TABLE IF NOT EXISTS push_subs (tenant text, endpoint text primary key, sub jsonb)");
@@ -164,8 +170,8 @@ async function dbInit() {
     cv.rows.forEach(x => { const c = x.data; if (c && c.id) { c._rev = Number(c._rev || c.ts || 0); t.store[c.id] = c; t._convRev = Math.max(Number(t._convRev || 0), c._rev); } });
     const ru = await pool.query("SELECT id,title,content,updated FROM rules WHERE tenant=$1 ORDER BY id", [slug]);
     ru.rows.forEach(x => { t.rules[x.id] = { id: x.id, title: x.title, content: x.content, updated: Number(x.updated || 0) }; if (x.id >= t.ruleSeq) t.ruleSeq = x.id + 1; });
-    const ex = await pool.query("SELECT id,q,final,draft0,instr,ts,source,confirmed_count,learning_meta FROM examples WHERE tenant=$1 ORDER BY id DESC LIMIT 500", [slug]);
-    ex.rows.forEach(x => { t.examples[x.id] = { id: x.id, q: x.q, final: x.final, draft0: x.draft0, instr: x.instr, ts: Number(x.ts), source: x.source || "web", confirmedCount: Math.max(1, Number(x.confirmed_count || 1)), learningMeta: sanitizeLearningMeta(x.learning_meta) }; if (x.id >= t.exampleSeq) t.exampleSeq = x.id + 1; });
+    const ex = await pool.query("SELECT id,q,final,draft0,instr,ts,source,confirmed_count,learning_meta,learning_chat FROM examples WHERE tenant=$1 ORDER BY id DESC LIMIT 500", [slug]);
+    ex.rows.forEach(x => { t.examples[x.id] = { id: x.id, q: x.q, final: x.final, draft0: x.draft0, instr: x.instr, ts: Number(x.ts), source: x.source || "web", confirmedCount: Math.max(1, Number(x.confirmed_count || 1)), learningMeta: sanitizeLearningMeta(x.learning_meta), learningChat: sanitizeLearningChat(x.learning_chat) }; if (x.id >= t.exampleSeq) t.exampleSeq = x.id + 1; });
     await ensureLearningPerformanceSeeded(t);
     const al = await pool.query("SELECT id,type,summary,name,ts,done FROM alerts WHERE tenant=$1 ORDER BY ts DESC LIMIT 200", [slug]);
     t.alerts = al.rows.map(x => ({ id: x.id, type: x.type, summary: x.summary, name: x.name, ts: Number(x.ts), done: x.done }));
@@ -336,7 +342,7 @@ async function staffLineSummary(t, c) {
   const history = staffLineHistoryText(c);
   if (!history) return "新しい問い合わせです。";
   try {
-    const out = await aiChat(t, "患者との会話をスタッフが30秒で把握できるよう、事実だけを日本語で3文以内に要約する。医療判断や推測はしない。患者への返信文は書かない。", [{ role: "user", content: history }], 300);
+    const out = await aiChat(t, "患者との会話をスタッフが30秒で把握できるよう、事実だけを日本語で3文以内に要約する。医療判断や推測はしない。患者への返信文は書かない。", [{ role: "user", content: history }], 300, "summarize");
     if (out) return String(out).trim().slice(0, 1200);
   } catch (e) {}
   return history.slice(-1200);
@@ -423,7 +429,7 @@ async function staffLineReviseDraft(t, c, instruction) {
   let booking = ""; try { booking = await fetchBooking(t, c); } catch (e) {}
   const sys = "あなたは店舗の受付スタッフ。会話、現在の返信案、スタッフの修正指示を踏まえ、患者へ送る返信本文だけを作る。医療判断や情報の推測はしない。" + (booking ? "\n予約システムの確認結果:\n" + booking : "");
   const content = "会話:\n" + history + "\n\n現在の返信案:\n" + String(c.draft || "") + "\n\nスタッフの修正指示:\n" + String(instruction || "").slice(0, 1200);
-  const out = await aiChat(t, sys, [{ role: "user", content }], 1800);
+  const out = await aiChat(t, sys, [{ role: "user", content }], 1800, "chat");
   return String(out || "").trim();
 }
 const staffLineInFlight = new Set();
@@ -666,6 +672,9 @@ function sanitizeLearningMeta(value) {
     updated: Math.max(0, Number(m.updated || 0)),
   };
 }
+function sanitizeLearningChat(value) {
+  return (Array.isArray(value) ? value : []).slice(-20).filter(item => item && ["user", "assistant"].includes(item.role)).map(item => ({ role: item.role, content: String(item.content || "").slice(0, 3000) }));
+}
 function learningMetaSearchText(example) {
   const m = sanitizeLearningMeta(example && example.learningMeta);
   return [example && example.q, m.intent, m.decision, m.conditions, m.searchTerms.join(" ")].filter(Boolean).join(" ").slice(0, 1800);
@@ -740,18 +749,19 @@ async function exampleAdd(t, obj) {
     duplicate.draft0 = String(obj.draft0 || duplicate.draft0 || "").slice(0, 1500);
     duplicate.instr = String(obj.instr || duplicate.instr || "").slice(0, 800);
     duplicate.source = String(obj.source || duplicate.source || "web").slice(0, 40);
+    duplicate.learningChat = sanitizeLearningChat(obj.learningChat && obj.learningChat.length ? obj.learningChat : duplicate.learningChat);
     duplicate.confirmedCount = Math.max(1, Number(duplicate.confirmedCount || 1)) + 1;
     duplicate.ts = Date.now();
     if (pool) {
-      try { await pool.query("UPDATE examples SET q=$1,final=$2,draft0=$3,instr=$4,ts=$5,source=$6,confirmed_count=$7,learning_meta=$8 WHERE tenant=$9 AND id=$10", [duplicate.q, duplicate.final, duplicate.draft0, duplicate.instr, duplicate.ts, duplicate.source, duplicate.confirmedCount, sanitizeLearningMeta(duplicate.learningMeta), t.slug, duplicate.id]); }
+      try { await pool.query("UPDATE examples SET q=$1,final=$2,draft0=$3,instr=$4,ts=$5,source=$6,confirmed_count=$7,learning_meta=$8,learning_chat=$9 WHERE tenant=$10 AND id=$11", [duplicate.q, duplicate.final, duplicate.draft0, duplicate.instr, duplicate.ts, duplicate.source, duplicate.confirmedCount, sanitizeLearningMeta(duplicate.learningMeta), duplicate.learningChat, t.slug, duplicate.id]); }
       catch (e) { console.error("exampleAdd update:", e.message); }
     }
     return { ...duplicate, reused: true };
   }
   const id = t.exampleSeq++;
-  const ex = { id, q, final, draft0: String(obj.draft0 || "").slice(0, 1500), instr: String(obj.instr || "").slice(0, 800), ts: Date.now(), source: String(obj.source || "web").slice(0, 40), confirmedCount: 1, learningMeta: sanitizeLearningMeta(obj.learningMeta) };
+  const ex = { id, q, final, draft0: String(obj.draft0 || "").slice(0, 1500), instr: String(obj.instr || "").slice(0, 800), ts: Date.now(), source: String(obj.source || "web").slice(0, 40), confirmedCount: 1, learningMeta: sanitizeLearningMeta(obj.learningMeta), learningChat: sanitizeLearningChat(obj.learningChat) };
   t.examples[id] = ex;
-  if (pool) { try { await pool.query("INSERT INTO examples (tenant,id,q,final,draft0,instr,ts,source,confirmed_count,learning_meta) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)", [t.slug, id, ex.q, ex.final, ex.draft0, ex.instr, ex.ts, ex.source, ex.confirmedCount, ex.learningMeta]); } catch (e) { console.error("exampleAdd:", e.message); } }
+  if (pool) { try { await pool.query("INSERT INTO examples (tenant,id,q,final,draft0,instr,ts,source,confirmed_count,learning_meta,learning_chat) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)", [t.slug, id, ex.q, ex.final, ex.draft0, ex.instr, ex.ts, ex.source, ex.confirmedCount, ex.learningMeta, ex.learningChat]); } catch (e) { console.error("exampleAdd:", e.message); } }
   const ids = Object.keys(t.examples).map(Number).sort((a, b) => a - b);
   while (ids.length > EXAMPLE_MAX) { const old = ids.shift(); delete t.examples[old]; if (pool) pool.query("DELETE FROM examples WHERE tenant=$1 AND id=$2", [t.slug, old]).catch(() => {}); }
   return ex;
@@ -762,10 +772,7 @@ function prefsBlock(t) {
   return a.map(p => (typeof p === "string" ? p : (p && p.text) || "")).filter(Boolean).map(s => "・" + s).join("\n");
 }
 function examplesRanked(t, query, k, context) {
-  const pendingIds = new Set([
-    ...learningConflicts(t, true).flatMap(item => [Number(item.oldId), Number(item.newId)]),
-    ...learningDecisions(t, true).map(item => Number(item.exampleId)),
-  ]);
+  const pendingIds = new Set(learningConflicts(t, true).flatMap(item => item.kind === "rule" ? [Number(item.newId)] : [Number(item.oldId), Number(item.newId)]));
   // 構造化した問い合わせ意図・判断・検索語も検索対象にし、表現が違う質問から同じ対応を取り出す。
   const list = Object.values(t.examples || {}).filter(example => !pendingIds.has(Number(example.id))).map(example => Object.assign({}, example, { originalQ: example.q, q: learningMetaSearchText(example) }));
   if (!list.length) return [];
@@ -782,10 +789,7 @@ function trustedLearningPrecedent(example) {
 async function checkConflict(t, q, newFinal, excludeId) {
   // 新しい例を先に保存した後で検索するため、ランキング前に除外する。
   // ランキング後に除外すると類似例の重複排除で古い回答まで消え、矛盾を見逃す。
-  const pendingIds = new Set([
-    ...learningConflicts(t, true).flatMap(item => [Number(item.oldId), Number(item.newId)]),
-    ...learningDecisions(t, true).map(item => Number(item.exampleId)),
-  ]);
+  const pendingIds = new Set(learningConflicts(t, true).flatMap(item => item.kind === "rule" ? [Number(item.newId)] : [Number(item.oldId), Number(item.newId)]));
   const candidates = Object.values(t.examples || {}).filter(example => Number(example.id) !== Number(excludeId) && !pendingIds.has(Number(example.id))).map(example => Object.assign({}, example, { originalQ: example.q, q: learningMetaSearchText(example) }));
   const cand = rankLearningExamples(candidates, { latest: q, context: q }, 3);
   if (!cand.length) return null;
@@ -793,7 +797,7 @@ async function checkConflict(t, q, newFinal, excludeId) {
   const sys = "2つの『お客様への返信』が、同じ種類の問い合わせに対して“事実・方針”で食い違うかだけを判定する。言い回し・丁寧さ・長さの違いは食い違いではない。料金・可否・日数・場所・有無・条件などの内容が矛盾する場合のみ conflict=true。質問の種類が違う場合や、単に情報が増えただけ・補足しただけの場合は false。出力はJSONのみ: {\"conflict\":true|false}";
   const u = "【過去】お客様: " + String(old.originalQ || old.q).slice(0, 200) + "\n返信: " + String(old.final).slice(0, 500) + "\n\n【今回】お客様: " + String(q).slice(0, 200) + "\n返信: " + String(newFinal).slice(0, 500);
   try {
-    const raw = await aiChat(t, sys, [{ role: "user", content: u }], 100);
+    const raw = await aiChat(t, sys, [{ role: "user", content: u }], 100, "critical");
     const m = raw && raw.match(/\{[\s\S]*\}/);
     const o = m ? JSON.parse(m[0]) : {};
     if (o && o.conflict === true) return { oldId: old.id, oldQ: old.originalQ || old.q, oldFinal: old.final };
@@ -804,41 +808,14 @@ function learningConflicts(t, pendingOnly) {
   const list = Array.isArray(t.config.learningConflicts) ? t.config.learningConflicts : (t.config.learningConflicts = []);
   return list.filter(item => item && (!pendingOnly || item.status === "pending")).sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
 }
-function learningDecisions(t, pendingOnly) {
-  const list = Array.isArray(t.config.learningDecisions) ? t.config.learningDecisions : (t.config.learningDecisions = []);
-  return list.filter(item => item && (!pendingOnly || item.status === "pending")).sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
-}
-async function learningDecisionAdd(t, ex, payload) {
-  if (!ex) return null;
-  let item = learningDecisions(t, true).find(row => Number(row.exampleId) === Number(ex.id));
-  if (!item) {
-    item = {
-      id: "ld-" + Date.now().toString(36) + "-" + crypto.randomBytes(3).toString("hex"),
-      exampleId: Number(ex.id), conversationId: String(payload && payload.conversationId || ""),
-      context: String(payload && payload.context || "").slice(0, 4000),
-      status: "pending", createdAt: Date.now(), resolvedAt: 0, resolution: "",
-    };
-    t.config.learningDecisions.push(item);
-  } else {
-    item.conversationId = String(payload && payload.conversationId || item.conversationId || "");
-    item.context = String(payload && payload.context || item.context || "").slice(0, 4000);
-    item.createdAt = Date.now();
-  }
-  while (t.config.learningDecisions.length > 200) t.config.learningDecisions.shift();
-  await saveTenantConfig(t);
-  return item;
-}
-async function learningDecisionResolve(t, item, resolution) {
-  if (!item) return;
-  item.status = "resolved"; item.resolution = String(resolution || ""); item.resolvedAt = Date.now();
-  await saveTenantConfig(t);
-}
 async function learningConflictAdd(t, data) {
   if (!data || !data.oldId || !data.newId) return null;
-  const existing = learningConflicts(t, true).find(item => Number(item.oldId) === Number(data.oldId) && Number(item.newId) === Number(data.newId));
+  const kind = data.kind === "rule" ? "rule" : "example";
+  const existing = learningConflicts(t, true).find(item => (item.kind || "example") === kind && Number(item.oldId) === Number(data.oldId) && Number(item.newId) === Number(data.newId));
   if (existing) return existing;
   const item = {
     id: "lc-" + Date.now().toString(36) + "-" + crypto.randomBytes(3).toString("hex"),
+    kind: data.kind === "rule" ? "rule" : "example", oldRuleId: data.kind === "rule" ? Number(data.oldRuleId || data.oldId) : 0,
     q: String(data.q || "").slice(0, 800), oldId: Number(data.oldId), oldFinal: String(data.oldFinal || "").slice(0, 1500),
     newId: Number(data.newId), newFinal: String(data.newFinal || "").slice(0, 1500), source: String(data.source || "web").slice(0, 40),
     status: "pending", createdAt: Date.now(), resolvedAt: 0, resolution: "",
@@ -847,6 +824,12 @@ async function learningConflictAdd(t, data) {
   while (t.config.learningConflicts.length > 100) t.config.learningConflicts.shift();
   try { await saveTenantConfig(t); } catch (e) { console.error("learningConflictAdd:", e && e.message); }
   return item;
+}
+function publicLearningConflict(item) {
+  return item ? {
+    id: item.id, kind: item.kind || "example", q: item.q, oldId: item.oldId, oldRuleId: item.oldRuleId || 0,
+    oldFinal: item.oldFinal, newId: item.newId, newFinal: item.newFinal,
+  } : null;
 }
 async function exampleDelete(t, id) {
   id = Number(id); if (!id || !(t.examples && t.examples[id])) return false;
@@ -866,6 +849,7 @@ async function distillRules(t, c, opts) {
     const related = rulesSearch(t, q + " " + finalText, 8);
     const relatedTxt = related.length ? related.map(r => "[ID:" + r.id + " / 更新:" + (Number(r.updated || 0) ? new Date(Number(r.updated)).toLocaleDateString("ja-JP") : "不明") + "] " + r.title + ": " + String(r.content).slice(0, 200)).join("\n") : "（関連ルールなし）";
     const instrTxt = String((opts && opts.instr) || "").slice(0, 800);
+    const learningChatTxt = sanitizeLearningChat(opts && opts.learningChat).map(item => (item.role === "user" ? "スタッフ" : "右腕くん") + ": " + item.content).join("\n").slice(0, 12000);
     const notesTxt = notesBlock(c);
     const sys = "あなたはクリニック受付のナレッジ管理者。スタッフが患者に送った返信、AIの初回下書き、スタッフの修正指示、最終返信から、店舗ルールと再利用できる判断手順を構造化する。"
       + "\n抽出してよいもの: 料金・所要時間・可否（できる/できない）・場所・アクセス・持ち物・営業/受付時間・支払い方法・案内先（URL/窓口）・手順・キャンセルや変更の規定など、誰に聞かれても毎回同じ答えになる情報。"
@@ -876,17 +860,16 @@ async function distillRules(t, c, opts) {
       + "\n出力は必ず次のJSONのみ: {\"rules\":[{\"action\":\"add|update\",\"targetId\":数値またはnull,\"title\":\"短い見出し\",\"content\":\"事実を簡潔に\"}],\"memory\":{\"scope\":\"reusable|one_off\",\"intent\":\"問い合わせの種類\",\"decision\":\"回答時に取る判断・案内手順\",\"conditions\":\"適用条件\",\"avoid\":\"避ける回答\",\"searchTerms\":[\"言い換え\"]}}"
       + "\nルールは最大2件。確実な店舗事実が無ければrulesは空配列。判断手順を安全に一般化できなければmemory.scopeをone_offにする。";
     const u = "【患者の問い合わせ】\n" + (q || "（なし）")
-      + ((opts && opts.context) ? "\n\n【今回の話題に関する直近の会話】\n" + String(opts.context).slice(0, 4000) : "")
       + ((opts && opts.draft0) ? "\n\n【AIの初回下書き】\n" + String(opts.draft0).slice(0, 1500) : "")
       + "\n\n【スタッフが実際に送った返信】\n" + finalText
       + (instrTxt ? "\n\n【スタッフが返信作成時に出した指示（ここに事実が含まれることが多い）】\n" + instrTxt : "")
+      + (learningChatTxt ? "\n\n【返信を作るまでの右腕くんとの修正チャット（指示・質問・回答の流れも学習判断に使う）】\n" + learningChatTxt : "")
       + (notesTxt ? "\n\n【この会話でのスタッフ指示メモ】\n" + notesTxt : "")
       + "\n\n【既存の関連ルール】\n" + relatedTxt;
-    const raw = await aiChat(t, sys, [{ role: "user", content: u }], 1500);
+    const raw = await aiChat(t, sys, [{ role: "user", content: u }], 1500, "learning");
     if (!raw) return [];
     let out = null; try { const m = raw.match(/\{[\s\S]*\}/); out = JSON.parse(m ? m[0] : raw); } catch (e) { console.error("distillRules parse:", String(raw).slice(0, 120)); return []; }
-    // 明示確認後の対応例整理では、正式な店舗ルールを黙って変更せず、判断メモリだけを構造化する。
-    const items = opts && opts.applyRules === false ? [] : (Array.isArray(out && out.rules) ? out.rules : []).slice(0, 2);
+    const items = (Array.isArray(out && out.rules) ? out.rules : []).slice(0, 2);
     const applied = [];
     for (const it of items) {
       const title = String((it && it.title) || "").trim().slice(0, 100);
@@ -923,20 +906,23 @@ function recentCustomerQuestion(c) {
     .join(" ")
     .slice(0, 600);
 }
-function learningConversationContext(c) {
-  return activeConversationMessages(c).slice(-12).map(message => {
-    const role = message && message.from === "them" ? "患者" : "スタッフ";
-    return role + ": " + String(message && message.text || "").trim().slice(0, 600);
-  }).filter(line => !/: $/.test(line)).join("\n").slice(0, 4000);
+// 明示語は初期選択の提案にだけ使い、最終決定はスタッフが行う。
+function learningScopeSuggestion(instr) {
+  const text = String(instr || "");
+  if (/(今回は|今回だけ|今だけ|一旦|とりあえず|この返信だけ)/.test(text)) return "none";
+  if (/(この患者|この方|このお客様|この人|この会話)/.test(text)) return "patient";
+  if (/(今後|以後|常に|毎回|すべての返信|全返信)/.test(text)) return "all";
+  return "similar";
 }
-
-// スタッフの修正をAIの推測だけで恒久化せず、送信後に「学習する／しない」を選べる確認データへ整える。
+// スタッフの修正をAIの推測だけで恒久化せず、送信後に適用範囲を選べる確認データへ整える。
 function learningReviewPayload(ex, opts) {
   if (!ex) return null;
   const instr = String(opts && opts.instr || "").trim();
   const changed = String(opts && opts.final || "").trim() !== String(opts && opts.draft0 || "").trim() || !!instr;
   if (!changed) return null;
-  const text = String(opts && opts.reviewText || "").trim() || instr || "この種類の問い合わせでは、スタッフが実際に送った回答内容と案内順序を今後の基準にする";
+  // 「大丈夫」「短く」などの短い修正指示を、そのまま独立した学習ルールとして表示・保存しない。
+  // 問い合わせと最終回答を含む文脈から、適用条件・確認事項・回答方針へ組み直す。
+  const text = contextualLearningFallback({ q: opts && opts.q, final: opts && opts.final, instr, reviewText: opts && opts.reviewText });
   return {
     exampleId: Number(ex.id),
     conversationId: String(opts && opts.conversationId || ""),
@@ -944,17 +930,36 @@ function learningReviewPayload(ex, opts) {
     final: String(opts && opts.final || "").slice(0, 1500),
     draft0: String(opts && opts.draft0 || "").slice(0, 1500),
     instr: instr.slice(0, 800),
-    text: text.slice(0, 800),
-    context: String(opts && opts.context || "").slice(0, 4000),
+    text: text.slice(0, 2400),
+    suggestedScope: learningScopeSuggestion(instr),
   };
+}
+
+async function proposeContextualLearningText(t, input) {
+  const fallback = contextualLearningFallback(input);
+  const system = "あなたはクリニック受付AIの学習設計者です。スタッフの短い修正語だけを覚えず、患者の問い合わせ、元の下書き、修正チャット、実際に送った最終返信の流れを読み、次回再利用できる判断手順へ一般化してください。予約確認では、確認できていない予約を『問題ない』と断定するルールにしてはいけません。患者固有の氏名・会員ID・電話番号・予約日時は一般ルールへ入れず、必要なら『提示された本人確認情報』『予約日時』のように一般化します。今回限りの特例も一般化しません。必ずJSONのみで {\"situation\":\"どんな状況で使うか\",\"checks\":\"回答前に何を確認するか\",\"response\":\"確認結果ごとにどう回答するか\",\"exclusions\":\"他患者へ引き継がない情報\"} を返してください。";
+  const payload = {
+    inquiry: String(input && input.q || "").slice(0, 1200),
+    originalDraft: String(input && input.draft0 || "").slice(0, 1800),
+    correctionChat: sanitizeLearningChat(input && input.learningChat).slice(-12),
+    staffInstruction: String(input && input.instr || "").slice(0, 800),
+    finalReply: String(input && input.final || "").slice(0, 1800),
+    existingCandidate: String(input && input.reviewText || "").slice(0, 800),
+  };
+  try {
+    const raw = await aiChat(t, system, [{ role: "user", content: JSON.stringify(payload) }], 1200, "learning");
+    const match = String(raw || "").match(/\{[\s\S]*\}/);
+    return formatLearningProposal(match ? JSON.parse(match[0]) : null, fallback);
+  } catch (e) {
+    console.error("learning proposal:", String(e && e.message || e).slice(0, 80));
+    return fallback;
+  }
 }
 
 // 「送信しない」で対応終了した問い合わせを、次の新着への未回答質問として再利用しない。
 // 会話履歴自体は監査・閲覧用に残し、AIへ渡す作業中の文脈だけを区切る。
 function activeConversationMessages(c) {
-  const msgs = c && Array.isArray(c.msgs) ? c.msgs : [];
-  const start = Math.min(msgs.length, Math.max(0, Number(c && c.handledThroughIndex) || 0));
-  return msgs.slice(start);
+  return selectConversationContext(c, { maxCurrent: 30, maxOlder: 12 }).current;
 }
 
 // Web画面・スタッフLINEのどちらから送っても、同じ経路で「人が確認した返信」を学習する。
@@ -967,20 +972,16 @@ async function learnStaffOutcome(t, c, opts) {
   const instr = String(opts.instr || "").trim();
   if (!q || !finalText) return { learnedId: null, conflict: null, learnedRules: [] };
 
-  const ex = await exampleAdd(t, { q, final: finalText, draft0, instr, source: opts.source || "web" });
+  const learningChat = sanitizeLearningChat(opts.learningChat);
+  const ex = await exampleAdd(t, { q, final: finalText, draft0, instr, learningChat, source: opts.source || "web" });
   if (!ex) return { learnedId: null, conflict: null, learnedRules: [] };
   const changed = finalText !== draft0 || !!instr;
-  // すでに同じ質問・同じ最終返信が学習済みなら、新しい知識ではないため再確認や削除対象にしない。
-  if (opts.reviewScope === true && ex.reused) return { learnedId: ex.id, conflict: null, learnedRules: [], reused: true, learningReview: null };
   const learningReview = opts.reviewScope === true ? learningReviewPayload(ex, {
-    q, final: finalText, draft0, instr, reviewText: opts.reviewText, conversationId: c && c.id, context: learningConversationContext(c)
+    q, final: finalText, draft0, instr, reviewText: opts.reviewText, conversationId: c && c.id
   }) : null;
-  if (learningReview) {
-    const pending = await learningDecisionAdd(t, ex, learningReview);
-    learningReview.decisionId = pending && pending.id || "";
-    // スタッフが決めるまでは下書き生成・矛盾判定・ルール蒸留の材料にしない。
-    return { learnedId: ex.id, conflict: null, learnedRules: [], reused: !!ex.reused, learningReview };
-  }
+  const proposalP = learningReview && opts.waitForAi !== false
+    ? proposeContextualLearningText(t, { q, final: finalText, draft0, instr, reviewText: opts.reviewText, learningChat })
+    : Promise.resolve(learningReview && learningReview.text || "");
   const conflictP = (changed ? checkConflict(t, q, finalText, ex.id) : Promise.resolve(null)).then(conflict => {
     if (!conflict) return null;
     return learningConflictAdd(t, { q, oldId: conflict.oldId, oldFinal: conflict.oldFinal, newId: ex.id, newFinal: finalText, source: opts.source || "web" });
@@ -992,7 +993,7 @@ async function learnStaffOutcome(t, c, opts) {
   // 矛盾があるのに新回答を先に正式ルールへ蒸留しない。人が正解を選ぶまで両案を保留する。
   // Web画面では適用範囲をスタッフが確認してから恒久ルールへ反映する。
   // スタッフLINEは確認画面を出せないため、従来どおり安全条件を満たす内容だけ自動蒸留する。
-  const distillP = changed ? outcomeP.then(conflict => conflict ? [] : distillRules(t, c, { q, final: finalText, draft0, instr, exampleId: ex.id })) : Promise.resolve([]);
+  const distillP = changed && !learningReview ? outcomeP.then(conflict => conflict ? [] : distillRules(t, c, { q, final: finalText, draft0, instr, learningChat, exampleId: ex.id })) : Promise.resolve([]);
 
   if (opts.waitForAi === false) {
     distillP.catch((e) => console.error("learnStaffOutcome distill:", e && e.message));
@@ -1001,10 +1002,101 @@ async function learnStaffOutcome(t, c, opts) {
   }
 
   const completed = await Promise.race([
-    Promise.all([distillP, outcomeP]).then(([learnedRules, conflict]) => ({ learnedRules, conflict })),
-    new Promise((resolve) => setTimeout(() => resolve({ learnedRules: [], conflict: null }), 6000)),
+    Promise.all([distillP, outcomeP, proposalP]).then(([learnedRules, conflict, proposal]) => ({ learnedRules, conflict, proposal })),
+    new Promise((resolve) => setTimeout(() => resolve({ learnedRules: [], conflict: null, proposal: learningReview && learningReview.text || "" }), 8000)),
   ]).catch(() => ({ learnedRules: [], conflict: null }));
-  return { learnedId: ex.id, conflict: completed.conflict, learnedRules: completed.learnedRules, reused: !!ex.reused, learningReview };
+  const contextualReview = learningReview ? Object.assign({}, learningReview, { text: completed.proposal || learningReview.text }) : null;
+  return { learnedId: ex.id, conflict: completed.conflict, learnedRules: completed.learnedRules, reused: !!ex.reused, learningReview: contextualReview };
+}
+
+function learningJobs(t) {
+  const jobs = Array.isArray(t.config.learningJobs) ? t.config.learningJobs : (t.config.learningJobs = []);
+  return jobs.filter(Boolean);
+}
+function publicLearningJob(job) {
+  return {
+    id: String(job.id || ""), conversationId: String(job.conversationId || ""), status: String(job.status || "processing"),
+    createdAt: Number(job.createdAt || 0), updatedAt: Number(job.updatedAt || 0), resultType: String(job.resultType || ""),
+    learningReview: job.learningReview || null, conflict: job.conflict || null, error: String(job.error || ""),
+  };
+}
+function finishLearningJob(t, id) {
+  const job = learningJobs(t).find(item => item.id === String(id || ""));
+  if (job) { job.status = "done"; job.updatedAt = Date.now(); }
+  return job;
+}
+function finishLearningJobFor(t, id, exampleId, conflictId) {
+  const direct = finishLearningJob(t, id);
+  if (direct) return direct;
+  const job = learningJobs(t).find(item => item.status !== "done" && (
+    (conflictId && item.conflict && item.conflict.id === conflictId) ||
+    (exampleId && Number(item.exampleId) === Number(exampleId))
+  ));
+  if (job) { job.status = "done"; job.updatedAt = Date.now(); }
+  return job;
+}
+async function checkFormalRuleConflict(t, q, proposal, newId, source) {
+  const related = rulesSearch(t, q + " " + proposal, 6);
+  if (!related.length) return null;
+  const system = "新しい学習案が、現在の正式ルールと直接矛盾するかだけを判定する。情報の追加、詳しい説明、言い回しの違いは矛盾ではない。料金・可否・期限・場所・必須条件・手順が両立しない場合だけ conflict=true。JSONのみ: {\"conflict\":true|false,\"ruleId\":数値}";
+  const user = "【正式ルール】\n" + related.map(r => "[ID:" + r.id + "] " + r.title + ": " + r.content).join("\n") + "\n\n【新しい学習案】\n" + proposal;
+  try {
+    const raw = await aiChat(t, system, [{ role: "user", content: user.slice(0, 10000) }], 180, "critical");
+    const match = String(raw || "").match(/\{[\s\S]*\}/), out = match ? JSON.parse(match[0]) : {};
+    const rule = related.find(item => Number(item.id) === Number(out.ruleId));
+    if (out.conflict === true && rule) return learningConflictAdd(t, {
+      kind: "rule", q, oldId: rule.id, oldRuleId: rule.id, oldFinal: rule.title + "\n" + rule.content,
+      newId, newFinal: proposal, source,
+    });
+  } catch (e) { console.error("formal rule conflict:", e && e.message); }
+  return null;
+}
+const runningLearningJobs = new Set();
+async function processLearningJob(t, jobId) {
+  const key = t.slug + "::" + jobId;
+  if (runningLearningJobs.has(key)) return;
+  const job = learningJobs(t).find(item => item.id === jobId && item.status === "processing");
+  if (!job) return;
+  runningLearningJobs.add(key);
+  try {
+    const p = job.payload || {}, ex = t.examples && t.examples[Number(job.exampleId)];
+    if (!ex) throw new Error("example_not_found");
+    const proposal = await proposeContextualLearningText(t, p);
+    const review = Object.assign({}, job.learningReview || {}, { text: proposal });
+    const exampleConflict = p.changed ? await checkConflict(t, p.q, p.final, ex.id) : null;
+    let conflict = exampleConflict ? await learningConflictAdd(t, {
+      kind: "example", q: p.q, oldId: exampleConflict.oldId, oldFinal: exampleConflict.oldFinal,
+      newId: ex.id, newFinal: p.final, source: p.source,
+    }) : null;
+    if (!conflict) conflict = await checkFormalRuleConflict(t, p.q, proposal, ex.id, p.source);
+    try { await recordLearningPerformance(t, p.q, !!p.changed, !!conflict); } catch (e) { console.error("learning performance:", e && e.message); }
+    job.status = "ready"; job.resultType = conflict ? "conflict" : "review"; job.learningReview = conflict ? null : review;
+    job.conflict = conflict ? publicLearningConflict(conflict) : null; job.payload = null; job.updatedAt = Date.now();
+  } catch (e) {
+    job.status = "ready"; job.resultType = "review"; job.error = String(e && e.message || e).slice(0, 120); job.payload = null; job.updatedAt = Date.now();
+  } finally {
+    runningLearningJobs.delete(key);
+    while (t.config.learningJobs.length > 80) t.config.learningJobs.shift();
+    await saveTenantConfig(t).catch(e => console.error("learning job save:", e && e.message));
+  }
+}
+async function queueStaffLearning(t, c, opts) {
+  const q = String(opts.q || recentCustomerQuestion(c)).trim(), final = String(opts.final || "").trim();
+  if (!q || !final) return null;
+  const draft0 = String(opts.draft0 || "").trim(), instr = String(opts.instr || "").trim(), learningChat = sanitizeLearningChat(opts.learningChat);
+  const ex = await exampleAdd(t, { q, final, draft0, instr, learningChat, source: opts.source || "web" });
+  if (!ex) return null;
+  const review = learningReviewPayload(ex, { q, final, draft0, instr, reviewText: opts.reviewText, conversationId: c && c.id });
+  if (!review) return { learnedId: ex.id, job: null };
+  const now = Date.now(), job = {
+    id: "lj-" + now.toString(36) + "-" + crypto.randomBytes(3).toString("hex"), conversationId: String(c && c.id || ""),
+    exampleId: ex.id, status: "processing", resultType: "", createdAt: now, updatedAt: now, learningReview: review, conflict: null,
+    payload: { q, final, draft0, instr, learningChat, reviewText: opts.reviewText, source: opts.source || "web", changed: final !== draft0 || !!instr },
+  };
+  learningJobs(t).push(job); while (t.config.learningJobs.length > 80) t.config.learningJobs.shift();
+  await saveTenantConfig(t);
+  setImmediate(() => processLearningJob(t, job.id));
+  return { learnedId: ex.id, job: publicLearningJob(job) };
 }
 // 2つのテキストがほぼ同内容か（bigram重なり率）。ルールの二重登録ガード用。
 function similarEnough(a, b) {
@@ -1043,7 +1135,7 @@ function rulesSearch(t, query, limit) {
 const GEMINI_MAX_CHARS = 800000;
 const RULE_BUDGETS = { claude: 150000, gpt: 300000, gemini: GEMINI_MAX_CHARS }; // 各AIの物理枠（文字数）。ここを超えると関連性の低いルールが除外される
 function ruleBudget(t) {
-  const eng = (S(t).engine || "gemini");
+  const eng = (S(t).engine || "gpt");
   return RULE_BUDGETS[eng] || RULE_BUDGETS.gemini;
 }
 // ルールブックの合計文字数（rulesBlockと同じ換算: 「・タイトル: 本文」＋改行1）
@@ -1107,20 +1199,26 @@ app.get("/health/ready", async (req, res) => {
 
 // ===== AIエンジン切り替え（返信文の生成のみ） =====
 // 選択中エンジンが未設定・一時障害でも、設定済みの別エンジンへ安全にフォールバックする。
+function configuredExtraOpenAiModels(){
+  return String(process.env.OPENAI_EXTRA_MODELS || "").split(",").map(v=>v.trim()).filter(Boolean).slice(0,20);
+}
+function openAiRoute(t, task, override){
+  return resolveAiRoute(S(t), task, { extraModels: configuredExtraOpenAiModels(), override });
+}
 function aiEngineAvailable(eng){
   return eng === "gpt" ? !!process.env.OPENAI_KEY : eng === "gemini" ? !!process.env.GEMINI_KEY : eng === "claude" ? !!ANTHROPIC_KEY : false;
 }
 function aiEngineOrder(t){
-  const selected = ["gpt","gemini","claude"].includes(S(t).engine) ? S(t).engine : "gemini";
+  const selected = ["gpt","gemini","claude"].includes(S(t).engine) ? S(t).engine : "gpt";
   return [selected,"gpt","gemini","claude"].filter((x,i,a)=>a.indexOf(x)===i && aiEngineAvailable(x));
 }
 function activeAiEngine(t){ return aiEngineOrder(t)[0] || ""; }
-async function aiChatOne(eng, system, messages, maxTokens){
+async function aiChatOne(eng, system, messages, maxTokens, route){
   if(eng === "gpt"){
-    const model = process.env.OPENAI_MODEL || "gpt-5.4";
+    route = route || { model: process.env.OPENAI_MODEL || "gpt-5.6-terra", reasoningEffort: "medium" };
     const r = await fetch("https://api.openai.com/v1/chat/completions", { method:"POST",
       headers: { "Content-Type":"application/json", "Authorization":"Bearer "+process.env.OPENAI_KEY },
-      body: JSON.stringify({ model, max_completion_tokens:maxTokens, reasoning_effort:"medium", messages:[{role:"system",content:system}].concat(messages) }) });
+      body: JSON.stringify({ model:route.model, max_completion_tokens:maxTokens, reasoning_effort:route.reasoningEffort, messages:[{role:"system",content:system}].concat(messages) }) });
     if(!r.ok) throw new Error("openai_"+r.status);
     const d = await r.json(); return d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
   }
@@ -1147,9 +1245,10 @@ async function aiChatOne(eng, system, messages, maxTokens){
   if(!r.ok) throw new Error("anthropic_"+r.status);
   const d = await r.json(); return (d.content && d.content[0] && d.content[0].text) || null;
 }
-async function aiChat(t, system, messages, maxTokens){
+async function aiChat(t, system, messages, maxTokens, task, routeOverride){
+  const route = openAiRoute(t, task || "draft", routeOverride);
   for(const eng of aiEngineOrder(t)){
-    try{ const text = await aiChatOne(eng, system, messages, maxTokens); if(text) return text; }
+    try{ const text = await aiChatOne(eng, system, messages, maxTokens, eng === "gpt" ? route : null); if(text) return text; }
     catch(e){ console.error("ai provider:", eng, String(e.message||e).slice(0,80)); }
   }
   return null;
@@ -1157,8 +1256,8 @@ async function aiChat(t, system, messages, maxTokens){
 
 // aiChatのストリーミング版。onDelta(text片)を呼びながら全文を返す。（編集チャットのGPT風リアルタイム表示用）
 // gpt/gemini はOpenAI互換SSE、Claude(保険)はAnthropic SSE。ストリーム不可ならnullを返し、呼び出し側がaiChatにフォールバックする。
-async function aiChatStream(t, system, messages, maxTokens, onDelta){
-  const eng = (S(t).engine || "gemini");
+async function aiChatStream(t, system, messages, maxTokens, onDelta, task){
+  const eng = (S(t).engine || "gpt");
   async function openaiCompat(url, key, model, extra){
     const r = await fetch(url, { method:"POST",
       headers: { "Content-Type":"application/json", "Authorization":"Bearer "+key },
@@ -1180,8 +1279,8 @@ async function aiChatStream(t, system, messages, maxTokens, onDelta){
   }
   try{
     if(eng === "gpt" && process.env.OPENAI_KEY){
-      const model = process.env.OPENAI_MODEL || "gpt-5.4";
-      const out = await openaiCompat("https://api.openai.com/v1/chat/completions", process.env.OPENAI_KEY, model, { max_completion_tokens: maxTokens, reasoning_effort: "medium" });
+      const route = openAiRoute(t, task || "chat");
+      const out = await openaiCompat("https://api.openai.com/v1/chat/completions", process.env.OPENAI_KEY, route.model, { max_completion_tokens: maxTokens, reasoning_effort: route.reasoningEffort });
       if(out) return out;
     }
     if(eng === "gemini" && process.env.GEMINI_KEY){
@@ -1274,7 +1373,7 @@ async function finalizeGeneratedDraft(t, raw, channel){
   let text = cleanDraftText(raw), issues = draftQualityIssues(text);
   if(!issues.length) return { text, issues:[] };
   const sys = "患者へ送る日本語文の校正者。事実・日時・料金・URL・可否・固有名詞・謝罪の有無を変えず、不自然な敬語、過剰な格式、重複だけを直す。新しい情報を足さない。" + (channel==="mail" ? "メールの署名は残す。" : "LINE本文として簡潔にする。") + "返信本文だけを出力する。";
-  const revised = await aiChat(t, sys, [{role:"user",content:text.slice(0,5000)}], 1800);
+  const revised = await aiChat(t, sys, [{role:"user",content:text.slice(0,5000)}], 1800, "finalize");
   if(revised){
     const candidate = cleanDraftText(revised);
     if(candidate && !draftQualityIssues(candidate).includes("empty")) text = candidate;
@@ -1294,7 +1393,7 @@ async function validateDraftAgainstEvidence(t, input){
     + "\n\n" + evidence
     + "\n\n【返信案】\n" + String(input.draft || "").slice(0, 5000);
   try {
-    const raw = await aiChat(t, sys, [{ role: "user", content: user }], 900);
+    const raw = await aiChat(t, sys, [{ role: "user", content: user }], 900, "audit");
     if (!raw) return { pass: false, answered: false, unsupportedClaims: [], contradictions: [], reason: "送信前監査を実行できませんでした" };
     const match = raw.match(/\{[\s\S]*\}/);
     const parsed = JSON.parse(match ? match[0] : raw);
@@ -1452,7 +1551,7 @@ async function classifyApproval(t, confirmText, text) {
   }
   try {
     const sys = "あなたは分類器。患者に次の確認メッセージを送った直後の返信を分類する。確認メッセージ:「" + String(confirmText || "").slice(0, 300) + "」。返信がこの確認への明確な同意（実行してよい）なら yes、明確な拒否なら no、別の話題・条件の変更・曖昧・判断に迷う場合は other。必ず yes / no / other のうち1語だけを出力する。";
-    const raw = await aiChat(t, sys, [{ role: "user", content: String(text || "").slice(0, 500) }], 10);
+    const raw = await aiChat(t, sys, [{ role: "user", content: String(text || "").slice(0, 500) }], 10, "classify");
     const a = String(raw || "").toLowerCase();
     if (/\byes\b/.test(a)) return "yes";
     if (/\bno\b/.test(a)) return "no";
@@ -1778,7 +1877,7 @@ async function genDraft(t, c, opts) {
     + "\nis_urgent: 痛み・出血・腫れ・強い不調など緊急性があればtrue。"
     + "\ntopics: お客様の直近メッセージにある「返信すべき質問・依頼」を、それぞれ短い日本語ラベル(q)で列挙する（最大5件）。状況連絡・挨拶・お礼や、時間が経って既に解決済みと思われるもの（例: かなり前に届いた『遅れます』）は need:false。それ以外は need:true。質問が1つだけなら1件でよい。";
   try {
-    const raw = await aiChat(t, sys, msgsArr, 4000);
+    const raw = await aiChat(t, sys, msgsArr, 4000, "draft", opts && opts.aiRouteOverride);
     if (!raw) return null;
     let out = null; try { const m = raw.match(/\{[\s\S]*\}/); out = JSON.parse(m ? m[0] : raw); } catch (e) { out = { draft: salvageDraft(raw), confidence: "low", is_urgent: false, needs_human: true, site_alert: "none", site_summary: "" }; }
     if (out && typeof out === "object") {
@@ -1902,7 +2001,9 @@ async function handleInbound(t, opts) {
   if (opts.pic) c.pic = opts.pic;
   if (opts.acct) c.acct = opts.acct; // どの連携アカウント（LINEチャネル/メールアドレス）経由か
   const med = ["image", "video", "file", "audio"].includes(opts.media) ? opts.media : null;
-  c.msgs.push({ from: "them", text: opts.text || "", media: med, mediaId: med ? (opts.mediaId || null) : null, fileName: med === "file" ? (opts.fileName || "ファイル") : undefined, time: nowt() });
+  const previousMessage = c.msgs[c.msgs.length - 1];
+  if (previousMessage && !previousMessage.at && Number(c.ts || 0) > 0) previousMessage.at = Number(c.ts);
+  c.msgs.push({ from: "them", text: opts.text || "", media: med, mediaId: med ? (opts.mediaId || null) : null, fileName: med === "file" ? (opts.fileName || "ファイル") : undefined, time: nowt(), at: recvAt });
   statBump(t, "in");
   if (opts.subject) c.subject = String(opts.subject).slice(0, 300);
   c.status = "todo"; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
@@ -2531,10 +2632,11 @@ async function deliverMessageBundle(t, c, text, files, baseUrl) {
 }
 function appendDeliveredBundle(c, text, files, baseUrl, extra) {
   const common = extra && typeof extra === "object" ? extra : {};
-  if (text) c.msgs.push(Object.assign({ from: "us", text, time: nowt() }, common));
+  const deliveredAt = Date.now();
+  if (text) c.msgs.push(Object.assign({ from: "us", text, time: nowt(), at: deliveredAt }, common));
   files.forEach((file) => {
     const image = /^image\//i.test(file.mime);
-    c.msgs.push(Object.assign({ from: "us", media: image ? "image" : "file", url: baseUrl + "/files/" + file.id, fileName: file.name, time: nowt() }, common));
+    c.msgs.push(Object.assign({ from: "us", media: image ? "image" : "file", url: baseUrl + "/files/" + file.id, fileName: file.name, time: nowt(), at: deliveredAt }, common));
   });
 }
 
@@ -2561,23 +2663,22 @@ app.post("/api/send", guard, async (req, res) => {
   const baseUrl = messagePublicBase(req);
   try { ({ sent, sendErr } = await deliverMessageBundle(t, c, text, files, baseUrl)); }
   finally { sendLocks.delete(sendLockKey); }
-  let learnedId = null, conflict = null, learnedRules = [], learningReview = null;
+  let learnedId = null, learningJob = null;
   if (sent) {
     const draft0 = String(c.draft0 || "").trim(); // 学習判定用に、消す前のAI初回下書きを確保
     const q0 = recentCustomerQuestion(c);
     const instr = String(req.body.instr || "").trim();
+    const learningChat = sanitizeLearningChat(req.body.learningChat);
     const reviewText = String(req.body.learningText || "").trim().slice(0, 800);
     appendDeliveredBundle(c, text, files, baseUrl, { learningRefs: c.learningRefs || [] }); c.draft = ""; c.draft0 = ""; c.learningRefs = []; c.status = "done"; c.flag = false; c.lastAuto = false; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
     statBump(t, "staff");
     if (text) {
-      const learned = await learnStaffOutcome(t, c, { q: q0, final: text, draft0, instr, reviewText, source: "web", waitForAi: true, reviewScope: true });
-      learnedId = learned.learnedId;
-      learnedRules = learned.learnedRules || [];
-      learningReview = learned.learningReview || null;
-      if (learned.conflict) conflict = { id: learned.conflict.id, q: learned.conflict.q, oldId: learned.conflict.oldId, oldFinal: learned.conflict.oldFinal, newId: learned.conflict.newId, newFinal: learned.conflict.newFinal };
+      const queued = await queueStaffLearning(t, c, { q: q0, final: text, draft0, instr, learningChat, reviewText, source: "web" });
+      learnedId = queued && queued.learnedId;
+      learningJob = queued && queued.job;
     }
   }
-  res.json({ ok: true, sent, sendErr, learnedId, conflict, learnedRules, learningReview });
+  res.json({ ok: true, sent, sendErr, learnedId, learningJob });
 });
 
 function scheduledMessages(t) {
@@ -2619,7 +2720,7 @@ app.post("/api/scheduled-message", guard, oneMutationAtATime("scheduled-message"
     attachments: loaded.files.map(file => ({ id: file.id, name: file.name, mime: file.mime })),
     sendAt: normalized.sendAt, status: "scheduled", createdAt: Date.now(), updatedAt: Date.now(), baseUrl,
     question: recentCustomerQuestion(c), draft0: String(c.draft0 || "").trim().slice(0, 1500),
-    instr: String(req.body.instr || "").trim().slice(0, 800), learningText: String(req.body.learningText || "").trim().slice(0, 800),
+    instr: String(req.body.instr || "").trim().slice(0, 800), learningText: String(req.body.learningText || "").trim().slice(0, 800), learningChat: sanitizeLearningChat(req.body.learningChat),
     learningRefs: Array.isArray(c.learningRefs) ? c.learningRefs : []
   };
   const list = scheduledMessages(t); list.push(item); t.config.scheduledMessages = pruneScheduledMessages(list);
@@ -2743,33 +2844,29 @@ app.post("/api/conn", guard, oneMutationAtATime("connection"), async (req, res) 
   res.json({ ok: true, lineConfigured: !!C.lineToken(t) && !!C.lineSecret(t), mailConfigured: !!C.smtpUser(t) && !!C.smtpPass(t), emailInternal: !!emailOn(t) });
 });
 
-// 新モデル検知：OpenAIのモデル一覧から、現行(OPENAI_MODEL)より新しいフラッグシップGPTが出ているか判定。結果は1日キャッシュ（毎回APIを叩かない）。
-let MODEL_CHECK_CACHE = { ts: 0, current: "", latest: "", newer: false, error: null };
-async function checkNewerModel() {
+// 新モデル検知：役割別ルーターで使用中の世代より新しいGPT世代が利用可能か判定する。
+let MODEL_CHECK_CACHE = { ts: 0, latest: "", latestVersion: 0, error: null };
+async function checkNewerModel(t) {
   const now = Date.now();
-  if (MODEL_CHECK_CACHE.ts && now - MODEL_CHECK_CACHE.ts < 24 * 60 * 60 * 1000) return MODEL_CHECK_CACHE;
-  const current = process.env.OPENAI_MODEL || "gpt-5.4";
-  let latest = current, newer = false, error = null;
+  const routes=normalizeAiRoutes(S(t).aiRoutes,configuredExtraOpenAiModels()), currentModels=[...new Set(Object.values(routes).map(route=>route.model))];
+  const ver=id=>{const m=/^gpt-(\d+(?:\.\d+)?)(?:-(?:sol|terra|luna))?$/.exec(String(id||""));return m?parseFloat(m[1]):null;};
+  const currentVersion=Math.max(0,...currentModels.map(ver).filter(v=>v!=null));
+  if (MODEL_CHECK_CACHE.ts && now - MODEL_CHECK_CACHE.ts < 24 * 60 * 60 * 1000) return Object.assign({},MODEL_CHECK_CACHE,{current:currentModels.join(" / "),newer:MODEL_CHECK_CACHE.latestVersion>currentVersion});
+  let latest = currentModels[0]||"gpt-5.6-terra", latestVersion=currentVersion, error = null;
   try {
     if (process.env.OPENAI_KEY) {
       const r = await fetch("https://api.openai.com/v1/models", { headers: { "Authorization": "Bearer " + process.env.OPENAI_KEY } });
       if (r.ok) {
         const d = await r.json();
         const ids = (d.data || []).map(m => m.id);
-        // フラッグシップの文章生成モデルだけを対象（gpt-5.5 / gpt-6 等）。mini・nano・pro・codex・audio・日付付きスナップショット等は誤検知防止のため除外。
-        const ver = id => { const m = /^gpt-(\d+(?:\.\d+)?)$/.exec(id); return m ? parseFloat(m[1]) : null; };
-        const curV = ver(current);
-        let bestId = current, bestV = (curV != null ? curV : -1);
-        ids.forEach(id => { const v = ver(id); if (v != null && v > bestV) { bestV = v; bestId = id; } });
-        latest = bestId;
-        newer = (curV != null && bestV > curV);
+        ids.forEach(id => { const v = ver(id); if (v != null && v > latestVersion) { latestVersion=v; latest=id; } });
       } else { error = "models_" + r.status; }
     } else { error = "no_key"; }
   } catch (e) { error = String(e.message || e).slice(0, 80); }
-  MODEL_CHECK_CACHE = { ts: now, current, latest, newer, error };
-  return MODEL_CHECK_CACHE;
+  MODEL_CHECK_CACHE = { ts: now, latest, latestVersion, error };
+  return Object.assign({},MODEL_CHECK_CACHE,{current:currentModels.join(" / "),newer:latestVersion>currentVersion});
 }
-app.get("/api/model-check", guard, async (req, res) => { res.json(await checkNewerModel()); });
+app.get("/api/model-check", guard, async (req, res) => { res.json(await checkNewerModel(req.tenant)); });
 function publicSettings(t) {
   const performance = learningPerformanceSummary(t);
   return Object.assign({}, S(t), {
@@ -2778,18 +2875,22 @@ function publicSettings(t) {
     publicUrlConfigured: !!publicConversationUrl({ id: "preview" }),
     engines: { claude: !!ANTHROPIC_KEY, gpt: !!process.env.OPENAI_KEY, gemini: !!process.env.GEMINI_KEY },
     activeEngine: activeAiEngine(t),
-    learningDecisionsPending: learningDecisions(t, true).length,
+    aiRoutes: normalizeAiRoutes(S(t).aiRoutes, configuredExtraOpenAiModels()),
+    aiModelCatalog: publicModelCatalog(configuredExtraOpenAiModels()),
     learningConflictsPending: learningConflicts(t, true).length,
     learningAutomation: { ready: performance.filter(item => item.ready).length, tracked: performance.filter(item => item.key !== "other").length },
     rules: { chars: rulesCharTotal(t), count: rulesList(t).length, budget: ruleBudget(t), budgets: RULE_BUDGETS }
   });
 }
 app.get("/api/settings", guard, (req, res) => res.json(publicSettings(req.tenant)));
-app.get("/api/learning-pending-count", guard, (req, res) => res.json({
-  ok: true,
-  decisions: learningDecisions(req.tenant, true).length,
-  conflicts: learningConflicts(req.tenant, true).length,
-}));
+app.get("/api/learning-pending-count", guard, (req, res) => {
+  const jobs = learningJobs(req.tenant).filter(job => job.status === "ready");
+  res.json({
+    ok: true,
+    decisions: jobs.filter(job => job.resultType === "review").length,
+    conflicts: learningConflicts(req.tenant, true).length,
+  });
+});
 // 設定・ルール・学習例を反映した文章を、患者へ送らずに確認する品質テスト。
 app.post("/api/quality-preview", guard, async (req,res)=>{
   const t=req.tenant, inquiry=String(req.body.inquiry||"").trim().slice(0,1200), channel=req.body.channel==="mail"?"mail":"line";
@@ -2799,6 +2900,22 @@ app.post("/api/quality-preview", guard, async (req,res)=>{
   const out=await genDraft(t,c,{skipExternal:true});
   if(!out||!String(out.draft||"").trim()) return res.status(502).json({ok:false,error:"ai_failed"});
   res.json({ok:true,draft:String(out.draft).slice(0,5000),confidence:String(out.confidence||""),qualityIssues:Array.isArray(out.qualityIssues)?out.qualityIssues:[],learningRefs:Array.isArray(out.learningRefs)?out.learningRefs:[],learningUsage:out.learningUsage||null,grounding:out.grounding||null,validation:out.validation||null,learningReadiness:out.learningReadiness||null,engine:activeAiEngine(t)});
+});
+// 新モデルを本番回答へ使わず、同じ問い合わせで比較する並行テスト。
+// 会話・学習・予約・送信状態は一切保存せず、候補モデルの出力だけを返す。
+app.post("/api/model-shadow-preview", guard, async (req,res)=>{
+  const t=req.tenant, inquiry=String(req.body.inquiry||"").trim().slice(0,1200), channel=req.body.channel==="mail"?"mail":"line";
+  if(!inquiry) return res.status(400).json({ok:false,error:"empty"});
+  if(!process.env.OPENAI_KEY) return res.status(503).json({ok:false,error:"no_openai_key"});
+  const candidate=resolveAiRoute({aiRoutes:{draft:req.body.candidate||{}}},"draft",{extraModels:configuredExtraOpenAiModels()});
+  const active=openAiRoute(t,"draft");
+  const makeConversation=()=>({id:"shadow-preview",userId:"shadow-preview",name:"テスト患者",channel,msgs:[{from:"them",text:inquiry,time:nowt()}],draft:""});
+  const [baseline,shadow]=await Promise.all([
+    genDraft(t,makeConversation(),{skipExternal:true,aiRouteOverride:active}),
+    genDraft(t,makeConversation(),{skipExternal:true,aiRouteOverride:candidate}),
+  ]);
+  if(!baseline||!shadow) return res.status(502).json({ok:false,error:"ai_failed"});
+  res.json({ok:true,persisted:false,sent:false,active:{route:active,draft:String(baseline.draft||"").slice(0,5000),validation:baseline.validation||null},candidate:{route:candidate,draft:String(shadow.draft||"").slice(0,5000),validation:shadow.validation||null}});
 });
 function staffLineStatus(t, req) {
   const host = String(req.headers["x-forwarded-host"] || req.headers.host || "").split(",")[0].trim();
@@ -2928,6 +3045,7 @@ app.post("/api/settings", guard, oneMutationAtATime("settings"), async (req, res
   if (typeof req.body.tone === "string") S(t).tone = req.body.tone.slice(0, 1500);
   if (req.body.autoDelayMin != null && isFinite(Number(req.body.autoDelayMin))) S(t).autoDelayMin = Math.min(60, Math.max(0, Math.round(Number(req.body.autoDelayMin))));
   if (["claude", "gpt", "gemini"].includes(req.body.engine)) S(t).engine = req.body.engine;
+  if (req.body.aiRoutes && typeof req.body.aiRoutes === "object") S(t).aiRoutes = normalizeAiRoutes(req.body.aiRoutes, configuredExtraOpenAiModels());
   try { await saveTenantConfig(t); } catch (e) {}
   res.json(Object.assign({ ok: true }, publicSettings(t)));
 });
@@ -2943,23 +3061,15 @@ app.post("/api/rule-undo", guard, async (req, res) => {
 });
 app.get("/api/learning-data", guard, (req, res) => {
   const t = req.tenant;
-  const decisions = learningDecisions(t, true).map(item => {
-    const ex = t.examples && t.examples[Number(item.exampleId)];
-    return ex ? {
-      id: item.id, exampleId: ex.id, conversationId: item.conversationId || "", createdAt: item.createdAt || 0,
-      q: ex.q || "", final: ex.final || "", draft0: ex.draft0 || "", instr: ex.instr || "", source: ex.source || "web",
-    } : null;
-  }).filter(Boolean);
-  const pendingDecisionIds = new Set(decisions.map(item => Number(item.exampleId)));
   const prefs = (Array.isArray(S(t).prefs) ? S(t).prefs : []).map((p, i) => ({
     key: p && typeof p === "object" && p.id != null ? String(p.id) : "legacy:" + i,
     text: String(typeof p === "string" ? p : ((p && p.text) || ""))
   })).filter(p => p.text);
-  const examples = Object.values(t.examples || {}).filter(e => !pendingDecisionIds.has(Number(e.id))).sort((a, b) => (b.ts || 0) - (a.ts || 0) || b.id - a.id).map(e => ({
+  const examples = Object.values(t.examples || {}).sort((a, b) => (b.ts || 0) - (a.ts || 0) || b.id - a.id).map(e => ({
     id: e.id, q: e.q || "", final: e.final || "", draft0: e.draft0 || "", instr: e.instr || "", ts: e.ts || 0,
     source: e.source || "web", confirmedCount: Math.max(1, Number(e.confirmedCount || 1)), learningMeta: sanitizeLearningMeta(e.learningMeta)
   }));
-  res.json({ ok: true, rules: rulesList(t).map(r => ({ id: r.id, title: r.title || "", content: r.content || "", updated: Number(r.updated || 0) })), prefs, examples, decisions, conflicts: learningConflicts(t, true), performance: learningPerformanceSummary(t) });
+  res.json({ ok: true, rules: rulesList(t).map(r => ({ id: r.id, title: r.title || "", content: r.content || "", updated: Number(r.updated || 0) })), prefs, examples, conflicts: learningConflicts(t, true), performance: learningPerformanceSummary(t) });
 });
 app.post("/api/rule-save", guard, oneMutationAtATime("learning"), async (req, res) => {
   const t = req.tenant; const title = String(req.body.title || "").trim().slice(0, 100); const content = String(req.body.content || "").trim().slice(0, 2000);
@@ -2987,32 +3097,60 @@ app.post("/api/example-update", guard, oneMutationAtATime("learning"), async (re
   res.json({ ok: true, example: ex });
 });
 app.post("/api/example-delete", guard, oneMutationAtATime("learning"), async (req, res) => { const t = req.tenant; try { await exampleDelete(t, req.body.id); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false, error: "delete" }); } });
-// 送信後の学習確認。画面は「学習する／学習しない」の2択にし、構造化・矛盾判定は応答後に行う。
+app.get("/api/learning-jobs", guard, (req, res) => {
+  const t = req.tenant;
+  learningJobs(t).filter(job => job.status === "processing").forEach(job => setImmediate(() => processLearningJob(t, job.id)));
+  res.json({ ok: true, jobs: learningJobs(t).filter(job => job.status !== "done").slice(-30).map(publicLearningJob) });
+});
+// 送信後の学習確認。AIの自動判定ではなく、スタッフが選んだ適用範囲を正本として保存する。
 app.post("/api/learning-scope", guard, oneMutationAtATime("learning"), async (req, res) => {
   const t = req.tenant, id = Number(req.body.exampleId), scope = String(req.body.scope || "");
   const ex = t.examples && t.examples[id];
   if (!ex) return res.status(404).json({ ok: false, error: "not_found" });
-  const decision = learningDecisions(t, true).find(item => item.id === String(req.body.decisionId || "") || Number(item.exampleId) === id);
-  if (!decision) return res.status(404).json({ ok: false, error: "decision_not_found" });
-  if (!["none", "learn"].includes(scope)) return res.status(400).json({ ok: false, error: "bad_scope" });
+  if (!["none", "learn", "patient", "similar", "all"].includes(scope)) return res.status(400).json({ ok: false, error: "bad_scope" });
+  const text = String(req.body.text || ex.instr || "").trim().slice(0, 2400);
+  if (scope !== "none" && !text) return res.status(400).json({ ok: false, error: "required" });
   try {
     if (scope === "none") {
       await exampleDelete(t, id);
-      await learningDecisionResolve(t, decision, "none");
+      finishLearningJobFor(t, req.body.learningJobId, id, ""); await saveTenantConfig(t);
       return res.json({ ok: true, scope, message: "今回は学習しません" });
     }
-    await learningDecisionResolve(t, decision, "learn");
-    res.json({ ok: true, scope, processing: true, message: "学習を受け付けました。会話の流れをバックグラウンドで整理します" });
-    const c = t.store[String(decision.conversationId || req.body.conversationId || "")] || null;
-    Promise.resolve().then(async () => {
-      const changed = String(ex.final || "").trim() !== String(ex.draft0 || "").trim() || !!String(ex.instr || "").trim();
-      const conflict = changed ? await checkConflict(t, ex.q, ex.final, ex.id) : null;
-      const savedConflict = conflict ? await learningConflictAdd(t, { q: ex.q, oldId: conflict.oldId, oldFinal: conflict.oldFinal, newId: ex.id, newFinal: ex.final, source: ex.source || "web" }) : null;
-      try { await recordLearningPerformance(t, ex.q, changed, !!savedConflict); } catch (e) { console.error("learning performance:", e && e.message); }
-      if (!savedConflict) await distillRules(t, c, { q: ex.q, context: decision.context || "", final: ex.final, draft0: ex.draft0, instr: ex.instr, exampleId: ex.id, applyRules: false });
-    }).catch(e => console.error("approved learning:", e && e.message));
+    if (scope === "learn") {
+      // 「学習する」を選んだ結果をAIのone_off判定だけで捨てない。確定対応例は必ず再利用対象として残し、
+      // 修正チャット全体から共通方針・店舗ルールも追加で整理する。
+      const meta = sanitizeLearningMeta({ scope: "reusable", intent: learningIntentKey(ex.q), decision: text, conditions: "同じ状況・問い合わせに適用", avoid: "患者固有の事実と今回限りの特例は他の患者へ引き継がない", searchTerms: [String(ex.q || "").slice(0, 120)], updated: Date.now() });
+      await exampleLearningMetaUpdate(t, id, meta);
+      const c = t.store[String(req.body.conversationId || "")] || null;
+      const learnedRules = await distillRules(t, c, { q: ex.q, final: ex.final, draft0: ex.draft0, instr: ex.instr, learningChat: ex.learningChat, exampleId: ex.id });
+      finishLearningJobFor(t, req.body.learningJobId, id, ""); await saveTenantConfig(t);
+      return res.json({ ok: true, scope, learnedRules, message: learnedRules.length ? "対応例と修正チャットを学習し、店舗ルールも整理しました" : "対応例と修正チャットを今後の回答へ学習しました" });
+    }
+    if (scope === "patient") {
+      const c = t.store[String(req.body.conversationId || "")];
+      if (!c) return res.status(404).json({ ok: false, error: "conversation_not_found" });
+      noteAdd(c, "この患者への今後の対応方針: " + text);
+      await dbSave(t, c);
+      await exampleDelete(t, id);
+      return res.json({ ok: true, scope, message: "この患者だけの対応方針として保存しました" });
+    }
+    const meta = sanitizeLearningMeta({
+      scope: "reusable",
+      intent: learningIntentKey(ex.q),
+      decision: text,
+      conditions: scope === "similar" ? "同じ種類の問い合わせに適用" : "すべての返信に適用",
+      avoid: "",
+      searchTerms: [String(ex.q || "").slice(0, 120)],
+      updated: Date.now(),
+    });
+    await exampleLearningMetaUpdate(t, id, meta);
+    if (scope === "all") {
+      const memory = draftChatSaveMemory(t, text);
+      return res.json({ ok: true, scope, memory: memory || text, message: "今後の全返信に適用する方針として保存しました" });
+    }
+    res.json({ ok: true, scope, message: "同じ種類の問い合わせへ使う学習として保存しました" });
   } catch (e) {
-    if (!res.headersSent) res.status(500).json({ ok: false, error: "save" });
+    res.status(500).json({ ok: false, error: "save" });
   }
 });
 app.post("/api/learning-conflict-resolve", guard, oneMutationAtATime("learning"), async (req, res) => {
@@ -3021,15 +3159,25 @@ app.post("/api/learning-conflict-resolve", guard, oneMutationAtATime("learning")
   if (!item) return res.status(404).json({ ok: false, error: "not_found" });
   try {
     let chosen = null;
-    if (mode === "new") { chosen = t.examples && t.examples[item.newId]; await exampleDelete(t, item.oldId); }
+    if (item.kind === "rule") {
+      const rule = t.rules && t.rules[Number(item.oldRuleId || item.oldId)];
+      if (!rule) return res.status(404).json({ ok: false, error: "rule_not_found" });
+      if (mode === "new") { await ruleUpdate(t, rule.id, rule.title, item.newFinal); chosen = t.examples && t.examples[item.newId]; }
+      else if (mode === "old") { await exampleDelete(t, item.newId); }
+      else if (mode === "custom") {
+        const final = String(req.body.final || "").trim().slice(0, 2000); if (!final) return res.status(400).json({ ok: false, error: "required" });
+        await ruleUpdate(t, rule.id, rule.title, final); chosen = t.examples && t.examples[item.newId];
+      } else return res.status(400).json({ ok: false, error: "bad_mode" });
+    } else if (mode === "new") { chosen = t.examples && t.examples[item.newId]; await exampleDelete(t, item.oldId); }
     else if (mode === "old") { chosen = t.examples && t.examples[item.oldId]; await exampleDelete(t, item.newId); }
     else if (mode === "custom") {
       const final = String(req.body.final || "").trim().slice(0, 1500); if (!final) return res.status(400).json({ ok: false, error: "required" });
       await exampleDelete(t, item.oldId); await exampleDelete(t, item.newId);
       chosen = await exampleAdd(t, { q: item.q, final, draft0: item.newFinal, instr: "学習矛盾の確認でスタッフが正解を指定", source: "conflict_resolution" });
     } else return res.status(400).json({ ok: false, error: "bad_mode" });
-    if (chosen) await distillRules(t, null, { q: item.q, final: chosen.final, draft0: mode === "custom" ? item.newFinal : "", instr: "学習矛盾の確認でこの回答を今後の正解として選択", exampleId: chosen.id });
+    if (chosen && item.kind !== "rule") await distillRules(t, null, { q: item.q, final: chosen.final, draft0: mode === "custom" ? item.newFinal : "", instr: "学習矛盾の確認でこの回答を今後の正解として選択", exampleId: chosen.id });
     item.status = "resolved"; item.resolution = mode; item.resolvedAt = Date.now();
+    finishLearningJobFor(t, req.body.learningJobId, 0, item.id);
     await saveTenantConfig(t);
     res.json({ ok: true, pending: learningConflicts(t, true).length });
   } catch (e) { res.status(500).json({ ok: false, error: "save" }); }
@@ -3189,7 +3337,7 @@ app.post("/api/ai-regen", guard, async (req, res) => {
     + "\n" + JP_QUALITY
     + "\n出力はそのままお客様に送信される。だからお客様に送る返信文だけを出力すること。【】付きの見出し、状況の説明、会話の引用、区切り線(---)、前置き、かぎ括弧は一切含めてはいけない。1文字目から返信本文で始めること。";
   try {
-    let text = await aiChat(t, sys, msgsArr, 3000); // 選択中エンジン（既定Gemini）で生成
+    let text = await aiChat(t, sys, msgsArr, 3000, "draft");
     if (!text) { return res.json({ ok: false, error: "ai_error" }); }
     // safety: strip any echoed meta sections (headers / separators) the model might add
     if (/\n-{3,}\n?/.test(text)) text = text.split(/\n-{3,}\n?/).pop();
@@ -3227,8 +3375,11 @@ async function draftChatPrep(t, body) {
     break;
   }
   if (!edits.length || edits[edits.length - 1].role !== "user") return { error: "empty" };
-  const conv = c.msgs.slice(-20).map(m => (m.from === "them" ? "お客様" : "クリニック") + ": " + (m.text || (m.media ? "［" + m.media + "］" : ""))).join("\n").slice(0, 6000);
-  const lastQ = c.msgs.filter(m => m.from === "them").slice(-1).map(m => m.text || "").join("");
+  const context = selectConversationContext(c, { maxCurrent: 20, maxOlder: 10 });
+  const line = m => (m.from === "them" ? "お客様" : "クリニック") + ": " + (m.text || (m.media ? "［" + m.media + "］" : ""));
+  const conv = context.current.map(line).join("\n").slice(0, 6000);
+  const olderConv = context.olderRelevant.map(line).join("\n").slice(0, 3000);
+  const lastQ = context.current.filter(m => m.from === "them").slice(-1).map(m => m.text || "").join("");
   const editTxt = edits.map(e => e.content).join(" ");
   const rel = rulesRanked(t, (lastQ + " " + editTxt).slice(0, 1500));
   const rulesTxt = rel.length ? rulesBlock(rel, ruleBudget(t)) : "";
@@ -3240,7 +3391,8 @@ async function draftChatPrep(t, body) {
   }
   const base = "あなたは「" + (t.name || "クリニック") + "」の受付スタッフの返信作成アシスタントです。"
     + "スタッフと会話しながら、お客様への返信下書きを一緒に磨き上げます。あなたと会話しているのはスタッフで、下書きを送る相手はお客様です。"
-    + "\n\n【お客様との会話履歴（この最新メッセージへの返信を作っている。必ず全体を読み込み、文脈を正確に踏まえること）】\n" + conv
+    + "\n\n【現在の話題（この最新メッセージへの返信に使う主な会話）】\n" + conv
+    + (olderConv ? "\n\n【過去の関連説明（最新メッセージが参照している場合だけ補助的に使う）】\n" + olderConv + "\n過去側で完了した質問には改めて回答せず、現在の話題に必要な事実だけ引き継ぐ。" : "")
     + "\n\n本日は" + today + "です。キャンセル料など日付が関わる案内は、本日と予約日の差から判断する。憶測で日付を決めない。"
     + "医療判断・診断はしない。断定的表現や絵文字は使わない。" + sig
     + (rulesTxt ? "\n\n【店舗ルール（料金・規定・対応可否はここに従い、推測で答えない）】\n" + rulesTxt : "")
@@ -3329,11 +3481,11 @@ app.post("/api/draft-chat", guard, async (req, res) => {
     + "\n" + DRAFTCHAT_MEMORY_RULE
     + "\n" + DRAFTCHAT_RULE_RULE;
   try {
-    const raw = await aiChat(t, sys, p.edits, 4000);
+    const raw = await aiChat(t, sys, p.edits, 4000, "chat");
     if (!raw) return res.json({ ok: false, error: "ai_failed" });
     let out = { reply: "", draft: "" };
     try { const m = raw.match(/\{[\s\S]*\}/); out = JSON.parse(m ? m[0] : raw); } catch (e) { out = { reply: "", draft: salvageDraft(raw) }; }
-    // 文章作成中は学習候補の抽出だけ行う。恒久保存は患者への送信後にスタッフが学習するか決めて確定する。
+    // 文章作成中は学習候補の抽出だけ行う。恒久保存は患者への送信後にスタッフが適用範囲を選んで確定する。
     const savedMem = String(out.memory || "").trim().slice(0, 200);
     let savedRule = null;
     if (out.rule && typeof out.rule === "object") {
@@ -3363,9 +3515,9 @@ app.post("/api/draft-chat-stream", guard, async (req, res) => {
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("X-Accel-Buffering", "no");
   try {
-    let full = await aiChatStream(t, sys, p.edits, 4000, (d) => { try { res.write(d); } catch (e) {} });
+    let full = await aiChatStream(t, sys, p.edits, 4000, (d) => { try { res.write(d); } catch (e) {} }, "chat");
     if (!full) { // ストリーム不可時は非ストリームで生成して一括送信
-      full = await aiChat(t, sys, p.edits, 4000);
+      full = await aiChat(t, sys, p.edits, 4000, "chat");
       if (full) res.write(full);
     }
     let savedMem = "", savedRule = null, staffAction = null;
@@ -3836,7 +3988,7 @@ async function processScheduledMessagesForTenant(t) {
           try { await alertAdd(t, "システム", "予約メッセージは送信済みですが、履歴保存を確認できませんでした。二重送信せず管理者へ確認してください。", ""); } catch (_) {}
         }
         if (item.text) {
-          learnStaffOutcome(t, c, { q: item.question, final: item.text, draft0: item.draft0, instr: item.instr, reviewText: item.learningText, source: "web", waitForAi: false, reviewScope: true }).catch(e => console.error("scheduled learning:", e && e.message));
+          learnStaffOutcome(t, c, { q: item.question, final: item.text, draft0: item.draft0, instr: item.instr, learningChat: item.learningChat, reviewText: item.learningText, source: "web", waitForAi: false, reviewScope: true }).catch(e => console.error("scheduled learning:", e && e.message));
         }
       } catch (e) {
         await scheduledMessageFailure(t, item, e && e.message || "send_failed");
@@ -4062,7 +4214,7 @@ app.post("/api/assistant", guard, async (req, res) => {
     + (lead ? "\n\nあなたは会話の冒頭で既にこう発言済み（ユーザーはこれへの返事をしている）: " + lead.slice(0, 500) : "")
     + "\n\n関連する既存ルール（全" + totalRules + "件中、この会話に関連するもののみ抽出。編集判断用、ユーザーにそのまま見せない）:\n" + list + ctxTxt;
   try {
-    const raw = await aiChat(t, sys, msgs, 1500) || ""; // 既定Gemini（失敗時はaiChat内でClaude保険）
+    const raw = await aiChat(t, sys, msgs, 1500, "learning") || "";
     if (!raw) return res.json({ ok: false, error: "ai_error" });
     let out = { reply: "", proposals: [], actions: [] };
     try { const m = raw.match(/\{[\s\S]*\}/); out = JSON.parse(m ? m[0] : raw); } catch (e) { out = { reply: raw.slice(0, 1200), proposals: [], actions: [] }; }
@@ -4905,6 +5057,11 @@ const PAGE = `<!DOCTYPE html>
   .amcard button:disabled{background:#d1d5db;cursor:default;}
   .spin{display:inline-block;width:13px;height:13px;border:2px solid #ddd6fe;border-top-color:#7c3aed;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:7px;}
   @keyframes spin{to{transform:rotate(360deg);}}
+  #learningProgress{position:fixed;inset:0;z-index:95;display:none;align-items:center;justify-content:center;background:rgba(15,23,42,.52);padding:18px;pointer-events:auto;}
+  .learningProgressCard{width:min(88vw,390px);padding:24px 20px;background:#fff;border-radius:16px;box-shadow:0 20px 55px rgba(0,0,0,.28);text-align:center;}
+  .learningProgressSpinner{width:38px;height:38px;margin:0 auto 13px;border:4px solid #ddd6fe;border-top-color:#7c3aed;border-radius:50%;animation:spin .75s linear infinite;}
+  .learningProgressTitle{font-size:16px;font-weight:800;color:#312e81;}
+  .learningProgressNote{margin-top:7px;font-size:12px;line-height:1.65;color:#64748b;}
   /* 編集チャットはモーダルではなく「横並びドロワー」：開いていても左の患者とのやり取りは見える・スクロールできる */
   #dpanel{position:fixed;inset:0;background:transparent;z-index:72;display:none;pointer-events:none;}
   #dCard{position:absolute;right:0;top:0;bottom:0;width:min(96vw,430px);background:#f5f3ff;display:flex;flex-direction:column;overflow:hidden;box-shadow:-4px 0 24px rgba(76,29,149,.24);animation:slideinX .28s cubic-bezier(.22,.9,.36,1);pointer-events:auto;border-left:1px solid #c4b5fd;}
@@ -5081,6 +5238,7 @@ const PAGE = `<!DOCTYPE html>
   <div id="chat"><div id="empty">左の一覧から会話を選んでください</div></div>
 </div>
 <div id="menu"></div>
+<div id="learningProgress" role="status" aria-live="polite" aria-busy="true"><div class="learningProgressCard"><div class="learningProgressSpinner" aria-hidden="true"></div><div class="learningProgressTitle">回答と学習内容を検証中</div><div class="learningProgressNote">会話全体から「どんな状況で、何を確認し、どう回答するか」を整理しています。<br>完了するまでこの画面でお待ちください。</div></div></div>
 <div id="dpanel"><div id="dCard">
   <div id="dHead"><div><div class="dModeTitle">🤝 右腕くんに相談中</div><div class="dModeNote">ここでの入力は患者には送信されません</div></div><button class="cbtn" onclick="closeDraftChat()">患者画面に戻る</button></div>
   <div id="dMsgs"></div>
@@ -5089,7 +5247,7 @@ const PAGE = `<!DOCTYPE html>
     <button class="cbtn" onclick="dChip('もっと丁寧で温かい言い方にして')">丁寧に</button>
     <button class="cbtn" onclick="dChip('もっと柔らかい印象にして')">柔らかく</button>
   </div>
-  <div id="dComposer"><div class="dInputWrap"><textarea id="dText" placeholder="右腕くんへの指示を入力…（例：もっと簡潔にして）"></textarea><div class="enterHint">Enter＝改行　相談は下のボタン</div></div><button id="dSendBtn" class="cbtn dsend" onclick="dSend()">右腕くんへ相談</button></div>
+  <div id="dComposer"><div class="dInputWrap"><textarea id="dText" oninput="rememberDraftChatInput()" placeholder="右腕くんへの指示を入力…（例：もっと簡潔にして）"></textarea><div class="enterHint">Enter＝改行　相談は下のボタン</div></div><button id="dSendBtn" class="cbtn dsend" onclick="dSend()">右腕くんへ相談</button></div>
 </div></div>
 <div id="setPop"><div class="settingsCard">
   <div class="settingsHeader"><h3>⚙ 設定</h3><button type="button" class="cbtn" onclick="closeSet()">閉じる</button></div>
@@ -5164,11 +5322,12 @@ const PAGE = `<!DOCTYPE html>
   <div class="settingsSection">
     <div style="font-size:13px;margin-bottom:4px;">🧠 返信文を作るAIエンジン</div>
     <select id="setEngine" onchange="renderRuleGauge()" style="width:100%;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:13px;">
-      <option value="gpt">GPT（OpenAI・gpt-5系）</option>
+      <option value="gpt">GPT-5.6（用途別に自動切替）</option>
       <option value="gemini">Gemini（gemini-3-flash）</option>
       <option value="claude">Claude（保険・安定）</option>
     </select>
-    <div id="engineNote" style="font-size:11px;color:#6b7280;margin-top:2px;">文章作成（AI下書き・自動返信・AIで作り直す）に使うAIです。GPTを使うにはRailwayに OPENAI_KEY（必要なら OPENAI_MODEL）の設定が必要です。未設定のまま選ぶと安全のためClaudeで生成します。みぎうで君チャットと資料読み込みは引き続きClaude/Geminiを使用します。</div>
+    <div id="engineNote" style="font-size:11px;color:#6b7280;margin-top:2px;">通常の下書き・学習はTerra、分類はLuna、予約など重要判断はSolを使います。1つのOpenAI APIキーで切り替わります。</div>
+    <details id="aiRouteDetails" style="margin-top:8px;"><summary style="font-size:12px;cursor:pointer;color:#047857;">モデルの役割別設定</summary><div id="aiRouteFields" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:7px;"></div><div style="font-size:10.5px;color:#6b7280;line-height:1.5;margin-top:5px;">将来のモデルは運営側の登録後、この一覧から役割ごとに切り替えられます。設定変更前は「並行テスト」で患者へ送らず比較できます。</div></details>
     <div id="modelAlert" style="display:none;font-size:11px;background:#fef3c7;border:1px solid #fcd34d;color:#92400e;border-radius:8px;padding:8px;margin-top:6px;line-height:1.5;"></div>
   </div>
   <div class="settingsSection">
@@ -5176,6 +5335,7 @@ const PAGE = `<!DOCTYPE html>
     <div style="font-size:11px;color:#6b7280;line-height:1.5;margin-bottom:7px;">実際の店舗ルール・トーン・学習例を使って返信案だけを生成します。患者やLINEには送信されず、会話履歴にも残りません。</div>
     <textarea id="qualityPreviewInput" placeholder="テスト例：明日の予約を変更できますか？" style="width:100%;box-sizing:border-box;min-height:64px;border:1px solid #d1d5db;border-radius:8px;padding:8px;font-size:13px;font-family:inherit;"></textarea>
     <div style="display:flex;gap:6px;margin-top:6px;align-items:center;"><select id="qualityPreviewChannel" style="padding:7px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;"><option value="line">LINE</option><option value="mail">メール</option></select><button type="button" id="qualityPreviewBtn" class="cbtn send" onclick="runQualityPreview()">返信案をテスト生成</button></div>
+    <button type="button" id="shadowPreviewBtn" class="cbtn" onclick="runShadowPreview()" style="width:100%;margin-top:6px;">候補モデルを並行テスト（回答には使用しない）</button>
     <div id="qualityPreviewResult" style="display:none;white-space:pre-wrap;margin-top:8px;padding:9px;border:1px solid #d1fae5;border-radius:8px;background:#f0fdf4;font-size:12px;line-height:1.65;color:#1f2937;"></div>
   </div>
   <div class="settingsSection">
@@ -5291,15 +5451,14 @@ const PAGE = `<!DOCTYPE html>
 <div id="learnManagePop"><div class="learningCard">
   <div class="learningHeader">
     <div class="learningHeaderRow"><h3>🧠 学習データ管理</h3><button type="button" class="cbtn" onclick="closeLearning()">閉じる</button></div>
-    <div style="font-size:11px;color:#6b7280;line-height:1.6;margin-top:6px;"><b>学習判断待ち</b>では返信後に保留した内容を学習するか決めます。回答が食い違った場合は<b>矛盾の確認</b>で今後の正解を決めます。</div>
+    <div style="font-size:11px;color:#6b7280;line-height:1.6;margin-top:6px;"><b>店舗ルール</b>は店舗の事実・規定、<b>全体の返信方針</b>は全返信への共通指示、<b>過去の対応・学習例</b>は似た質問へ再利用する実例です。回答が食い違った場合は<b>学習確認待ち</b>で今後の正解を決めます。</div>
     <div id="learnPerformance" style="font-size:11px;color:#475569;line-height:1.55;margin-top:5px;"></div>
   </div>
   <div class="learningToolbar">
     <button type="button" class="cbtn learnTabBtn" data-tab="rules" onclick="setLearningTab('rules')">📚 店舗ルール <span id="learnRulesCount"></span></button>
     <button type="button" class="cbtn learnTabBtn" data-tab="prefs" onclick="setLearningTab('prefs')">🧠 全体の返信方針 <span id="learnPrefsCount"></span></button>
     <button type="button" class="cbtn learnTabBtn" data-tab="examples" onclick="setLearningTab('examples')">💬 過去の対応・学習例 <span id="learnExamplesCount"></span></button>
-    <button type="button" class="cbtn learnTabBtn" data-tab="decisions" onclick="setLearningTab('decisions')">🧠 学習判断待ち <span id="learnDecisionsCount"></span></button>
-    <button type="button" class="cbtn learnTabBtn" data-tab="conflicts" onclick="setLearningTab('conflicts')">⚠ 矛盾の確認 <span id="learnConflictsCount"></span></button>
+    <button type="button" class="cbtn learnTabBtn" data-tab="conflicts" onclick="setLearningTab('conflicts')">⚠ 学習確認待ち <span id="learnConflictsCount"></span></button>
     <input id="learnSearch" oninput="renderLearning()" placeholder="この種類を検索">
   </div>
   <div id="learnHelp" style="padding:9px 16px;background:#f8fafc;border-bottom:1px solid #e5e7eb;font-size:11px;color:#475569;line-height:1.55;"></div>
@@ -5315,14 +5474,18 @@ const PAGE = `<!DOCTYPE html>
   <div style="background:#fff;border-radius:16px;width:min(94vw,520px);max-height:90vh;overflow-y:auto;box-shadow:0 20px 50px rgba(0,0,0,.25);">
     <div style="padding:16px 18px 10px;border-bottom:1px solid #e5e7eb;">
       <h3 style="margin:0 0 5px;font-size:16px;">🧠 今回の対応を学習しますか？</h3>
-      <div style="font-size:11px;color:#64748b;line-height:1.55;">患者の質問、直前までの会話、AI下書き、修正指示、実際に送った返信をまとめて読み、今後使える判断として整理します。</div>
+      <div style="font-size:11px;color:#64748b;line-height:1.55;">学習するを選ぶと、修正チャットを含む一連のやり取りを読み、患者固有・今回限り・共通方針・店舗ルールを右腕くんが自動で整理します。</div>
     </div>
     <div style="padding:14px 18px;">
+      <label style="display:block;font-size:11px;font-weight:700;color:#475569;">会話全体から整理した学習案（必要なら修正できます）
+        <textarea id="learningScopeText" rows="10" style="display:block;width:100%;margin-top:5px;padding:9px;border:1px solid #cbd5e1;border-radius:9px;font:12px/1.6 inherit;resize:vertical;" placeholder="適用する状況・確認すること・回答方針を整理しています"></textarea>
+      </label>
+      <div id="learningScopeHint" style="font-size:11px;color:#6d28d9;margin:7px 0 11px;">保存後も設定→学習データ管理から更新・削除できます。</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-        <button type="button" class="cbtn send" data-learning-scope="learn" onclick="saveLearningScope('learn',this)" style="padding:12px;">学習する<br><small>会話全体から整理</small></button>
+        <button type="button" class="cbtn send" data-learning-scope="learn" onclick="saveLearningScope('learn',this)" style="padding:12px;">学習する<br><small>AIが用途別に整理</small></button>
         <button type="button" class="cbtn" data-learning-scope="none" onclick="saveLearningScope('none',this)" style="padding:12px;">学習しない<br><small>今回の内容は残さない</small></button>
       </div>
-      <div style="font-size:10.5px;color:#64748b;line-height:1.55;margin-top:9px;">既存内容と食い違う場合は自動上書きせず、「設定 → 学習データ管理 → 矛盾の確認」に残します。</div>
+      <div style="font-size:10.5px;color:#64748b;line-height:1.55;margin-top:8px;">料金・営業時間・キャンセル規定など重要な変更が既存内容と食い違う場合は、自動上書きせず確認待ちにします。</div>
     </div>
     <div style="padding:10px 18px 14px;display:flex;justify-content:flex-end;border-top:1px solid #e5e7eb;"><button type="button" class="cbtn" onclick="closeLearningScope()">あとで決める</button></div>
   </div>
@@ -5336,26 +5499,27 @@ const PAGE = `<!DOCTYPE html>
 </div>
 <div id="learnToast" style="display:none;position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:75;background:#065f46;color:#fff;border-radius:10px;padding:8px 14px;font-size:12px;box-shadow:0 6px 20px rgba(0,0,0,.25);">✓ この対応を学習しました</div>
 <div id="conflictPop" style="position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:80;display:none;align-items:center;justify-content:center;"><div style="background:#fff;border-radius:14px;padding:18px;width:min(92vw,380px);max-height:86vh;overflow-y:auto;">
-  <h3 style="margin:0 0 8px;font-size:15px;">⚠️ 前と答えが食い違っています</h3>
-  <div style="font-size:12px;color:#374151;margin-bottom:4px;">似た質問に、前はこう答えていました：</div>
+  <h3 id="conflictTitle" style="margin:0 0 8px;font-size:15px;">⚠️ 前と答えが食い違っています</h3>
+  <div id="conflictOldLabel" style="font-size:12px;color:#374151;margin-bottom:4px;">似た質問に、前はこう答えていました：</div>
   <div id="conflictOld" style="font-size:12px;background:#f3f4f6;border-radius:8px;padding:8px;margin-bottom:8px;white-space:pre-wrap;"></div>
-  <div style="font-size:12px;color:#374151;margin-bottom:4px;">今回はこう答えました：</div>
+  <div id="conflictNewLabel" style="font-size:12px;color:#374151;margin-bottom:4px;">今回はこう答えました：</div>
   <div id="conflictNew" style="font-size:12px;background:#ede9fe;border-radius:8px;padding:8px;margin-bottom:12px;white-space:pre-wrap;"></div>
   <div style="font-size:12px;color:#374151;margin-bottom:10px;">今後はどちらを基準にしますか？</div>
   <div style="display:flex;flex-direction:column;gap:8px;">
-    <button class="cbtn send" style="width:100%;" onclick="resolveConflict('new',this)">今後は今回の回答を正解にする</button>
-    <button class="cbtn" style="width:100%;" onclick="resolveConflict('old',this)">今回は特例（前の回答を正解のまま残す）</button>
+    <button id="conflictNewButton" class="cbtn send" style="width:100%;" onclick="resolveConflict('new',this)">今後は今回の回答を正解にする</button>
+    <button id="conflictOldButton" class="cbtn" style="width:100%;" onclick="resolveConflict('old',this)">今回は特例（前の回答を正解のまま残す）</button>
     <button class="cbtn" style="width:100%;" onclick="resolveConflict('later',this)">どちらでもない・後で正しい回答を入力</button>
   </div>
 </div></div>
 <script>
 let DATA=[];let DATA_REV=0;let DATA_READY=false;let current=null;
+const learningJobsByConversation={},shownLearningJobs=new Set();
 const roomsEl=document.getElementById("rooms"),chatEl=document.getElementById("chat"),appEl=document.getElementById("app");
 let initialConv="";try{initialConv=new URLSearchParams(location.search).get("conv")||"";}catch(e){}
 let learningPendingCounts={decisions:0,conflicts:0},learningBadgeBusy=false;
 function renderLearningPendingBadge(){const b=document.getElementById("learningPendingBadge");if(!b)return;const decisions=Number(learningPendingCounts.decisions||0),conflicts=Number(learningPendingCounts.conflicts||0),total=decisions+conflicts;b.style.display=total?"inline-block":"none";b.textContent=total?"🧠 学習確認 "+total+"件":"";b.classList.toggle("hasConflict",conflicts>0);b.title=(decisions?"学習判断待ち "+decisions+"件":"")+(decisions&&conflicts?"／":"")+(conflicts?"矛盾の確認 "+conflicts+"件":"");}
 async function refreshLearningBadge(){if(learningBadgeBusy)return;learningBadgeBusy=true;try{const r=await fetch("/api/learning-pending-count"),j=await r.json();if(r.ok&&j.ok){learningPendingCounts={decisions:Number(j.decisions||0),conflicts:Number(j.conflicts||0)};renderLearningPendingBadge();}}catch(e){}finally{learningBadgeBusy=false;}}
-function openLearningPending(){learnTab=learningPendingCounts.decisions>0?"decisions":"conflicts";openLearning();}
+async function openLearningPending(){if(learningPendingCounts.decisions>0){await pollLearningJobs();const job=Object.values(learningJobsByConversation).find(item=>item&&item.status==="ready"&&item.resultType==="review"&&item.learningReview);if(job){if(current!==job.conversationId)openChat(job.conversationId);shownLearningJobs.add(job.id);showLearningScope(Object.assign({},job.learningReview,{learningJobId:job.id}));return;}}learnTab="conflicts";openLearning();}
 async function load(){ try{ const r=await fetch(DATA_READY?("/api/conversation-updates?since="+encodeURIComponent(DATA_REV)):"/api/conversations");const j=await r.json();if(Array.isArray(j)){DATA=j;DATA_REV=DATA.reduce((m,c)=>Math.max(m,Number(c&&c._rev||c&&c.ts||0)),0);DATA_READY=true;}else if(j&&j.ok){const byId=new Map(DATA.map(c=>[c.id,c]));(j.updates||[]).forEach(c=>byId.set(c.id,c));const meta=j.meta||{};byId.forEach(c=>{c.staffLineReviewAvailable=!!meta.staffLineReviewAvailable;c.inboxOrder=meta.inboxOrder||c.inboxOrder;});const ordered=[];(j.order||[]).forEach(id=>{const c=byId.get(id);if(c){ordered.push(c);byId.delete(id);}});DATA=ordered.concat([...byId.values()]);DATA_REV=Math.max(DATA_REV,Number(j.version||0));DATA_READY=true;} }catch(e){} renderList(); if(initialConv&&!current){const target=DATA.find(x=>x.id===initialConv);if(target){const id=initialConv;initialConv="";openChat(id);try{history.replaceState(null,"",location.pathname);}catch(e){}}} if(current){ const c=DATA.find(x=>x.id===current); if(c){syncMsgs(c);renderScheduledMessages(c);} } }
 function api(path,body){ return fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); }
 const uiBusyKeys=new Set();
@@ -5419,7 +5583,8 @@ function renderList(){
     const d=document.createElement("div");
     d.className="room"+(current===r.id?" active":"")+(r.flag?" flag":"");
     const acctBadge=(r.acct&&r.acct.name&&r.acct.name!=="メイン")?' <span class="badge">'+esc(r.acct.name)+'</span>':'';
-    d.innerHTML=av(r)+'<div class="rmid"><div class="rtop"><span class="rname">'+esc(r.name)+acctBadge+'</span><span class="rtime">'+tlabel(r)+'</span></div><div class="rlast">'+esc(r.last||"")+'</div></div><div class="stat">'+statIcon(r)+'</div>';
+    const learningJob=learningJobsByConversation[r.id],learningBadge=learningJob?('<span style="font-size:10px;color:'+(learningJob.status==="ready"?'#6d28d9':'#64748b')+';white-space:nowrap;">'+(learningJob.status==="ready"?'🧠 学習確認':'… 学習整理中')+'</span>'):'';
+    d.innerHTML=av(r)+'<div class="rmid"><div class="rtop"><span class="rname">'+esc(r.name)+acctBadge+'</span><span class="rtime">'+tlabel(r)+'</span></div><div class="rlast">'+esc(r.last||"")+'</div>'+learningBadge+'</div><div class="stat">'+statIcon(r)+'</div>';
     d.onclick=()=>openChat(r.id);
     roomsEl.appendChild(d);
   });
@@ -5432,7 +5597,7 @@ function renderGrounding(r){const el=document.getElementById("groundingUsed");if
 let draftEditTimer=null;
 function draftEdited(){const d=document.getElementById("draft"),r=DATA.find(x=>x.id===current);if(!d||!r)return;r.draft=d.value;r.grounding={autoSendAllowed:false,reasons:["スタッフが下書きを編集したため手動送信します"],sources:["スタッフ編集"]};r.validation={pass:false,skipped:true,reason:"編集後の文章は自動送信しません"};renderGrounding(r);clearTimeout(draftEditTimer);const id=current,text=d.value;draftEditTimer=setTimeout(()=>api("/api/draft-edited",{id,draft:text}).catch(()=>{}),350);}
 function syncMsgs(c){const m=document.getElementById("msgs");if(!m)return;if(m.getAttribute("data-count")!==String(c.msgs.length)){m.innerHTML=bubblesHtml(c);m.setAttribute("data-count",String(c.msgs.length));m.scrollTop=m.scrollHeight;}}
-function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)return; appEl.classList.add("chatopen");
+function openChat(id,keep){if(window.__dBusy&&current&&current!==id){uiAlert("右腕くんが回答を作成中です。完了してから別の会話を開いてください");return;}if(current&&current!==id)hideDraftChatForConversationSwitch();current=id;const r=DATA.find(x=>x.id===id);if(!r)return; appEl.classList.add("chatopen");
   const bubbles=bubblesHtml(r);
   const staffReviewButton=r.staffLineReviewAvailable?'<button class="cbtn" id="staffReviewResend" onclick="resendStaffApproval()">'+(r.staffLineApproval?'📲 承認依頼を再送':'📲 スタッフLINEで確認')+'</button>':'';
   chatEl.innerHTML='<div id="chatHead"><button id="backBtn" onclick="closeChat()">‹</button>'+av(r,30)+'<span id="chatName">'+esc(r.name)+'　<span style="font-size:11px;color:#6b7280;">'+(r.channel==="line"?"LINE":"メール")+((r.acct&&r.acct.name&&r.acct.name!=="メイン")?"・"+esc(r.acct.name):"")+'</span></span><button id="shareClinicBtn" class="hbtn" onclick="shareClinic()">🏥 クリニックへ共有</button></div>'+
@@ -5441,9 +5606,9 @@ function openChat(id,keep){ current=id;const r=DATA.find(x=>x.id===id);if(!r)ret
     '<div id="msgs">'+bubbles+'</div>'+
     '<div id="composer"><div id="aiLabel"><span class="patientModeTitle">🟢 患者への返信を編集中</span><span class="patientModeNote">この入力欄の内容は患者へ送信されます</span></div><div id="groundingUsed" style="display:'+(groundingText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:'+(r.grounding&&r.grounding.autoSendAllowed&&r.validation&&r.validation.pass?'#047857':'#b45309')+';margin:2px 0 5px;">'+esc(groundingText(r))+'</div><div id="topicChips" style="display:none;"></div><div id="scheduledList"></div><div id="pendingAttachments"></div><div id="draftRow"><button id="attach" onclick="attach()" title="画像・ファイルを追加">📎</button><textarea id="draft" oninput="draftEdited()" onpaste="handleDraftPaste(event)" placeholder="患者へのメッセージ。画像やファイルもここへ貼り付けできます">'+esc(r.draft||"")+'</textarea></div><div class="enterHint">Enter＝改行　送信はボタンのみ</div>'+
     '<div id="cbtns"><div class="composerSecondary"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ 右腕くんに相談</button>'+staffReviewButton+'<button id="markDoneBtn" class="cbtn done" onclick="markDone()">対応済み</button></div><div class="composerPrimary"><button class="cbtn schedule" onclick="openScheduledMessage()">🕒 予約送信</button><button class="cbtn send" onclick="sendMsg()">患者へ送信</button></div></div></div>';
-  const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r);renderPendingAttachments();renderScheduledMessages(r); loadCustomer(id); if(!keep)renderList();
+  const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r);renderPendingAttachments();renderScheduledMessages(r); loadCustomer(id); if(!keep)renderList(); showReadyLearningFor(id);
 }
-function closeChat(){appEl.classList.remove("chatopen");current=null;renderList();}
+function closeChat(){hideDraftChatForConversationSwitch();appEl.classList.remove("chatopen");current=null;renderList();}
 // ===== うけつけるん 顧客情報パネル =====
 var custPid=null; var karteEntries={};
 var custCache={}; var karteCache={}; // 会話ごとのコンテキスト/カルテのメモリキャッシュ（体感1秒以下）
@@ -5868,19 +6033,31 @@ async function redraftSelected(){ if(!current||!selTopics)return; const sel=[...
 async function markDone(){const id=current,btn=document.getElementById("markDoneBtn");await withBusy("done-"+id,btn,"処理中…",async()=>{try{await api("/api/done",{id});await load();}catch(e){uiAlert("変更に失敗しました");}});}
 async function markAllDone(){if(!await uiConfirm("すべてのチャットを「対応済み」に変更します。よろしいですか？"))return;const btn=document.getElementById("markAllDoneBtn");await withBusy("done-all",btn,"処理中…",async()=>{try{const r=await api("/api/done-all",{});const j=await r.json();closeSet();if(current){closeChat();}await load();uiAlert((j.count||0)+"件を対応済みにしました");}catch(e){uiAlert("変更に失敗しました");}});}
 let learningScopeData=null;
+const learningScopeLabels={none:"学習しない",learn:"学習する"};
 function showLearningScope(data){
   learningScopeData=data||null;if(!learningScopeData)return;
-  const p=document.getElementById("learningScopePop");
+  const p=document.getElementById("learningScopePop"),tx=document.getElementById("learningScopeText"),hint=document.getElementById("learningScopeHint");
+  if(tx)tx.value=learningScopeData.text||learningScopeData.instr||"";
+  if(hint)hint.textContent="保存後も設定→学習データ管理から更新・削除できます。";
+  document.querySelectorAll("[data-learning-scope]").forEach(b=>{b.style.boxShadow="none";});
   if(p)p.style.display="flex";refreshLearningBadge();
 }
 function closeLearningScope(){const p=document.getElementById("learningScopePop");if(p)p.style.display="none";learningScopeData=null;}
 async function saveLearningScope(scope,btn){
   const data=learningScopeData;if(!data)return;
+  const text=(document.getElementById("learningScopeText").value||"").trim();
+  if(scope!=="none"&&!text){uiAlert("今後守る内容を入力してください");return;}
   await withBusy("learning-scope-"+data.exampleId,btn,"保存中…",async()=>{try{
-    const r=await api("/api/learning-scope",{decisionId:data.decisionId,exampleId:data.exampleId,conversationId:data.conversationId,scope}),j=await r.json();
+    const r=await api("/api/learning-scope",{exampleId:data.exampleId,conversationId:data.conversationId,learningJobId:data.learningJobId,scope,text}),j=await r.json();
     if(!r.ok||!j.ok)throw new Error(j.error||"save");
     closeLearningScope();showLearnResult(j.message||"学習内容を保存しました");refreshLearningBadge();
   }catch(e){uiAlert("学習内容を保存できませんでした。設定→学習データ管理から確認してください。");}});
+}
+function openRuleLearning(){
+  const data=learningScopeData;if(!data)return;
+  const text=(document.getElementById("learningScopeText").value||"").trim();
+  const ctx={customer:data.q||"",draft0:data.draft0||"",finalText:data.final||"",instructions:text||data.instr||"",confirmedGeneral:true};
+  closeLearningScope();openAsst(ctx);
 }
 function showLearnResult(message){const b=document.getElementById("learnToast");if(!b)return;b.textContent="✓ "+message;b.style.display="block";clearTimeout(learnToastTimer);learnToastTimer=setTimeout(()=>{b.style.display="none";},4500);}
 const pendingAttachmentsByConversation={};
@@ -5920,15 +6097,19 @@ function renderPendingAttachments(){
 }
 function removePendingAttachment(index){pendingAttachments(current).splice(index,1);renderPendingAttachments();}
 function attach(){const input=document.createElement("input");input.type="file";input.multiple=true;input.accept="image/*,video/mp4,video/quicktime,application/pdf,.pdf,.doc,.docx,.xls,.xlsx,.txt,.csv";input.onchange=()=>uploadComposerFiles(input.files);input.click();}
-function draftLearningPayload(id,text){const cd0=DATA.find(x=>x.id===id),orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim(),edited=(text!==orig);let instr="",learningText="";try{if(dSessions&&dSessions[id]){if(Array.isArray(dSessions[id].hist))instr=dSessions[id].hist.filter(m=>m&&m.role==="user").map(m=>String(m.content||"")).join(" / ").slice(0,1500);learningText=String(dSessions[id].memory||"").slice(0,800);}}catch(e){}return{instr:edited?instr:"",learningText:edited?learningText:""};}
-async function sendMsg(){if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="患者へ送信中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText});let json={};try{json=await response.json();}catch(e){}if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";if(json.conflict){showConflict(json.conflict);}else if(json.learningReview){showLearningScope(json.learningReview);}else if(json.learnedRules&&json.learnedRules.length){showRuleToast(json.learnedRules);}else if(json.learnedId){showLearnToast(json.learnedId);}await load();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
+function draftLearningPayload(id,text){const cd0=DATA.find(x=>x.id===id),orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim(),edited=(text!==orig);let instr="",learningText="",learningChat=[];try{if(dSessions&&dSessions[id]){if(Array.isArray(dSessions[id].hist)){learningChat=dSessions[id].hist.filter(m=>m&&["user","assistant"].includes(m.role)).slice(-20).map(m=>({role:m.role,content:String(m.content||"").slice(0,3000)}));instr=learningChat.filter(m=>m.role==="user").map(m=>m.content).join(" / ").slice(0,1500);}learningText=String(dSessions[id].memory||"").slice(0,800);}}catch(e){}return{instr:edited?instr:"",learningText:edited?learningText:"",learningChat:edited?learningChat:[]};}
+function showLearningProgress(){const p=document.getElementById("learningProgress");if(p)p.style.display="flex";}
+function hideLearningProgress(){const p=document.getElementById("learningProgress");if(p)p.style.display="none";}
+function showReadyLearningFor(id){const job=learningJobsByConversation[id];if(!job||job.status!=="ready"||shownLearningJobs.has(job.id)||current!==id)return;shownLearningJobs.add(job.id);if(job.resultType==="conflict"&&job.conflict){showConflict(Object.assign({},job.conflict,{learningJobId:job.id}));}else if(job.learningReview){showLearningScope(Object.assign({},job.learningReview,{learningJobId:job.id}));}}
+async function pollLearningJobs(){try{const r=await fetch("/api/learning-jobs"),j=await r.json();if(!r.ok||!j.ok)return;Object.keys(learningJobsByConversation).forEach(k=>delete learningJobsByConversation[k]);(j.jobs||[]).forEach(job=>{const old=learningJobsByConversation[job.conversationId];if(!old||Number(job.updatedAt)>=Number(old.updatedAt))learningJobsByConversation[job.conversationId]=job;});renderList();if(current)showReadyLearningFor(current);}catch(e){}}
+async function sendMsg(){if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="患者へ送信中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat});let json={};try{json=await response.json();}catch(e){}if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";if(json.learningJob){learningJobsByConversation[id]=json.learningJob;showLearnResult("送信しました。学習案はバックグラウンドで整理中です");}await load();pollLearningJobs();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
 let scheduledMessageDraft=null;
 function localDateTimeValue(date){const pad=n=>String(n).padStart(2,"0");return date.getFullYear()+"-"+pad(date.getMonth()+1)+"-"+pad(date.getDate())+"T"+pad(date.getHours())+":"+pad(date.getMinutes());}
 function openScheduledMessage(){
   if(window.__composerUploadBusy){uiAlert("添付の準備が終わってから予約してください");return;}
   const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id).slice();
   if(!text&&!files.length){uiAlert("予約する本文または添付ファイルを追加してください");return;}
-  const learning=draftLearningPayload(id,text);scheduledMessageDraft={id,text,files,instr:learning.instr,learningText:learning.learningText};
+  const learning=draftLearningPayload(id,text);scheduledMessageDraft={id,text,files,instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat};
   const at=new Date(Date.now()+10*60000);at.setSeconds(0,0);at.setMinutes(Math.ceil(at.getMinutes()/5)*5);
   document.getElementById("scheduledMessageAt").value=localDateTimeValue(at);
   document.getElementById("scheduledMessageMeta").textContent=(text?"入力中の本文":"本文なし")+(files.length?"・添付 "+files.length+"件":"")+"をこのまま予約します";
@@ -5939,7 +6120,7 @@ async function saveScheduledMessage(){
   const data=scheduledMessageDraft,input=document.getElementById("scheduledMessageAt"),button=document.getElementById("scheduledMessageSave");if(!data)return;
   const sendAt=new Date(input.value).getTime();if(!sendAt||sendAt<Date.now()+5000){uiAlert("現在より後の送信日時を指定してください");return;}
   await withBusy("scheduled-message-"+data.id,button,"予約中…",async()=>{try{
-    const response=await api("/api/scheduled-message",{id:data.id,text:data.text,fileIds:data.files.map(file=>file.id),sendAt,instr:data.instr,learningText:data.learningText}),json=await response.json();
+    const response=await api("/api/scheduled-message",{id:data.id,text:data.text,fileIds:data.files.map(file=>file.id),sendAt,instr:data.instr,learningText:data.learningText,learningChat:data.learningChat}),json=await response.json();
     if(!response.ok||!json.ok)throw new Error(json.error||"schedule");
     pendingAttachmentsByConversation[data.id]=[];if(current===data.id){const draft=document.getElementById("draft");if(draft)draft.value="";renderPendingAttachments();}
     closeScheduledMessage();await load();uiAlert("送信予約を登録しました。送信前なら会話画面から取り消せます");
@@ -5957,8 +6138,14 @@ async function resendStaffApproval(){if(!current)return;const b=document.getElem
 async function shareClinic(){const note=await uiPrompt("現場に伝える内容を入力してください（空欄のままOKを押すと、お客様の直近メッセージをそのまま共有します）","");if(note===null)return;const btn=document.getElementById("shareClinicBtn"),id=current;await withBusy("share-"+id,btn,"共有中…",async()=>{try{const r=await api("/api/share",{id,note:note||""});const j=await r.json();if(j.ok)uiAlert("現場ボードに共有しました");else uiAlert("共有に失敗しました");}catch(e){uiAlert("共有に失敗しました");}});}
 async function toggleFlag(){if(!current)return;const id=current,b=document.getElementById("flagBtn");let next=null;await withBusy("flag-"+id,b,"変更中…",async()=>{try{const r=await api("/api/tag",{id});const j=await r.json();next=!!j.flag;const cd=DATA.find(x=>x.id===id);if(cd)cd.flag=next;renderList();}catch(e){uiAlert("変更に失敗しました");}});if(b&&next!==null)b.textContent=next?"⚑ 要対応を外す":"⚑ 要対応";}
 // ---- AIで作り直す（会話型・下書きを会話で磨く。会話ごとにセッションを保持し再開可能）----
-let dHist=[],dLog=[],dSessions={};
+let dHist=[],dLog=[],dSessions={},dComposerDrafts={},dComposerOwner="";
 const dMsgsEl=document.getElementById("dMsgs");
+function rememberDraftChatInput(){const x=document.getElementById("dText");if(x&&dComposerOwner)dComposerDrafts[dComposerOwner]=x.value;}
+function hideDraftChatForConversationSwitch(){
+  rememberDraftChatInput();dComposerOwner="";
+  const panel=document.getElementById("dpanel"),app=document.getElementById("app");
+  if(panel)panel.style.display="none";if(app)app.classList.remove("dopen");
+}
 function dRender(role,text){const d=document.createElement("div");d.className="am "+role;d.textContent=text;dMsgsEl.appendChild(d);dMsgsEl.scrollTop=dMsgsEl.scrollHeight;return d;}
 function dAdd(role,text){dLog.push({type:role,text});return dRender(role,text);}
 function dDraftCard(entry){const card=document.createElement("div");card.className="amcard";
@@ -5984,6 +6171,7 @@ function dBookingCard(info){const card=document.createElement("div");card.classN
 function staffBookingError(code){return ({not_linked:"うけつけるん連携が有効ではありません。",patient_not_verified:"この会話の患者を安全に特定できないため操作できません。",appointment_mismatch:"現在の患者の予約と一致しないため停止しました。",not_changeable:"この予約は変更・キャンセルできません。",patient_confirmation_pending:"患者様への確認待ち手続きがあるため、先にそちらを完了してください。",staff_confirmation_pending:"別の予約操作が確認待ちです。先に表示中の確認カードを実行または取り消してください。",slot_taken:"指定枠はすでに埋まっています。",bad_date:"日付を確認してください。",bad_datetime:"変更先の日時を確認してください。",expired:"確認期限が切れました。もう一度指示してください。",result_unknown:"実行結果を確認できません。うけつけるんの予約詳細で確認してください。"})[code]||"予約システムで処理できませんでした。";}
 async function dHandleBookingAction(action){if(!action||!action.type)return;dAdd("sysn","うけつけるんで対象患者と最新の予約状態を確認しています…");try{const r=await api("/api/staff-booking-action",Object.assign({id:current},action));const j=await r.json();if(j.ok&&j.kind==="info")dAdd("ai",j.text||"確認できました");else if(j.ok&&j.kind==="confirm")dBookingCard(j);else{let msg=j.text||staffBookingError(j.error);if(j.alternatives&&j.alternatives.length)msg+="\\n空き候補: "+j.alternatives.map(x=>x.label).join(" / ");dAdd("sysn","⚠ "+msg);}}catch(e){dAdd("sysn","うけつけるんへ接続できませんでした。予約操作は行っていません。");}}
 function openDraftChat(){if(!current)return;const openId=current;const c=DATA.find(x=>x.id===openId);if(!c)return;
+  rememberDraftChatInput();dComposerOwner=openId;
   dMsgsEl.innerHTML="";
   const s=dSessions[current];
   if(s&&s.ts===c.ts){ // 会話に動きがなければ前回の続きから再開
@@ -6001,6 +6189,7 @@ function openDraftChat(){if(!current)return;const openId=current;const c=DATA.fi
       dAdd("ai","まだ下書きがありません。どんな返信にしたいか教えてください。お客様との会話は読み込み済みです。");
     }
   }
+  const composer=document.getElementById("dText");if(composer)composer.value=dComposerDrafts[openId]||"";
   document.getElementById("dpanel").style.display="block";
   const app=document.getElementById("app");if(app)app.classList.add("dopen"); // 会話エリアをドロワー分だけ詰める（横並び表示）
   fetch("/api/staff-booking-pending?id="+encodeURIComponent(openId)).then(r=>r.json()).then(j=>{if(current===openId&&j&&j.pending)dBookingCard(j.pending);}).catch(()=>{});
@@ -6009,10 +6198,10 @@ function slideClose(pid,cid){const p=document.getElementById(pid),c=document.get
   const mob=window.matchMedia("(max-width:760px)").matches;
   c.style.animation=(mob?"slideoutY":"slideoutX")+" .22s ease forwards";
   setTimeout(()=>{p.style.display="none";c.style.animation="";},220);}
-function closeDraftChat(){const app=document.getElementById("app");if(app)app.classList.remove("dopen");slideClose("dpanel","dCard");}
-function dChip(t){const x=document.getElementById("dText");x.value=t;dSend();}
+function closeDraftChat(){rememberDraftChatInput();const app=document.getElementById("app");if(app)app.classList.remove("dopen");slideClose("dpanel","dCard");}
+function dChip(t){const x=document.getElementById("dText");x.value=t;rememberDraftChatInput();dSend();}
 // GPT風ストリーミング送信。返事が文字単位で流れ、下書きカードもリアルタイムに埋まる。失敗時は従来API(JSON)へ自動フォールバック。
-async function dSend(){if(window.__dBusy)return;const x=document.getElementById("dText");const txt=x.value.trim();if(!txt)return;window.__dBusy=true;const btn=document.getElementById("dSendBtn"),old=btn&&btn.innerHTML;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>作成中…';}x.value="";
+async function dSend(){if(window.__dBusy)return;const x=document.getElementById("dText");const txt=x.value.trim();if(!txt)return;window.__dBusy=true;const btn=document.getElementById("dSendBtn"),old=btn&&btn.innerHTML;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>作成中…';}x.value="";if(dComposerOwner)dComposerDrafts[dComposerOwner]="";
   dAdd("user",txt);dHist.push({role:"user",content:txt});
   const logEntry={type:"ai",text:""};dLog.push(logEntry);
   const aiEl=dRender("ai","…");
@@ -6046,7 +6235,7 @@ async function dSend(){if(window.__dBusy)return;const x=document.getElementById(
     if(meta.ok===false||(!fin.reply&&!fin.draft))throw new Error("stream_empty");
     if(fin.reply&&meta.engine){aiEl.textContent=fin.reply+" 〔"+meta.engine+"で作成〕";logEntry.text=aiEl.textContent;}
     dHist.push({role:"assistant",content:(fin.draft||fin.reply||"").slice(0,4000)});
-    if(meta.memory){if(dSessions[current])dSessions[current].memory=meta.memory;dAdd("sysn","🧠 学習候補：「"+meta.memory+"」（患者への送信後に、学習する／しないを選べます）");}
+    if(meta.memory){if(dSessions[current])dSessions[current].memory=meta.memory;dAdd("sysn","🧠 学習候補：「"+meta.memory+"」（患者への送信後に、会話全体から判断手順へ整理して学習するか選べます）");}
     if(meta.rule){if(dSessions[current])dSessions[current].rule=meta.rule;dAdd("sysn","📚 店舗ルール候補：「"+meta.rule.title+"」（患者への送信後に内容を確認して反映できます）");}
     if(meta.action)await dHandleBookingAction(meta.action);
   }catch(e){
@@ -6059,7 +6248,7 @@ async function dSend(){if(window.__dBusy)return;const x=document.getElementById(
         aiEl.textContent=j.reply||"できました";logEntry.text=aiEl.textContent;
         if(!cardEntry)dNewCard(j.draft);else{cardEntry.draft=j.draft;const cEl=cardEntry._el?cardEntry._el.querySelector(".c"):null;if(cEl)cEl.textContent=j.draft;}
         dHist.push({role:"assistant",content:j.draft});
-        if(j.memory){if(dSessions[current])dSessions[current].memory=j.memory;dAdd("sysn","🧠 学習候補：「"+j.memory+"」（患者への送信後に、学習する／しないを選べます）");}
+        if(j.memory){if(dSessions[current])dSessions[current].memory=j.memory;dAdd("sysn","🧠 学習候補：「"+j.memory+"」（患者への送信後に、会話全体から判断手順へ整理して学習するか選べます）");}
         if(j.rule){if(dSessions[current])dSessions[current].rule=j.rule;dAdd("sysn","📚 店舗ルール候補：「"+j.rule.title+"」（患者への送信後に内容を確認して反映できます）");}
         if(j.action)await dHandleBookingAction(j.action);
       }else{aiEl.textContent="エラー: "+(j.error||"不明");logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";}
@@ -6129,7 +6318,7 @@ function renderPrefs(prefs){const el=document.getElementById("prefList");if(!el)
 async function addPref(){const inp=document.getElementById("prefInput");const value=(inp&&inp.value||"").trim();if(!value)return;await withBusy("legacy-pref-add",null,"",async()=>{try{const r=await api("/api/pref-add",{text:value});const j=await r.json();if(j.ok){if(inp)inp.value="";renderPrefs(j.prefs||[]);}}catch(e){uiAlert("追加に失敗しました");}});}
 async function delPref(id){await withBusy("legacy-pref-delete-"+id,null,"",async()=>{try{const r=await api("/api/pref-delete",{id});const j=await r.json();if(j.ok)renderPrefs(j.prefs||[]);}catch(e){uiAlert("削除に失敗しました");}});}
 // 店舗ルール・全体の返信方針・過去の対応・学習例を、保存先は分けたまま一画面で管理する。
-let LEARN={rules:[],prefs:[],examples:[],decisions:[],conflicts:[],performance:[]},learnTab="rules";
+let LEARN={rules:[],prefs:[],examples:[],conflicts:[],performance:[]},learnTab="rules";
 function learnField(label,value,rows,readOnly){
   const box=document.createElement("label");box.style.cssText="display:block;margin-top:8px;font-size:11px;font-weight:600;color:#475569;";box.appendChild(document.createTextNode(label));
   const el=rows?document.createElement("textarea"):document.createElement("input");if(!rows)el.type="text";el.value=value||"";if(rows)el.rows=rows;if(readOnly)el.readOnly=true;
@@ -6141,7 +6330,7 @@ function learnCard(){const d=document.createElement("div");d.style.cssText="bord
 function setLearnStatus(text,bad){const e=document.getElementById("learnStatus");if(e){e.textContent=text||"";e.style.color=bad?"#dc2626":"#6b7280";}}
 async function reloadLearning(){
   setLearnStatus("読み込み中…");
-  try{const r=await fetch("/api/learning-data");const j=await r.json();if(!r.ok||!j.ok)throw new Error("load");LEARN={rules:j.rules||[],prefs:j.prefs||[],examples:j.examples||[],decisions:j.decisions||[],conflicts:j.conflicts||[],performance:j.performance||[]};learningPendingCounts={decisions:LEARN.decisions.length,conflicts:LEARN.conflicts.length};renderLearningPendingBadge();renderLearning();setLearnStatus("");}
+  try{const r=await fetch("/api/learning-data");const j=await r.json();if(!r.ok||!j.ok)throw new Error("load");LEARN={rules:j.rules||[],prefs:j.prefs||[],examples:j.examples||[],conflicts:j.conflicts||[],performance:j.performance||[]};learningPendingCounts.conflicts=LEARN.conflicts.length;renderLearningPendingBadge();renderLearning();setLearnStatus("");}
   catch(e){setLearnStatus("学習データを読み込めませんでした",true);}
 }
 function openLearning(){document.getElementById("learnManagePop").style.display="flex";reloadLearning();}
@@ -6150,18 +6339,17 @@ function setLearningTab(tab){learnTab=tab;document.getElementById("learnSearch")
 function learningMatches(item,query){if(!query)return true;return Object.values(item||{}).some(v=>String(v||"").toLowerCase().includes(query));}
 function renderLearning(){
   const list=document.getElementById("learnList");if(!list)return;list.innerHTML="";
-  document.getElementById("learnRulesCount").textContent="("+LEARN.rules.length+")";document.getElementById("learnPrefsCount").textContent="("+LEARN.prefs.length+")";document.getElementById("learnExamplesCount").textContent="("+LEARN.examples.length+")";document.getElementById("learnDecisionsCount").textContent="("+LEARN.decisions.length+")";document.getElementById("learnConflictsCount").textContent="("+LEARN.conflicts.length+")";
+  document.getElementById("learnRulesCount").textContent="("+LEARN.rules.length+")";document.getElementById("learnPrefsCount").textContent="("+LEARN.prefs.length+")";document.getElementById("learnExamplesCount").textContent="("+LEARN.examples.length+")";document.getElementById("learnConflictsCount").textContent="("+LEARN.conflicts.length+")";
   const perf=document.getElementById("learnPerformance"),ready=(LEARN.performance||[]).filter(x=>x.ready);if(perf)perf.textContent=ready.length?"✅ 自動対応の実績基準を満たした種類: "+ready.map(x=>x.label).join("、"):"現在は実績を蓄積中です。種類ごとに5件以上、うち無修正3件以上を目安に自動対応候補になります。";
   document.querySelectorAll(".learnTabBtn").forEach(b=>{const on=b.dataset.tab===learnTab;b.style.background=on?"#ecfdf5":"#fff";b.style.borderColor=on?"#10b981":"#d1d5db";b.style.color=on?"#047857":"#374151";});
   const help=document.getElementById("learnHelp"),add=document.getElementById("learnAddBtn");
   if(learnTab==="rules"){help.textContent="店舗の料金・営業時間・対応可否などの事実や規定です。関連する質問への回答では最優先で使われます。";add.style.display="inline-block";add.textContent="＋店舗ルールを追加";}
   else if(learnTab==="prefs"){help.textContent="文体や案内方針など、すべての返信に毎回適用する共通指示です。患者固有の情報は登録しないでください。";add.style.display="inline-block";add.textContent="＋返信方針を追加";}
   else if(learnTab==="examples"){help.textContent="スタッフが実際に送った返信の実例です。似た問い合わせのときに対応方法と文章を再利用します。患者情報を含む場合があるため、不要な例は削除できます。";add.style.display="none";}
-  else if(learnTab==="decisions"){help.textContent="返信後に『あとで決める』で保留した対応です。学習するまでは、右腕くんの下書きに使用されません。";add.style.display="none";}
   else{help.textContent="似た質問への回答が前回と今回で食い違っています。今後どちらを正解にするか、または正しい回答を入力してください。決めるまで自動学習の基準にはしません。";add.style.display="none";}
   const q=(document.getElementById("learnSearch").value||"").trim().toLowerCase();const items=(LEARN[learnTab]||[]).filter(x=>learningMatches(x,q));
   if(!items.length){const e=document.createElement("div");e.style.cssText="text-align:center;color:#94a3b8;padding:42px 10px;font-size:13px;";e.textContent=q?"検索に一致するデータはありません":"まだデータはありません";list.appendChild(e);return;}
-  items.forEach(item=>{if(learnTab==="rules")renderLearnRule(list,item);else if(learnTab==="prefs")renderLearnPref(list,item);else if(learnTab==="examples")renderLearnExample(list,item);else if(learnTab==="decisions")renderLearnDecision(list,item);else renderLearnConflict(list,item);});
+  items.forEach(item=>{if(learnTab==="rules")renderLearnRule(list,item);else if(learnTab==="prefs")renderLearnPref(list,item);else if(learnTab==="examples")renderLearnExample(list,item);else renderLearnConflict(list,item);});
 }
 function renderLearnRule(list,item){
   const card=learnCard(),title=learnField("見出し",item.title||"",0),content=learnField("ルール本文",item.content||"",4);card.appendChild(title.box);card.appendChild(content.box);
@@ -6179,15 +6367,6 @@ function renderLearnExample(list,item){
   const meta=item.learningMeta||{},q=learnField("患者からの問い合わせ",item.q||"",3),final=learnField("スタッフが実際に送った返信",item.final||"",5),instr=learnField("返信作成時の修正指示（任意）",item.instr||"",2),intent=learnField("AIが整理した問い合わせの種類",meta.intent||"",1),decision=learnField("今後再利用する判断・案内手順",meta.decision||"",3),conditions=learnField("適用条件",meta.conditions||"",2),avoid=learnField("避ける回答",meta.avoid||"",2);card.appendChild(q.box);card.appendChild(final.box);card.appendChild(instr.box);const detm=document.createElement("details");detm.style.cssText="margin-top:8px;font-size:11px;color:#475569;";const summ=document.createElement("summary");summ.textContent="AIが学習した判断を確認・編集";summ.style.cursor="pointer";detm.appendChild(summ);detm.appendChild(intent.box);detm.appendChild(decision.box);detm.appendChild(conditions.box);detm.appendChild(avoid.box);card.appendChild(detm);
   if(item.draft0){const det=document.createElement("details");det.style.cssText="margin-top:8px;font-size:11px;color:#64748b;";const sum=document.createElement("summary");sum.textContent="元のAI下書きを確認（編集不可）";sum.style.cursor="pointer";det.appendChild(sum);const draft=learnField("",item.draft0,3,true);det.appendChild(draft.box);card.appendChild(det);}
   const row=document.createElement("div");row.style.cssText="display:flex;justify-content:flex-end;gap:7px;margin-top:9px;";row.appendChild(learnButton("削除",false,async()=>{if(!await uiConfirm("この過去の対応・学習例を削除しますか？"))return;await learnMutate("/api/example-delete",{id:item.id},"削除しました");}));row.appendChild(learnButton("保存",true,async()=>{await learnMutate("/api/example-update",{id:item.id,q:q.el.value,final:final.el.value,instr:instr.el.value,learningMeta:{intent:intent.el.value,decision:decision.el.value,conditions:conditions.el.value,avoid:avoid.el.value,searchTerms:meta.searchTerms||[],scope:(decision.el.value.trim()?"reusable":"one_off")}},"保存しました");}));card.appendChild(row);list.appendChild(card);
-}
-function renderLearnDecision(list,item){
-  const card=learnCard(),date=document.createElement("div");date.style.cssText="font-size:10px;color:#6d28d9;font-weight:600;";date.textContent="🧠 学習判断待ち ・ "+(item.createdAt?new Date(item.createdAt).toLocaleString("ja-JP"):"日時不明");card.appendChild(date);
-  const q=learnField("患者からの問い合わせ",item.q||"",3,true),final=learnField("スタッフが実際に送った返信",item.final||"",5,true);card.appendChild(q.box);card.appendChild(final.box);
-  if(item.instr){const instr=learnField("返信作成時の修正指示",item.instr,2,true);card.appendChild(instr.box);}
-  const row=document.createElement("div");row.style.cssText="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px;";row.appendChild(learnButton("学習する",true,()=>resolveLearningDecision(item,"learn")));row.appendChild(learnButton("学習しない",false,()=>resolveLearningDecision(item,"none")));card.appendChild(row);list.appendChild(card);
-}
-async function resolveLearningDecision(item,scope){
-  setLearnStatus(scope==="learn"?"学習を受け付けています…":"削除しています…");try{const r=await api("/api/learning-scope",{decisionId:item.id,exampleId:item.exampleId,conversationId:item.conversationId,scope}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");await reloadLearning();setLearnStatus(j.message||"更新しました");}catch(e){setLearnStatus("更新できませんでした",true);}
 }
 function renderLearnConflict(list,item){
   const card=learnCard(),date=document.createElement("div");date.style.cssText="font-size:10px;color:#b45309;font-weight:600;";date.textContent="⚠ 確認待ち ・ "+(item.createdAt?new Date(item.createdAt).toLocaleString("ja-JP"):"日時不明");card.appendChild(date);
@@ -6250,8 +6429,8 @@ async function busyCancelRichMenuSchedule(id,btn){return withBusy("rich-menu-wri
 async function undoLearn(id){ return withBusy("undo-learning-"+id,null,"",async()=>{try{ await api("/api/example-delete",{id}); }catch(e){} const b=document.getElementById("learnToast"); if(b){ b.innerHTML='↩ 学習を取り消しました（特例として記録しません）'; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";},2000); }}); }
 // 矛盾の確認：前の答えと今回の答えが食い違った時に出す。基準を選ぶと不要な方の対応例を削除。
 let conflictData=null;
-function showConflict(c){ conflictData=c; const o=document.getElementById("conflictOld"),n=document.getElementById("conflictNew"); if(o)o.textContent=c.oldFinal||""; if(n)n.textContent=c.newFinal||""; const p=document.getElementById("conflictPop"); if(p)p.style.display="flex"; }
-async function resolveConflict(mode,btn){ const c=conflictData;if(!c)return;if(mode==="later"){conflictData=null;const p=document.getElementById("conflictPop");if(p)p.style.display="none";learnTab="conflicts";openLearning();return;}await withBusy("resolve-conflict-"+c.id,btn,"更新中…",async()=>{try{const r=await api("/api/learning-conflict-resolve",{id:c.id,mode}),j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error("save");conflictData=null;const p=document.getElementById("conflictPop");if(p)p.style.display="none";}catch(e){uiAlert("学習内容を更新できませんでした");}}); }
+function showConflict(c){ conflictData=c;const rule=c.kind==="rule",o=document.getElementById("conflictOld"),n=document.getElementById("conflictNew"),title=document.getElementById("conflictTitle"),ol=document.getElementById("conflictOldLabel"),nl=document.getElementById("conflictNewLabel"),ob=document.getElementById("conflictOldButton"),nb=document.getElementById("conflictNewButton");if(title)title.textContent=rule?"⚠️ 正式ルールと新しい学習案が矛盾しています":"⚠️ 前と答えが食い違っています";if(ol)ol.textContent=rule?"現在の正式ルール：":"似た質問に、前はこう答えていました：";if(nl)nl.textContent=rule?"今回の新しい学習案：":"今回はこう答えました：";if(ob)ob.textContent=rule?"正式ルールを残し、今回の学習はしない":"今回は特例（前の回答を正解のまま残す）";if(nb)nb.textContent=rule?"正式ルールを新しい学習案へ更新":"今後は今回の回答を正解にする";if(o)o.textContent=c.oldFinal||"";if(n)n.textContent=c.newFinal||"";const p=document.getElementById("conflictPop");if(p)p.style.display="flex";}
+async function resolveConflict(mode,btn){ const c=conflictData;if(!c)return;if(mode==="later"){conflictData=null;const p=document.getElementById("conflictPop");if(p)p.style.display="none";learnTab="conflicts";openLearning();return;}await withBusy("resolve-conflict-"+c.id,btn,"更新中…",async()=>{try{const r=await api("/api/learning-conflict-resolve",{id:c.id,learningJobId:c.learningJobId,mode}),j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error("save");conflictData=null;const p=document.getElementById("conflictPop");if(p)p.style.display="none";pollLearningJobs();}catch(e){uiAlert("学習内容を更新できませんでした");}}); }
 // 「どちらでもない」→ みぎうで君を開き、食い違った2案を背景に、正しい案内をチャットで決めてルール化する
 function openConflictChat(c){ openAsst(null); try{ asstHist.push({role:"user",content:"（背景）似た質問で過去の回答が食い違っていました。前の回答:「"+(c.oldFinal||"")+"」／今回の回答:「"+(c.newFinal||"")+"」。どちらも正解ではありません。これからスタッフが正しい案内を教えるので、それを既存ルールと矛盾しない形でルール化する提案をしてください。"}); }catch(e){} amAdd("sysn","過去の回答が食い違っていました。正しい案内を教えてください——内容をルールにします。"); }
 // ---- settings popup ----
@@ -6275,8 +6454,11 @@ function renderRuleGauge(){
     else { warn.style.display="none"; }
   }
 }
+const AI_ROUTE_LABELS={draft:"下書き・自動返信",chat:"文章修正チャット",learning:"学習・ルール整理",audit:"送信前監査",classify:"軽い分類",critical:"予約・重要判断"};
+function renderAiRouteFields(settings){const box=document.getElementById("aiRouteFields");if(!box)return;const routes=settings.aiRoutes||{},catalog=Array.isArray(settings.aiModelCatalog)?settings.aiModelCatalog:[];box.innerHTML=Object.keys(AI_ROUTE_LABELS).map(task=>{const current=routes[task]&&routes[task].model||"";return '<label style="font-size:10.5px;color:#475569;">'+AI_ROUTE_LABELS[task]+'<select data-ai-route="'+task+'" style="width:100%;padding:7px;border:1px solid #d1d5db;border-radius:7px;font-size:11px;margin-top:2px;">'+catalog.map(m=>'<option value="'+esc(m.id)+'"'+(m.id===current?' selected':'')+'>'+esc(m.label)+'</option>').join("")+'</select></label>';}).join("");}
+function collectAiRoutes(){const out={};document.querySelectorAll("[data-ai-route]").forEach(el=>{out[el.getAttribute("data-ai-route")]={model:el.value};});return out;}
 async function openSet(){try{const ar=await fetch("/api/account");const a=await ar.json();document.getElementById("accountLoginId").textContent="ログインID: "+(a.loginId||"");document.getElementById("setAccountEmail").value=a.accountEmail||"";document.getElementById("accountEmailStat").textContent=(a.accountEmail?"再設定メールアドレス登録済み":"再設定メールアドレス未登録")+(a.resetEmailReady?"・メール送信可能":"・送信メール設定が必要");}catch(e){}
-  try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setBookingActions").checked=!!s.bookingActions;document.getElementById("setInboxOrder").value=s.inboxOrder||"unanswered_first";document.getElementById("setStaffLineEnabled").checked=!!s.staffLineEnabled;document.getElementById("setStaffLineReplyMode").value=s.staffLineReplyMode||"exceptions";document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"gemini";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);window.__rules=s.rules||null;renderRuleGauge();renderPrefs(s.prefs||[]);const lcs=document.getElementById("learningConflictSummary"),pending=Number(s.learningDecisionsPending||0),conflicts=Number(s.learningConflictsPending||0);if(lcs)lcs.textContent=(pending?" 🧠 学習判断待ち "+pending+"件":"")+(conflicts?" ⚠ 矛盾の確認 "+conflicts+"件":"");const las=document.getElementById("learningAutomationSummary"),la=s.learningAutomation||{};if(las)las.textContent=la.ready?" ✅ 自動対応候補 "+la.ready+"種類":" 学習実績を蓄積中";
+  try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setBookingActions").checked=!!s.bookingActions;document.getElementById("setInboxOrder").value=s.inboxOrder||"unanswered_first";document.getElementById("setStaffLineEnabled").checked=!!s.staffLineEnabled;document.getElementById("setStaffLineReplyMode").value=s.staffLineReplyMode||"exceptions";document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"gpt";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);renderAiRouteFields(s);window.__rules=s.rules||null;renderRuleGauge();renderPrefs(s.prefs||[]);const lcs=document.getElementById("learningConflictSummary");if(lcs)lcs.textContent=s.learningConflictsPending?" ⚠ 学習確認待ち "+s.learningConflictsPending+"件":"";const las=document.getElementById("learningAutomationSummary"),la=s.learningAutomation||{};if(las)las.textContent=la.ready?" ✅ 自動対応候補 "+la.ready+"種類":" 学習実績を蓄積中";
   if(s.engines){const n=document.getElementById("engineNote");const active=({gpt:"GPT",gemini:"Gemini",claude:"Claude"})[s.activeEngine]||"なし";n.textContent="設定状況: GPT"+(s.engines.gpt?"✓設定済み":"⚠キー未設定")+"・Gemini"+(s.engines.gemini?"✓設定済み":"⚠キー未設定")+"・Claude"+(s.engines.claude?"✓設定済み":"⚠キー未設定")+"。優先エンジン: "+active+"（✓はキーの登録を示します。実際の有効性は下の文章品質テストで確認してください。失敗時は次の設定済みAIへ自動切替します）。";}}catch(e){}
   refreshModelAlert();
   try{const cr=await fetch("/api/conn");const c=await cr.json();document.getElementById("connStat").textContent=(c.lineConfigured?"LINE✓ ":"LINE未 ")+(c.mailConfigured?"メール✓":"メール未");document.getElementById("cSmtpHost").value=c.smtpHost||"";document.getElementById("cSmtpPort").value=c.smtpPort||"";document.getElementById("cSmtpUser").value=c.smtpUser||"";document.getElementById("cImapHost").value=c.imapHost||"";document.getElementById("cImapPort").value=c.imapPort||"";document.getElementById("cImapUser").value=c.imapUser||"";document.getElementById("cEmailInternal").checked=!!c.emailInternal;renderAccts(c);}catch(e){}
@@ -6343,8 +6525,9 @@ async function disconnectStaffLine(){if(!await uiConfirm("右腕くんとスタ�
 async function changeStaffLineRole(id,role,select){await withBusy("staff-line-role-"+id,select,"変更中…",async()=>{try{const r=await api("/api/staff-line/staff-role",{id,role}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");renderStaffLineStaff(j.staff||[]);}catch(e){uiAlert(e.message==="last_admin"?"最後の管理者は変更できません。先に別の管理者を指定してください":"権限を変更できませんでした");await loadStaffLine();}});}
 async function deleteStaffLineStaff(id,btn){if(!await uiConfirm("このスタッフのLINE操作権限を解除しますか？"))return;await withBusy("staff-line-delete-"+id,btn,"解除中…",async()=>{try{const r=await api("/api/staff-line/staff-delete",{id}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"delete");renderStaffLineStaff(j.staff||[]);}catch(e){uiAlert(e.message==="last_admin"?"最後の管理者は解除できません":"登録を解除できませんでした");await loadStaffLine();}});}
 async function runQualityPreview(){const input=document.getElementById("qualityPreviewInput"),out=document.getElementById("qualityPreviewResult"),btn=document.getElementById("qualityPreviewBtn"),inquiry=input.value.trim();if(!inquiry){uiAlert("テストする問い合わせ文を入力してください");return;}btn.disabled=true;btn.textContent="生成中…";out.style.display="block";out.textContent="返信案を生成しています…";try{const r=await api("/api/quality-preview",{inquiry,channel:document.getElementById("qualityPreviewChannel").value}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"failed");const label=({gpt:"GPT",gemini:"Gemini",claude:"Claude"})[j.engine]||j.engine;const refs=Array.isArray(j.learningRefs)?j.learningRefs:[];const g=j.grounding||{},v=j.validation||{};const audit=g.autoSendAllowed&&v.pass?" / 根拠監査OK":" / スタッフ確認: "+((g.reasons&&g.reasons[0])||v.reason||"根拠不足");out.textContent=j.draft+"\\n\\n―― "+label+" / 確信率 "+(j.confidence||"不明")+(j.qualityIssues&&j.qualityIssues.length?" / 自動校正済み":"")+(refs.length?" / 過去対応 "+refs.length+"件参照":" / 過去対応の該当なし")+audit;}catch(e){out.textContent=e.message==="no_ai_key"?"AIキーが未設定のため生成できません。運営にAI接続設定を依頼してください。":e.message==="ai_failed"?"登録済みのAIキーを確認できませんでした。キーの失効・利用上限・モデル権限を運営側で確認してください。患者やLINEには送信されていません。":"生成できませんでした。時間をおいて再度お試しください。";}finally{btn.disabled=false;btn.textContent="返信案をテスト生成";}}
+async function runShadowPreview(){const inquiry=document.getElementById("qualityPreviewInput").value.trim(),out=document.getElementById("qualityPreviewResult"),btn=document.getElementById("shadowPreviewBtn"),routes=collectAiRoutes();if(!inquiry){uiAlert("テストする問い合わせ文を入力してください");return;}btn.disabled=true;btn.textContent="2つのモデルを比較中…";out.style.display="block";out.textContent="本番回答には使わず、並行テストしています…";try{const r=await api("/api/model-shadow-preview",{inquiry,channel:document.getElementById("qualityPreviewChannel").value,candidate:routes.draft}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"failed");out.textContent="【現在のモデル "+j.active.route.model+"】\\n"+j.active.draft+"\\n\\n【候補モデル "+j.candidate.route.model+"】\\n"+j.candidate.draft+"\\n\\n※患者への送信・会話保存・学習は行っていません。";}catch(e){out.textContent=e.message==="no_openai_key"?"OpenAI APIが未接続です。":"並行テストを実行できませんでした。";}finally{btn.disabled=false;btn.textContent="候補モデルを並行テスト（回答には使用しない）";}}
 let settingsSaveBusy=false;
-async function saveSet(){if(settingsSaveBusy)return;const btn=document.getElementById("saveSettingsBtn");settingsSaveBusy=true;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>保存中…';}const autoReply=document.getElementById("setAuto").checked;const bookingActions=document.getElementById("setBookingActions").checked;const inboxOrder=document.getElementById("setInboxOrder").value;const staffLineEnabled=document.getElementById("setStaffLineEnabled").checked;const staffLineReplyMode=document.getElementById("setStaffLineReplyMode").value;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{const r=await api("/api/settings",{autoReply,bookingActions,inboxOrder,staffLineEnabled,staffLineReplyMode,level,tone,engine,autoDelayMin});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");await load();uiAlert("設定を保存しました");closeSet();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"先に法人専用スタッフLINEと通知グループを接続してください":e.message==="no_ai_key"?"AIキーが未設定のため自動返信を有効にできません。運営へ接続設定を依頼してください":"保存に失敗しました");}finally{settingsSaveBusy=false;if(btn){btn.disabled=false;btn.removeAttribute("aria-busy");btn.textContent="設定を保存";}}}
+async function saveSet(){if(settingsSaveBusy)return;const btn=document.getElementById("saveSettingsBtn");settingsSaveBusy=true;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>保存中…';}const autoReply=document.getElementById("setAuto").checked;const bookingActions=document.getElementById("setBookingActions").checked;const inboxOrder=document.getElementById("setInboxOrder").value;const staffLineEnabled=document.getElementById("setStaffLineEnabled").checked;const staffLineReplyMode=document.getElementById("setStaffLineReplyMode").value;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;const aiRoutes=collectAiRoutes();const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{const r=await api("/api/settings",{autoReply,bookingActions,inboxOrder,staffLineEnabled,staffLineReplyMode,level,tone,engine,aiRoutes,autoDelayMin});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");await load();uiAlert("設定を保存しました");closeSet();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"先に法人専用スタッフLINEと通知グループを接続してください":e.message==="no_ai_key"?"AIキーが未設定のため自動返信を有効にできません。運営へ接続設定を依頼してください":"保存に失敗しました");}finally{settingsSaveBusy=false;if(btn){btn.disabled=false;btn.removeAttribute("aria-busy");btn.textContent="設定を保存";}}}
 async function changeLoginId(){
   const next=await uiPrompt("新しいログインID（半角英数字3〜30文字。スタッフ全員のログインに使います）");if(!next)return;
   const btn=document.getElementById("changeLoginIdBtn");await withBusy("change-login-id",btn,"変更中…",async()=>{try{const r=await api("/api/change-loginid",{next:next.trim()});const j=await r.json();
@@ -6386,13 +6569,13 @@ async function refreshModelAlert(){
     const dot=document.getElementById("newModelDot"); const box=document.getElementById("modelAlert");
     if(m&&m.newer){
       if(dot)dot.style.display="inline";
-      if(box){box.style.display="block";box.innerHTML="🆕 新しいAIモデル <b>"+esc(m.latest)+"</b> が出ています（現在: "+esc(m.current)+"）。<br>▶ 試す: RailwayのVariablesで OPENAI_MODEL を「"+esc(m.latest)+"」に変えてDeploy。<br>↩ 戻す: 使い勝手が悪ければ OPENAI_MODEL を「"+esc(m.current)+"」に戻すだけ。";}
+      if(box){box.style.display="block";box.innerHTML="🆕 新しいAIモデル <b>"+esc(m.latest)+"</b> が利用できます（現在: "+esc(m.current)+"）。<br>運営が候補モデルへ登録後、この画面の役割別設定と『並行テスト』で患者回答に使わず比較できます。";}
     }else{ if(dot)dot.style.display="none"; if(box)box.style.display="none"; }
   }catch(e){}
 }
 // 自動化ダッシュボード帯（直近7日の自動対応状況）。起動時＋5分ごとに更新。
 async function loadStats(){try{const r=await fetch("/api/stats");const j=await r.json();if(!j||!j.ok)return;const w=j.week||{};const el=document.getElementById("statsBar");if(!el)return;const rate=(w.autoRate==null)?"—":(w.autoRate+"%");el.innerHTML="📊 直近7日：問い合わせ <b>"+(w.in||0)+"</b> 件 ・ AI自動返信率 <b>"+rate+"</b>（"+(w.auto||0)+"件）・ スタッフ返信 <b>"+(w.staff||0)+"</b> 件 ・ 学習ルール <b>+"+(w.rules||0)+"</b> 件";el.style.display="block";}catch(e){}}
-load(); setInterval(load, 6000); refreshLearningBadge(); setInterval(refreshLearningBadge,15000); refreshModelAlert(); loadStats(); setInterval(loadStats, 300000);
+load(); setInterval(load, 6000); pollLearningJobs(); setInterval(pollLearningJobs, 2500); refreshLearningBadge(); setInterval(refreshLearningBadge,15000); refreshModelAlert(); loadStats(); setInterval(loadStats, 300000);
 </script>
 </body>
 </html>`;
