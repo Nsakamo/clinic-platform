@@ -93,14 +93,35 @@ test("スタッフの修正過程を構造化した判断メモリとして保�
   assert.match(source, /学習した判断:/);
 });
 
-test("Web送信後はAI任せにせずスタッフが学習の適用範囲を確定する", () => {
-  assert.match(source, /function learningScopeSuggestion/);
+test("Web送信後は学習する・しないの2択で確定し、保留内容を永続化する", () => {
   assert.match(source, /reviewScope: true/);
+  assert.match(source, /config\.learningDecisions/);
+  assert.match(source, /learningDecisionAdd\(t, ex, learningReview\)/);
   assert.match(source, /app\.post\("\/api\/learning-scope", guard/);
-  assert.match(source, /\["none", "patient", "similar", "all"\]/);
-  assert.match(source, /今回の修正をどう学習しますか？/);
-  assert.match(source, /今回だけ[\s\S]{0,300}この患者だけ[\s\S]{0,300}同じ問い合わせ[\s\S]{0,300}今後の全返信/);
-  assert.match(source, /店舗ルールの追加・更新・削除として確認/);
+  assert.match(source, /\["none", "learn"\]/);
+  assert.match(source, /今回の対応を学習しますか？/);
+  assert.match(source, /学習する[\s\S]{0,300}学習しない/);
+  assert.doesNotMatch(source, /今回だけ[\s\S]{0,300}この患者だけ[\s\S]{0,300}同じ問い合わせ[\s\S]{0,300}今後の全返信/);
+  assert.match(source, /data-tab="decisions"/);
+  assert.match(source, /学習判断待ち/);
+  assert.match(source, /function learningConversationContext/);
+  assert.match(source, /【今回の話題に関する直近の会話】/);
+  assert.match(source, /opts\.reviewScope === true && ex\.reused/);
+});
+
+test("学習判断待ちと矛盾中の対応例は下書き生成から除外する", () => {
+  assert.match(source, /learningDecisions\(t, true\)\.map\(item => Number\(item\.exampleId\)\)/);
+  assert.match(source, /applyRules: false/);
+  assert.match(source, /既存内容と食い違う場合は自動上書きせず/);
+});
+
+test("受信画面に未処理の学習確認件数を常時表示し、該当タブへ直接移動する", () => {
+  assert.match(source, /app\.get\("\/api\/learning-pending-count", guard/);
+  assert.match(source, /id="learningPendingBadge"/);
+  assert.match(source, /🧠 学習確認 "\+total\+"件/);
+  assert.match(source, /function openLearningPending\(\)/);
+  assert.match(source, /learningPendingCounts\.decisions>0\?"decisions":"conflicts"/);
+  assert.match(source, /setInterval\(refreshLearningBadge,15000\)/);
 });
 
 test("文章作成中の学習候補は送信後の確認前に恒久保存しない", () => {
