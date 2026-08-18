@@ -5,11 +5,15 @@ const path = require("node:path");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
 
-test("患者への送信後は学習をバックグラウンドで続け、元の会話だけへ確認を返す", () => {
+test("患者への送信直後に元の会話で学習確認を出し、AI整理はバックグラウンドで続ける", () => {
   assert.match(source, /queueStaffLearning\(t, c/);
   assert.match(source, /app\.get\("\/api\/learning-jobs"/);
-  assert.match(source, /学習案はバックグラウンドで整理中です/);
+  assert.match(source, /immediateLearning=Object\.assign/);
+  assert.match(source, /if\(immediateLearning&&current===id\)showLearningScope\(immediateLearning\)/);
+  assert.match(source, /shownLearningJobs\.add\(json\.learningJob\.id\)/);
   assert.match(source, /current!==id\)return;shownLearningJobs\.add/);
+  assert.match(source, /if \(job\.status !== "processing"\) return/);
+  assert.doesNotMatch(source, /学習案はバックグラウンドで整理中です/);
   assert.doesNotMatch(source, /window\.__sendBusy=true;showLearningProgress\(\)/);
 });
 

@@ -1106,8 +1106,12 @@ async function processLearningJob(t, jobId) {
     const p = job.payload || {}, ex = t.examples && t.examples[Number(job.exampleId)];
     if (!ex) throw new Error("example_not_found");
     const proposal = await proposeContextualLearningText(t, p);
+    // 送信直後の確認でスタッフが既に「学習する／しない」を決めた場合は、
+    // 遅れて完了したバックグラウンド処理で確認待ちへ戻さない。
+    if (job.status !== "processing") return;
     const review = Object.assign({}, job.learningReview || {}, { text: proposal });
     const exampleConflict = p.changed ? await checkConflict(t, p.q, p.final, ex.id) : null;
+    if (job.status !== "processing") return;
     let conflict = exampleConflict ? await learningConflictAdd(t, {
       kind: "example", q: p.q, oldId: exampleConflict.oldId, oldFinal: exampleConflict.oldFinal,
       newId: ex.id, newFinal: p.final, source: p.source,
@@ -3155,11 +3159,13 @@ app.post("/api/learning-scope", guard, oneMutationAtATime("learning"), async (re
     if (scope === "learn") {
       // 「学習する」を選んだ結果をAIのone_off判定だけで捨てない。確定対応例は必ず再利用対象として残し、
       // 修正チャット全体から共通方針・店舗ルールも追加で整理する。
+      // 判断を先に確定し、並行中の学習案生成が遅れて「未対応」へ復活するのを防ぐ。
+      finishLearningJobFor(t, req.body.learningJobId, id, "");
       const meta = sanitizeLearningMeta({ scope: "reusable", intent: learningIntentKey(ex.q), decision: text, conditions: "同じ状況・問い合わせに適用", avoid: "患者固有の事実と今回限りの特例は他の患者へ引き継がない", searchTerms: [String(ex.q || "").slice(0, 120)], updated: Date.now() });
       await exampleLearningMetaUpdate(t, id, meta);
       const c = t.store[String(req.body.conversationId || "")] || null;
       const learnedRules = await distillRules(t, c, { q: ex.q, final: ex.final, draft0: ex.draft0, instr: ex.instr, learningChat: ex.learningChat, exampleId: ex.id });
-      finishLearningJobFor(t, req.body.learningJobId, id, ""); await saveTenantConfig(t);
+      await saveTenantConfig(t);
       return res.json({ ok: true, scope, learnedRules, message: learnedRules.length ? "対応例と修正チャットを学習し、店舗ルールも整理しました" : "対応例と修正チャットを今後の回答へ学習しました" });
     }
     if (scope === "patient") {
@@ -5549,18 +5555,17 @@ const PAGE = `<!DOCTYPE html>
       <h3 style="margin:0 0 5px;font-size:16px;">🧠 今回の対応を学習しますか？</h3>
       <div style="font-size:11px;color:#64748b;line-height:1.55;">学習するを選ぶと、修正チャットを含む一連のやり取りを読み、患者固有・今回限り・共通方針・店舗ルールを右腕くんが自動で整理します。</div>
     </div>
-    <div style="padding:14px 18px;">
-      <label style="display:block;font-size:11px;font-weight:700;color:#475569;">会話全体から整理した学習案（必要なら修正できます）
+    <div style="padding:14px 18px 16px;">
+      <label style="display:block;font-size:11px;font-weight:700;color:#475569;">学習する内容（必要なら修正できます）
         <textarea id="learningScopeText" rows="10" style="display:block;width:100%;margin-top:5px;padding:9px;border:1px solid #cbd5e1;border-radius:9px;font:12px/1.6 inherit;resize:vertical;" placeholder="適用する状況・確認すること・回答方針を整理しています"></textarea>
       </label>
       <div id="learningScopeHint" style="font-size:11px;color:#6d28d9;margin:7px 0 11px;">保存後も設定→学習データ管理から更新・削除できます。</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-        <button type="button" class="cbtn send" data-learning-scope="learn" onclick="saveLearningScope('learn',this)" style="padding:12px;">学習する<br><small>AIが用途別に整理</small></button>
+        <button type="button" class="cbtn send" data-learning-scope="learn" onclick="saveLearningScope('learn',this)" style="padding:12px;">学習する<br><small>会話全体をもとに整理</small></button>
         <button type="button" class="cbtn" data-learning-scope="none" onclick="saveLearningScope('none',this)" style="padding:12px;">学習しない<br><small>今回の内容は残さない</small></button>
       </div>
       <div style="font-size:10.5px;color:#64748b;line-height:1.55;margin-top:8px;">料金・営業時間・キャンセル規定など重要な変更が既存内容と食い違う場合は、自動上書きせず確認待ちにします。</div>
     </div>
-    <div style="padding:10px 18px 14px;display:flex;justify-content:flex-end;border-top:1px solid #e5e7eb;"><button type="button" class="cbtn" onclick="closeLearningScope()">あとで決める</button></div>
   </div>
 </div>
 <div id="scheduledMessagePop" style="position:fixed;inset:0;background:rgba(15,23,42,.48);z-index:84;display:none;align-items:center;justify-content:center;padding:14px;">
@@ -6176,7 +6181,7 @@ function showLearningProgress(){const p=document.getElementById("learningProgres
 function hideLearningProgress(){const p=document.getElementById("learningProgress");if(p)p.style.display="none";}
 function showReadyLearningFor(id){const job=learningJobsByConversation[id];if(!job||job.status!=="ready"||shownLearningJobs.has(job.id)||current!==id)return;shownLearningJobs.add(job.id);if(job.resultType==="conflict"&&job.conflict){showConflict(Object.assign({},job.conflict,{learningJobId:job.id}));}else if(job.learningReview){showLearningScope(Object.assign({},job.learningReview,{learningJobId:job.id}));}}
 async function pollLearningJobs(){try{const r=await fetch("/api/learning-jobs"),j=await r.json();if(!r.ok||!j.ok)return;Object.keys(learningJobsByConversation).forEach(k=>delete learningJobsByConversation[k]);(j.jobs||[]).forEach(job=>{const old=learningJobsByConversation[job.conversationId];if(!old||Number(job.updatedAt)>=Number(old.updatedAt))learningJobsByConversation[job.conversationId]=job;});renderList();if(current)showReadyLearningFor(current);}catch(e){}}
-async function sendMsg(){if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="患者へ送信中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat});let json={};try{json=await response.json();}catch(e){}if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";if(json.learningJob){learningJobsByConversation[id]=json.learningJob;showLearnResult("送信しました。学習案はバックグラウンドで整理中です");}await load();pollLearningJobs();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
+async function sendMsg(){if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="患者へ送信中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat});let json={};try{json=await response.json();}catch(e){}if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";let immediateLearning=null;if(json.learningJob&&json.learningJob.learningReview){learningJobsByConversation[id]=json.learningJob;shownLearningJobs.add(json.learningJob.id);immediateLearning=Object.assign({},json.learningJob.learningReview,{learningJobId:json.learningJob.id});}await load();if(immediateLearning&&current===id)showLearningScope(immediateLearning);else if(!immediateLearning)showLearnResult("送信しました");pollLearningJobs();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
 let scheduledMessageDraft=null;
 function localDateTimeValue(date){const pad=n=>String(n).padStart(2,"0");return date.getFullYear()+"-"+pad(date.getMonth()+1)+"-"+pad(date.getDate())+"T"+pad(date.getHours())+":"+pad(date.getMinutes());}
 function openScheduledMessage(){
