@@ -107,7 +107,7 @@
 - 1法人につき1つのスタッフLINE公式アカウント、1つの専用スタッフグループを接続する。
 - 共有Slack AppとSlack通知は廃止した。Slack用API・設定UI・資格情報は使用しない。
 - スタッフLINEのアクセストークンとチャネルシークレットは、各法人が右腕くんの設定画面から登録する。
-- 秘密情報はAPIで再表示しない。CRED_KEY 未設定時は新規保存を拒否し、設定時はAES-256-GCMで暗号化保存する。
+- 秘密情報はAPIで再表示しない。CRED_KEY 未設定時は新規保存を拒否し、設定時はAES-256-GCMで暗号化保存する。本番・Railwayは有効なCRED_KEYがなければ待受を開始しない。
 - 患者向けLINEと同じチャネル、または他法人が登録済みのスタッフLINEチャネルは登録できない。
 - Webhookは /webhook/staff-line。destination で法人を一意に決めた後、その法人のチャネルシークレットで署名を検証する。別法人へのフォールバックはしない。
 
@@ -172,11 +172,24 @@
 
 ## 主な環境変数
 
-- CRED_KEY: LINE・メール資格情報の保存時暗号化。32バイト（hex64桁またはbase64）。スタッフLINEの新規設定では必須。
+- CRED_KEY: LINE・メール資格情報の保存時暗号化。32バイト（hex64桁またはbase64）。本番・Railwayの起動およびスタッフLINE等の資格情報保存に必須。
 - PUBLIC_BASE_URL: 右腕くんの公開URL。スタッフLINE通知内の会話リンクに使用する。
 - PLATFORM_SECRET, PARTNER_BOOKING_URL: うけつけるん連携。
 - PARTNER_VERCEL_BYPASS_SECRET: Vercel Deployment Protection下のうけつけるんstagingへ、右腕くんstagingからだけ到達させる自動化用秘密鍵。本番は未設定。
 - RESET_SMTP_HOST, RESET_SMTP_PORT, RESET_SMTP_USER, RESET_SMTP_PASS, RESET_SMTP_FROM: パスワード再設定専用メール。
+
+## 依存ライブラリの安全更新
+
+- `body-parser` 1.20.6、`ip-address` 10.5.0、`deepmerge-ts` 8.0.1 を `overrides` で固定し、間接依存の既知脆弱性を解消する。
+- 更新後は `npm audit --omit=dev` が0件であることに加え、メール本文・添付の解析とNodemailerのメール生成を回帰テストする。
+- `node_modules/` はGitで追跡せず、`package-lock.json` を正本としてデプロイ時に `npm ci` で再現する。
+
+## 公開前セキュリティ方針
+
+- 本番・Railwayでは `CRED_KEY` に加えてHTTPSの `PUBLIC_BASE_URL`（または `APP_URL` / `RAILWAY_PUBLIC_DOMAIN`）も必須。再設定・SSO・Webhook・添付URLをHostヘッダから生成しない。
+- ログイン中テナントが任意URLをサーバーへ取得させる旧 `/api/import-own` は廃止した。移行データは運営認証済みの `/api/partner/import` へ本文として渡す。
+- 旧決定論的セッションは受理しない。既存利用者は新しいランダムセッションで再ログインする。
+- Cookie認証の変更リクエストはブラウザが送るOriginを公開URLと照合し、API全体へ1IPあたり毎分600件の上限を設ける。
 
 ## アカウントとパスワード再設定
 
