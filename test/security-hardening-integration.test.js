@@ -31,6 +31,26 @@ test("管理環境はCRED_KEYなしで待受を開始しない", () => {
   assert.doesNotMatch(result.stdout, /listening on/);
 });
 
+test("管理環境は固定PUBLIC_BASE_URLなしで待受を開始しない", () => {
+  const result = spawnSync(process.execPath, ["migiude.js"], {
+    cwd: root,
+    encoding: "utf8",
+    timeout: 5000,
+    env: Object.assign({}, process.env, {
+      NODE_ENV: "production",
+      CRED_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      PUBLIC_BASE_URL: "",
+      APP_URL: "",
+      RAILWAY_PUBLIC_DOMAIN: "",
+      DATABASE_URL: "",
+      PORT: "0",
+    }),
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /本番環境では有効なPUBLIC_BASE_URLが必須/);
+  assert.doesNotMatch(result.stdout, /listening on/);
+});
+
 test("暗号化不能時に資格情報を平文へフォールバックしない", () => {
   const encStart = source.indexOf("function encField");
   const encEnd = source.indexOf("function decField", encStart);
@@ -59,4 +79,14 @@ test("受付くん転送は完了まで待ち、失敗を患者受信処理へ�
   assert.match(source, /await forwardToPartner\(t, c,/);
   assert.match(source, /const result = await deliverPartnerEvent/);
   assert.match(source, /return result\.ok/);
+});
+
+test("監査で指摘された旧経路と危険なURL許可を残さない", () => {
+  assert.doesNotMatch(source, /app\.post\("\/api\/import-own"/);
+  assert.doesNotMatch(source, /legacySessToken/);
+  assert.doesNotMatch(source, /http:\/\/localhost\(\?:\\d\+\)\?/);
+  assert.match(source, /API_RATE_MAX = 600/);
+  assert.match(source, /origin !== requestPublicBase\(req\)/);
+  assert.match(source, /&quot;/);
+  assert.match(source, /rel="noopener noreferrer"/);
 });

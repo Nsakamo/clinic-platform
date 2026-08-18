@@ -21,6 +21,20 @@ const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const app = express();
 app.use(express.json({ limit: "16mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: false, limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
+const API_RATE_WINDOW_MS = 60 * 1000;
+const API_RATE_MAX = 600;
+const apiRateBuckets = new Map();
+app.use("/api", (req, res, next) => {
+  const now = Date.now();
+  const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown").split(",")[0].trim();
+  const bucket = apiRateBuckets.get(ip) || { startedAt: now, count: 0 };
+  if (now - bucket.startedAt >= API_RATE_WINDOW_MS) { bucket.startedAt = now; bucket.count = 0; }
+  bucket.count += 1;
+  apiRateBuckets.set(ip, bucket);
+  if (apiRateBuckets.size > 5000) for (const [key, value] of apiRateBuckets) if (now - value.startedAt >= API_RATE_WINDOW_MS) apiRateBuckets.delete(key);
+  if (bucket.count > API_RATE_MAX) { res.set("Retry-After", "60"); return res.status(429).json({ error: "rate_limited" }); }
+  next();
+});
 const PORT = process.env.PORT || 3000;
 // 秘密鍵の定数時間比較（タイミング攻撃対策）。長さ不一致は即false（timingSafeEqualは同長が前提）。
 function safeEq(a, b) {
@@ -45,7 +59,21 @@ function partnerHeaders(contentType) {
   if (PARTNER_VERCEL_BYPASS_SECRET) headers["x-vercel-protection-bypass"] = PARTNER_VERCEL_BYPASS_SECRET;
   return headers;
 }
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || process.env.APP_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? "https://" + process.env.RAILWAY_PUBLIC_DOMAIN : "");
+function normalizePublicBase(value) {
+  try {
+    const url = new URL(String(value || "").trim());
+    if (url.protocol !== "https:" || url.username || url.password) return "";
+    return url.origin;
+  } catch (e) { return ""; }
+}
+const PUBLIC_BASE_URL = normalizePublicBase(process.env.PUBLIC_BASE_URL || process.env.APP_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? "https://" + process.env.RAILWAY_PUBLIC_DOMAIN : ""));
+function requestPublicBase(req) {
+  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL;
+  if (isManagedRuntime()) return "";
+  const host = String(req && (req.headers["x-forwarded-host"] || req.headers.host) || "").split(",")[0].trim().toLowerCase();
+  if (!/^(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/.test(host)) return "";
+  return "http://" + host;
+}
 // パスワード再設定メールは患者対応用メールとは分離できる。未設定時だけ当該テナントのSMTPへ後方互換フォールバック。
 const RESET_SMTP = {
   host: process.env.RESET_SMTP_HOST || "smtp.gmail.com",
@@ -485,9 +513,6 @@ function loginFail(key) {
   loginFails.set(key, e);
 }
 function loginReset(key) { loginFails.delete(key); }
-// 旧: 決定的トークン（失効不可）。後方互換フォールバックのため照合ロジックだけ残す。
-// TODO: 次リリースで決定的トークンのフォールバック（legacySessToken / tenantFromReq内のlegacy判定）を削除する。
-function legacySessToken(slug, passHash) { return sha("sess|" + slug + "|" + passHash); }
 // ===== 新: ランダムなセッションID方式（失効可・有効期限あり）。jsonb config内に保持しスキーマ変更を回避 =====
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30日
 function sessions(t) { // t.config.sessions = { [tokenHash]: { created, exp, ua } }
@@ -530,11 +555,16 @@ function tenantFromReq(req) {
     if (e.exp && e.exp < Date.now()) { delete s[h]; saveTenantConfig(t).catch(() => {}); return null; } // 失効
     return t;
   }
-  // 後方互換フォールバック: 旧決定的トークン（本番の突然のログアウトを避けるため当面受理）。TODO: 次リリースで削除。
-  if (safeEq(tok, legacySessToken(slug, t.config.passHash))) return t;
   return null;
 }
-function guard(req, res, next) { const t = tenantFromReq(req); if (!t) return res.status(401).json({ error: "auth" }); req.tenant = t; next(); }
+function guard(req, res, next) {
+  const t = tenantFromReq(req);
+  if (!t) return res.status(401).json({ error: "auth" });
+  const origin = String(req.headers.origin || "").replace(/\/$/, "");
+  if (!/^(GET|HEAD|OPTIONS)$/i.test(req.method) && origin && origin !== requestPublicBase(req)) return res.status(403).json({ error: "origin" });
+  req.tenant = t;
+  next();
+}
 const inflightMutations = new Set();
 function oneMutationAtATime(operation, resource) {
   return function (req, res, next) {
@@ -2577,10 +2607,7 @@ async function deliverText(t, c, text) {
 }
 
 function messagePublicBase(req) {
-  const configured = String(PUBLIC_BASE_URL || "").trim().replace(/\/$/, "");
-  if (/^https:\/\//i.test(configured)) return configured;
-  const host = String(req && (req.headers["x-forwarded-host"] || req.headers.host) || "").split(",")[0].trim();
-  return /^[A-Za-z0-9.-]+(?::\d+)?$/.test(host) ? "https://" + host : "";
+  return requestPublicBase(req);
 }
 function messageAttachmentAllowed(file) {
   const mime = String(file && file.mime || "").toLowerCase();
@@ -2773,7 +2800,7 @@ app.get("/api/conn", guard, (req, res) => {
     emailInternal: !!emailOn(t),
     smtpHost: C.smtpHost(t), smtpPort: C.smtpPort(t), smtpUser: C.smtpUser(t),
     imapHost: C.imapHost(t), imapPort: C.imapPort(t), imapUser: C.imapUser(t),
-    webhookUrl: "https://" + (req.headers["x-forwarded-host"] || req.headers.host) + "/webhook/line",
+    webhookUrl: requestPublicBase(req) ? requestPublicBase(req) + "/webhook/line" : "",
     extraLines: (Array.isArray(conn.lines) ? conn.lines : []).map(a => ({ name: a.name || "LINE" })),
     extraMails: (Array.isArray(conn.mails) ? conn.mails : []).map(a => ({ name: a.name || "メール", smtpUser: a.smtpUser || "" }))
   });
@@ -2929,9 +2956,7 @@ app.post("/api/model-shadow-preview", guard, async (req,res)=>{
   res.json({ok:true,persisted:false,sent:false,active:{route:active,draft:String(baseline.draft||"").slice(0,5000),validation:baseline.validation||null},candidate:{route:candidate,draft:String(shadow.draft||"").slice(0,5000),validation:shadow.validation||null}});
 });
 function staffLineStatus(t, req) {
-  const host = String(req.headers["x-forwarded-host"] || req.headers.host || "").split(",")[0].trim();
-  const fallbackBase = /^[A-Za-z0-9.-]+(?::\d+)?$/.test(host) ? "https://" + host : "";
-  const base = /^https:\/\//i.test(PUBLIC_BASE_URL) ? PUBLIC_BASE_URL.replace(/\/$/, "") : fallbackBase;
+  const base = requestPublicBase(req);
   return {
     configured: !!(C.staffLineToken(t) && C.staffLineSecret(t) && t.config.conn.staffLineBotId),
     botName: String(t.config.conn.staffLineName || "").slice(0, 120),
@@ -3713,7 +3738,7 @@ function normalizeRichArea(raw, index) {
   const type = ["uri", "message"].includes(raw.type) ? raw.type : "uri";
   const value = String(raw.value || "").trim().slice(0, 1000);
   if (!value) return null;
-  if (type === "uri" && !/^(https:\/\/|http:\/\/localhost(?::\d+)?\/|tel:|mailto:|line:\/\/)/i.test(value)) return null;
+  if (type === "uri" && !/^(https:\/\/|tel:|mailto:|line:\/\/)/i.test(value)) return null;
   return {
     id: String(raw.id || crypto.randomBytes(6).toString("hex")).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 40) || "area-" + index,
     label: String(raw.label || "ボタン" + String.fromCharCode(65 + index)).trim().slice(0, 40),
@@ -4034,7 +4059,8 @@ app.post("/api/send-file", guard, async (req, res) => {
   let f = FILES[fid];
   if (!f && pool) { try { const r = await pool.query("SELECT tenant,name,mime,data FROM files WHERE id=$1 AND tenant=$2", [fid, t.slug]); if (r.rows[0]) f = FILES[fid] = { tenant: r.rows[0].tenant, name: r.rows[0].name, mime: r.rows[0].mime, data: r.rows[0].data }; } catch (e) {} }
   if (!f || (f.tenant && f.tenant !== t.slug)) return res.status(404).json({ error: "no_file" });
-  const base = "https://" + (req.headers["x-forwarded-host"] || req.headers.host);
+  const base = requestPublicBase(req);
+  if (!base) return res.status(503).json({ error: "public_base_url_required" });
   const url = base + "/files/" + fid;
   const isImg = /^image\//.test(f.mime);
   let sent = false, sendErr = null;
@@ -4364,43 +4390,6 @@ app.post("/api/partner/import", (req,res,next)=>{ if(partnerOk(req)) return next
   }catch(e){ res.status(500).json({ok:false,error:String(e.message||e).slice(0,80)}); }
 });
 
-// 自テナントへの引っ越し（ログイン中のテナント自身が、旧システムのエクスポートURLからデータを取り込む）
-app.post("/api/import-own", guard, async (req,res)=>{
-  const t = req.tenant;
-  const url = String(req.body.url||"");
-  if(!/^https:\/\//.test(url)) return res.status(400).json({ok:false,error:"bad_url"});
-  let b;
-  try{
-    const r = await fetch(url);
-    if(!r.ok) return res.status(502).json({ok:false,error:"fetch_"+r.status});
-    b = await r.json();
-  }catch(e){ return res.status(502).json({ok:false,error:"fetch_failed"}); }
-  if(!b || !Array.isArray(b.conversations)) return res.status(400).json({ok:false,error:"bad_backup"});
-  let convs = 0, rulesN = 0;
-  try{
-    for(const c of b.conversations.slice(0,2000)){
-      if(!c || !c.id) continue;
-      t.store[c.id] = c; dbSave(t, c); convs++;
-    }
-    const existingTitles = new Set(Object.values(t.rules||{}).map(r=>r.title));
-    for(const r of (Array.isArray(b.rules)?b.rules:[]).slice(0,500)){
-      if(!r || typeof r.content !== "string" || !r.content.trim()) continue;
-      if(existingTitles.has(String(r.title||"ルール").slice(0,100))) continue; // 二重実行しても重複しない
-      await ruleAdd(t, String(r.title||"ルール").slice(0,100), r.content.slice(0,2000)); rulesN++;
-    }
-    if(b.settings && typeof b.settings === "object"){
-      const s = t.config.settings;
-      if(typeof b.settings.autoReply === "boolean") s.autoReply = b.settings.autoReply;
-      if(b.settings.level === "high" || b.settings.level === "medium") s.level = b.settings.level;
-      if(typeof b.settings.tone === "string") s.tone = b.settings.tone.slice(0,1500);
-      if(b.settings.autoDelayMin != null && isFinite(Number(b.settings.autoDelayMin))) s.autoDelayMin = Math.min(60, Math.max(0, Math.round(Number(b.settings.autoDelayMin))));
-      if(["claude","gpt","gemini"].includes(b.settings.engine)) s.engine = b.settings.engine;
-      await saveTenantConfig(t);
-    }
-    res.json({ok:true, convs, rules:rulesN, ruleCount:Object.keys(t.rules).length, convoCount:Object.keys(t.store).length});
-  }catch(e){ res.status(500).json({ok:false,error:String(e.message||e).slice(0,80)}); }
-});
-
 // ---------- パートナーアプリ連携API（受付くん等。鍵: header x-partner-key = PLATFORM_SECRET） ----------
 function partnerOk(req){ return !!ADMIN_SECRET && safeEq(req.headers["x-partner-key"], ADMIN_SECRET); }
 function pGuard(req,res,next){ if(partnerOk(req)) return next(); res.status(401).json({error:"auth"}); }
@@ -4483,7 +4472,8 @@ app.put("/api/partner/line-config", pGuard, async (req,res)=>{
     if(req.body.channel_id) conn.lineChannelId = String(req.body.channel_id).slice(0,40);
   }
   try{ await saveTenantConfig(t); }catch(e){ return res.status(500).json({ok:false}); }
-  res.json({ ok:true, webhook_url: "https://" + (req.headers.host||"") + "/webhook/line" });
+  const base = requestPublicBase(req);
+  res.json({ ok:true, webhook_url: base ? base + "/webhook/line" : "" });
 });
 // メール設定（受付くん運営画面から。設定完了で受信監視も自動オン）
 app.put("/api/partner/mail-config", pGuard, async (req,res)=>{
@@ -4512,9 +4502,10 @@ app.post("/api/partner/suspend", pGuard, async (req,res)=>{
 // SSO: 受付くん側から「右腕くんを開く」ボタン用のワンタイムURLを発行（5分有効・1回限り）
 app.post("/api/partner/sso", pGuard, (req,res)=>{
   const t = TEN[String(req.body.slug||"")]; if(!t || t.config.suspended) return res.status(404).json({ok:false});
+  const base = requestPublicBase(req); if(!base) return res.status(503).json({ok:false,error:"public_base_url_required"});
   const tok = crypto.randomBytes(24).toString("hex");
   SSO_TOKENS[tok] = { slug: t.slug, exp: Date.now() + 5*60000 };
-  res.json({ ok:true, url: "https://" + (req.headers.host||"") + "/sso?t=" + tok });
+  res.json({ ok:true, url: base + "/sso?t=" + tok });
 });
 // 受付くん管理画面用: ログイン再発行（現パスワード不要）。partner key 必須・新パスワードを平文で1回だけ返す
 app.post("/api/partner/reset-login", pGuard, async (req,res)=>{
@@ -4716,7 +4707,8 @@ app.post("/api/partner/password-reset", pGuard, async (req,res)=>{
   const email = normalizeEmail(t.config.accountEmail);
   if(!email) return res.status(400).json({ok:false,error:"account_email_required"});
   try{
-    const base = String(PUBLIC_BASE_URL || ("https://" + (req.headers["x-forwarded-host"] || req.headers.host || "")));
+    const base = requestPublicBase(req);
+    if(!base) return res.status(503).json({ok:false,error:"public_base_url_required"});
     const mailStatus = await issuePasswordReset(t, email, base);
     if(mailStatus !== "accepted") return res.status(502).json({ok:false,error:"reset_mail_unavailable"});
     console.log("partner password-reset: reset mail accepted for", t.slug);
@@ -4746,7 +4738,7 @@ app.post("/api/forgot", async (req,res)=>{
       RESET_REQ_AT[rateKey] = now;
       const t = tenantByRecovery(loginId, email);
       if(t){
-        const base = String(PUBLIC_BASE_URL || ("https://" + (req.headers["x-forwarded-host"] || req.headers.host || ""))).replace(/\/$/, "");
+        const base = requestPublicBase(req);
         const mailStatus = await issuePasswordReset(t, email, base);
         if(mailStatus !== "accepted") console.error("forgot: reset mail unavailable for", t.slug);
         debug = mailStatus;
@@ -4783,6 +4775,10 @@ app.get("/board", (req, res) => { res.set("Content-Type", "text/html; charset=ut
 (async () => {
   if (isManagedRuntime() && !CRED_KEY) {
     console.error("起動を中止しました: 本番環境では有効なCRED_KEYが必須です");
+    process.exit(1);
+  }
+  if (isManagedRuntime() && !PUBLIC_BASE_URL) {
+    console.error("起動を中止しました: 本番環境では有効なPUBLIC_BASE_URLが必須です");
     process.exit(1);
   }
   if (!CRED_KEY) console.warn("CRED_KEY 未設定: ローカル開発では起動できますが、資格情報の保存は拒否されます。");
@@ -4891,7 +4887,7 @@ h1{font-size:18px;margin:0;}
 <script>
 function tick(){var d=new Date();document.getElementById("clock").textContent=d.toLocaleDateString("ja-JP",{month:"numeric",day:"numeric",weekday:"short"})+" "+String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");}
 tick();setInterval(tick,15000);
-function esc(s){return (s||"").replace(/[<>&]/g,function(c){return {"<":"&lt;",">":"&gt;","&":"&amp;"}[c];});}
+function esc(s){return String(s||"").replace(/[<>&"']/g,function(c){return {"<":"&lt;",">":"&gt;","&":"&amp;",'"':"&quot;","'":"&#39;"}[c];}).replace(/\x60/g,"&#96;");}
 async function loadB(){try{var r=await fetch("/api/alerts");var arr=await r.json();var el=document.getElementById("cards");el.innerHTML=arr.map(function(a){var t=new Date(a.ts);var hm=String(t.getHours()).padStart(2,"0")+":"+String(t.getMinutes()).padStart(2,"0");return '<div class="card t'+esc(a.type)+'"><span class="chip">'+esc(a.type)+'</span><div class="sum">'+esc(a.summary)+'</div><div class="meta"><span>'+esc(a.name||"")+'　'+hm+'</span><button class="okbtn" onclick="doneA('+a.id+',this)">対応した</button></div></div>';}).join("");document.getElementById("empty").style.display=arr.length?"none":"block";}catch(e){}}
 var doneBusy={};async function doneA(id,b){if(doneBusy[id])return;doneBusy[id]=true;var old=b&&b.textContent;if(b){b.disabled=true;b.textContent="処理中…";}try{await fetch("/api/alert-done",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:id})});await loadB();}finally{delete doneBusy[id];if(b&&b.isConnected){b.disabled=false;b.textContent=old;}}}
 loadB();setInterval(loadB,8000);
@@ -5590,7 +5586,8 @@ function tlabel(r){
   if(d.getFullYear()===n.getFullYear()) return (d.getMonth()+1)+"/"+d.getDate();
   return d.getFullYear()+"/"+(d.getMonth()+1)+"/"+d.getDate();
 }
-function av(r,sz){ const s=sz||40; const bg=r.pic?("background-image:url("+r.pic+");"):("background:"+(r.color||"#888")+";"); return '<div class="avatar" style="width:'+s+'px;height:'+s+'px;font-size:'+(s/3)+'px;'+bg+'">'+(r.pic?"":(r.name||"?").charAt(0))+chIcon(r.channel)+'</div>'; }
+function safeMediaUrl(value){try{const u=new URL(String(value||""),location.origin);return (u.origin===location.origin||u.protocol==="https:")?u.href:"";}catch(e){return "";}}
+function av(r,sz){ const s=sz||40,pic=safeMediaUrl(r.pic),bg=pic?("background-image:url(&quot;"+esc(pic)+"&quot;);"):("background:"+(/^#[0-9a-f]{3,8}$/i.test(String(r.color||""))?r.color:"#888")+";"); return '<div class="avatar" style="width:'+s+'px;height:'+s+'px;font-size:'+(s/3)+'px;'+bg+'">'+(pic?"":esc((r.name||"?").charAt(0)))+chIcon(r.channel)+'</div>'; }
 function renderList(){
   document.getElementById("cnt").textContent="未対応 "+DATA.filter(r=>r.status!=="done").length+"件";
   roomsEl.innerHTML="";
@@ -5606,8 +5603,8 @@ function renderList(){
     roomsEl.appendChild(d);
   });
 }
-function esc(s){return (s||"").replace(/[<>&]/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]));}
-function mediaHtml(m){ var cls='b '+(m.from==="them"?"them":"us"); var src=m.mediaId?('/api/line-media/'+m.mediaId):(m.url||"https://placehold.co/300x220/e5e7eb/6b7280?text=%F0%9F%93%B7"); if(m.media==="image")return '<div class="'+cls+' media"><a href="'+src+'" target="_blank"><img class="ph" src="'+src+'"></a></div>'; if(m.media==="video")return (m.mediaId||m.url)?('<div class="'+cls+' media"><video class="ph" style="max-width:220px;border-radius:10px;" controls preload="metadata" src="'+src+'"></video></div>'):('<div class="'+cls+' media"><div class="vid">▶<span>動画</span></div></div>'); if(m.media==="file")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" style="text-decoration:none;">📄 '+esc(m.fileName||"ファイル")+'</a></div>'; if(m.media==="audio")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" style="text-decoration:none;">🎤 音声メッセージ</a></div>'; return ''; }
+function esc(s){return String(s||"").replace(/[<>&"']/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;",'"':"&quot;","'":"&#39;"}[c])).replace(/\x60/g,"&#96;");}
+function mediaHtml(m){ var cls='b '+(m.from==="them"?"them":"us"); var raw=m.mediaId?('/api/line-media/'+String(m.mediaId).replace(/[^0-9a-zA-Z_-]/g,"")):(m.url||"https://placehold.co/300x220/e5e7eb/6b7280?text=%F0%9F%93%B7"),src=esc(safeMediaUrl(raw)); if(!src)return ''; if(m.media==="image")return '<div class="'+cls+' media"><a href="'+src+'" target="_blank" rel="noopener noreferrer"><img class="ph" src="'+src+'"></a></div>'; if(m.media==="video")return (m.mediaId||m.url)?('<div class="'+cls+' media"><video class="ph" style="max-width:220px;border-radius:10px;" controls preload="metadata" src="'+src+'"></video></div>'):('<div class="'+cls+' media"><div class="vid">▶<span>動画</span></div></div>'); if(m.media==="file")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">📄 '+esc(m.fileName||"ファイル")+'</a></div>'; if(m.media==="audio")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">🎤 音声メッセージ</a></div>'; return ''; }
 function bubblesHtml(r){return r.msgs.map(m=>{const body=m.media?mediaHtml(m):('<div class="b '+(m.from==="them"?"them":"us")+'">'+esc(m.text)+'</div>');const tl=(m.time||"")+(m.auto?' <span style="color:#7c3aed;">🤖 自動返信</span>':"")+(m.scheduled?' <span style="color:#1d4ed8;">🕒 予約送信</span>':"");return body+'<div class="btime" style="align-self:'+(m.from==="them"?"flex-start":"flex-end")+'">'+tl+'</div>';}).join("");}
 function groundingText(r){if(!(r&&r.grounding))return "";const g=r.grounding,v=r.validation||{};if(g.autoSendAllowed&&v.pass)return "✓ 送信前の根拠監査済み"+(g.sources&&g.sources.length?"（"+g.sources.join("・")+"）":"");const reasons=Array.isArray(g.reasons)?g.reasons:[];return "⚠ スタッフ確認が必要"+(reasons.length?"："+reasons.join("／"):(v.reason?"："+v.reason:""));}
 function renderGrounding(r){const el=document.getElementById("groundingUsed");if(!el)return;const text=groundingText(r);el.textContent=text;el.style.display=text?"block":"none";el.style.color=(r&&r.grounding&&r.grounding.autoSendAllowed&&r.validation&&r.validation.pass)?"#047857":"#b45309";}

@@ -182,6 +182,14 @@
 
 - `body-parser` 1.20.6、`ip-address` 10.5.0、`deepmerge-ts` 8.0.1 を `overrides` で固定し、間接依存の既知脆弱性を解消する。
 - 更新後は `npm audit --omit=dev` が0件であることに加え、メール本文・添付の解析とNodemailerのメール生成を回帰テストする。
+- `node_modules/` はGitで追跡せず、`package-lock.json` を正本としてデプロイ時に `npm ci` で再現する。
+
+## 公開前セキュリティ方針
+
+- 本番・Railwayでは `CRED_KEY` に加えてHTTPSの `PUBLIC_BASE_URL`（または `APP_URL` / `RAILWAY_PUBLIC_DOMAIN`）も必須。再設定・SSO・Webhook・添付URLをHostヘッダから生成しない。
+- ログイン中テナントが任意URLをサーバーへ取得させる旧 `/api/import-own` は廃止した。移行データは運営認証済みの `/api/partner/import` へ本文として渡す。
+- 旧決定論的セッションは受理しない。既存利用者は新しいランダムセッションで再ログインする。
+- Cookie認証の変更リクエストはブラウザが送るOriginを公開URLと照合し、API全体へ1IPあたり毎分600件の上限を設ける。
 
 ## アカウントとパスワード再設定
 
