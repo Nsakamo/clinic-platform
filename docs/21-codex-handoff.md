@@ -178,6 +178,11 @@
 - PARTNER_VERCEL_BYPASS_SECRET: Vercel Deployment Protection下のうけつけるんstagingへ、右腕くんstagingからだけ到達させる自動化用秘密鍵。本番は未設定。
 - RESET_SMTP_HOST, RESET_SMTP_PORT, RESET_SMTP_USER, RESET_SMTP_PASS, RESET_SMTP_FROM: パスワード再設定専用メール。
 
+## 依存ライブラリの安全更新
+
+- `body-parser` 1.20.6、`ip-address` 10.5.0、`deepmerge-ts` 8.0.1 を `overrides` で固定し、間接依存の既知脆弱性を解消する。
+- 更新後は `npm audit --omit=dev` が0件であることに加え、メール本文・添付の解析とNodemailerのメール生成を回帰テストする。
+
 ## アカウントとパスワード再設定
 
 - パートナーAPIからの新規テナント作成は管理者メールアドレスを必須とする。
