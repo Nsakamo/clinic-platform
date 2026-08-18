@@ -100,23 +100,27 @@ test("Web送信後はスタッフが学習するかを2択で決め、AIが用�
   assert.match(source, /\["none", "learn", "patient", "similar", "all"\]/);
   assert.match(source, /今回の対応を学習しますか？/);
   assert.match(source, /学習する[\s\S]{0,300}学習しない/);
+  assert.doesNotMatch(source, />あとで決める<\/button>/);
   assert.match(source, /proposeContextualLearningText/);
-  assert.match(source, /会話全体から整理した学習案/);
+  assert.match(source, /学習する内容（必要なら修正できます）/);
   assert.doesNotMatch(source, /患者への送信後に、今回だけ／患者だけ／同じ問い合わせ／全返信から適用範囲を選べます/);
-  assert.match(source, /AIのone_off判定だけで捨てない/);
+  assert.match(source, /スタッフが「学習する」を選ぶまでは対応例へ保存せず/);
+  assert.match(source, /job\.status = "processing"/);
+  assert.match(source, /setImmediate\(\(\) => processLearningJob\(t, job\.id\)\)/);
   assert.match(source, /learningChat:learning\.learningChat/);
   assert.match(source, /右腕くんとの修正チャット/);
 });
 
 test("受信画面に未処理の学習確認件数を常時表示し、学習案または矛盾確認へ移動する", () => {
   assert.match(source, /app\.get\("\/api\/learning-pending-count", guard/);
-  assert.match(source, /job\.status === "ready"/);
-  assert.match(source, /job\.resultType === "review"/);
+  assert.match(source, /job\.status === "awaiting_decision"/);
+  assert.match(source, /job\.resultType==="conflict"/);
   assert.match(source, /id="learningPendingBadge"/);
-  assert.match(source, /🧠 学習確認 "\+total\+"件/);
+  assert.match(source, /🧠 要確認 "\+total\+"件/);
   assert.match(source, /async function openLearningPending\(\)/);
   assert.match(source, /showLearningScope\(Object\.assign/);
-  assert.match(source, /learnTab="conflicts";openLearning\(\)/);
+  assert.match(source, /showConflict\(conflict\)/);
+  assert.match(source, /learning-conflict-consult/);
   assert.match(source, /setInterval\(refreshLearningBadge,15000\)/);
 });
 
