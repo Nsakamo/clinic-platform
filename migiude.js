@@ -17,6 +17,7 @@ const { lineWebhookEventId, lineWebhookRetryDelay, isProcessableLineEvent } = re
 const { normalizeAiRoutes, resolveAiRoute, publicModelCatalog } = require("./lib/ai-model-router");
 const { contextualLearningFallback, formatLearningProposal } = require("./lib/learning-context");
 const { selectConversationContext } = require("./lib/conversation-context");
+const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const app = express();
 app.use(express.json({ limit: "16mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: false, limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
@@ -105,7 +106,7 @@ function newTenant(slug, name, config) {
   return { slug, name: name || slug, config, store: {}, rules: {}, ruleSeq: 1, examples: {}, exampleSeq: 1, alerts: [], alertSeq: 1, push: {}, _purgedSlack: purgedSlack, _scheduledRecovered: scheduledRecovered };
 }
 async function saveTenantConfig(t) {
-  try { encryptConnSecrets(t.config.conn); } catch (e) { console.error("encryptConnSecrets:", e.message); } // 保存直前にメール/LINE資格情報を暗号化（CRED_KEY未設定なら平文のまま）
+  encryptConnSecrets(t.config.conn); // 資格情報は暗号化できない限り保存しない
   if (pool) await pool.query("UPDATE tenants SET name=$2, config=$3 WHERE slug=$1", [t.slug, t.name, t.config]);
 }
 
@@ -217,7 +218,7 @@ function verifyPassword(input, stored) {
   return { ok, legacy: ok }; // legacy=true のとき、成功していればbcryptへ再ハッシュして保存する（lazy migration）
 }
 // ===== メール/LINE資格情報の at-rest 暗号化（AES-256-GCM） =====
-// CRED_KEY（32バイト鍵。hex64桁 または base64）。未設定なら暗号化はスキップ＝平文動作（起動は止めない）。
+// CRED_KEY（32バイト鍵。hex64桁 または base64）。本番・Railwayでは必須。
 const CRED_KEY = (function () {
   const raw = String(process.env.CRED_KEY || "").trim();
   if (!raw) return null;
@@ -226,17 +227,20 @@ const CRED_KEY = (function () {
     if (/^[0-9a-fA-F]{64}$/.test(raw)) buf = Buffer.from(raw, "hex");
     else { const b = Buffer.from(raw, "base64"); if (b.length === 32) buf = b; }
     if (buf && buf.length === 32) return buf;
-    console.warn("CRED_KEY が32バイト(hex64/base64)ではありません: メール/LINE資格情報の暗号化は無効（平文動作）");
+    console.error("CRED_KEY が32バイト(hex64/base64)ではありません");
     return null;
-  } catch (e) { console.warn("CRED_KEY の解釈に失敗: 暗号化は無効（平文動作）"); return null; }
+  } catch (e) { console.error("CRED_KEY の解釈に失敗しました"); return null; }
 })();
 const ENC_PREFIX = "enc:v1:";
-// 平文 -> "enc:v1:"+base64(iv(12)|tag(16)|ciphertext)。CRED_KEY未設定なら平文そのまま返す（後方互換）。
+function isManagedRuntime() {
+  return process.env.NODE_ENV === "production" || !!process.env.RAILWAY_ENVIRONMENT || !!process.env.RAILWAY_ENVIRONMENT_NAME || !!process.env.RAILWAY_PUBLIC_DOMAIN;
+}
+// 平文 -> "enc:v1:"+base64(iv(12)|tag(16)|ciphertext)。暗号化できない値は保存しない。
 function encField(plain) {
   if (plain == null) return plain;
   const s = String(plain);
   if (!s) return s;                       // 空文字はそのまま
-  if (!CRED_KEY) return s;                // 鍵なし=平文動作
+  if (!CRED_KEY) throw new Error("credential_encryption_not_configured");
   if (s.startsWith(ENC_PREFIX)) return s; // 既に暗号化済みは二重暗号化しない
   try {
     const iv = crypto.randomBytes(12);
@@ -244,7 +248,7 @@ function encField(plain) {
     const ct = Buffer.concat([cipher.update(s, "utf8"), cipher.final()]);
     const tag = cipher.getAuthTag();
     return ENC_PREFIX + Buffer.concat([iv, tag, ct]).toString("base64");
-  } catch (e) { console.error("encField:", e.message); return s; } // 失敗時は平文で保存（動作継続）
+  } catch (e) { throw new Error("credential_encryption_failed"); }
 }
 // "enc:v1:..." なら復号、無ければ平文とみなしそのまま返す（後方互換: 既存の平文値も読める）。
 function decField(stored) {
@@ -262,8 +266,18 @@ function decField(stored) {
 }
 // conn配下の資格情報フィールドを保存直前に暗号化する（メイン＋追加アカウント lines[]/mails[]）。冪等（enc:済みは再暗号化しない）。
 const ENC_CONN_KEYS = ["lineToken", "lineSecret", "staffLineToken", "staffLineSecret", "smtpPass", "imapPass"];
+function connHasSecrets(conn) {
+  if (!conn || typeof conn !== "object") return false;
+  if (ENC_CONN_KEYS.some(k => typeof conn[k] === "string" && !!conn[k])) return true;
+  if (Array.isArray(conn.lines) && conn.lines.some(a => a && (a.token || a.secret))) return true;
+  return Array.isArray(conn.mails) && conn.mails.some(a => a && (a.smtpPass || a.imapPass));
+}
 function encryptConnSecrets(conn) {
-  if (!conn || typeof conn !== "object" || !CRED_KEY) return; // 鍵なしなら平文のまま（後方互換）
+  if (!conn || typeof conn !== "object") return;
+  if (!CRED_KEY) {
+    if (connHasSecrets(conn)) throw new Error("credential_encryption_not_configured");
+    return;
+  }
   ENC_CONN_KEYS.forEach(k => { if (typeof conn[k] === "string" && conn[k]) conn[k] = encField(conn[k]); });
   if (Array.isArray(conn.lines)) conn.lines.forEach(a => { if (a) { if (a.token) a.token = encField(a.token); if (a.secret) a.secret = encField(a.secret); } });
   if (Array.isArray(conn.mails)) conn.mails.forEach(a => { if (a) { if (a.smtpPass) a.smtpPass = encField(a.smtpPass); if (a.imapPass) a.imapPass = encField(a.imapPass); } });
@@ -499,7 +513,7 @@ function issueSession(t, ua) {
 function destroyAllSessions(t) { t.config.sessions = {}; saveTenantConfig(t).catch(() => {}); }
 function setSess(res, t) {
   const raw = issueSession(t, res.req && res.req.headers && res.req.headers["user-agent"]);
-  res.set("Set-Cookie", "sess=" + Buffer.from(t.slug).toString("base64") + "." + raw + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000");
+  res.set("Set-Cookie", "sess=" + Buffer.from(t.slug).toString("base64") + "." + raw + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000");
 }
 function tenantFromReq(req) {
   const sess = cookies(req).sess || "";
@@ -614,7 +628,7 @@ app.post("/api/logout", (req, res) => {
     const sess = cookies(req).sess || ""; const dot = sess.lastIndexOf(".");
     if (dot > 0) { const slug = Buffer.from(sess.slice(0, dot), "base64").toString("utf8"); const t = TEN[slug]; if (t) { const h = sha(sess.slice(dot + 1)); if (sessions(t)[h]) { delete sessions(t)[h]; saveTenantConfig(t).catch(() => {}); } } }
   } catch (e) {}
-  res.set("Set-Cookie", "sess=; Path=/; HttpOnly; Max-Age=0"); res.json({ ok: true });
+  res.set("Set-Cookie", "sess=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"); res.json({ ok: true });
 });
 app.post("/api/change-pass", guard, oneMutationAtATime("change-pass"), async (req, res) => {
   const t = req.tenant;
@@ -1417,31 +1431,28 @@ function salvageDraft(raw) {
   }
   return s;
 }
-// ===== 受付くん連携: 受信イベント転送（fire-and-forget。失敗してもメイン処理は止めない） =====
-function forwardToPartner(t, c, extra) {
-  try {
-    if (!PARTNER_KEY || !PARTNER_HOOK_URL) return;
-    const payload = {
-      slug: t.slug,
-      convId: c.id,
-      channel: c.channel,
-      userId: c.userId,
-      name: c.name || "",
-      text: c.last || lastText(c) || "",
-      subject: c.subject || "",
-      acct: c.acct || null,
-      ts: c.ts || Date.now(),
-    };
-    if (extra && typeof extra === "object") Object.assign(payload, extra);
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, 5000);
-    fetch(PARTNER_HOOK_URL, {
-      method: "POST",
-      headers: partnerHeaders("application/json"),
-      body: JSON.stringify(payload),
-      signal: ctrl.signal,
-    }).then(() => {}).catch(() => {}).finally(() => clearTimeout(timer));
-  } catch (e) {}
+// ===== 受付くん連携: 受信イベント転送（失敗してもメイン処理は止めない） =====
+async function forwardToPartner(t, c, extra) {
+  if (!PARTNER_KEY || !PARTNER_HOOK_URL) return false;
+  const payload = {
+    slug: t.slug,
+    convId: c.id,
+    channel: c.channel,
+    userId: c.userId,
+    name: c.name || "",
+    text: c.last || lastText(c) || "",
+    subject: c.subject || "",
+    acct: c.acct || null,
+    ts: c.ts || Date.now(),
+  };
+  if (extra && typeof extra === "object") Object.assign(payload, extra);
+  const result = await deliverPartnerEvent({
+    url: PARTNER_HOOK_URL,
+    payload,
+    headers: partnerHeaders("application/json"),
+  });
+  if (!result.ok) console.error("partner delivery failed:", result.idempotencyKey.slice(0, 12), result.error || result.status || "unknown");
+  return result.ok;
 }
 
 // ===== 受付くん連携: AI下書き前の予約照会 =====
@@ -2083,7 +2094,7 @@ async function handleInbound(t, opts) {
     if (c.draft && c.draft.trim() && S(t).staffLineEnabled && S(t).staffLineReplyMode === "exceptions" && staffLineReady(t)) staffLineRequestApproval(t, c, reason).catch(() => {});
     else staffLineEscalate(t, c, reason).catch(() => {});
   }
-  try { forwardToPartner(t, c, { autoSent: autoSent || baDone, autoScheduled }); } catch (e) {} // 受付くんへ受信イベントを転送
+  try { await forwardToPartner(t, c, { autoSent: autoSent || baDone, autoScheduled }); } catch (e) { console.error("partner delivery failed: unexpected"); } // 受付くんへ受信イベントを転送
   return { id, autoSent: autoSent || baDone, autoScheduled };
 }
 
@@ -4011,7 +4022,9 @@ app.get("/files/:id", async (req, res) => {
   if (t && f.tenant && f.tenant !== t.slug) return res.status(404).end();
   res.set("Content-Type", f.mime);
   res.set("Content-Disposition", "inline; filename*=UTF-8''" + encodeURIComponent(f.name));
-  res.set("Cache-Control", "public, max-age=604800");
+  res.set("Cache-Control", "private, no-store, max-age=0");
+  res.set("Pragma", "no-cache");
+  res.set("X-Content-Type-Options", "nosniff");
   res.send(f.data);
 });
 app.post("/api/send-file", guard, async (req, res) => {
@@ -4768,7 +4781,11 @@ app.get("/", (req, res) => { res.set("Content-Type", "text/html; charset=utf-8")
 app.get("/signup", (req, res) => res.redirect("/")); // 申込みは営業契約後に運営が作成
 app.get("/board", (req, res) => { res.set("Content-Type", "text/html; charset=utf-8"); res.set("Cache-Control", "no-store"); res.send(pageWithEnvironmentBanner(req, tenantFromReq(req) ? BOARD_PAGE : LOGIN_PAGE)); });
 (async () => {
-  if (!CRED_KEY) console.warn("CRED_KEY 未設定: メール/LINE資格情報の at-rest 暗号化は無効です（平文で保存・動作）。設定すると次回保存時から自動的に暗号化されます。");
+  if (isManagedRuntime() && !CRED_KEY) {
+    console.error("起動を中止しました: 本番環境では有効なCRED_KEYが必須です");
+    process.exit(1);
+  }
+  if (!CRED_KEY) console.warn("CRED_KEY 未設定: ローカル開発では起動できますが、資格情報の保存は拒否されます。");
   try { if (pool) await dbInit(); } catch (e) { console.error("dbInit failed:", e.message); }
   try { await pushInit(); } catch (e) { console.error("pushInit failed:", e.message); }
   setInterval(() => { pollAll().catch(() => {}); }, 60000); setTimeout(() => { pollAll().catch(() => {}); }, 8000);

@@ -107,7 +107,7 @@
 - 1法人につき1つのスタッフLINE公式アカウント、1つの専用スタッフグループを接続する。
 - 共有Slack AppとSlack通知は廃止した。Slack用API・設定UI・資格情報は使用しない。
 - スタッフLINEのアクセストークンとチャネルシークレットは、各法人が右腕くんの設定画面から登録する。
-- 秘密情報はAPIで再表示しない。CRED_KEY 未設定時は新規保存を拒否し、設定時はAES-256-GCMで暗号化保存する。
+- 秘密情報はAPIで再表示しない。CRED_KEY 未設定時は新規保存を拒否し、設定時はAES-256-GCMで暗号化保存する。本番・Railwayは有効なCRED_KEYがなければ待受を開始しない。
 - 患者向けLINEと同じチャネル、または他法人が登録済みのスタッフLINEチャネルは登録できない。
 - Webhookは /webhook/staff-line。destination で法人を一意に決めた後、その法人のチャネルシークレットで署名を検証する。別法人へのフォールバックはしない。
 
@@ -172,7 +172,7 @@
 
 ## 主な環境変数
 
-- CRED_KEY: LINE・メール資格情報の保存時暗号化。32バイト（hex64桁またはbase64）。スタッフLINEの新規設定では必須。
+- CRED_KEY: LINE・メール資格情報の保存時暗号化。32バイト（hex64桁またはbase64）。本番・Railwayの起動およびスタッフLINE等の資格情報保存に必須。
 - PUBLIC_BASE_URL: 右腕くんの公開URL。スタッフLINE通知内の会話リンクに使用する。
 - PLATFORM_SECRET, PARTNER_BOOKING_URL: うけつけるん連携。
 - PARTNER_VERCEL_BYPASS_SECRET: Vercel Deployment Protection下のうけつけるんstagingへ、右腕くんstagingからだけ到達させる自動化用秘密鍵。本番は未設定。
