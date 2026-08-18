@@ -3336,6 +3336,54 @@ app.post("/api/draft-edited", guard, async (req, res) => {
   dbSave(t, c);
   res.json({ ok: true });
 });
+
+// 右腕くんへの修正指示用音声入力。音声はOpenAIへ直接転送し、このサーバーやDBには保存しない。
+// gpt-transcribe は医院名・施術名などのキーワードヒントを受け取れるため、テナントごとの用語を補助する。
+const VOICE_MIME_EXT = {
+  "audio/webm": "webm", "audio/mp4": "mp4", "audio/mpeg": "mp3", "audio/mp3": "mp3",
+  "audio/mpga": "mpga", "audio/m4a": "m4a", "audio/wav": "wav", "audio/x-wav": "wav"
+};
+function decodeVoiceAudio(body) {
+  const mime = String(body && body.mime || "").split(";")[0].trim().toLowerCase();
+  const ext = VOICE_MIME_EXT[mime];
+  const encoded = String(body && body.data || "");
+  if (!ext || !encoded || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded) || encoded.length % 4 !== 0) return { error: "unsupported_audio" };
+  let data;
+  try { data = Buffer.from(encoded, "base64"); } catch (e) { return { error: "bad_audio" }; }
+  if (!data.length) return { error: "empty_audio" };
+  if (data.length > 10 * 1024 * 1024) return { error: "audio_too_large" };
+  return { data, mime, ext };
+}
+function voiceKeywords(t) {
+  const words = [t && t.name, "右腕くん", "うけつけるん", "キレイパス", "カンナムオンニ", "トリビュー"];
+  Object.values(t && t.rules || {}).slice(-30).forEach(rule => words.push(rule && rule.title));
+  return words.map(v => String(v || "").trim().replace(/[<>\r\n]/g, "").slice(0, 80)).filter((v, i, a) => v && a.indexOf(v) === i).slice(0, 40);
+}
+app.post("/api/transcribe-voice", guard, async (req, res) => {
+  if (!process.env.OPENAI_KEY) return res.status(503).json({ ok: false, error: "no_openai_key" });
+  const audio = decodeVoiceAudio(req.body);
+  if (audio.error) return res.status(400).json({ ok: false, error: audio.error });
+  try {
+    const form = new FormData();
+    form.append("model", process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-transcribe");
+    form.append("file", new Blob([audio.data], { type: audio.mime }), "staff-instruction." + audio.ext);
+    form.append("prompt", "日本語のクリニック受付スタッフが、患者への返信下書きをどう修正するか右腕くんへ口頭で指示しています。医院名、施術名、媒体名、日時、金額をできるだけ正確に文字起こししてください。");
+    form.append("languages[]", "ja");
+    voiceKeywords(req.tenant).forEach(word => form.append("keywords[]", word));
+    const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST", headers: { "Authorization": "Bearer " + process.env.OPENAI_KEY }, body: form,
+      signal: AbortSignal.timeout(60000)
+    });
+    if (!response.ok) { console.error("voice transcription:", response.status); return res.status(502).json({ ok: false, error: "transcription_failed" }); }
+    const result = await response.json();
+    const text = String(result && result.text || "").trim().slice(0, 6000);
+    if (!text) return res.status(502).json({ ok: false, error: "empty_transcript" });
+    res.json({ ok: true, text });
+  } catch (e) {
+    console.error("voice transcription:", String(e && e.message || e).slice(0, 100));
+    res.status(502).json({ ok: false, error: "transcription_failed" });
+  }
+});
 app.post("/api/ai-regen", guard, async (req, res) => {
   const t = req.tenant;
   const idea = (req.body.idea || "").trim();
@@ -3404,7 +3452,7 @@ async function draftChatPrep(t, body) {
   if (!c) return { error: "no_conv" };
   const edits = (Array.isArray(body.messages) ? body.messages : []).slice(-14)
     .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
-    .map(m => ({ role: m.role, content: m.content.slice(0, 4000) }));
+    .map(m => ({ role: m.role, content: m.content.slice(0, 4000), inputMode: m.inputMode === "voice" ? "voice" : "text" }));
   while (edits.length && edits[0].role === "assistant") {
     edits[0] = { role: "user", content: "【現在の下書き（あなたが既に作成済み）】\n" + edits[0].content };
     if (edits[1] && edits[1].role === "user") { edits[0].content += "\n\n" + edits[1].content; edits.splice(1, 1); }
@@ -3417,6 +3465,10 @@ async function draftChatPrep(t, body) {
   const olderConv = context.olderRelevant.map(line).join("\n").slice(0, 3000);
   const lastQ = context.current.filter(m => m.from === "them").slice(-1).map(m => m.text || "").join("");
   const editTxt = edits.map(e => e.content).join(" ");
+  const latestStaffInput = edits.slice().reverse().find(e => e.role === "user");
+  const voiceInputNote = latestStaffInput && latestStaffInput.inputMode === "voice"
+    ? "\n\n【音声入力されたスタッフ指示】最新のスタッフ指示は音声認識から変換された文章です。誤字、同音異義語、助詞抜け、途中の言い直しがあっても、お客様との会話、現在の下書き、店舗ルール、院内用語から意図を復元し、明らかな変換ミスをスタッフに直させず反映する。意味不明な語をそのまま患者向け下書きへ転記しない。ただし患者名、医院、予約日時、金額、回数、予約の変更・取消など重要情報に複数の解釈が残る場合は推測せず、replyで短く確認し、actionはnone、下書きは変更しない。"
+    : "";
   const rel = rulesRanked(t, (lastQ + " " + editTxt).slice(0, 1500));
   const rulesTxt = rel.length ? rulesBlock(rel, ruleBudget(t)) : "";
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
@@ -3438,10 +3490,11 @@ async function draftChatPrep(t, body) {
     + staffBookingPrompt(baCtx)
     + "\n\n" + JP_QUALITY
     + "\n\nスタッフの指示がどんなに短くても（「あってる」「もっと短く」「優しく」等）、お客様との会話の文脈に当てはめて意味を解釈すること。"
+    + voiceInputNote
     + "\n\n【会話の仕方】ChatGPTのような自然な会話相手として振る舞う。スタッフが指示ではなく質問・相談をしてきた場合（例:「キャンセル料っていくらだっけ？」「どっちの言い方がいいと思う？」）は、店舗ルールと会話文脈を踏まえて返事で普通に答え、下書きは変えなくてよい。指示が曖昧なら、解釈した上で作りつつ、返事で一言確認する。"
     + "\n\n【書き方の最重要方針】(1)スタッフの指示は的確に反映する。(2)指示されていない部分の内容・構成・言い回しは、むやみに書き換えない（前の下書きを土台に、指示箇所だけ直す。つながりが不自然になる場合の最小限の調整は可）。勝手に情報を足したり削ったりしない。(3)全体は優秀な受付スタッフが書くような、自然で読みやすく簡潔な文にする。形式的な前置き・保険表現を詰め込まない（店舗ルールで必須の情報がある時だけ補う）。";
   const engLabel = (S(t).engine === "gpt" && process.env.OPENAI_KEY) ? "GPT" : (S(t).engine === "gemini" && process.env.GEMINI_KEY) ? "Gemini" : (ANTHROPIC_KEY ? "Claude(保険)" : "AI");
-  return { c, edits, base, engLabel, baCtx };
+  return { c, edits: edits.map(e => ({ role: e.role, content: e.content })), base, engLabel, baCtx };
 }
 
 function normalizeStaffBookingAction(p, raw) {
@@ -5091,6 +5144,12 @@ const PAGE = `<!DOCTYPE html>
   #dChips .cbtn{border-color:#c4b5fd;background:#fff;color:#5b21b6;}
   .dInputWrap{flex:1;min-width:0;}
   #dText{display:block;width:100%;border:1px solid #d1d5db;border-radius:10px;padding:10px 12px;font-size:14px;font-family:inherit;min-height:110px;max-height:240px;resize:vertical;}
+  .dVoiceRow{display:flex;align-items:center;gap:8px;margin-top:6px;min-height:34px;}
+  #dVoiceBtn{border:1px solid #a78bfa;background:#fff;color:#5b21b6;border-radius:9px;padding:7px 11px;font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap;}
+  #dVoiceBtn.recording{border-color:#ef4444;background:#fef2f2;color:#b91c1c;animation:voicePulse 1.2s ease-in-out infinite;}
+  #dVoiceBtn:disabled{opacity:.65;cursor:default;animation:none;}
+  #dVoiceStatus{font-size:11px;color:#6d28d9;line-height:1.35;}
+  @keyframes voicePulse{50%{box-shadow:0 0 0 4px rgba(239,68,68,.12);}}
   #dComposer{display:flex;gap:8px;padding:10px;border-top:1px solid #c4b5fd;align-items:flex-end;background:#ede9fe;}
   .cbtn.dsend{background:#6d28d9;border-color:#6d28d9;color:#fff;font-weight:700;white-space:nowrap;padding-left:10px;padding-right:10px;}
   .cbtn.dsend:disabled{background:#a78bfa;border-color:#a78bfa;}
@@ -5104,6 +5163,7 @@ const PAGE = `<!DOCTYPE html>
     #dComposer{display:grid;grid-template-columns:1fr;align-items:stretch;padding:10px calc(10px + env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) calc(10px + env(safe-area-inset-left));}
     #dText,#asstText{font-size:16px;min-height:84px;transition:min-height .15s;}
     #dText:focus,#asstText:focus{min-height:128px;}
+    #dVoiceBtn{min-height:44px;font-size:14px;padding:9px 14px;}
     .cbtn.dsend{width:100%;min-height:52px;font-size:15px;}
   }
   #asstHead{padding:11px 13px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:14px;gap:8px;}
@@ -5260,7 +5320,7 @@ const PAGE = `<!DOCTYPE html>
     <button class="cbtn" onclick="dChip('もっと丁寧で温かい言い方にして')">丁寧に</button>
     <button class="cbtn" onclick="dChip('もっと柔らかい印象にして')">柔らかく</button>
   </div>
-  <div id="dComposer"><div class="dInputWrap"><textarea id="dText" oninput="rememberDraftChatInput()" placeholder="右腕くんへの指示を入力…（例：もっと簡潔にして）"></textarea><div class="enterHint">Enter＝改行　相談は下のボタン</div></div><button id="dSendBtn" class="cbtn dsend" onclick="dSend()">右腕くんへ相談</button></div>
+  <div id="dComposer"><div class="dInputWrap"><textarea id="dText" oninput="rememberDraftChatInput()" placeholder="右腕くんへの指示を入力…（例：もっと簡潔にして）"></textarea><div class="dVoiceRow"><button type="button" id="dVoiceBtn" onclick="toggleDraftVoice()">🎙 音声入力</button><span id="dVoiceStatus" role="status" aria-live="polite">話した内容は文字になり、右腕くんが変換ミスも文脈から読み取ります</span></div><div class="enterHint">Enter＝改行　相談は下のボタン</div></div><button id="dSendBtn" class="cbtn dsend" onclick="dSend()">右腕くんへ相談</button></div>
 </div></div>
 <div id="setPop"><div class="settingsCard">
   <div class="settingsHeader"><h3>⚙ 設定</h3><button type="button" class="cbtn" onclick="closeSet()">閉じる</button></div>
@@ -5611,7 +5671,7 @@ function renderGrounding(r){const el=document.getElementById("groundingUsed");if
 let draftEditTimer=null;
 function draftEdited(){const d=document.getElementById("draft"),r=DATA.find(x=>x.id===current);if(!d||!r)return;r.draft=d.value;r.grounding={autoSendAllowed:false,reasons:["スタッフが下書きを編集したため手動送信します"],sources:["スタッフ編集"]};r.validation={pass:false,skipped:true,reason:"編集後の文章は自動送信しません"};renderGrounding(r);clearTimeout(draftEditTimer);const id=current,text=d.value;draftEditTimer=setTimeout(()=>api("/api/draft-edited",{id,draft:text}).catch(()=>{}),350);}
 function syncMsgs(c){const m=document.getElementById("msgs");if(!m)return;if(m.getAttribute("data-count")!==String(c.msgs.length)){m.innerHTML=bubblesHtml(c);m.setAttribute("data-count",String(c.msgs.length));m.scrollTop=m.scrollHeight;}}
-function openChat(id,keep){if(window.__dBusy&&current&&current!==id){uiAlert("右腕くんが回答を作成中です。完了してから別の会話を開いてください");return;}if(current&&current!==id)hideDraftChatForConversationSwitch();current=id;const r=DATA.find(x=>x.id===id);if(!r)return; appEl.classList.add("chatopen");
+function openChat(id,keep){if((window.__dBusy||window.__voiceBusy)&&current&&current!==id){uiAlert(window.__voiceBusy?"音声を処理中です。完了してから別の会話を開いてください":"右腕くんが回答を作成中です。完了してから別の会話を開いてください");return;}if(current&&current!==id)hideDraftChatForConversationSwitch();current=id;const r=DATA.find(x=>x.id===id);if(!r)return; appEl.classList.add("chatopen");
   const bubbles=bubblesHtml(r);
   const staffReviewButton=r.staffLineReviewAvailable?'<button class="cbtn" id="staffReviewResend" onclick="resendStaffApproval()">'+(r.staffLineApproval?'📲 承認依頼を再送':'📲 スタッフLINEで確認')+'</button>':'';
   chatEl.innerHTML='<div id="chatHead"><button id="backBtn" onclick="closeChat()">‹</button>'+av(r,30)+'<span id="chatName">'+esc(r.name)+'　<span style="font-size:11px;color:#6b7280;">'+(r.channel==="line"?"LINE":"メール")+((r.acct&&r.acct.name&&r.acct.name!=="メイン")?"・"+esc(r.acct.name):"")+'</span></span><button id="shareClinicBtn" class="hbtn" onclick="shareClinic()">🏥 クリニックへ共有</button></div>'+
@@ -6152,9 +6212,40 @@ async function resendStaffApproval(){if(!current)return;const b=document.getElem
 async function shareClinic(){const note=await uiPrompt("現場に伝える内容を入力してください（空欄のままOKを押すと、お客様の直近メッセージをそのまま共有します）","");if(note===null)return;const btn=document.getElementById("shareClinicBtn"),id=current;await withBusy("share-"+id,btn,"共有中…",async()=>{try{const r=await api("/api/share",{id,note:note||""});const j=await r.json();if(j.ok)uiAlert("現場ボードに共有しました");else uiAlert("共有に失敗しました");}catch(e){uiAlert("共有に失敗しました");}});}
 async function toggleFlag(){if(!current)return;const id=current,b=document.getElementById("flagBtn");let next=null;await withBusy("flag-"+id,b,"変更中…",async()=>{try{const r=await api("/api/tag",{id});const j=await r.json();next=!!j.flag;const cd=DATA.find(x=>x.id===id);if(cd)cd.flag=next;renderList();}catch(e){uiAlert("変更に失敗しました");}});if(b&&next!==null)b.textContent=next?"⚑ 要対応を外す":"⚑ 要対応";}
 // ---- AIで作り直す（会話型・下書きを会話で磨く。会話ごとにセッションを保持し再開可能）----
-let dHist=[],dLog=[],dSessions={},dComposerDrafts={},dComposerOwner="";
+let dHist=[],dLog=[],dSessions={},dComposerDrafts={},dComposerOwner="",dVoiceDerived={};
+let dVoiceRecorder=null,dVoiceStream=null,dVoiceChunks=[],dVoiceOwner="",dVoiceStopTimer=null;
+function dVoiceUi(label,recording,busy){const b=document.getElementById("dVoiceBtn"),s=document.getElementById("dVoiceStatus");if(b){b.textContent=label||"🎙 音声入力";b.classList.toggle("recording",!!recording);b.disabled=!!busy;}if(s)s.textContent=recording?"録音中です。話し終わったら停止を押してください":(busy?"音声を文字に変換しています…":"話した内容は文字になり、右腕くんが変換ミスも文脈から読み取ります");}
+function dVoiceCleanup(){if(dVoiceStopTimer){clearTimeout(dVoiceStopTimer);dVoiceStopTimer=null;}if(dVoiceStream){dVoiceStream.getTracks().forEach(track=>track.stop());dVoiceStream=null;}dVoiceRecorder=null;dVoiceChunks=[];dVoiceOwner="";window.__voiceBusy=false;}
+function voiceBlobBase64(blob){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result||"").split(",")[1]||"");reader.onerror=reject;reader.readAsDataURL(blob);});}
+async function toggleDraftVoice(){
+  if(dVoiceRecorder&&dVoiceRecorder.state==="recording"){dVoiceRecorder.stop();return;}
+  if(window.__voiceBusy)return;
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia||typeof MediaRecorder==="undefined"){uiAlert("このブラウザでは専用の音声入力を利用できません。端末のキーボードにあるマイクをご利用ください。");return;}
+  window.__voiceBusy=true;dVoiceUi("マイク準備中…",false,true);
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}});
+    const types=["audio/mp4","audio/webm;codecs=opus","audio/webm"],type=types.find(v=>MediaRecorder.isTypeSupported&&MediaRecorder.isTypeSupported(v))||"";
+    const recorder=type?new MediaRecorder(stream,{mimeType:type}):new MediaRecorder(stream);
+    dVoiceRecorder=recorder;dVoiceStream=stream;dVoiceChunks=[];dVoiceOwner=dComposerOwner||current;
+    recorder.ondataavailable=event=>{if(event.data&&event.data.size)dVoiceChunks.push(event.data);};
+    recorder.onerror=()=>{dVoiceCleanup();dVoiceUi();uiAlert("音声を録音できませんでした。マイクの許可をご確認ください。");};
+    recorder.onstop=async()=>{
+      const owner=dVoiceOwner,chunks=dVoiceChunks.slice(),mime=String(recorder.mimeType||type||"audio/webm");
+      if(dVoiceStopTimer){clearTimeout(dVoiceStopTimer);dVoiceStopTimer=null;}if(dVoiceStream){dVoiceStream.getTracks().forEach(track=>track.stop());dVoiceStream=null;}dVoiceRecorder=null;dVoiceChunks=[];dVoiceUi("文字変換中…",false,true);
+      try{
+        const blob=new Blob(chunks,{type:mime});if(!blob.size)throw new Error("empty_audio");if(blob.size>10*1024*1024)throw new Error("audio_too_large");
+        const data=await voiceBlobBase64(blob),response=await api("/api/transcribe-voice",{mime,data}),json=await response.json();
+        if(!response.ok||!json.ok||!json.text)throw new Error(json.error||"transcription_failed");
+        const before=String(dComposerDrafts[owner]||"").trim(),text=(before?before+"\\n":"")+String(json.text).trim();dComposerDrafts[owner]=text;dVoiceDerived[owner]=true;
+        if(dComposerOwner===owner){const input=document.getElementById("dText");if(input){input.value=text;input.focus();}}
+      }catch(e){const message=e.message==="audio_too_large"?"録音が長すぎます。短く区切ってもう一度お試しください。":"音声を文字に変換できませんでした。もう一度お試しください。";uiAlert(message);}
+      finally{dVoiceCleanup();dVoiceUi();}
+    };
+    recorder.start(500);dVoiceUi("■ 録音を停止",true,false);dVoiceStopTimer=setTimeout(()=>{if(dVoiceRecorder&&dVoiceRecorder.state==="recording")dVoiceRecorder.stop();},3*60*1000);
+  }catch(e){dVoiceCleanup();dVoiceUi();uiAlert("マイクを利用できませんでした。ブラウザのマイク許可をご確認ください。");}
+}
 const dMsgsEl=document.getElementById("dMsgs");
-function rememberDraftChatInput(){const x=document.getElementById("dText");if(x&&dComposerOwner)dComposerDrafts[dComposerOwner]=x.value;}
+function rememberDraftChatInput(){const x=document.getElementById("dText");if(x&&dComposerOwner){dComposerDrafts[dComposerOwner]=x.value;if(!x.value.trim())delete dVoiceDerived[dComposerOwner];}}
 function hideDraftChatForConversationSwitch(){
   rememberDraftChatInput();dComposerOwner="";
   const panel=document.getElementById("dpanel"),app=document.getElementById("app");
@@ -6212,11 +6303,11 @@ function slideClose(pid,cid){const p=document.getElementById(pid),c=document.get
   const mob=window.matchMedia("(max-width:760px)").matches;
   c.style.animation=(mob?"slideoutY":"slideoutX")+" .22s ease forwards";
   setTimeout(()=>{p.style.display="none";c.style.animation="";},220);}
-function closeDraftChat(){rememberDraftChatInput();const app=document.getElementById("app");if(app)app.classList.remove("dopen");slideClose("dpanel","dCard");}
+function closeDraftChat(){if(window.__voiceBusy){uiAlert("音声を処理中です。完了してから患者画面へ戻ってください");return;}rememberDraftChatInput();const app=document.getElementById("app");if(app)app.classList.remove("dopen");slideClose("dpanel","dCard");}
 function dChip(t){const x=document.getElementById("dText");x.value=t;rememberDraftChatInput();dSend();}
 // GPT風ストリーミング送信。返事が文字単位で流れ、下書きカードもリアルタイムに埋まる。失敗時は従来API(JSON)へ自動フォールバック。
-async function dSend(){if(window.__dBusy)return;const x=document.getElementById("dText");const txt=x.value.trim();if(!txt)return;window.__dBusy=true;const btn=document.getElementById("dSendBtn"),old=btn&&btn.innerHTML;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>作成中…';}x.value="";if(dComposerOwner)dComposerDrafts[dComposerOwner]="";
-  dAdd("user",txt);dHist.push({role:"user",content:txt});
+async function dSend(){if(window.__dBusy||window.__voiceBusy)return;const x=document.getElementById("dText");const txt=x.value.trim();if(!txt)return;const owner=dComposerOwner||current,fromVoice=!!dVoiceDerived[owner];window.__dBusy=true;const btn=document.getElementById("dSendBtn"),old=btn&&btn.innerHTML;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>作成中…';}x.value="";if(owner){dComposerDrafts[owner]="";delete dVoiceDerived[owner];}
+  dAdd("user",txt);dHist.push({role:"user",content:txt,inputMode:fromVoice?"voice":"text"});
   const logEntry={type:"ai",text:""};dLog.push(logEntry);
   const aiEl=dRender("ai","…");
   let cardEntry=null;

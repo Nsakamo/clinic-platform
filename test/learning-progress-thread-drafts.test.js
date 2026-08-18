@@ -22,6 +22,7 @@ test("右腕くんへの未送信入力を会話IDごとに保持する", () => 
 });
 
 test("右腕くんが回答中は別会話へ切り替えない", () => {
-  assert.match(source, /window\.__dBusy&&current&&current!==id/);
+  assert.match(source, /\(window\.__dBusy\|\|window\.__voiceBusy\)&&current&&current!==id/);
   assert.match(source, /完了してから別の会話を開いてください/);
+  assert.match(source, /音声を処理中です。完了してから別の会話を開いてください/);
 });
