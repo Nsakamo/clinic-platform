@@ -40,6 +40,7 @@ test("実HTTPで認証・Origin・テナント分離・固定公開URLを検証�
       DATABASE_URL: "",
       CRED_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
       PUBLIC_BASE_URL: PUBLIC_BASE,
+      ALLOWED_APP_ORIGINS: "https://legacy-rightarm.up.railway.app",
       PLATFORM_SECRET: PARTNER_KEY,
     }),
     stdio: ["ignore", "pipe", "pipe"],
@@ -80,6 +81,15 @@ test("実HTTPで認証・Origin・テナント分離・固定公開URLを検証�
     });
     assert.equal(csrf.response.status, 403);
     assert.equal(csrf.body.error, "origin");
+    assert.match(csrf.body.sendErr, /公式URLから開き直してください/);
+
+    const legacyOrigin = await json("/api/account", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: cookieA, Origin: "https://legacy-rightarm.up.railway.app" },
+      body: JSON.stringify({ accountEmail: "legacy-origin@example.test" }),
+    });
+    assert.equal(legacyOrigin.response.status, 200);
+    assert.equal(legacyOrigin.body.ok, true);
 
     const upload = await json("/api/upload", {
       method: "POST",

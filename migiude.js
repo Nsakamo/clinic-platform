@@ -67,12 +67,20 @@ function normalizePublicBase(value) {
   } catch (e) { return ""; }
 }
 const PUBLIC_BASE_URL = normalizePublicBase(process.env.PUBLIC_BASE_URL || process.env.APP_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? "https://" + process.env.RAILWAY_PUBLIC_DOMAIN : ""));
+// 独自ドメインへ切替える前のRailway URLなど、運営が明示した同一サービスの入口だけを追加許可する。
+// 任意のHost/X-Forwarded-Hostは信用せず、固定環境変数に登録されたHTTPS originのみを採用する。
+const ADDITIONAL_APP_ORIGINS = new Set(String(process.env.ALLOWED_APP_ORIGINS || "").split(",").map(normalizePublicBase).filter(Boolean));
 function requestPublicBase(req) {
   if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL;
   if (isManagedRuntime()) return "";
   const host = String(req && (req.headers["x-forwarded-host"] || req.headers.host) || "").split(",")[0].trim().toLowerCase();
   if (!/^(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/.test(host)) return "";
   return "http://" + host;
+}
+function isAllowedAppOrigin(req, origin) {
+  const normalized = normalizePublicBase(origin);
+  if (!normalized) return false;
+  return normalized === requestPublicBase(req) || ADDITIONAL_APP_ORIGINS.has(normalized);
 }
 // パスワード再設定メールは患者対応用メールとは分離できる。未設定時だけ当該テナントのSMTPへ後方互換フォールバック。
 const RESET_SMTP = {
@@ -561,7 +569,12 @@ function guard(req, res, next) {
   const t = tenantFromReq(req);
   if (!t) return res.status(401).json({ error: "auth" });
   const origin = String(req.headers.origin || "").replace(/\/$/, "");
-  if (!/^(GET|HEAD|OPTIONS)$/i.test(req.method) && origin && origin !== requestPublicBase(req)) return res.status(403).json({ error: "origin" });
+  if (!/^(GET|HEAD|OPTIONS)$/i.test(req.method) && origin && !isAllowedAppOrigin(req, origin)) {
+    return res.status(403).json({
+      error: "origin",
+      sendErr: "この画面のURLでは送信できません。画面を再読み込みし、改善しない場合はログイン時に案内された公式URLから開き直してください"
+    });
+  }
   req.tenant = t;
   next();
 }

@@ -86,7 +86,9 @@ test("監査で指摘された旧経路と危険なURL許可を残さない", ()
   assert.doesNotMatch(source, /legacySessToken/);
   assert.doesNotMatch(source, /http:\/\/localhost\(\?:\\d\+\)\?/);
   assert.match(source, /API_RATE_MAX = 600/);
-  assert.match(source, /origin !== requestPublicBase\(req\)/);
+  assert.match(source, /!isAllowedAppOrigin\(req, origin\)/);
+  assert.match(source, /ALLOWED_APP_ORIGINS/);
+  assert.match(source, /new Set\(String\(process\.env\.ALLOWED_APP_ORIGINS/);
   assert.match(source, /&quot;/);
   assert.match(source, /rel="noopener noreferrer"/);
 });
