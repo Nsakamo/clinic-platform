@@ -89,6 +89,10 @@ test("監査で指摘された旧経路と危険なURL許可を残さない", ()
   assert.match(source, /!isAllowedAppOrigin\(req, origin\)/);
   assert.match(source, /ALLOWED_APP_ORIGINS/);
   assert.match(source, /new Set\(String\(process\.env\.ALLOWED_APP_ORIGINS/);
+  assert.match(source, /oneMutationAtATime\("learning", learningMutationResource\)/);
+  assert.match(source, /job\.status === "processing"/);
+  assert.match(source, /resumed: true/);
+  assert.match(source, /r\.status===409&&j\.error==="already_processing"/);
   assert.match(source, /&quot;/);
   assert.match(source, /rel="noopener noreferrer"/);
 });
