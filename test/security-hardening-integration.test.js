@@ -93,6 +93,9 @@ test("監査で指摘された旧経路と危険なURL許可を残さない", ()
   assert.match(source, /job\.status === "processing"/);
   assert.match(source, /resumed: true/);
   assert.match(source, /r\.status===409&&j\.error==="already_processing"/);
+  assert.match(source, /source: "web-recovered"/);
+  assert.match(source, /recoveredConversation/);
+  assert.match(source, /recovery_not_found/);
   assert.match(source, /&quot;/);
   assert.match(source, /rel="noopener noreferrer"/);
 });
