@@ -3184,16 +3184,20 @@ app.get("/api/learning-jobs", guard, (req, res) => {
   learningJobs(t).filter(job => job.status === "processing").forEach(job => setImmediate(() => processLearningJob(t, job.id)));
   res.json({ ok: true, jobs: learningJobs(t).filter(job => job.status !== "done").slice(-30).map(publicLearningJob) });
 });
-app.post("/api/learning-job-ack", guard, oneMutationAtATime("learning"), async (req, res) => {
+function learningMutationResource(req) {
+  return String(req.body.learningJobId || req.body.id || req.body.exampleId || req.body.conversationId || "global");
+}
+app.post("/api/learning-job-ack", guard, oneMutationAtATime("learning", learningMutationResource), async (req, res) => {
   const job = learningJobs(req.tenant).find(item => item.id === String(req.body.id || ""));
   if (!job) return res.status(404).json({ ok: false, error: "not_found" });
   if (job.status === "completed") { job.status = "done"; job.updatedAt = Date.now(); await saveTenantConfig(req.tenant); }
   res.json({ ok: true });
 });
 // 送信後の学習確認。AIの自動判定ではなく、スタッフが選んだ適用範囲を正本として保存する。
-app.post("/api/learning-scope", guard, oneMutationAtATime("learning"), async (req, res) => {
-  const t = req.tenant, id = Number(req.body.exampleId), scope = String(req.body.scope || "");
+app.post("/api/learning-scope", guard, oneMutationAtATime("learning", learningMutationResource), async (req, res) => {
+  const t = req.tenant, requestedId = Number(req.body.exampleId), scope = String(req.body.scope || "");
   const job = learningJobs(t).find(item => item.id === String(req.body.learningJobId || ""));
+  const id = requestedId || Number(job && job.exampleId || 0);
   let ex = t.examples && t.examples[id];
   if (!job && !ex) return res.status(404).json({ ok: false, error: "not_found" });
   if (!["none", "learn", "patient", "similar", "all"].includes(scope)) return res.status(400).json({ ok: false, error: "bad_scope" });
@@ -3209,6 +3213,15 @@ app.post("/api/learning-scope", guard, oneMutationAtATime("learning"), async (re
       return res.json({ ok: true, scope, message: "今回は学習しません" });
     }
     if (scope === "learn") {
+      // 前回の保存が応答前に中断した場合も、同じボタン操作を安全に再開できるようにする。
+      if (job && job.status === "processing") {
+        await saveTenantConfig(t);
+        setImmediate(() => processLearningJob(t, job.id));
+        return res.json({ ok: true, scope, processing: true, resumed: true, message: "学習内容の確認を再開しました" });
+      }
+      if (job && ["completed", "done"].includes(job.status)) {
+        return res.json({ ok: true, scope, processing: false, duplicate: true, message: "学習内容は保存済みです" });
+      }
       if (job && job.status === "awaiting_decision") {
         const p = job.payload || {};
         ex = await exampleAdd(t, { q: p.q, final: p.final, draft0: p.draft0, instr: p.instr, learningChat: p.learningChat, source: p.source || "web" });
@@ -3255,6 +3268,7 @@ app.post("/api/learning-scope", guard, oneMutationAtATime("learning"), async (re
     }
     res.json({ ok: true, scope, message: "同じ種類の問い合わせへ使う学習として保存しました" });
   } catch (e) {
+    console.error("learning scope save:", t.slug, String(req.body.learningJobId || id || "unknown"), String(e && e.message || e).slice(0, 160));
     res.status(500).json({ ok: false, error: "save" });
   }
 });
@@ -3269,7 +3283,7 @@ app.post("/api/learning-conflict-consult", guard, async (req, res) => {
     res.json({ ok: true, proposal });
   } catch (e) { res.status(500).json({ ok: false, error: "ai_failed" }); }
 });
-app.post("/api/learning-conflict-resolve", guard, oneMutationAtATime("learning"), async (req, res) => {
+app.post("/api/learning-conflict-resolve", guard, oneMutationAtATime("learning", learningMutationResource), async (req, res) => {
   const t = req.tenant, id = String(req.body.id || ""), mode = String(req.body.mode || "");
   const item = learningConflicts(t, true).find(conflict => conflict.id === id);
   if (!item) return res.status(404).json({ ok: false, error: "not_found" });
@@ -6219,13 +6233,18 @@ async function saveLearningScope(scope,btn){
   const text=(document.getElementById("learningScopeText").value||"").trim();
   if(scope!=="none"&&!text){uiAlert("今後守る内容を入力してください");return;}
   await withBusy("learning-scope-"+(data.learningJobId||data.exampleId),btn,"保存中…",async()=>{try{
-    const r=await api("/api/learning-scope",{exampleId:data.exampleId,conversationId:data.conversationId,learningJobId:data.learningJobId,scope,text}),j=await r.json();
+    const payload={exampleId:data.exampleId,conversationId:data.conversationId,learningJobId:data.learningJobId,scope,text};
+    let r=await api("/api/learning-scope",payload),j=await r.json();
+    if(r.status===409&&j.error==="already_processing"){
+      await new Promise(resolve=>setTimeout(resolve,600));
+      r=await api("/api/learning-scope",payload);j=await r.json();
+    }
     if(!r.ok||!j.ok)throw new Error(j.error||"save");
     closeLearningScope();
     if(scope==="learn")showLearningOutcome({type:"processing",title:"学習内容を確認しています",message:"重複・矛盾・患者固有情報を裏側で確認中です"});
     else showLearningOutcome({type:"ignored",title:"今回は学習しません",message:"患者への送信履歴だけを残し、学習候補は削除しました"});
     pollLearningJobs();refreshLearningBadge();
-  }catch(e){uiAlert("学習内容を保存できませんでした。設定→学習データ管理から確認してください。");}});
+  }catch(e){uiAlert(e.message==="already_processing"?"別の学習処理を保存中です。数秒後にもう一度押してください。":"学習内容を保存できませんでした。内容は確認待ちに残しています。右上の「要確認」または設定→学習データ管理から再度保存してください。");}});
 }
 function openRuleLearning(){
   const data=learningScopeData;if(!data)return;
