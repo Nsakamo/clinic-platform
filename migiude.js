@@ -817,6 +817,8 @@ function prefsBlock(t) {
 }
 function examplesRanked(t, query, k, context) {
   const pendingIds = new Set(learningConflicts(t, true).flatMap(item => item.kind === "rule" ? [Number(item.newId)] : [Number(item.oldId), Number(item.newId)]));
+  // 「学習する」選択後も、安全確認が終わるまでは新規候補を患者回答へ使わない。
+  learningJobs(t).filter(job => job.status === "processing" && !job.reused && Number(job.exampleId)).forEach(job => pendingIds.add(Number(job.exampleId)));
   // 構造化した問い合わせ意図・判断・検索語も検索対象にし、表現が違う質問から同じ対応を取り出す。
   const list = Object.values(t.examples || {}).filter(example => !pendingIds.has(Number(example.id))).map(example => Object.assign({}, example, { originalQ: example.q, q: learningMetaSearchText(example) }));
   if (!list.length) return [];
@@ -1061,7 +1063,8 @@ function publicLearningJob(job) {
   return {
     id: String(job.id || ""), conversationId: String(job.conversationId || ""), status: String(job.status || "processing"),
     createdAt: Number(job.createdAt || 0), updatedAt: Number(job.updatedAt || 0), resultType: String(job.resultType || ""),
-    learningReview: job.learningReview || null, conflict: job.conflict || null, error: String(job.error || ""),
+    learningReview: job.learningReview || null, conflict: job.conflict || null, outcome: job.outcome || null,
+    error: String(job.error || ""),
   };
 }
 function finishLearningJob(t, id) {
@@ -1095,6 +1098,15 @@ async function checkFormalRuleConflict(t, q, proposal, newId, source) {
   } catch (e) { console.error("formal rule conflict:", e && e.message); }
   return null;
 }
+async function proposeConflictResolution(t, item, instruction) {
+  const system = "あなたは受付AIの学習ルール編集者です。現在のルールと新しい候補の食い違いについて、スタッフの指示を最優先に、両立する条件を明確にした正式ルール案を1つ作ってください。患者固有の氏名・日時・会員IDは一般化し、推測を追加しません。JSONのみ: {\"proposal\":\"確定候補の本文\"}";
+  const user = "【現在】\n" + String(item.oldFinal || "").slice(0, 1800)
+    + "\n\n【今回】\n" + String(item.newFinal || "").slice(0, 1800)
+    + "\n\n【スタッフの指示】\n" + String(instruction || "").slice(0, 1200);
+  const raw = await aiChat(t, system, [{ role: "user", content: user }], 900, "learning");
+  const match = String(raw || "").match(/\{[\s\S]*\}/), parsed = match ? JSON.parse(match[0]) : {};
+  return String(parsed.proposal || "").trim().slice(0, 2400);
+}
 const runningLearningJobs = new Set();
 async function processLearningJob(t, jobId) {
   const key = t.slug + "::" + jobId;
@@ -1106,18 +1118,40 @@ async function processLearningJob(t, jobId) {
     const p = job.payload || {}, ex = t.examples && t.examples[Number(job.exampleId)];
     if (!ex) throw new Error("example_not_found");
     const proposal = await proposeContextualLearningText(t, p);
+    if (job.status !== "processing") return;
     const review = Object.assign({}, job.learningReview || {}, { text: proposal });
     const exampleConflict = p.changed ? await checkConflict(t, p.q, p.final, ex.id) : null;
+    if (job.status !== "processing") return;
     let conflict = exampleConflict ? await learningConflictAdd(t, {
       kind: "example", q: p.q, oldId: exampleConflict.oldId, oldFinal: exampleConflict.oldFinal,
       newId: ex.id, newFinal: p.final, source: p.source,
     }) : null;
     if (!conflict) conflict = await checkFormalRuleConflict(t, p.q, proposal, ex.id, p.source);
     try { await recordLearningPerformance(t, p.q, !!p.changed, !!conflict); } catch (e) { console.error("learning performance:", e && e.message); }
-    job.status = "ready"; job.resultType = conflict ? "conflict" : "review"; job.learningReview = conflict ? null : review;
-    job.conflict = conflict ? publicLearningConflict(conflict) : null; job.payload = null; job.updatedAt = Date.now();
+    if (conflict) {
+      job.status = "ready"; job.resultType = "conflict"; job.learningReview = null;
+      job.conflict = publicLearningConflict(conflict); job.outcome = null;
+    } else {
+      const c = t.store[String(job.conversationId || "")] || null;
+      const learnedRules = await distillRules(t, c, { q: p.q, final: p.final, draft0: p.draft0, instr: p.instr, learningChat: p.learningChat, exampleId: ex.id });
+      const updated = learnedRules.some(item => item.action === "update"), added = learnedRules.some(item => item.action === "add");
+      const type = job.reused && !updated && !added ? "duplicate" : (updated ? "updated" : "new");
+      job.status = "completed"; job.resultType = type; job.learningReview = review; job.conflict = null;
+      job.outcome = type === "duplicate"
+        ? { type, title: "既存の学習へ統合しました", message: "同じ内容を増やさず、既存の対応例の確認回数を更新しました" }
+        : type === "updated"
+          ? { type, title: "既存のルールを更新しました", message: "新しい内容を既存ルールへ反映しました" }
+          : { type, title: "新しい学習として保存しました", message: "今後、同じ種類の問い合わせで回答判断に利用します" };
+    }
+    job.payload = null; job.updatedAt = Date.now();
   } catch (e) {
-    job.status = "ready"; job.resultType = "review"; job.error = String(e && e.message || e).slice(0, 120); job.payload = null; job.updatedAt = Date.now();
+    if (job.exampleId && !job.reused) {
+      try { await exampleDelete(t, Number(job.exampleId)); }
+      catch (cleanupError) { console.error("learning example cleanup:", cleanupError && cleanupError.message); }
+    }
+    job.status = "completed"; job.resultType = "error"; job.error = String(e && e.message || e).slice(0, 120);
+    job.outcome = { type: "error", title: "学習内容を確認できませんでした", message: "学習データ管理からもう一度確認してください" };
+    job.payload = null; job.updatedAt = Date.now();
   } finally {
     runningLearningJobs.delete(key);
     while (t.config.learningJobs.length > 80) t.config.learningJobs.shift();
@@ -1128,19 +1162,18 @@ async function queueStaffLearning(t, c, opts) {
   const q = String(opts.q || recentCustomerQuestion(c)).trim(), final = String(opts.final || "").trim();
   if (!q || !final) return null;
   const draft0 = String(opts.draft0 || "").trim(), instr = String(opts.instr || "").trim(), learningChat = sanitizeLearningChat(opts.learningChat);
-  const ex = await exampleAdd(t, { q, final, draft0, instr, learningChat, source: opts.source || "web" });
-  if (!ex) return null;
-  const review = learningReviewPayload(ex, { q, final, draft0, instr, reviewText: opts.reviewText, conversationId: c && c.id });
-  if (!review) return { learnedId: ex.id, job: null };
+  // スタッフが「学習する」を選ぶまでは対応例へ保存せず、候補だけを保持する。
+  // これにより「学習しない」で既存の重複例を誤って削除することもない。
+  const review = learningReviewPayload({ id: 0 }, { q, final, draft0, instr, reviewText: opts.reviewText, conversationId: c && c.id });
+  if (!review) return { learnedId: null, job: null };
   const now = Date.now(), job = {
     id: "lj-" + now.toString(36) + "-" + crypto.randomBytes(3).toString("hex"), conversationId: String(c && c.id || ""),
-    exampleId: ex.id, status: "processing", resultType: "", createdAt: now, updatedAt: now, learningReview: review, conflict: null,
+    exampleId: 0, reused: false, status: "awaiting_decision", resultType: "", createdAt: now, updatedAt: now, learningReview: review, conflict: null, outcome: null,
     payload: { q, final, draft0, instr, learningChat, reviewText: opts.reviewText, source: opts.source || "web", changed: final !== draft0 || !!instr },
   };
   learningJobs(t).push(job); while (t.config.learningJobs.length > 80) t.config.learningJobs.shift();
   await saveTenantConfig(t);
-  setImmediate(() => processLearningJob(t, job.id));
-  return { learnedId: ex.id, job: publicLearningJob(job) };
+  return { learnedId: null, job: publicLearningJob(job) };
 }
 // 2つのテキストがほぼ同内容か（bigram重なり率）。ルールの二重登録ガード用。
 function similarEnough(a, b) {
@@ -2922,10 +2955,10 @@ function publicSettings(t) {
 }
 app.get("/api/settings", guard, (req, res) => res.json(publicSettings(req.tenant)));
 app.get("/api/learning-pending-count", guard, (req, res) => {
-  const jobs = learningJobs(req.tenant).filter(job => job.status === "ready");
+  const jobs = learningJobs(req.tenant);
   res.json({
     ok: true,
-    decisions: jobs.filter(job => job.resultType === "review").length,
+    decisions: jobs.filter(job => job.status === "awaiting_decision" || (job.status === "ready" && job.resultType === "review")).length,
     conflicts: learningConflicts(req.tenant, true).length,
   });
 });
@@ -3138,29 +3171,52 @@ app.get("/api/learning-jobs", guard, (req, res) => {
   learningJobs(t).filter(job => job.status === "processing").forEach(job => setImmediate(() => processLearningJob(t, job.id)));
   res.json({ ok: true, jobs: learningJobs(t).filter(job => job.status !== "done").slice(-30).map(publicLearningJob) });
 });
+app.post("/api/learning-job-ack", guard, oneMutationAtATime("learning"), async (req, res) => {
+  const job = learningJobs(req.tenant).find(item => item.id === String(req.body.id || ""));
+  if (!job) return res.status(404).json({ ok: false, error: "not_found" });
+  if (job.status === "completed") { job.status = "done"; job.updatedAt = Date.now(); await saveTenantConfig(req.tenant); }
+  res.json({ ok: true });
+});
 // 送信後の学習確認。AIの自動判定ではなく、スタッフが選んだ適用範囲を正本として保存する。
 app.post("/api/learning-scope", guard, oneMutationAtATime("learning"), async (req, res) => {
   const t = req.tenant, id = Number(req.body.exampleId), scope = String(req.body.scope || "");
-  const ex = t.examples && t.examples[id];
-  if (!ex) return res.status(404).json({ ok: false, error: "not_found" });
+  const job = learningJobs(t).find(item => item.id === String(req.body.learningJobId || ""));
+  let ex = t.examples && t.examples[id];
+  if (!job && !ex) return res.status(404).json({ ok: false, error: "not_found" });
   if (!["none", "learn", "patient", "similar", "all"].includes(scope)) return res.status(400).json({ ok: false, error: "bad_scope" });
-  const text = String(req.body.text || ex.instr || "").trim().slice(0, 2400);
+  const text = String(req.body.text || (job && job.learningReview && job.learningReview.text) || (ex && ex.instr) || "").trim().slice(0, 2400);
   if (scope !== "none" && !text) return res.status(400).json({ ok: false, error: "required" });
   try {
     if (scope === "none") {
-      await exampleDelete(t, id);
-      finishLearningJobFor(t, req.body.learningJobId, id, ""); await saveTenantConfig(t);
+      // 新方式では未確定候補を捨てるだけ。旧方式の保存済み例だけ後方互換で削除する。
+      if (ex && (!job || Number(job.exampleId))) await exampleDelete(t, id);
+      if (job) { job.status = "done"; job.resultType = "ignored"; job.payload = null; job.updatedAt = Date.now(); }
+      else finishLearningJobFor(t, req.body.learningJobId, id, "");
+      await saveTenantConfig(t);
       return res.json({ ok: true, scope, message: "今回は学習しません" });
     }
     if (scope === "learn") {
-      // 「学習する」を選んだ結果をAIのone_off判定だけで捨てない。確定対応例は必ず再利用対象として残し、
-      // 修正チャット全体から共通方針・店舗ルールも追加で整理する。
+      if (job && job.status === "awaiting_decision") {
+        const p = job.payload || {};
+        ex = await exampleAdd(t, { q: p.q, final: p.final, draft0: p.draft0, instr: p.instr, learningChat: p.learningChat, source: p.source || "web" });
+        if (!ex) throw new Error("example_save");
+        job.exampleId = ex.id; job.reused = !!ex.reused; job.status = "processing"; job.resultType = "";
+        job.learningReview = Object.assign({}, job.learningReview || {}, { exampleId: ex.id, text });
+        job.payload = Object.assign({}, p, { reviewText: text }); job.updatedAt = Date.now();
+      } else if (job && job.status === "ready" && job.resultType === "review" && ex) {
+        // 旧バージョンでAI整理済み・判断待ちになっていた案件も、新しい安全確認フローへ移行する。
+        job.status = "processing"; job.resultType = ""; job.reused = !!ex.reused;
+        job.learningReview = Object.assign({}, job.learningReview || {}, { exampleId: ex.id, text });
+        job.payload = { q: ex.q, final: ex.final, draft0: ex.draft0, instr: ex.instr, learningChat: ex.learningChat, reviewText: text, source: ex.source || "web", changed: ex.final !== ex.draft0 || !!ex.instr };
+        job.updatedAt = Date.now();
+      }
+      if (!ex) return res.status(404).json({ ok: false, error: "example_not_found" });
       const meta = sanitizeLearningMeta({ scope: "reusable", intent: learningIntentKey(ex.q), decision: text, conditions: "同じ状況・問い合わせに適用", avoid: "患者固有の事実と今回限りの特例は他の患者へ引き継がない", searchTerms: [String(ex.q || "").slice(0, 120)], updated: Date.now() });
-      await exampleLearningMetaUpdate(t, id, meta);
-      const c = t.store[String(req.body.conversationId || "")] || null;
-      const learnedRules = await distillRules(t, c, { q: ex.q, final: ex.final, draft0: ex.draft0, instr: ex.instr, learningChat: ex.learningChat, exampleId: ex.id });
-      finishLearningJobFor(t, req.body.learningJobId, id, ""); await saveTenantConfig(t);
-      return res.json({ ok: true, scope, learnedRules, message: learnedRules.length ? "対応例と修正チャットを学習し、店舗ルールも整理しました" : "対応例と修正チャットを今後の回答へ学習しました" });
+      await exampleLearningMetaUpdate(t, ex.id, meta);
+      await saveTenantConfig(t);
+      if (job) setImmediate(() => processLearningJob(t, job.id));
+      else setImmediate(async () => { try { await distillRules(t, t.store[String(req.body.conversationId || "")] || null, { q: ex.q, final: ex.final, draft0: ex.draft0, instr: ex.instr, learningChat: ex.learningChat, exampleId: ex.id }); } catch (e) {} });
+      return res.json({ ok: true, scope, processing: true, message: "学習内容を裏側で確認しています" });
     }
     if (scope === "patient") {
       const c = t.store[String(req.body.conversationId || "")];
@@ -3188,6 +3244,17 @@ app.post("/api/learning-scope", guard, oneMutationAtATime("learning"), async (re
   } catch (e) {
     res.status(500).json({ ok: false, error: "save" });
   }
+});
+app.post("/api/learning-conflict-consult", guard, async (req, res) => {
+  const t = req.tenant, item = learningConflicts(t, true).find(conflict => conflict.id === String(req.body.id || ""));
+  if (!item) return res.status(404).json({ ok: false, error: "not_found" });
+  const instruction = String(req.body.instruction || "").trim().slice(0, 1200);
+  if (!instruction) return res.status(400).json({ ok: false, error: "required" });
+  try {
+    const proposal = await proposeConflictResolution(t, item, instruction);
+    if (!proposal) throw new Error("empty");
+    res.json({ ok: true, proposal });
+  } catch (e) { res.status(500).json({ ok: false, error: "ai_failed" }); }
 });
 app.post("/api/learning-conflict-resolve", guard, oneMutationAtATime("learning"), async (req, res) => {
   const t = req.tenant, id = String(req.body.id || ""), mode = String(req.body.mode || "");
@@ -3336,6 +3403,54 @@ app.post("/api/draft-edited", guard, async (req, res) => {
   dbSave(t, c);
   res.json({ ok: true });
 });
+
+// 右腕くんへの修正指示用音声入力。音声はOpenAIへ直接転送し、このサーバーやDBには保存しない。
+// gpt-transcribe は医院名・施術名などのキーワードヒントを受け取れるため、テナントごとの用語を補助する。
+const VOICE_MIME_EXT = {
+  "audio/webm": "webm", "audio/mp4": "mp4", "audio/mpeg": "mp3", "audio/mp3": "mp3",
+  "audio/mpga": "mpga", "audio/m4a": "m4a", "audio/wav": "wav", "audio/x-wav": "wav"
+};
+function decodeVoiceAudio(body) {
+  const mime = String(body && body.mime || "").split(";")[0].trim().toLowerCase();
+  const ext = VOICE_MIME_EXT[mime];
+  const encoded = String(body && body.data || "");
+  if (!ext || !encoded || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded) || encoded.length % 4 !== 0) return { error: "unsupported_audio" };
+  let data;
+  try { data = Buffer.from(encoded, "base64"); } catch (e) { return { error: "bad_audio" }; }
+  if (!data.length) return { error: "empty_audio" };
+  if (data.length > 10 * 1024 * 1024) return { error: "audio_too_large" };
+  return { data, mime, ext };
+}
+function voiceKeywords(t) {
+  const words = [t && t.name, "右腕くん", "うけつけるん", "キレイパス", "カンナムオンニ", "トリビュー"];
+  Object.values(t && t.rules || {}).slice(-30).forEach(rule => words.push(rule && rule.title));
+  return words.map(v => String(v || "").trim().replace(/[<>\r\n]/g, "").slice(0, 80)).filter((v, i, a) => v && a.indexOf(v) === i).slice(0, 40);
+}
+app.post("/api/transcribe-voice", guard, async (req, res) => {
+  if (!process.env.OPENAI_KEY) return res.status(503).json({ ok: false, error: "no_openai_key" });
+  const audio = decodeVoiceAudio(req.body);
+  if (audio.error) return res.status(400).json({ ok: false, error: audio.error });
+  try {
+    const form = new FormData();
+    form.append("model", process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-transcribe");
+    form.append("file", new Blob([audio.data], { type: audio.mime }), "staff-instruction." + audio.ext);
+    form.append("prompt", "日本語のクリニック受付スタッフが、患者への返信下書きをどう修正するか右腕くんへ口頭で指示しています。医院名、施術名、媒体名、日時、金額をできるだけ正確に文字起こししてください。");
+    form.append("languages[]", "ja");
+    voiceKeywords(req.tenant).forEach(word => form.append("keywords[]", word));
+    const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST", headers: { "Authorization": "Bearer " + process.env.OPENAI_KEY }, body: form,
+      signal: AbortSignal.timeout(60000)
+    });
+    if (!response.ok) { console.error("voice transcription:", response.status); return res.status(502).json({ ok: false, error: "transcription_failed" }); }
+    const result = await response.json();
+    const text = String(result && result.text || "").trim().slice(0, 6000);
+    if (!text) return res.status(502).json({ ok: false, error: "empty_transcript" });
+    res.json({ ok: true, text });
+  } catch (e) {
+    console.error("voice transcription:", String(e && e.message || e).slice(0, 100));
+    res.status(502).json({ ok: false, error: "transcription_failed" });
+  }
+});
 app.post("/api/ai-regen", guard, async (req, res) => {
   const t = req.tenant;
   const idea = (req.body.idea || "").trim();
@@ -3404,7 +3519,7 @@ async function draftChatPrep(t, body) {
   if (!c) return { error: "no_conv" };
   const edits = (Array.isArray(body.messages) ? body.messages : []).slice(-14)
     .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
-    .map(m => ({ role: m.role, content: m.content.slice(0, 4000) }));
+    .map(m => ({ role: m.role, content: m.content.slice(0, 4000), inputMode: m.inputMode === "voice" ? "voice" : "text" }));
   while (edits.length && edits[0].role === "assistant") {
     edits[0] = { role: "user", content: "【現在の下書き（あなたが既に作成済み）】\n" + edits[0].content };
     if (edits[1] && edits[1].role === "user") { edits[0].content += "\n\n" + edits[1].content; edits.splice(1, 1); }
@@ -3417,6 +3532,10 @@ async function draftChatPrep(t, body) {
   const olderConv = context.olderRelevant.map(line).join("\n").slice(0, 3000);
   const lastQ = context.current.filter(m => m.from === "them").slice(-1).map(m => m.text || "").join("");
   const editTxt = edits.map(e => e.content).join(" ");
+  const latestStaffInput = edits.slice().reverse().find(e => e.role === "user");
+  const voiceInputNote = latestStaffInput && latestStaffInput.inputMode === "voice"
+    ? "\n\n【音声入力されたスタッフ指示】最新のスタッフ指示は音声認識から変換された文章です。誤字、同音異義語、助詞抜け、途中の言い直しがあっても、お客様との会話、現在の下書き、店舗ルール、院内用語から意図を復元し、明らかな変換ミスをスタッフに直させず反映する。意味不明な語をそのまま患者向け下書きへ転記しない。ただし患者名、医院、予約日時、金額、回数、予約の変更・取消など重要情報に複数の解釈が残る場合は推測せず、replyで短く確認し、actionはnone、下書きは変更しない。"
+    : "";
   const rel = rulesRanked(t, (lastQ + " " + editTxt).slice(0, 1500));
   const rulesTxt = rel.length ? rulesBlock(rel, ruleBudget(t)) : "";
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
@@ -3438,10 +3557,11 @@ async function draftChatPrep(t, body) {
     + staffBookingPrompt(baCtx)
     + "\n\n" + JP_QUALITY
     + "\n\nスタッフの指示がどんなに短くても（「あってる」「もっと短く」「優しく」等）、お客様との会話の文脈に当てはめて意味を解釈すること。"
+    + voiceInputNote
     + "\n\n【会話の仕方】ChatGPTのような自然な会話相手として振る舞う。スタッフが指示ではなく質問・相談をしてきた場合（例:「キャンセル料っていくらだっけ？」「どっちの言い方がいいと思う？」）は、店舗ルールと会話文脈を踏まえて返事で普通に答え、下書きは変えなくてよい。指示が曖昧なら、解釈した上で作りつつ、返事で一言確認する。"
     + "\n\n【書き方の最重要方針】(1)スタッフの指示は的確に反映する。(2)指示されていない部分の内容・構成・言い回しは、むやみに書き換えない（前の下書きを土台に、指示箇所だけ直す。つながりが不自然になる場合の最小限の調整は可）。勝手に情報を足したり削ったりしない。(3)全体は優秀な受付スタッフが書くような、自然で読みやすく簡潔な文にする。形式的な前置き・保険表現を詰め込まない（店舗ルールで必須の情報がある時だけ補う）。";
   const engLabel = (S(t).engine === "gpt" && process.env.OPENAI_KEY) ? "GPT" : (S(t).engine === "gemini" && process.env.GEMINI_KEY) ? "Gemini" : (ANTHROPIC_KEY ? "Claude(保険)" : "AI");
-  return { c, edits, base, engLabel, baCtx };
+  return { c, edits: edits.map(e => ({ role: e.role, content: e.content })), base, engLabel, baCtx };
 }
 
 function normalizeStaffBookingAction(p, raw) {
@@ -4914,6 +5034,10 @@ const PAGE = `<!DOCTYPE html>
   #listHeadMeta{display:flex;align-items:center;gap:7px;}
   #learningPendingBadge{display:none;border:1px solid #f59e0b;background:#fffbeb;color:#92400e;border-radius:999px;padding:4px 8px;font-size:10.5px;font-weight:800;cursor:pointer;white-space:nowrap;}
   #learningPendingBadge.hasConflict{border-color:#ef4444;background:#fef2f2;color:#b91c1c;}
+  #learningResultBanner{display:none;position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:91;width:min(92vw,620px);align-items:center;gap:10px;padding:12px 14px;border:1px solid;border-radius:13px;box-shadow:0 14px 38px rgba(15,23,42,.2);}
+  #learningResultBanner.show{display:flex;}#learningResultBanner.processing{background:#f5f3ff;border-color:#c4b5fd;color:#5b21b6;}#learningResultBanner.new,#learningResultBanner.updated{background:#ecfdf5;border-color:#86efac;color:#166534;}#learningResultBanner.duplicate{background:#eff6ff;border-color:#93c5fd;color:#1d4ed8;}#learningResultBanner.conflict{background:#fff7ed;border-color:#fdba74;color:#9a3412;}#learningResultBanner.ignored{background:#f8fafc;border-color:#cbd5e1;color:#475569;}#learningResultBanner.error{background:#fef2f2;border-color:#fca5a5;color:#b91c1c;}
+  .learningResultIcon{width:34px;height:34px;border-radius:10px;background:rgba(255,255,255,.72);display:grid;place-items:center;font-size:17px;flex:0 0 auto;}.learningResultCopy{min-width:0;flex:1;}.learningResultCopy strong{display:block;font-size:13px;}.learningResultCopy small{display:block;font-size:11px;line-height:1.45;margin-top:2px;opacity:.82;}.learningResultLabel{border:1px solid currentColor;border-radius:999px;padding:4px 8px;background:rgba(255,255,255,.55);font-size:10px;font-weight:800;white-space:nowrap;}.learningResultClose{border:0;background:transparent;color:currentColor;font-size:19px;cursor:pointer;padding:2px;}
+  .learningConflictCard{width:min(94vw,720px);height:min(90vh,760px);background:#fff;border-radius:16px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 22px 65px rgba(15,23,42,.28);}.learningConflictHead{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:14px 16px;border-bottom:1px solid var(--line);}.learningConflictHead h3{margin:0;font-size:15px;}.learningConflictThread{flex:1;overflow-y:auto;padding:16px;background:#f8fafc;}.learningConflictLine{display:flex;align-items:flex-start;gap:8px;margin-bottom:12px;}.learningConflictAvatar{width:30px;height:30px;border-radius:9px;background:#0f766e;color:#fff;display:grid;place-items:center;font-size:10px;font-weight:800;flex:0 0 auto;}.learningConflictMessage{max-width:calc(100% - 40px);padding:11px 12px;border:1px solid #dbe4e1;border-radius:4px 13px 13px 13px;background:#fff;font-size:12px;line-height:1.6;}.learningConflictDiff{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0;}.learningConflictRule{padding:9px;border:1px solid #d1d5db;border-radius:9px;background:#f8fafc;white-space:pre-wrap;}.learningConflictRule.old{border-top:4px solid #94a3b8;}.learningConflictRule.new{border-top:4px solid #f59e0b;background:#fffbeb;}.learningConflictRule b{display:block;font-size:10px;margin-bottom:4px;}.learningConflictQuick{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px;}.learningConflictQuick .cbtn{font-size:11px;padding:7px 9px;}.learningConflictUser{display:none;justify-content:flex-end;margin:8px 0 12px;}.learningConflictUser.show{display:flex;}.learningConflictUser div{max-width:82%;padding:10px 12px;border-radius:13px 4px 13px 13px;background:#dcfce7;font-size:12px;white-space:pre-wrap;}.learningConflictProposal{display:none;}.learningConflictProposal.show{display:flex;}.learningConflictCompose{padding:10px 13px calc(10px + env(safe-area-inset-bottom));border-top:1px solid var(--line);background:#fff;}.learningConflictCompose textarea{box-sizing:border-box;width:100%;min-height:64px;border:1px solid #a7c7c0;border-radius:9px;padding:9px;font:13px/1.5 inherit;resize:vertical;}.learningConflictComposeActions{display:flex;justify-content:flex-end;margin-top:6px;}
   #tools{display:flex;gap:6px;padding:4px 12px 10px;border-bottom:1px solid var(--line);}
   .tbtn{flex:1;font-size:11px;padding:7px 2px;border:1px solid var(--line);background:#fff;border-radius:9px;cursor:pointer;white-space:nowrap;color:var(--text);}
   .tbtn:hover{background:#f9fafb;}
@@ -5091,6 +5215,12 @@ const PAGE = `<!DOCTYPE html>
   #dChips .cbtn{border-color:#c4b5fd;background:#fff;color:#5b21b6;}
   .dInputWrap{flex:1;min-width:0;}
   #dText{display:block;width:100%;border:1px solid #d1d5db;border-radius:10px;padding:10px 12px;font-size:14px;font-family:inherit;min-height:110px;max-height:240px;resize:vertical;}
+  .dVoiceRow{display:flex;align-items:center;gap:8px;margin-top:6px;min-height:34px;}
+  #dVoiceBtn{border:1px solid #a78bfa;background:#fff;color:#5b21b6;border-radius:9px;padding:7px 11px;font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap;}
+  #dVoiceBtn.recording{border-color:#ef4444;background:#fef2f2;color:#b91c1c;animation:voicePulse 1.2s ease-in-out infinite;}
+  #dVoiceBtn:disabled{opacity:.65;cursor:default;animation:none;}
+  #dVoiceStatus{font-size:11px;color:#6d28d9;line-height:1.35;}
+  @keyframes voicePulse{50%{box-shadow:0 0 0 4px rgba(239,68,68,.12);}}
   #dComposer{display:flex;gap:8px;padding:10px;border-top:1px solid #c4b5fd;align-items:flex-end;background:#ede9fe;}
   .cbtn.dsend{background:#6d28d9;border-color:#6d28d9;color:#fff;font-weight:700;white-space:nowrap;padding-left:10px;padding-right:10px;}
   .cbtn.dsend:disabled{background:#a78bfa;border-color:#a78bfa;}
@@ -5104,6 +5234,7 @@ const PAGE = `<!DOCTYPE html>
     #dComposer{display:grid;grid-template-columns:1fr;align-items:stretch;padding:10px calc(10px + env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) calc(10px + env(safe-area-inset-left));}
     #dText,#asstText{font-size:16px;min-height:84px;transition:min-height .15s;}
     #dText:focus,#asstText:focus{min-height:128px;}
+    #dVoiceBtn{min-height:44px;font-size:14px;padding:9px 14px;}
     .cbtn.dsend{width:100%;min-height:52px;font-size:15px;}
   }
   #asstHead{padding:11px 13px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:14px;gap:8px;}
@@ -5231,6 +5362,7 @@ const PAGE = `<!DOCTYPE html>
     .rmFooter{padding:8px 9px calc(8px + env(safe-area-inset-bottom));}
     .rmFooter .cbtn{min-height:42px;}
     .learningFooter #learnAddBtn{min-width:132px;}
+    #learningResultBanner{left:8px;right:8px;bottom:calc(8px + env(safe-area-inset-bottom));transform:none;width:auto;padding:10px;}.learningResultLabel{display:none;}.learningConflictCard{width:100vw;height:100vh;height:100dvh;border-radius:0;}.learningConflictHead{padding:calc(10px + env(safe-area-inset-top)) 11px 10px;}.learningConflictThread{padding:11px;}.learningConflictDiff{grid-template-columns:1fr;}.learningConflictMessage{max-width:calc(100% - 38px);}.learningConflictCompose textarea{font-size:16px;}
   }
 </style>
 </head>
@@ -5260,7 +5392,7 @@ const PAGE = `<!DOCTYPE html>
     <button class="cbtn" onclick="dChip('もっと丁寧で温かい言い方にして')">丁寧に</button>
     <button class="cbtn" onclick="dChip('もっと柔らかい印象にして')">柔らかく</button>
   </div>
-  <div id="dComposer"><div class="dInputWrap"><textarea id="dText" oninput="rememberDraftChatInput()" placeholder="右腕くんへの指示を入力…（例：もっと簡潔にして）"></textarea><div class="enterHint">Enter＝改行　相談は下のボタン</div></div><button id="dSendBtn" class="cbtn dsend" onclick="dSend()">右腕くんへ相談</button></div>
+  <div id="dComposer"><div class="dInputWrap"><textarea id="dText" oninput="rememberDraftChatInput()" placeholder="右腕くんへの指示を入力…（例：もっと簡潔にして）"></textarea><div class="dVoiceRow"><button type="button" id="dVoiceBtn" onclick="toggleDraftVoice()">🎙 音声入力</button><span id="dVoiceStatus" role="status" aria-live="polite">話した内容は文字になり、右腕くんが変換ミスも文脈から読み取ります</span></div><div class="enterHint">Enter＝改行　相談は下のボタン</div></div><button id="dSendBtn" class="cbtn dsend" onclick="dSend()">右腕くんへ相談</button></div>
 </div></div>
 <div id="setPop"><div class="settingsCard">
   <div class="settingsHeader"><h3>⚙ 設定</h3><button type="button" class="cbtn" onclick="closeSet()">閉じる</button></div>
@@ -5489,18 +5621,17 @@ const PAGE = `<!DOCTYPE html>
       <h3 style="margin:0 0 5px;font-size:16px;">🧠 今回の対応を学習しますか？</h3>
       <div style="font-size:11px;color:#64748b;line-height:1.55;">学習するを選ぶと、修正チャットを含む一連のやり取りを読み、患者固有・今回限り・共通方針・店舗ルールを右腕くんが自動で整理します。</div>
     </div>
-    <div style="padding:14px 18px;">
-      <label style="display:block;font-size:11px;font-weight:700;color:#475569;">会話全体から整理した学習案（必要なら修正できます）
+    <div style="padding:14px 18px 16px;">
+      <label style="display:block;font-size:11px;font-weight:700;color:#475569;">学習する内容（必要なら修正できます）
         <textarea id="learningScopeText" rows="10" style="display:block;width:100%;margin-top:5px;padding:9px;border:1px solid #cbd5e1;border-radius:9px;font:12px/1.6 inherit;resize:vertical;" placeholder="適用する状況・確認すること・回答方針を整理しています"></textarea>
       </label>
       <div id="learningScopeHint" style="font-size:11px;color:#6d28d9;margin:7px 0 11px;">保存後も設定→学習データ管理から更新・削除できます。</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-        <button type="button" class="cbtn send" data-learning-scope="learn" onclick="saveLearningScope('learn',this)" style="padding:12px;">学習する<br><small>AIが用途別に整理</small></button>
+        <button type="button" class="cbtn send" data-learning-scope="learn" onclick="saveLearningScope('learn',this)" style="padding:12px;">学習する<br><small>会話全体をもとに整理</small></button>
         <button type="button" class="cbtn" data-learning-scope="none" onclick="saveLearningScope('none',this)" style="padding:12px;">学習しない<br><small>今回の内容は残さない</small></button>
       </div>
       <div style="font-size:10.5px;color:#64748b;line-height:1.55;margin-top:8px;">料金・営業時間・キャンセル規定など重要な変更が既存内容と食い違う場合は、自動上書きせず確認待ちにします。</div>
     </div>
-    <div style="padding:10px 18px 14px;display:flex;justify-content:flex-end;border-top:1px solid #e5e7eb;"><button type="button" class="cbtn" onclick="closeLearningScope()">あとで決める</button></div>
   </div>
 </div>
 <div id="scheduledMessagePop" style="position:fixed;inset:0;background:rgba(15,23,42,.48);z-index:84;display:none;align-items:center;justify-content:center;padding:14px;">
@@ -5511,28 +5642,41 @@ const PAGE = `<!DOCTYPE html>
   </div>
 </div>
 <div id="learnToast" style="display:none;position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:75;background:#065f46;color:#fff;border-radius:10px;padding:8px 14px;font-size:12px;box-shadow:0 6px 20px rgba(0,0,0,.25);">✓ この対応を学習しました</div>
-<div id="conflictPop" style="position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:80;display:none;align-items:center;justify-content:center;"><div style="background:#fff;border-radius:14px;padding:18px;width:min(92vw,380px);max-height:86vh;overflow-y:auto;">
-  <h3 id="conflictTitle" style="margin:0 0 8px;font-size:15px;">⚠️ 前と答えが食い違っています</h3>
-  <div id="conflictOldLabel" style="font-size:12px;color:#374151;margin-bottom:4px;">似た質問に、前はこう答えていました：</div>
-  <div id="conflictOld" style="font-size:12px;background:#f3f4f6;border-radius:8px;padding:8px;margin-bottom:8px;white-space:pre-wrap;"></div>
-  <div id="conflictNewLabel" style="font-size:12px;color:#374151;margin-bottom:4px;">今回はこう答えました：</div>
-  <div id="conflictNew" style="font-size:12px;background:#ede9fe;border-radius:8px;padding:8px;margin-bottom:12px;white-space:pre-wrap;"></div>
-  <div style="font-size:12px;color:#374151;margin-bottom:10px;">今後はどちらを基準にしますか？</div>
-  <div style="display:flex;flex-direction:column;gap:8px;">
-    <button id="conflictNewButton" class="cbtn send" style="width:100%;" onclick="resolveConflict('new',this)">今後は今回の回答を正解にする</button>
-    <button id="conflictOldButton" class="cbtn" style="width:100%;" onclick="resolveConflict('old',this)">今回は特例（前の回答を正解のまま残す）</button>
-    <button class="cbtn" style="width:100%;" onclick="resolveConflict('later',this)">どちらでもない・後で正しい回答を入力</button>
+<div id="learningResultBanner" role="status"><span id="learningResultIcon" class="learningResultIcon"></span><span class="learningResultCopy"><strong id="learningResultTitle"></strong><small id="learningResultMessage"></small></span><span id="learningResultLabel" class="learningResultLabel"></span><button type="button" class="learningResultClose" aria-label="閉じる" onclick="event.stopPropagation();closeLearningResult()">×</button></div>
+<div id="conflictPop" style="position:fixed;inset:0;background:rgba(15,23,42,.48);z-index:92;display:none;align-items:center;justify-content:center;">
+  <div class="learningConflictCard">
+    <div class="learningConflictHead"><h3>🧠 学習内容の確認・右腕くん</h3><button type="button" class="cbtn" onclick="closeConflictThread()">閉じる</button></div>
+    <div id="conflictThread" class="learningConflictThread">
+      <div class="learningConflictLine"><div class="learningConflictAvatar">AI</div><div class="learningConflictMessage">
+        <div id="conflictTitle" style="font-weight:800;margin-bottom:5px;">現在の内容と今回の学習候補に違いが見つかりました</div>
+        <div id="conflictQuestion" style="color:#64748b;margin-bottom:8px;"></div>
+        <div class="learningConflictDiff">
+          <div class="learningConflictRule old"><b id="conflictOldLabel">現在の正式ルール</b><span id="conflictOld"></span></div>
+          <div class="learningConflictRule new"><b id="conflictNewLabel">今回の学習候補</b><span id="conflictNew"></span></div>
+        </div>
+        どのように整理しますか？文章で教えても、下の候補を選んでも構いません。
+        <div class="learningConflictQuick">
+          <button id="conflictOldButton" type="button" class="cbtn" onclick="resolveConflict('old',this)">現在を残す</button>
+          <button id="conflictNewButton" type="button" class="cbtn" onclick="resolveConflict('new',this)">今回へ変更</button>
+          <button type="button" class="cbtn" onclick="prefillConflictInstruction('現在と今回の内容は適用条件が違うので、条件を分けて両方残して')">条件で使い分け</button>
+          <button type="button" class="cbtn" onclick="resolveConflict('old',this)">今回の候補を削除</button>
+        </div>
+      </div></div>
+      <div id="conflictUserLine" class="learningConflictUser"><div id="conflictUserText"></div></div>
+      <div id="conflictProposalLine" class="learningConflictLine learningConflictProposal"><div class="learningConflictAvatar">AI</div><div class="learningConflictMessage">次の内容なら矛盾せず保存できます。<div id="conflictProposalText" class="learningConflictRule new" style="margin-top:8px;"></div><div style="display:flex;justify-content:flex-end;gap:7px;margin-top:8px;"><button type="button" class="cbtn" onclick="focusConflictInstruction()">修正を伝える</button><button id="conflictConfirmCustom" type="button" class="cbtn send" onclick="confirmConflictProposal(this)">この内容で確定</button></div></div></div>
+    </div>
+    <div class="learningConflictCompose"><textarea id="conflictInstruction" placeholder="例：通常予約は前日まで無料で、外部媒体予約だけ2日前からにして"></textarea><div class="learningConflictComposeActions"><button id="conflictConsultButton" type="button" class="cbtn send" onclick="consultLearningConflict(this)">右腕くんに送る</button></div></div>
   </div>
-</div></div>
+</div>
 <script>
 let DATA=[];let DATA_REV=0;let DATA_READY=false;let current=null;
-const learningJobsByConversation={},shownLearningJobs=new Set();
+const learningJobsByConversation={},shownLearningDecisions=new Set(),shownLearningResults=new Set();let learningJobList=[];
 const roomsEl=document.getElementById("rooms"),chatEl=document.getElementById("chat"),appEl=document.getElementById("app");
 let initialConv="";try{initialConv=new URLSearchParams(location.search).get("conv")||"";}catch(e){}
 let learningPendingCounts={decisions:0,conflicts:0},learningBadgeBusy=false;
-function renderLearningPendingBadge(){const b=document.getElementById("learningPendingBadge");if(!b)return;const decisions=Number(learningPendingCounts.decisions||0),conflicts=Number(learningPendingCounts.conflicts||0),total=decisions+conflicts;b.style.display=total?"inline-block":"none";b.textContent=total?"🧠 学習確認 "+total+"件":"";b.classList.toggle("hasConflict",conflicts>0);b.title=(decisions?"学習判断待ち "+decisions+"件":"")+(decisions&&conflicts?"／":"")+(conflicts?"矛盾の確認 "+conflicts+"件":"");}
+function renderLearningPendingBadge(){const b=document.getElementById("learningPendingBadge");if(!b)return;const decisions=Number(learningPendingCounts.decisions||0),conflicts=Number(learningPendingCounts.conflicts||0),total=decisions+conflicts;b.style.display=total?"inline-block":"none";b.textContent=total?(conflicts?"🧠 要確認 "+total+"件":"🧠 学習判断 "+total+"件"):"";b.classList.toggle("hasConflict",conflicts>0);b.title=(decisions?"学習判断待ち "+decisions+"件":"")+(decisions&&conflicts?"／":"")+(conflicts?"矛盾の確認 "+conflicts+"件":"");}
 async function refreshLearningBadge(){if(learningBadgeBusy)return;learningBadgeBusy=true;try{const r=await fetch("/api/learning-pending-count"),j=await r.json();if(r.ok&&j.ok){learningPendingCounts={decisions:Number(j.decisions||0),conflicts:Number(j.conflicts||0)};renderLearningPendingBadge();}}catch(e){}finally{learningBadgeBusy=false;}}
-async function openLearningPending(){if(learningPendingCounts.decisions>0){await pollLearningJobs();const job=Object.values(learningJobsByConversation).find(item=>item&&item.status==="ready"&&item.resultType==="review"&&item.learningReview);if(job){if(current!==job.conversationId)openChat(job.conversationId);shownLearningJobs.add(job.id);showLearningScope(Object.assign({},job.learningReview,{learningJobId:job.id}));return;}}learnTab="conflicts";openLearning();}
+async function openLearningPending(){if(learningPendingCounts.conflicts>0){try{const r=await fetch("/api/learning-data"),j=await r.json();const conflict=j&&j.conflicts&&j.conflicts[0];if(conflict){showConflict(conflict);return;}}catch(e){}}if(learningPendingCounts.decisions>0){await pollLearningJobs();const job=learningJobList.find(item=>item&&item.learningReview&&(item.status==="awaiting_decision"||(item.status==="ready"&&item.resultType==="review")));if(job){if(current!==job.conversationId)openChat(job.conversationId);shownLearningDecisions.add(job.id);showLearningScope(Object.assign({},job.learningReview,{learningJobId:job.id}));return;}}openLearning();}
 async function load(){ try{ const r=await fetch(DATA_READY?("/api/conversation-updates?since="+encodeURIComponent(DATA_REV)):"/api/conversations");const j=await r.json();if(Array.isArray(j)){DATA=j;DATA_REV=DATA.reduce((m,c)=>Math.max(m,Number(c&&c._rev||c&&c.ts||0)),0);DATA_READY=true;}else if(j&&j.ok){const byId=new Map(DATA.map(c=>[c.id,c]));(j.updates||[]).forEach(c=>byId.set(c.id,c));const meta=j.meta||{};byId.forEach(c=>{c.staffLineReviewAvailable=!!meta.staffLineReviewAvailable;c.inboxOrder=meta.inboxOrder||c.inboxOrder;});const ordered=[];(j.order||[]).forEach(id=>{const c=byId.get(id);if(c){ordered.push(c);byId.delete(id);}});DATA=ordered.concat([...byId.values()]);DATA_REV=Math.max(DATA_REV,Number(j.version||0));DATA_READY=true;} }catch(e){} renderList(); if(initialConv&&!current){const target=DATA.find(x=>x.id===initialConv);if(target){const id=initialConv;initialConv="";openChat(id);try{history.replaceState(null,"",location.pathname);}catch(e){}}} if(current){ const c=DATA.find(x=>x.id===current); if(c){syncMsgs(c);renderScheduledMessages(c);} } }
 function api(path,body){ return fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); }
 const uiBusyKeys=new Set();
@@ -5597,7 +5741,7 @@ function renderList(){
     const d=document.createElement("div");
     d.className="room"+(current===r.id?" active":"")+(r.flag?" flag":"");
     const acctBadge=(r.acct&&r.acct.name&&r.acct.name!=="メイン")?' <span class="badge">'+esc(r.acct.name)+'</span>':'';
-    const learningJob=learningJobsByConversation[r.id],learningBadge=learningJob?('<span style="font-size:10px;color:'+(learningJob.status==="ready"?'#6d28d9':'#64748b')+';white-space:nowrap;">'+(learningJob.status==="ready"?'🧠 学習確認':'… 学習整理中')+'</span>'):'';
+    const learningJob=learningJobsByConversation[r.id],learningBadge=learningJob?('<span style="font-size:10px;color:'+(learningJob.status==="ready"?'#b91c1c':learningJob.status==="awaiting_decision"?'#92400e':'#64748b')+';white-space:nowrap;">'+(learningJob.status==="ready"?'⚠ 学習要確認':learningJob.status==="awaiting_decision"?'🧠 学習判断待ち':learningJob.status==="processing"?'… 学習確認中':'')+'</span>'):'';
     d.innerHTML=av(r)+'<div class="rmid"><div class="rtop"><span class="rname">'+esc(r.name)+acctBadge+'</span><span class="rtime">'+tlabel(r)+'</span></div><div class="rlast">'+esc(r.last||"")+'</div>'+learningBadge+'</div><div class="stat">'+statIcon(r)+'</div>';
     d.onclick=()=>openChat(r.id);
     roomsEl.appendChild(d);
@@ -5611,7 +5755,7 @@ function renderGrounding(r){const el=document.getElementById("groundingUsed");if
 let draftEditTimer=null;
 function draftEdited(){const d=document.getElementById("draft"),r=DATA.find(x=>x.id===current);if(!d||!r)return;r.draft=d.value;r.grounding={autoSendAllowed:false,reasons:["スタッフが下書きを編集したため手動送信します"],sources:["スタッフ編集"]};r.validation={pass:false,skipped:true,reason:"編集後の文章は自動送信しません"};renderGrounding(r);clearTimeout(draftEditTimer);const id=current,text=d.value;draftEditTimer=setTimeout(()=>api("/api/draft-edited",{id,draft:text}).catch(()=>{}),350);}
 function syncMsgs(c){const m=document.getElementById("msgs");if(!m)return;if(m.getAttribute("data-count")!==String(c.msgs.length)){m.innerHTML=bubblesHtml(c);m.setAttribute("data-count",String(c.msgs.length));m.scrollTop=m.scrollHeight;}}
-function openChat(id,keep){if(window.__dBusy&&current&&current!==id){uiAlert("右腕くんが回答を作成中です。完了してから別の会話を開いてください");return;}if(current&&current!==id)hideDraftChatForConversationSwitch();current=id;const r=DATA.find(x=>x.id===id);if(!r)return; appEl.classList.add("chatopen");
+function openChat(id,keep){if((window.__dBusy||window.__voiceBusy)&&current&&current!==id){uiAlert(window.__voiceBusy?"音声を処理中です。完了してから別の会話を開いてください":"右腕くんが回答を作成中です。完了してから別の会話を開いてください");return;}if(current&&current!==id)hideDraftChatForConversationSwitch();current=id;const r=DATA.find(x=>x.id===id);if(!r)return; appEl.classList.add("chatopen");
   const bubbles=bubblesHtml(r);
   const staffReviewButton=r.staffLineReviewAvailable?'<button class="cbtn" id="staffReviewResend" onclick="resendStaffApproval()">'+(r.staffLineApproval?'📲 承認依頼を再送':'📲 スタッフLINEで確認')+'</button>':'';
   chatEl.innerHTML='<div id="chatHead"><button id="backBtn" onclick="closeChat()">‹</button>'+av(r,30)+'<span id="chatName">'+esc(r.name)+'　<span style="font-size:11px;color:#6b7280;">'+(r.channel==="line"?"LINE":"メール")+((r.acct&&r.acct.name&&r.acct.name!=="メイン")?"・"+esc(r.acct.name):"")+'</span></span><button id="shareClinicBtn" class="hbtn" onclick="shareClinic()">🏥 クリニックへ共有</button></div>'+
@@ -6061,10 +6205,13 @@ async function saveLearningScope(scope,btn){
   const data=learningScopeData;if(!data)return;
   const text=(document.getElementById("learningScopeText").value||"").trim();
   if(scope!=="none"&&!text){uiAlert("今後守る内容を入力してください");return;}
-  await withBusy("learning-scope-"+data.exampleId,btn,"保存中…",async()=>{try{
+  await withBusy("learning-scope-"+(data.learningJobId||data.exampleId),btn,"保存中…",async()=>{try{
     const r=await api("/api/learning-scope",{exampleId:data.exampleId,conversationId:data.conversationId,learningJobId:data.learningJobId,scope,text}),j=await r.json();
     if(!r.ok||!j.ok)throw new Error(j.error||"save");
-    closeLearningScope();showLearnResult(j.message||"学習内容を保存しました");refreshLearningBadge();
+    closeLearningScope();
+    if(scope==="learn")showLearningOutcome({type:"processing",title:"学習内容を確認しています",message:"重複・矛盾・患者固有情報を裏側で確認中です"});
+    else showLearningOutcome({type:"ignored",title:"今回は学習しません",message:"患者への送信履歴だけを残し、学習候補は削除しました"});
+    pollLearningJobs();refreshLearningBadge();
   }catch(e){uiAlert("学習内容を保存できませんでした。設定→学習データ管理から確認してください。");}});
 }
 function openRuleLearning(){
@@ -6074,6 +6221,8 @@ function openRuleLearning(){
   closeLearningScope();openAsst(ctx);
 }
 function showLearnResult(message){const b=document.getElementById("learnToast");if(!b)return;b.textContent="✓ "+message;b.style.display="block";clearTimeout(learnToastTimer);learnToastTimer=setTimeout(()=>{b.style.display="none";},4500);}
+function showLearningOutcome(outcome,jobId){const o=outcome||{},type=String(o.type||"new"),b=document.getElementById("learningResultBanner"),icons={processing:"⋯",new:"✓",updated:"✓",duplicate:"⇄",conflict:"⚠",ignored:"−",error:"!"},labels={processing:"確認中",new:"新規保存",updated:"更新完了",duplicate:"重複統合",conflict:"要確認",ignored:"学習なし",error:"エラー"};if(!b)return;b.className="show "+type;document.getElementById("learningResultIcon").textContent=icons[type]||"✓";document.getElementById("learningResultTitle").textContent=o.title||"学習処理が完了しました";document.getElementById("learningResultMessage").textContent=o.message||"";document.getElementById("learningResultLabel").textContent=labels[type]||"完了";b.onclick=type==="conflict"?()=>openLearningPending():null;if(jobId)api("/api/learning-job-ack",{id:jobId}).catch(()=>{});}
+function closeLearningResult(){const b=document.getElementById("learningResultBanner");if(b){b.className="";b.onclick=null;}}
 const pendingAttachmentsByConversation={};
 function pendingAttachments(id){id=id||current;if(!id)return[];if(!Array.isArray(pendingAttachmentsByConversation[id]))pendingAttachmentsByConversation[id]=[];return pendingAttachmentsByConversation[id];}
 function messageFileAccepted(file){const mime=String(file&&file.type||"").toLowerCase(),name=String(file&&file.name||"").toLowerCase(),mimes=["image/jpeg","image/png","image/gif","image/webp","video/mp4","video/quicktime","application/pdf","application/msword","application/vnd.ms-excel","application/vnd.openxmlformats-officedocument.wordprocessingml.document","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet","text/plain","text/csv"],extensions=[".jpg",".jpeg",".png",".gif",".webp",".mp4",".mov",".pdf",".doc",".docx",".xls",".xlsx",".txt",".csv"];return mimes.includes(mime)||extensions.some(ext=>name.endsWith(ext));}
@@ -6114,9 +6263,9 @@ function attach(){const input=document.createElement("input");input.type="file";
 function draftLearningPayload(id,text){const cd0=DATA.find(x=>x.id===id),orig=String((cd0&&(cd0.draft0!=null?cd0.draft0:cd0.draft))||"").trim(),edited=(text!==orig);let instr="",learningText="",learningChat=[];try{if(dSessions&&dSessions[id]){if(Array.isArray(dSessions[id].hist)){learningChat=dSessions[id].hist.filter(m=>m&&["user","assistant"].includes(m.role)).slice(-20).map(m=>({role:m.role,content:String(m.content||"").slice(0,3000)}));instr=learningChat.filter(m=>m.role==="user").map(m=>m.content).join(" / ").slice(0,1500);}learningText=String(dSessions[id].memory||"").slice(0,800);}}catch(e){}return{instr:edited?instr:"",learningText:edited?learningText:"",learningChat:edited?learningChat:[]};}
 function showLearningProgress(){const p=document.getElementById("learningProgress");if(p)p.style.display="flex";}
 function hideLearningProgress(){const p=document.getElementById("learningProgress");if(p)p.style.display="none";}
-function showReadyLearningFor(id){const job=learningJobsByConversation[id];if(!job||job.status!=="ready"||shownLearningJobs.has(job.id)||current!==id)return;shownLearningJobs.add(job.id);if(job.resultType==="conflict"&&job.conflict){showConflict(Object.assign({},job.conflict,{learningJobId:job.id}));}else if(job.learningReview){showLearningScope(Object.assign({},job.learningReview,{learningJobId:job.id}));}}
-async function pollLearningJobs(){try{const r=await fetch("/api/learning-jobs"),j=await r.json();if(!r.ok||!j.ok)return;Object.keys(learningJobsByConversation).forEach(k=>delete learningJobsByConversation[k]);(j.jobs||[]).forEach(job=>{const old=learningJobsByConversation[job.conversationId];if(!old||Number(job.updatedAt)>=Number(old.updatedAt))learningJobsByConversation[job.conversationId]=job;});renderList();if(current)showReadyLearningFor(current);}catch(e){}}
-async function sendMsg(){if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="患者へ送信中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat});let json={};try{json=await response.json();}catch(e){}if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";if(json.learningJob){learningJobsByConversation[id]=json.learningJob;showLearnResult("送信しました。学習案はバックグラウンドで整理中です");}await load();pollLearningJobs();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
+function showReadyLearningFor(id){const job=learningJobsByConversation[id];if(!job||current!==id)return;const decision=job.status==="awaiting_decision"||(job.status==="ready"&&job.resultType==="review");if(decision&&job.learningReview&&!shownLearningDecisions.has(job.id)){shownLearningDecisions.add(job.id);showLearningScope(Object.assign({},job.learningReview,{learningJobId:job.id}));}}
+async function pollLearningJobs(){try{const r=await fetch("/api/learning-jobs"),j=await r.json();if(!r.ok||!j.ok)return;learningJobList=j.jobs||[];Object.keys(learningJobsByConversation).forEach(k=>delete learningJobsByConversation[k]);learningJobList.forEach(job=>{const old=learningJobsByConversation[job.conversationId];if(!old||Number(job.updatedAt)>=Number(old.updatedAt))learningJobsByConversation[job.conversationId]=job;});const result=learningJobList.find(job=>job.status==="completed"&&!shownLearningResults.has(job.id));if(result){shownLearningResults.add(result.id);showLearningOutcome(result.outcome||{type:result.resultType,title:"学習処理が完了しました",message:""},result.id);}const conflict=learningJobList.find(job=>job.status==="ready"&&job.resultType==="conflict"&&!shownLearningResults.has(job.id));if(conflict){shownLearningResults.add(conflict.id);showLearningOutcome({type:"conflict",title:"現在のルールと内容が異なります",message:"自動反映していません。右上の要確認から右腕くんと確認してください"});}renderList();if(current)showReadyLearningFor(current);refreshLearningBadge();}catch(e){}}
+async function sendMsg(){if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="患者へ送信中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat});let json={};try{json=await response.json();}catch(e){}if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";let immediateLearning=null;if(json.learningJob&&json.learningJob.learningReview){learningJobsByConversation[id]=json.learningJob;shownLearningDecisions.add(json.learningJob.id);immediateLearning=Object.assign({},json.learningJob.learningReview,{learningJobId:json.learningJob.id});}await load();if(immediateLearning&&current===id)showLearningScope(immediateLearning);else if(!immediateLearning)showLearnResult("送信しました");pollLearningJobs();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
 let scheduledMessageDraft=null;
 function localDateTimeValue(date){const pad=n=>String(n).padStart(2,"0");return date.getFullYear()+"-"+pad(date.getMonth()+1)+"-"+pad(date.getDate())+"T"+pad(date.getHours())+":"+pad(date.getMinutes());}
 function openScheduledMessage(){
@@ -6152,9 +6301,40 @@ async function resendStaffApproval(){if(!current)return;const b=document.getElem
 async function shareClinic(){const note=await uiPrompt("現場に伝える内容を入力してください（空欄のままOKを押すと、お客様の直近メッセージをそのまま共有します）","");if(note===null)return;const btn=document.getElementById("shareClinicBtn"),id=current;await withBusy("share-"+id,btn,"共有中…",async()=>{try{const r=await api("/api/share",{id,note:note||""});const j=await r.json();if(j.ok)uiAlert("現場ボードに共有しました");else uiAlert("共有に失敗しました");}catch(e){uiAlert("共有に失敗しました");}});}
 async function toggleFlag(){if(!current)return;const id=current,b=document.getElementById("flagBtn");let next=null;await withBusy("flag-"+id,b,"変更中…",async()=>{try{const r=await api("/api/tag",{id});const j=await r.json();next=!!j.flag;const cd=DATA.find(x=>x.id===id);if(cd)cd.flag=next;renderList();}catch(e){uiAlert("変更に失敗しました");}});if(b&&next!==null)b.textContent=next?"⚑ 要対応を外す":"⚑ 要対応";}
 // ---- AIで作り直す（会話型・下書きを会話で磨く。会話ごとにセッションを保持し再開可能）----
-let dHist=[],dLog=[],dSessions={},dComposerDrafts={},dComposerOwner="";
+let dHist=[],dLog=[],dSessions={},dComposerDrafts={},dComposerOwner="",dVoiceDerived={};
+let dVoiceRecorder=null,dVoiceStream=null,dVoiceChunks=[],dVoiceOwner="",dVoiceStopTimer=null;
+function dVoiceUi(label,recording,busy){const b=document.getElementById("dVoiceBtn"),s=document.getElementById("dVoiceStatus");if(b){b.textContent=label||"🎙 音声入力";b.classList.toggle("recording",!!recording);b.disabled=!!busy;}if(s)s.textContent=recording?"録音中です。話し終わったら停止を押してください":(busy?"音声を文字に変換しています…":"話した内容は文字になり、右腕くんが変換ミスも文脈から読み取ります");}
+function dVoiceCleanup(){if(dVoiceStopTimer){clearTimeout(dVoiceStopTimer);dVoiceStopTimer=null;}if(dVoiceStream){dVoiceStream.getTracks().forEach(track=>track.stop());dVoiceStream=null;}dVoiceRecorder=null;dVoiceChunks=[];dVoiceOwner="";window.__voiceBusy=false;}
+function voiceBlobBase64(blob){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result||"").split(",")[1]||"");reader.onerror=reject;reader.readAsDataURL(blob);});}
+async function toggleDraftVoice(){
+  if(dVoiceRecorder&&dVoiceRecorder.state==="recording"){dVoiceRecorder.stop();return;}
+  if(window.__voiceBusy)return;
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia||typeof MediaRecorder==="undefined"){uiAlert("このブラウザでは専用の音声入力を利用できません。端末のキーボードにあるマイクをご利用ください。");return;}
+  window.__voiceBusy=true;dVoiceUi("マイク準備中…",false,true);
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}});
+    const types=["audio/mp4","audio/webm;codecs=opus","audio/webm"],type=types.find(v=>MediaRecorder.isTypeSupported&&MediaRecorder.isTypeSupported(v))||"";
+    const recorder=type?new MediaRecorder(stream,{mimeType:type}):new MediaRecorder(stream);
+    dVoiceRecorder=recorder;dVoiceStream=stream;dVoiceChunks=[];dVoiceOwner=dComposerOwner||current;
+    recorder.ondataavailable=event=>{if(event.data&&event.data.size)dVoiceChunks.push(event.data);};
+    recorder.onerror=()=>{dVoiceCleanup();dVoiceUi();uiAlert("音声を録音できませんでした。マイクの許可をご確認ください。");};
+    recorder.onstop=async()=>{
+      const owner=dVoiceOwner,chunks=dVoiceChunks.slice(),mime=String(recorder.mimeType||type||"audio/webm");
+      if(dVoiceStopTimer){clearTimeout(dVoiceStopTimer);dVoiceStopTimer=null;}if(dVoiceStream){dVoiceStream.getTracks().forEach(track=>track.stop());dVoiceStream=null;}dVoiceRecorder=null;dVoiceChunks=[];dVoiceUi("文字変換中…",false,true);
+      try{
+        const blob=new Blob(chunks,{type:mime});if(!blob.size)throw new Error("empty_audio");if(blob.size>10*1024*1024)throw new Error("audio_too_large");
+        const data=await voiceBlobBase64(blob),response=await api("/api/transcribe-voice",{mime,data}),json=await response.json();
+        if(!response.ok||!json.ok||!json.text)throw new Error(json.error||"transcription_failed");
+        const before=String(dComposerDrafts[owner]||"").trim(),text=(before?before+"\\n":"")+String(json.text).trim();dComposerDrafts[owner]=text;dVoiceDerived[owner]=true;
+        if(dComposerOwner===owner){const input=document.getElementById("dText");if(input){input.value=text;input.focus();}}
+      }catch(e){const message=e.message==="audio_too_large"?"録音が長すぎます。短く区切ってもう一度お試しください。":"音声を文字に変換できませんでした。もう一度お試しください。";uiAlert(message);}
+      finally{dVoiceCleanup();dVoiceUi();}
+    };
+    recorder.start(500);dVoiceUi("■ 録音を停止",true,false);dVoiceStopTimer=setTimeout(()=>{if(dVoiceRecorder&&dVoiceRecorder.state==="recording")dVoiceRecorder.stop();},3*60*1000);
+  }catch(e){dVoiceCleanup();dVoiceUi();uiAlert("マイクを利用できませんでした。ブラウザのマイク許可をご確認ください。");}
+}
 const dMsgsEl=document.getElementById("dMsgs");
-function rememberDraftChatInput(){const x=document.getElementById("dText");if(x&&dComposerOwner)dComposerDrafts[dComposerOwner]=x.value;}
+function rememberDraftChatInput(){const x=document.getElementById("dText");if(x&&dComposerOwner){dComposerDrafts[dComposerOwner]=x.value;if(!x.value.trim())delete dVoiceDerived[dComposerOwner];}}
 function hideDraftChatForConversationSwitch(){
   rememberDraftChatInput();dComposerOwner="";
   const panel=document.getElementById("dpanel"),app=document.getElementById("app");
@@ -6212,11 +6392,11 @@ function slideClose(pid,cid){const p=document.getElementById(pid),c=document.get
   const mob=window.matchMedia("(max-width:760px)").matches;
   c.style.animation=(mob?"slideoutY":"slideoutX")+" .22s ease forwards";
   setTimeout(()=>{p.style.display="none";c.style.animation="";},220);}
-function closeDraftChat(){rememberDraftChatInput();const app=document.getElementById("app");if(app)app.classList.remove("dopen");slideClose("dpanel","dCard");}
+function closeDraftChat(){if(window.__voiceBusy){uiAlert("音声を処理中です。完了してから患者画面へ戻ってください");return;}rememberDraftChatInput();const app=document.getElementById("app");if(app)app.classList.remove("dopen");slideClose("dpanel","dCard");}
 function dChip(t){const x=document.getElementById("dText");x.value=t;rememberDraftChatInput();dSend();}
 // GPT風ストリーミング送信。返事が文字単位で流れ、下書きカードもリアルタイムに埋まる。失敗時は従来API(JSON)へ自動フォールバック。
-async function dSend(){if(window.__dBusy)return;const x=document.getElementById("dText");const txt=x.value.trim();if(!txt)return;window.__dBusy=true;const btn=document.getElementById("dSendBtn"),old=btn&&btn.innerHTML;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>作成中…';}x.value="";if(dComposerOwner)dComposerDrafts[dComposerOwner]="";
-  dAdd("user",txt);dHist.push({role:"user",content:txt});
+async function dSend(){if(window.__dBusy||window.__voiceBusy)return;const x=document.getElementById("dText");const txt=x.value.trim();if(!txt)return;const owner=dComposerOwner||current,fromVoice=!!dVoiceDerived[owner];window.__dBusy=true;const btn=document.getElementById("dSendBtn"),old=btn&&btn.innerHTML;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>作成中…';}x.value="";if(owner){dComposerDrafts[owner]="";delete dVoiceDerived[owner];}
+  dAdd("user",txt);dHist.push({role:"user",content:txt,inputMode:fromVoice?"voice":"text"});
   const logEntry={type:"ai",text:""};dLog.push(logEntry);
   const aiEl=dRender("ai","…");
   let cardEntry=null;
@@ -6442,11 +6622,14 @@ async function busyScheduleRichMenu(){return withBusy("rich-menu-write",document
 async function busyCancelRichMenuSchedule(id,btn){return withBusy("rich-menu-write",btn,"取消中…",()=>cancelRichMenuSchedule(id));}
 async function undoLearn(id){ return withBusy("undo-learning-"+id,null,"",async()=>{try{ await api("/api/example-delete",{id}); }catch(e){} const b=document.getElementById("learnToast"); if(b){ b.innerHTML='↩ 学習を取り消しました（特例として記録しません）'; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";},2000); }}); }
 // 矛盾の確認：前の答えと今回の答えが食い違った時に出す。基準を選ぶと不要な方の対応例を削除。
-let conflictData=null;
-function showConflict(c){ conflictData=c;const rule=c.kind==="rule",o=document.getElementById("conflictOld"),n=document.getElementById("conflictNew"),title=document.getElementById("conflictTitle"),ol=document.getElementById("conflictOldLabel"),nl=document.getElementById("conflictNewLabel"),ob=document.getElementById("conflictOldButton"),nb=document.getElementById("conflictNewButton");if(title)title.textContent=rule?"⚠️ 正式ルールと新しい学習案が矛盾しています":"⚠️ 前と答えが食い違っています";if(ol)ol.textContent=rule?"現在の正式ルール：":"似た質問に、前はこう答えていました：";if(nl)nl.textContent=rule?"今回の新しい学習案：":"今回はこう答えました：";if(ob)ob.textContent=rule?"正式ルールを残し、今回の学習はしない":"今回は特例（前の回答を正解のまま残す）";if(nb)nb.textContent=rule?"正式ルールを新しい学習案へ更新":"今後は今回の回答を正解にする";if(o)o.textContent=c.oldFinal||"";if(n)n.textContent=c.newFinal||"";const p=document.getElementById("conflictPop");if(p)p.style.display="flex";}
-async function resolveConflict(mode,btn){ const c=conflictData;if(!c)return;if(mode==="later"){conflictData=null;const p=document.getElementById("conflictPop");if(p)p.style.display="none";learnTab="conflicts";openLearning();return;}await withBusy("resolve-conflict-"+c.id,btn,"更新中…",async()=>{try{const r=await api("/api/learning-conflict-resolve",{id:c.id,learningJobId:c.learningJobId,mode}),j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error("save");conflictData=null;const p=document.getElementById("conflictPop");if(p)p.style.display="none";pollLearningJobs();}catch(e){uiAlert("学習内容を更新できませんでした");}}); }
-// 「どちらでもない」→ みぎうで君を開き、食い違った2案を背景に、正しい案内をチャットで決めてルール化する
-function openConflictChat(c){ openAsst(null); try{ asstHist.push({role:"user",content:"（背景）似た質問で過去の回答が食い違っていました。前の回答:「"+(c.oldFinal||"")+"」／今回の回答:「"+(c.newFinal||"")+"」。どちらも正解ではありません。これからスタッフが正しい案内を教えるので、それを既存ルールと矛盾しない形でルール化する提案をしてください。"}); }catch(e){} amAdd("sysn","過去の回答が食い違っていました。正しい案内を教えてください——内容をルールにします。"); }
+let conflictData=null,conflictProposal="";
+function showConflict(c){conflictData=c;conflictProposal="";const rule=c.kind==="rule";document.getElementById("conflictTitle").textContent=rule?"正式ルールと新しい学習候補に違いが見つかりました":"似た問い合わせで、前回と今回の回答が食い違っています";document.getElementById("conflictQuestion").textContent=c.q?("対象の問い合わせ："+c.q):"";document.getElementById("conflictOldLabel").textContent=rule?"現在の正式ルール":"以前の確認済み回答";document.getElementById("conflictNewLabel").textContent="今回の学習候補";document.getElementById("conflictOld").textContent=c.oldFinal||"";document.getElementById("conflictNew").textContent=c.newFinal||"";document.getElementById("conflictOldButton").textContent=rule?"現在のルールを残す":"以前の回答を残す";document.getElementById("conflictNewButton").textContent=rule?"今回の内容へ更新":"今回の回答を正解にする";document.getElementById("conflictInstruction").value="";document.getElementById("conflictUserLine").classList.remove("show");document.getElementById("conflictProposalLine").classList.remove("show");document.getElementById("conflictPop").style.display="flex";}
+function closeConflictThread(){document.getElementById("conflictPop").style.display="none";conflictData=null;conflictProposal="";}
+function prefillConflictInstruction(text){const input=document.getElementById("conflictInstruction");input.value=text||"";input.focus();}
+function focusConflictInstruction(){document.getElementById("conflictInstruction").focus();}
+async function consultLearningConflict(btn){const c=conflictData,input=document.getElementById("conflictInstruction"),instruction=(input.value||"").trim();if(!c||!instruction){input.focus();return;}await withBusy("consult-conflict-"+c.id,btn,"確認中…",async()=>{try{document.getElementById("conflictUserText").textContent=instruction;document.getElementById("conflictUserLine").classList.add("show");const r=await api("/api/learning-conflict-consult",{id:c.id,instruction}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"ai");conflictProposal=j.proposal||"";document.getElementById("conflictProposalText").textContent=conflictProposal;document.getElementById("conflictProposalLine").classList.add("show");input.value="";const thread=document.getElementById("conflictThread");thread.scrollTop=thread.scrollHeight;}catch(e){uiAlert("右腕くんが整理できませんでした。もう一度お試しください");}});}
+function confirmConflictProposal(btn){if(!conflictProposal)return;resolveConflict("custom",btn,conflictProposal);}
+async function resolveConflict(mode,btn,final){const c=conflictData;if(!c)return;await withBusy("resolve-conflict-"+c.id,btn,"更新中…",async()=>{try{const r=await api("/api/learning-conflict-resolve",{id:c.id,learningJobId:c.learningJobId,mode,final:final||""}),j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error("save");closeConflictThread();showLearningOutcome({type:mode==="old"?"ignored":"updated",title:mode==="old"?"現在の内容を残しました":"正式ルールを更新しました",message:mode==="old"?"今回の学習候補は回答へ反映しません":"確定した内容を今後の回答へ反映します"});pollLearningJobs();refreshLearningBadge();}catch(e){uiAlert("学習内容を更新できませんでした");}});}
 // ---- settings popup ----
 function renderRuleGauge(){
   const info=window.__rules; const bar=document.getElementById("ruleGaugeBar"); if(!bar) return;
