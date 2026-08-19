@@ -3199,11 +3199,22 @@ app.post("/api/learning-scope", guard, oneMutationAtATime("learning", learningMu
   const job = learningJobs(t).find(item => item.id === String(req.body.learningJobId || ""));
   const id = requestedId || Number(job && job.exampleId || 0);
   let ex = t.examples && t.examples[id];
-  if (!job && !ex) return res.status(404).json({ ok: false, error: "not_found" });
   if (!["none", "learn", "patient", "similar", "all"].includes(scope)) return res.status(400).json({ ok: false, error: "bad_scope" });
   const text = String(req.body.text || (job && job.learningReview && job.learningReview.text) || (ex && ex.instr) || "").trim().slice(0, 2400);
   if (scope !== "none" && !text) return res.status(400).json({ ok: false, error: "required" });
   try {
+    // デプロイや一時障害で確認待ちIDだけ失われても、画面に残った会話IDから直前の送信結果を復元する。
+    if (!job && !ex && scope === "learn") {
+      const recoveredConversation = t.store[String(req.body.conversationId || "")];
+      const recoveredFinalMessage = recoveredConversation && (recoveredConversation.msgs || []).slice().reverse().find(message => message && message.from === "us" && String(message.text || "").trim());
+      const recoveredQuestion = recoveredConversation ? recentCustomerQuestion(recoveredConversation) : "";
+      const recoveredFinal = String(recoveredFinalMessage && recoveredFinalMessage.text || "").trim().slice(0, 1500);
+      if (!recoveredQuestion || !recoveredFinal) return res.status(404).json({ ok: false, error: "recovery_not_found" });
+      ex = await exampleAdd(t, { q: recoveredQuestion, final: recoveredFinal, draft0: "", instr: text, learningChat: [], source: "web-recovered" });
+      if (!ex) throw new Error("recovery_save");
+    }
+    if (!job && !ex && scope === "none") return res.json({ ok: true, scope, duplicate: true, message: "今回は学習しません" });
+    if (!job && !ex) return res.status(404).json({ ok: false, error: "not_found" });
     if (scope === "none") {
       // 新方式では未確定候補を捨てるだけ。旧方式の保存済み例だけ後方互換で削除する。
       if (ex && (!job || Number(job.exampleId))) await exampleDelete(t, id);
