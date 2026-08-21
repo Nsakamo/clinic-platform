@@ -192,6 +192,8 @@ async function dbInit() {
   await pool.query("ALTER TABLE examples ADD COLUMN IF NOT EXISTS confirmed_count int DEFAULT 1");
   await pool.query("ALTER TABLE examples ADD COLUMN IF NOT EXISTS learning_meta jsonb DEFAULT '{}'::jsonb");
   await pool.query("ALTER TABLE examples ADD COLUMN IF NOT EXISTS learning_chat jsonb DEFAULT '[]'::jsonb");
+  await pool.query("CREATE TABLE IF NOT EXISTS learning_usage_events (tenant text not null, trace_id text not null, conversation_id text not null default '', generated_at bigint not null, usage jsonb not null default '{}'::jsonb, sent_at bigint, send_mode text, edited boolean, PRIMARY KEY(tenant,trace_id))");
+  await pool.query("CREATE INDEX IF NOT EXISTS learning_usage_events_tenant_generated_idx ON learning_usage_events(tenant,generated_at DESC)");
   await pool.query("CREATE TABLE IF NOT EXISTS alerts (id serial primary key, tenant text, type text, summary text, name text, ts bigint, done boolean default false)");
   await pool.query("CREATE TABLE IF NOT EXISTS files (id text primary key, tenant text, name text, mime text, data bytea, ts bigint)");
   await pool.query("CREATE TABLE IF NOT EXISTS push_subs (tenant text, endpoint text primary key, sub jsonb)");
@@ -793,6 +795,71 @@ function learningPerformanceSummary(t) {
     const pendingConflict = learningConflicts(t, true).some(item => learningIntentKey(item.q) === key);
     return { key, label: LEARNING_INTENT_LABELS[key] || key, total, unchanged: p.unchanged, corrected: p.corrected, conflicts: p.conflicts, pendingConflict, correctionRate, ready: key !== "other" && total >= 5 && p.unchanged >= 3 && !pendingConflict && correctionRate <= 0.4 };
   }).sort((a, b) => Number(b.ready) - Number(a.ready) || b.total - a.total);
+}
+function sanitizeLearningUsage(value) {
+  const usage = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const refs = (list, limit) => (Array.isArray(list) ? list : []).slice(0, limit).map(item => {
+    if (item && typeof item === "object") return { id: Number(item.id || 0), title: String(item.title || "").slice(0, 120) };
+    return { id: Number(item || 0), title: "" };
+  }).filter(item => item.id > 0);
+  return {
+    rules: refs(usage.rules, 30),
+    examples: refs(usage.examples, 12),
+    prefs: (Array.isArray(usage.prefs) ? usage.prefs : []).slice(0, 20).map(item => String(item || "").slice(0, 300)).filter(Boolean),
+  };
+}
+async function startLearningUsageTrace(t, c, generated, source) {
+  if (!t || !c || !generated) return null;
+  const usage = sanitizeLearningUsage(generated.learningUsage);
+  const trace = {
+    id: crypto.randomUUID(), generatedAt: Date.now(), source: String(source || "draft").slice(0, 40),
+    usage, draft: String(generated.draft || "").trim().slice(0, 5000),
+  };
+  c.learningTrace = trace;
+  if (pool) {
+    try {
+      await pool.query("INSERT INTO learning_usage_events (tenant,trace_id,conversation_id,generated_at,usage) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (tenant,trace_id) DO NOTHING", [t.slug, trace.id, c.id, trace.generatedAt, trace.usage]);
+    } catch (e) { console.error("learning usage start:", e.message); }
+  }
+  return trace;
+}
+async function finishLearningUsageTrace(t, c, finalText, mode, suppliedTrace) {
+  const trace = suppliedTrace || (c && c.learningTrace);
+  if (!t || !trace || !trace.id) return false;
+  const sentAt = Date.now(), edited = String(finalText || "").trim() !== String(trace.draft || "").trim();
+  if (pool) {
+    try {
+      await pool.query("UPDATE learning_usage_events SET sent_at=COALESCE(sent_at,$1),send_mode=COALESCE(send_mode,$2),edited=COALESCE(edited,$3) WHERE tenant=$4 AND trace_id=$5", [sentAt, String(mode || "staff").slice(0, 30), edited, t.slug, trace.id]);
+    } catch (e) { console.error("learning usage finish:", e.message); return false; }
+  }
+  if (c && c.learningTrace && c.learningTrace.id === trace.id) delete c.learningTrace;
+  return true;
+}
+function emptyLearningUsagePeriod() { return { generated: 0, generatedWithLearning: 0, sent: 0, unchanged: 0, corrected: 0, autoSent: 0 }; }
+async function learningUsageSummary(t) {
+  const summary = { startedAt: 0, all: emptyLearningUsagePeriod(), month: emptyLearningUsagePeriod(), examples: {}, rules: {} };
+  if (!pool) return summary;
+  const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime();
+  const aggregateSql = `SELECT MIN(generated_at)::bigint AS started_at,
+    COUNT(*)::int AS generated,
+    COUNT(*) FILTER (WHERE jsonb_array_length(COALESCE(usage->'rules','[]'::jsonb)) + jsonb_array_length(COALESCE(usage->'examples','[]'::jsonb)) + jsonb_array_length(COALESCE(usage->'prefs','[]'::jsonb)) > 0)::int AS generated_with_learning,
+    COUNT(*) FILTER (WHERE sent_at IS NOT NULL AND jsonb_array_length(COALESCE(usage->'rules','[]'::jsonb)) + jsonb_array_length(COALESCE(usage->'examples','[]'::jsonb)) + jsonb_array_length(COALESCE(usage->'prefs','[]'::jsonb)) > 0)::int AS sent,
+    COUNT(*) FILTER (WHERE sent_at IS NOT NULL AND edited IS FALSE AND jsonb_array_length(COALESCE(usage->'rules','[]'::jsonb)) + jsonb_array_length(COALESCE(usage->'examples','[]'::jsonb)) + jsonb_array_length(COALESCE(usage->'prefs','[]'::jsonb)) > 0)::int AS unchanged,
+    COUNT(*) FILTER (WHERE sent_at IS NOT NULL AND edited IS TRUE AND jsonb_array_length(COALESCE(usage->'rules','[]'::jsonb)) + jsonb_array_length(COALESCE(usage->'examples','[]'::jsonb)) + jsonb_array_length(COALESCE(usage->'prefs','[]'::jsonb)) > 0)::int AS corrected,
+    COUNT(*) FILTER (WHERE sent_at IS NOT NULL AND send_mode='auto' AND jsonb_array_length(COALESCE(usage->'rules','[]'::jsonb)) + jsonb_array_length(COALESCE(usage->'examples','[]'::jsonb)) + jsonb_array_length(COALESCE(usage->'prefs','[]'::jsonb)) > 0)::int AS auto_sent
+    FROM learning_usage_events WHERE tenant=$1 AND generated_at >= $2`;
+  const toPeriod = row => ({ generated: Number(row.generated || 0), generatedWithLearning: Number(row.generated_with_learning || 0), sent: Number(row.sent || 0), unchanged: Number(row.unchanged || 0), corrected: Number(row.corrected || 0), autoSent: Number(row.auto_sent || 0) });
+  try {
+    const [all, month, exampleRows, ruleRows] = await Promise.all([
+      pool.query(aggregateSql, [t.slug, 0]), pool.query(aggregateSql, [t.slug, monthStart]),
+      pool.query("SELECT (ref->>'id')::int AS id,COUNT(*)::int AS generated,COUNT(*) FILTER (WHERE sent_at IS NOT NULL)::int AS sent,COUNT(*) FILTER (WHERE sent_at IS NOT NULL AND edited IS FALSE)::int AS unchanged,COUNT(*) FILTER (WHERE sent_at IS NOT NULL AND edited IS TRUE)::int AS corrected FROM learning_usage_events CROSS JOIN LATERAL jsonb_array_elements(COALESCE(usage->'examples','[]'::jsonb)) ref WHERE tenant=$1 AND (ref->>'id') ~ '^[0-9]+$' GROUP BY 1", [t.slug]),
+      pool.query("SELECT (ref->>'id')::int AS id,COUNT(*)::int AS generated,COUNT(*) FILTER (WHERE sent_at IS NOT NULL)::int AS sent FROM learning_usage_events CROSS JOIN LATERAL jsonb_array_elements(COALESCE(usage->'rules','[]'::jsonb)) ref WHERE tenant=$1 AND (ref->>'id') ~ '^[0-9]+$' GROUP BY 1", [t.slug]),
+    ]);
+    summary.startedAt = Number(all.rows[0] && all.rows[0].started_at || 0); summary.all = toPeriod(all.rows[0] || {}); summary.month = toPeriod(month.rows[0] || {});
+    exampleRows.rows.forEach(row => { summary.examples[row.id] = { generated: Number(row.generated || 0), sent: Number(row.sent || 0), unchanged: Number(row.unchanged || 0), corrected: Number(row.corrected || 0) }; });
+    ruleRows.rows.forEach(row => { summary.rules[row.id] = { generated: Number(row.generated || 0), sent: Number(row.sent || 0) }; });
+  } catch (e) { console.error("learning usage summary:", e.message); }
+  return summary;
 }
 async function exampleAdd(t, obj) {
   const q = String(obj.q || "").slice(0, 600).trim();
@@ -1650,6 +1717,7 @@ async function classifyApproval(t, confirmText, text) {
 async function baDeliver(t, c, text) {
   const r = await deliverText(t, c, text);
   if (r && r.sent) {
+    await finishLearningUsageTrace(t, c, text, "auto");
     statBump(t, "auto");
     c.msgs.push({ from: "us", text, auto: true, learningRefs: c.learningRefs || [], time: nowt() });
     c.draft = ""; c.draft0 = ""; c.learningRefs = []; c.status = "done"; c.lastAuto = true;
@@ -1872,6 +1940,7 @@ function scheduleAutoReply(t, c, draftText, recvAt, delayMin) {
       if (!lastMsg || lastMsg.from !== "them") return; // 待機中に誰かが返信した
       const r = await deliverText(t, cur, draftText);
       if (r.sent) {
+        await finishLearningUsageTrace(t, cur, draftText, "auto");
         statBump(t, "auto");
         cur.msgs.push({ from: "us", text: draftText, auto: true, learningRefs: cur.learningRefs || [], grounding: cur.grounding || null, time: nowt() });
         cur.draft = ""; cur.draft0 = ""; cur.learningRefs = []; cur.status = "done"; cur.lastAuto = true;
@@ -2083,6 +2152,7 @@ async function handleInbound(t, opts) {
   cancelAutoReply(t, id);      // 新着が来たので、保留中の自動返信予約があれば取り消して作り直す
   let c = t.store[id];
   if (!c) { c = t.store[id] = { id, userId: uid, name: opts.name || (channel === "mail" ? uid : "LINEのお客様"), channel, color: colorFor(id), status: "todo", flag: false, msgs: [], draft: "" }; }
+  delete c.learningTrace; // 前の未送信下書きは新着で失効する。生成実績は残すが、次の送信とは結び付けない。
   c.userId = uid;
   if (opts.name) c.name = opts.name;
   if (opts.pic) c.pic = opts.pic;
@@ -2115,6 +2185,7 @@ async function handleInbound(t, opts) {
       const verifiedName = g.baCtx && g.baCtx.ok && g.baCtx.verified && g.baCtx.patient && String(g.baCtx.patient.name || "").trim();
       if (verifiedName) c.verifiedPatientName = verifiedName.slice(0, 120);
       c.draft = String(g.draft || ""); c.draft0 = c.draft; confidence = g.confidence; needsHuman = g.needs_human; urgent = g.is_urgent; siteAlert = g.site_alert; siteSummary = g.site_summary; c.topics = Array.isArray(g.topics) ? g.topics : []; c.learningRefs = Array.isArray(g.learningRefs) ? g.learningRefs : []; c.learningUsage = g.learningUsage || null; c.grounding = g.grounding || null; c.validation = g.validation || null; c.learningReadiness = g.learningReadiness || null;
+      await startLearningUsageTrace(t, c, g, "inbound");
     }
     // ===== 予約自動受付: AIが操作依頼(action)を出したら、確認文の送信までを自動処理 =====
     if (g && !staffLineReviewAll(t) && baEnabled(t) && PARTNER_KEY && g.action && typeof g.action === "object" && g.action.type && g.action.type !== "none") {
@@ -2152,7 +2223,7 @@ async function handleInbound(t, opts) {
         autoScheduled = true;
       } else {
         const r = await deliverText(t, c, draftText);
-        if (r.sent) { statBump(t, "auto"); c.msgs.push({ from: "us", text: draftText, auto: true, learningRefs: c.learningRefs || [], grounding: c.grounding || null, time: nowt() }); c.draft = ""; c.draft0 = ""; c.learningRefs = []; c.status = "done"; c.lastAuto = true; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c); autoSent = true; }
+        if (r.sent) { await finishLearningUsageTrace(t, c, draftText, "auto"); statBump(t, "auto"); c.msgs.push({ from: "us", text: draftText, auto: true, learningRefs: c.learningRefs || [], grounding: c.grounding || null, time: nowt() }); c.draft = ""; c.draft0 = ""; c.learningRefs = []; c.status = "done"; c.lastAuto = true; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c); autoSent = true; }
       }
     }
   } catch (e) {}
@@ -2485,6 +2556,7 @@ app.post("/webhook/staff-line", async (req, res) => {
         const question = recentCustomerQuestion(found.c);
         const sent = await deliverText(t, found.c, outgoing);
         if (!sent.sent) { found.approval.status = "pending"; dbSave(t, found.c); await staffLineReply(t, ev.replyToken, [staffLineText("⚠️ 送信に失敗しました。患者様には送られていません。右腕くんで送信設定を確認してください。")]); continue; }
+        await finishLearningUsageTrace(t, found.c, outgoing, "staff_line");
         found.c.msgs.push({ from: "us", text: outgoing, auto: false, approvedVia: "staff_line", approvedBy: userId, approvedByName: staff.name, learningRefs: found.c.learningRefs || [], time: nowt() });
         found.c.draft = ""; found.c.draft0 = ""; found.c.learningRefs = []; found.c.status = "done"; found.c.flag = false; found.c.lastAuto = false; found.c.time = nowt(); found.c.ts = Date.now(); found.c.last = lastText(found.c); found.approval.status = "sent"; dbSave(t, found.c); statBump(t, "staff");
         const learned = await learnStaffOutcome(t, found.c, { q: question, final: outgoing, draft0: initialDraft, instr: editInstruction, source: "staff_line", waitForAi: false });
@@ -2754,6 +2826,7 @@ app.post("/api/send", guard, async (req, res) => {
     const instr = String(req.body.instr || "").trim();
     const learningChat = sanitizeLearningChat(req.body.learningChat);
     const reviewText = String(req.body.learningText || "").trim().slice(0, 800);
+    await finishLearningUsageTrace(t, c, text, "staff");
     appendDeliveredBundle(c, text, files, baseUrl, { learningRefs: c.learningRefs || [] }); c.draft = ""; c.draft0 = ""; c.learningRefs = []; c.status = "done"; c.flag = false; c.lastAuto = false; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
     statBump(t, "staff");
     if (text) {
@@ -2805,12 +2878,13 @@ app.post("/api/scheduled-message", guard, oneMutationAtATime("scheduled-message"
     sendAt: normalized.sendAt, status: "scheduled", createdAt: Date.now(), updatedAt: Date.now(), baseUrl,
     question: recentCustomerQuestion(c), draft0: String(c.draft0 || "").trim().slice(0, 1500),
     instr: String(req.body.instr || "").trim().slice(0, 800), learningText: String(req.body.learningText || "").trim().slice(0, 800), learningChat: sanitizeLearningChat(req.body.learningChat),
-    learningRefs: Array.isArray(c.learningRefs) ? c.learningRefs : []
+    learningRefs: Array.isArray(c.learningRefs) ? c.learningRefs : [],
+    learningTrace: c.learningTrace && c.learningTrace.id ? c.learningTrace : null
   };
   const list = scheduledMessages(t); list.push(item); t.config.scheduledMessages = pruneScheduledMessages(list);
   try { await saveTenantConfig(t); }
   catch (e) { const index = list.indexOf(item); if (index >= 0) list.splice(index, 1); return res.status(500).json({ ok: false, error: "save" }); }
-  c.draft = ""; c.draft0 = ""; c.learningRefs = []; await dbSave(t, c);
+  c.draft = ""; c.draft0 = ""; c.learningRefs = []; delete c.learningTrace; await dbSave(t, c);
   res.json({ ok: true, scheduled: publicScheduledMessage(item) });
 });
 
@@ -3141,17 +3215,18 @@ app.post("/api/rule-undo", guard, async (req, res) => {
   const ok = t.rules[id] ? await ruleDelete(t, id) : false;
   res.json({ ok });
 });
-app.get("/api/learning-data", guard, (req, res) => {
+app.get("/api/learning-data", guard, async (req, res) => {
   const t = req.tenant;
   const prefs = (Array.isArray(S(t).prefs) ? S(t).prefs : []).map((p, i) => ({
     key: p && typeof p === "object" && p.id != null ? String(p.id) : "legacy:" + i,
     text: String(typeof p === "string" ? p : ((p && p.text) || ""))
   })).filter(p => p.text);
+  const usage = await learningUsageSummary(t);
   const examples = Object.values(t.examples || {}).sort((a, b) => (b.ts || 0) - (a.ts || 0) || b.id - a.id).map(e => ({
     id: e.id, q: e.q || "", final: e.final || "", draft0: e.draft0 || "", instr: e.instr || "", ts: e.ts || 0,
-    source: e.source || "web", confirmedCount: Math.max(1, Number(e.confirmedCount || 1)), learningMeta: sanitizeLearningMeta(e.learningMeta)
+    source: e.source || "web", confirmedCount: Math.max(1, Number(e.confirmedCount || 1)), learningMeta: sanitizeLearningMeta(e.learningMeta), usage: usage.examples[e.id] || { generated: 0, sent: 0, unchanged: 0, corrected: 0 }
   }));
-  res.json({ ok: true, rules: rulesList(t).map(r => ({ id: r.id, title: r.title || "", content: r.content || "", updated: Number(r.updated || 0) })), prefs, examples, conflicts: learningConflicts(t, true), performance: learningPerformanceSummary(t) });
+  res.json({ ok: true, rules: rulesList(t).map(r => ({ id: r.id, title: r.title || "", content: r.content || "", updated: Number(r.updated || 0), usage: usage.rules[r.id] || { generated: 0, sent: 0 } })), prefs, examples, conflicts: learningConflicts(t, true), performance: learningPerformanceSummary(t), usage });
 });
 app.post("/api/rule-save", guard, oneMutationAtATime("learning"), async (req, res) => {
   const t = req.tenant; const title = String(req.body.title || "").trim().slice(0, 100); const content = String(req.body.content || "").trim().slice(0, 2000);
@@ -3429,7 +3504,8 @@ app.post("/api/redraft", guard, async (req, res) => {
   const sel = Array.isArray(req.body.selected) ? req.body.selected.map(String).slice(0, 20) : [];
   const g = await genDraft(t, c, { only: sel });
   if (!g) return res.json({ ok: false });
-  c.draft = String(g.draft || ""); c.draft0 = c.draft; if (Array.isArray(g.topics)) c.topics = g.topics; c.learningRefs = Array.isArray(g.learningRefs) ? g.learningRefs : []; c.learningUsage = g.learningUsage || null; c.grounding = g.grounding || null; c.validation = g.validation || null; c.learningReadiness = g.learningReadiness || null; dbSave(t, c);
+  c.draft = String(g.draft || ""); c.draft0 = c.draft; if (Array.isArray(g.topics)) c.topics = g.topics; c.learningRefs = Array.isArray(g.learningRefs) ? g.learningRefs : []; c.learningUsage = g.learningUsage || null; c.grounding = g.grounding || null; c.validation = g.validation || null; c.learningReadiness = g.learningReadiness || null;
+  await startLearningUsageTrace(t, c, g, "redraft"); await dbSave(t, c);
   res.json({ ok: true, draft: c.draft, topics: c.topics || [], learningRefs: c.learningRefs, learningUsage: c.learningUsage, grounding: c.grounding, validation: c.validation, learningReadiness: c.learningReadiness });
 });
 app.post("/api/draft-edited", guard, async (req, res) => {
@@ -4172,6 +4248,7 @@ async function processScheduledMessagesForTenant(t) {
         if (!loaded.ok) { await scheduledMessageFailure(t, item, loaded.error); continue; }
         const delivered = await deliverMessageBundle(t, c, String(item.text || ""), loaded.files, String(item.baseUrl || PUBLIC_BASE_URL || "").replace(/\/$/, ""));
         if (!delivered.sent) { await scheduledMessageFailure(t, item, delivered.sendErr || "send_failed"); continue; }
+        await finishLearningUsageTrace(t, c, String(item.text || ""), "scheduled", item.learningTrace);
         appendDeliveredBundle(c, String(item.text || ""), loaded.files, String(item.baseUrl || PUBLIC_BASE_URL || "").replace(/\/$/, ""), { scheduled: true, scheduledAt: item.sendAt, learningRefs: item.learningRefs || [] });
         c.status = "done"; c.flag = false; c.lastAuto = false; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c);
         const historySaved = await dbSave(t, c);
@@ -5314,6 +5391,10 @@ const PAGE = `<!DOCTYPE html>
   .learningHeader{padding:15px 16px 11px;border-bottom:1px solid var(--line);}
   .learningHeaderRow{display:flex;align-items:center;justify-content:space-between;gap:10px;}
   .learningHeaderRow h3{margin:0;font-size:16px;}
+  .learningSummary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px;}
+  .learningSummaryCard{border:1px solid #d1fae5;background:#f0fdf4;border-radius:11px;padding:10px;min-width:0;}
+  .learningSummaryCard:nth-child(2){border-color:#ddd6fe;background:#f5f3ff;}.learningSummaryCard:nth-child(3){border-color:#bfdbfe;background:#eff6ff;}
+  .learningSummaryLabel{font-size:10.5px;color:#64748b;line-height:1.35;}.learningSummaryValue{font-size:21px;font-weight:800;color:#0f172a;margin-top:2px;}.learningSummarySub{font-size:10.5px;color:#475569;line-height:1.45;margin-top:3px;}
   .learningToolbar{padding:10px 16px;border-bottom:1px solid var(--line);display:flex;gap:7px;flex-wrap:wrap;align-items:center;}
   #learnSearch{margin-left:auto;min-width:180px;flex:1;max-width:280px;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:12px;}
   .learningFooter{padding:10px 16px;border-top:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:8px;}
@@ -5381,6 +5462,7 @@ const PAGE = `<!DOCTYPE html>
     .settingsCard .cbtn,.learningCard .cbtn{min-height:42px;}
     .learningHeader{padding:calc(12px + env(safe-area-inset-top)) 12px 10px;}
     .learningHeaderRow h3{font-size:15px;}
+    .learningSummary{grid-template-columns:1fr;gap:6px;}.learningSummaryCard{padding:8px 10px;display:grid;grid-template-columns:minmax(0,1fr) auto;column-gap:10px;align-items:center;}.learningSummaryValue{font-size:19px;grid-column:2;grid-row:1}.learningSummarySub{grid-column:1/-1;margin-top:2px;}
     .learningToolbar{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));padding:9px 10px;gap:6px;}
     .learningToolbar .learnTabBtn{padding:7px 3px;font-size:11px;white-space:normal;line-height:1.25;}
     .learningToolbar #learnSearch{grid-column:1/-1;}
@@ -5635,6 +5717,11 @@ const PAGE = `<!DOCTYPE html>
   <div class="learningHeader">
     <div class="learningHeaderRow"><h3>🧠 学習データ管理</h3><button type="button" class="cbtn" onclick="closeLearning()">閉じる</button></div>
     <div style="font-size:11px;color:#6b7280;line-height:1.6;margin-top:6px;"><b>店舗ルール</b>は店舗の事実・規定、<b>全体の返信方針</b>は全返信への共通指示、<b>過去の対応・学習例</b>は似た質問へ再利用する実例です。回答が食い違った場合は<b>学習確認待ち</b>で今後の正解を決めます。</div>
+    <div class="learningSummary" aria-label="学習状況">
+      <div class="learningSummaryCard"><div class="learningSummaryLabel">覚えた内容</div><div class="learningSummaryValue" id="learnRemembered">—</div><div class="learningSummarySub" id="learnRememberedSub">内訳を読み込んでいます</div></div>
+      <div class="learningSummaryCard"><div class="learningSummaryLabel">今月、学習内容を使って生成</div><div class="learningSummaryValue" id="learnGenerated">—</div><div class="learningSummarySub" id="learnGeneratedSub">患者向け下書きだけを集計</div></div>
+      <div class="learningSummaryCard"><div class="learningSummaryLabel">今月、実際に送信</div><div class="learningSummaryValue" id="learnSent">—</div><div class="learningSummarySub" id="learnSentSub">送信結果を読み込んでいます</div></div>
+    </div>
     <div id="learnPerformance" style="font-size:11px;color:#475569;line-height:1.55;margin-top:5px;"></div>
   </div>
   <div class="learningToolbar">
@@ -6555,7 +6642,7 @@ function renderPrefs(prefs){const el=document.getElementById("prefList");if(!el)
 async function addPref(){const inp=document.getElementById("prefInput");const value=(inp&&inp.value||"").trim();if(!value)return;await withBusy("legacy-pref-add",null,"",async()=>{try{const r=await api("/api/pref-add",{text:value});const j=await r.json();if(j.ok){if(inp)inp.value="";renderPrefs(j.prefs||[]);}}catch(e){uiAlert("追加に失敗しました");}});}
 async function delPref(id){await withBusy("legacy-pref-delete-"+id,null,"",async()=>{try{const r=await api("/api/pref-delete",{id});const j=await r.json();if(j.ok)renderPrefs(j.prefs||[]);}catch(e){uiAlert("削除に失敗しました");}});}
 // 店舗ルール・全体の返信方針・過去の対応・学習例を、保存先は分けたまま一画面で管理する。
-let LEARN={rules:[],prefs:[],examples:[],conflicts:[],performance:[]},learnTab="rules";
+let LEARN={rules:[],prefs:[],examples:[],conflicts:[],performance:[],usage:{all:{},month:{}}},learnTab="rules";
 function learnField(label,value,rows,readOnly){
   const box=document.createElement("label");box.style.cssText="display:block;margin-top:8px;font-size:11px;font-weight:600;color:#475569;";box.appendChild(document.createTextNode(label));
   const el=rows?document.createElement("textarea"):document.createElement("input");if(!rows)el.type="text";el.value=value||"";if(rows)el.rows=rows;if(readOnly)el.readOnly=true;
@@ -6567,7 +6654,7 @@ function learnCard(){const d=document.createElement("div");d.style.cssText="bord
 function setLearnStatus(text,bad){const e=document.getElementById("learnStatus");if(e){e.textContent=text||"";e.style.color=bad?"#dc2626":"#6b7280";}}
 async function reloadLearning(){
   setLearnStatus("読み込み中…");
-  try{const r=await fetch("/api/learning-data");const j=await r.json();if(!r.ok||!j.ok)throw new Error("load");LEARN={rules:j.rules||[],prefs:j.prefs||[],examples:j.examples||[],conflicts:j.conflicts||[],performance:j.performance||[]};learningPendingCounts.conflicts=LEARN.conflicts.length;renderLearningPendingBadge();renderLearning();setLearnStatus("");}
+  try{const r=await fetch("/api/learning-data");const j=await r.json();if(!r.ok||!j.ok)throw new Error("load");LEARN={rules:j.rules||[],prefs:j.prefs||[],examples:j.examples||[],conflicts:j.conflicts||[],performance:j.performance||[],usage:j.usage||{all:{},month:{}}};learningPendingCounts.conflicts=LEARN.conflicts.length;renderLearningPendingBadge();renderLearning();setLearnStatus("");}
   catch(e){setLearnStatus("学習データを読み込めませんでした",true);}
 }
 function openLearning(){document.getElementById("learnManagePop").style.display="flex";reloadLearning();}
@@ -6577,6 +6664,7 @@ function learningMatches(item,query){if(!query)return true;return Object.values(
 function renderLearning(){
   const list=document.getElementById("learnList");if(!list)return;list.innerHTML="";
   document.getElementById("learnRulesCount").textContent="("+LEARN.rules.length+")";document.getElementById("learnPrefsCount").textContent="("+LEARN.prefs.length+")";document.getElementById("learnExamplesCount").textContent="("+LEARN.examples.length+")";document.getElementById("learnConflictsCount").textContent="("+LEARN.conflicts.length+")";
+  const remembered=LEARN.rules.length+LEARN.prefs.length+LEARN.examples.length,month=(LEARN.usage&&LEARN.usage.month)||{},started=Number(LEARN.usage&&LEARN.usage.startedAt||0);document.getElementById("learnRemembered").textContent=remembered+"件";document.getElementById("learnRememberedSub").textContent="店舗ルール "+LEARN.rules.length+"・返信方針 "+LEARN.prefs.length+"・対応例 "+LEARN.examples.length;document.getElementById("learnGenerated").textContent=Number(month.generatedWithLearning||0)+"件";document.getElementById("learnGeneratedSub").textContent=started?new Date(started).toLocaleDateString("ja-JP")+"から集計（テスト生成は除外）":"利用回数はこの機能の反映後から集計";document.getElementById("learnSent").textContent=Number(month.sent||0)+"件";document.getElementById("learnSentSub").textContent="そのまま "+Number(month.unchanged||0)+"・修正後 "+Number(month.corrected||0)+"・自動送信 "+Number(month.autoSent||0);
   const perf=document.getElementById("learnPerformance"),ready=(LEARN.performance||[]).filter(x=>x.ready);if(perf)perf.textContent=ready.length?"✅ 自動対応の実績基準を満たした種類: "+ready.map(x=>x.label).join("、"):"現在は実績を蓄積中です。種類ごとに5件以上、うち無修正3件以上を目安に自動対応候補になります。";
   document.querySelectorAll(".learnTabBtn").forEach(b=>{const on=b.dataset.tab===learnTab;b.style.background=on?"#ecfdf5":"#fff";b.style.borderColor=on?"#10b981":"#d1d5db";b.style.color=on?"#047857":"#374151";});
   const help=document.getElementById("learnHelp"),add=document.getElementById("learnAddBtn");
@@ -6589,7 +6677,7 @@ function renderLearning(){
   items.forEach(item=>{if(learnTab==="rules")renderLearnRule(list,item);else if(learnTab==="prefs")renderLearnPref(list,item);else if(learnTab==="examples")renderLearnExample(list,item);else renderLearnConflict(list,item);});
 }
 function renderLearnRule(list,item){
-  const card=learnCard(),title=learnField("見出し",item.title||"",0),content=learnField("ルール本文",item.content||"",4);card.appendChild(title.box);card.appendChild(content.box);
+  const card=learnCard(),title=learnField("見出し",item.title||"",0),content=learnField("ルール本文",item.content||"",4),usage=item.usage||{};if(item.id!=null){const used=document.createElement("div");used.style.cssText="font-size:10.5px;color:#047857;font-weight:700;margin-bottom:5px;";used.textContent="回答生成に "+Number(usage.generated||0)+"回使用・実際の送信 "+Number(usage.sent||0)+"回";card.appendChild(used);}card.appendChild(title.box);card.appendChild(content.box);
   const row=document.createElement("div");row.style.cssText="display:flex;justify-content:flex-end;gap:7px;margin-top:9px;";
   if(item.id!=null)row.appendChild(learnButton("削除",false,async()=>{if(!await uiConfirm("この店舗ルールを削除しますか？"))return;await learnMutate("/api/rule-delete",{id:item.id},"削除しました");}));
   row.appendChild(learnButton("保存",true,async()=>{await learnMutate("/api/rule-save",{id:item.id,title:title.el.value,content:content.el.value},"保存しました");}));card.appendChild(row);list.appendChild(card);
@@ -6600,7 +6688,7 @@ function renderLearnPref(list,item){
   row.appendChild(learnButton("保存",true,async()=>{await learnMutate(item.key?"/api/pref-update":"/api/pref-add",item.key?{key:item.key,text:text.el.value}:{text:text.el.value},"保存しました");}));card.appendChild(row);list.appendChild(card);
 }
 function renderLearnExample(list,item){
-  const card=learnCard();const date=document.createElement("div");date.style.cssText="font-size:10px;color:#94a3b8;";const source=item.source==="staff_line"?"スタッフLINE承認":"右腕くん画面";date.textContent=(item.ts?new Date(item.ts).toLocaleString("ja-JP"):"日時不明")+" ・ "+source+" ・ スタッフ確認"+Math.max(1,Number(item.confirmedCount||1))+"回";card.appendChild(date);
+  const card=learnCard(),usage=item.usage||{};const date=document.createElement("div");date.style.cssText="font-size:10px;color:#94a3b8;";const source=item.source==="staff_line"?"スタッフLINE承認":"右腕くん画面";date.textContent=(item.ts?new Date(item.ts).toLocaleString("ja-JP"):"日時不明")+" ・ "+source+" ・ スタッフ確認"+Math.max(1,Number(item.confirmedCount||1))+"回";card.appendChild(date);const used=document.createElement("div");used.style.cssText="font-size:10.5px;color:#047857;font-weight:700;margin-top:5px;line-height:1.5;";used.textContent="回答生成に "+Number(usage.generated||0)+"回使用・送信 "+Number(usage.sent||0)+"回（そのまま "+Number(usage.unchanged||0)+"／修正後 "+Number(usage.corrected||0)+"）";card.appendChild(used);
   const meta=item.learningMeta||{},q=learnField("患者からの問い合わせ",item.q||"",3),final=learnField("スタッフが実際に送った返信",item.final||"",5),instr=learnField("返信作成時の修正指示（任意）",item.instr||"",2),intent=learnField("AIが整理した問い合わせの種類",meta.intent||"",1),decision=learnField("今後再利用する判断・案内手順",meta.decision||"",3),conditions=learnField("適用条件",meta.conditions||"",2),avoid=learnField("避ける回答",meta.avoid||"",2);card.appendChild(q.box);card.appendChild(final.box);card.appendChild(instr.box);const detm=document.createElement("details");detm.style.cssText="margin-top:8px;font-size:11px;color:#475569;";const summ=document.createElement("summary");summ.textContent="AIが学習した判断を確認・編集";summ.style.cursor="pointer";detm.appendChild(summ);detm.appendChild(intent.box);detm.appendChild(decision.box);detm.appendChild(conditions.box);detm.appendChild(avoid.box);card.appendChild(detm);
   if(item.draft0){const det=document.createElement("details");det.style.cssText="margin-top:8px;font-size:11px;color:#64748b;";const sum=document.createElement("summary");sum.textContent="元のAI下書きを確認（編集不可）";sum.style.cursor="pointer";det.appendChild(sum);const draft=learnField("",item.draft0,3,true);det.appendChild(draft.box);card.appendChild(det);}
   const row=document.createElement("div");row.style.cssText="display:flex;justify-content:flex-end;gap:7px;margin-top:9px;";row.appendChild(learnButton("削除",false,async()=>{if(!await uiConfirm("この過去の対応・学習例を削除しますか？"))return;await learnMutate("/api/example-delete",{id:item.id},"削除しました");}));row.appendChild(learnButton("保存",true,async()=>{await learnMutate("/api/example-update",{id:item.id,q:q.el.value,final:final.el.value,instr:instr.el.value,learningMeta:{intent:intent.el.value,decision:decision.el.value,conditions:conditions.el.value,avoid:avoid.el.value,searchTerms:meta.searchTerms||[],scope:(decision.el.value.trim()?"reusable":"one_off")}},"保存しました");}));card.appendChild(row);list.appendChild(card);
