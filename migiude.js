@@ -143,7 +143,17 @@ function newTenant(slug, name, config) {
 }
 async function saveTenantConfig(t) {
   encryptConnSecrets(t.config.conn); // 資格情報は暗号化できない限り保存しない
-  if (pool) await pool.query("UPDATE tenants SET name=$2, config=$3 WHERE slug=$1", [t.slug, t.name, t.config]);
+  if (!pool) return;
+  // tenants.config は1つのJSONとして更新するため、同じ法人の保存を並列実行すると、
+  // 後から完了した古い内容が直前の学習候補などを消す可能性がある。
+  // 法人単位で必ず開始順に直列化し、失敗後も次の保存は継続できるようにする。
+  const previous = t._configSaveQueue || Promise.resolve();
+  const save = previous.catch(() => {}).then(() =>
+    pool.query("UPDATE tenants SET name=$2, config=$3 WHERE slug=$1", [t.slug, t.name, t.config])
+  );
+  t._configSaveQueue = save;
+  try { await save; }
+  finally { if (t._configSaveQueue === save) t._configSaveQueue = null; }
 }
 
 // ===== 自動化ダッシュボード用の日次カウンタ（受信トレイ上部の帯に使う） =====
@@ -1137,7 +1147,10 @@ async function learnStaffOutcome(t, c, opts) {
 
 function learningJobs(t) {
   const jobs = Array.isArray(t.config.learningJobs) ? t.config.learningJobs : (t.config.learningJobs = []);
-  return jobs.filter(Boolean);
+  // filter()した配列へpushすると正本へ追加されず、画面にだけ候補が見えて
+  // 「学習する」を押した時にはIDが存在しない状態になる。無効値は正本上で除去する。
+  for (let index = jobs.length - 1; index >= 0; index--) if (!jobs[index]) jobs.splice(index, 1);
+  return jobs;
 }
 function publicLearningJob(job) {
   return {
@@ -3282,10 +3295,10 @@ app.post("/api/learning-scope", guard, oneMutationAtATime("learning", learningMu
     if (!job && !ex && scope === "learn") {
       const recoveredConversation = t.store[String(req.body.conversationId || "")];
       const recoveredFinalMessage = recoveredConversation && (recoveredConversation.msgs || []).slice().reverse().find(message => message && message.from === "us" && String(message.text || "").trim());
-      const recoveredQuestion = recoveredConversation ? recentCustomerQuestion(recoveredConversation) : "";
-      const recoveredFinal = String(recoveredFinalMessage && recoveredFinalMessage.text || "").trim().slice(0, 1500);
+      const recoveredQuestion = String((recoveredConversation && recentCustomerQuestion(recoveredConversation)) || req.body.q || "").trim().slice(0, 600);
+      const recoveredFinal = String((recoveredFinalMessage && recoveredFinalMessage.text) || req.body.final || "").trim().slice(0, 1500);
       if (!recoveredQuestion || !recoveredFinal) return res.status(404).json({ ok: false, error: "recovery_not_found" });
-      ex = await exampleAdd(t, { q: recoveredQuestion, final: recoveredFinal, draft0: "", instr: text, learningChat: [], source: "web-recovered" });
+      ex = await exampleAdd(t, { q: recoveredQuestion, final: recoveredFinal, draft0: String(req.body.draft0 || "").trim().slice(0, 1500), instr: String(req.body.instr || text).trim().slice(0, 800), learningChat: [], source: "web-recovered" });
       if (!ex) throw new Error("recovery_save");
     }
     if (!job && !ex && scope === "none") return res.json({ ok: true, scope, duplicate: true, message: "今回は学習しません" });
@@ -6331,7 +6344,7 @@ async function saveLearningScope(scope,btn){
   const text=(document.getElementById("learningScopeText").value||"").trim();
   if(scope!=="none"&&!text){uiAlert("今後守る内容を入力してください");return;}
   await withBusy("learning-scope-"+(data.learningJobId||data.exampleId),btn,"保存中…",async()=>{try{
-    const payload={exampleId:data.exampleId,conversationId:data.conversationId,learningJobId:data.learningJobId,scope,text};
+    const payload={exampleId:data.exampleId,conversationId:data.conversationId,learningJobId:data.learningJobId,scope,text,q:data.q,final:data.final,draft0:data.draft0,instr:data.instr};
     let r=await api("/api/learning-scope",payload),j=await r.json();
     if(r.status===409&&j.error==="already_processing"){
       await new Promise(resolve=>setTimeout(resolve,600));
@@ -6342,7 +6355,7 @@ async function saveLearningScope(scope,btn){
     if(scope==="learn")showLearningOutcome({type:"processing",title:"学習内容を確認しています",message:"重複・矛盾・患者固有情報を裏側で確認中です"});
     else showLearningOutcome({type:"ignored",title:"今回は学習しません",message:"患者への送信履歴だけを残し、学習候補は削除しました"});
     pollLearningJobs();refreshLearningBadge();
-  }catch(e){uiAlert(e.message==="already_processing"?"別の学習処理を保存中です。数秒後にもう一度押してください。":"学習内容を保存できませんでした。内容は確認待ちに残しています。右上の「要確認」または設定→学習データ管理から再度保存してください。");}});
+  }catch(e){uiAlert(e.message==="already_processing"?"別の学習処理を保存中です。数秒後にもう一度押してください。":e.message==="recovery_not_found"?"学習候補を復元できませんでした。この画面は閉じず、もう一度送信内容を確認してください。":"学習内容を保存できませんでした。右上の「要確認」に残っている場合は、そこからもう一度お試しください。");}});
 }
 function openRuleLearning(){
   const data=learningScopeData;if(!data)return;
