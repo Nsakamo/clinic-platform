@@ -7,9 +7,11 @@ const path = require("node:path");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
 
-test("Web画面とスタッフLINEが同じ学習保存経路を使う", () => {
+test("Web画面とスタッフLINEは送信成功後だけ確認済み対応例へ保存する", () => {
   assert.match(source, /learnStaffOutcome\(t, found\.c,[\s\S]{0,300}source: "staff_line"/);
-  assert.match(source, /learnStaffOutcome\(t, c,[\s\S]{0,300}source: "web"/);
+  assert.match(source, /queueStaffLearning\(t, c,[\s\S]{0,300}source: "web"/);
+  assert.match(source, /async function learnStaffOutcome[\s\S]{0,900}await exampleAdd\(t,/);
+  assert.match(source, /async function queueStaffLearning[\s\S]{0,900}await exampleAdd\(t,/);
 });
 
 test("スタッフLINEの修正指示を学習へ引き渡す", () => {
@@ -83,6 +85,8 @@ test("矛盾した回答を永続的な学習確認待ちへ保存して解決�
   assert.match(source, /outcomeP\.then\(conflict => conflict \? \[\] : distillRules/);
   assert.match(source, /if \(chosen && item\.kind !== "rule"\) await distillRules/);
   assert.match(source, /checkFormalRuleConflict/);
+  assert.match(source, /判定不能を「矛盾なし」と扱わない/);
+  assert.match(source, /正式ルールとの比較に失敗した時は自動更新を止め/);
 });
 
 test("スタッフの修正過程を構造化した判断メモリとして保存して再利用する", () => {
@@ -94,21 +98,21 @@ test("スタッフの修正過程を構造化した判断メモリとして保�
   assert.match(source, /学習した判断:/);
 });
 
-test("Web送信後はスタッフが学習するかを2択で決め、AIが用途別に整理する", () => {
-  assert.match(source, /reviewScope: true/);
+test("Web送信後は送信済み回答を自動学習し、AIが安全確認と用途別整理を行う", () => {
+  const queue = source.slice(source.indexOf("async function queueStaffLearning"), source.indexOf("// 2つのテキストがほぼ同内容か"));
+  assert.match(queue, /await exampleAdd\(t,/);
+  assert.match(queue, /status: "processing"/);
+  assert.match(queue, /setImmediate\(\(\) => processLearningJob\(t, job\.id\)\)/);
+  assert.doesNotMatch(queue, /status: "awaiting_decision"/);
   assert.match(source, /app\.post\("\/api\/learning-scope", guard/);
   assert.match(source, /\["none", "learn", "patient", "similar", "all"\]/);
-  assert.match(source, /今回の対応を学習しますか？/);
-  assert.match(source, /学習する[\s\S]{0,300}学習しない/);
-  assert.doesNotMatch(source, />あとで決める<\/button>/);
   assert.match(source, /proposeContextualLearningText/);
-  assert.match(source, /学習する内容（必要なら修正できます）/);
-  assert.doesNotMatch(source, /患者への送信後に、今回だけ／患者だけ／同じ問い合わせ／全返信から適用範囲を選べます/);
-  assert.match(source, /スタッフが「学習する」を選ぶまでは対応例へ保存せず/);
-  assert.match(source, /job\.status = "processing"/);
-  assert.match(source, /setImmediate\(\(\) => processLearningJob\(t, job\.id\)\)/);
+  assert.match(source, /患者へ実際に送信できた回答を人の確認済み結果として自動学習する/);
+  assert.match(source, /送信しました・自動学習中/);
   assert.match(source, /learningChat:learning\.learningChat/);
   assert.match(source, /右腕くんとの修正チャット/);
+  assert.match(source, /checkFormalRuleConflict/);
+  assert.match(source, /job\.status = "ready"; job\.resultType = "conflict"/);
 });
 
 test("受信画面に未処理の学習確認件数を常時表示し、学習案または矛盾確認へ移動する", () => {

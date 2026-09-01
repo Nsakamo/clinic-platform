@@ -5,33 +5,34 @@ const path = require("node:path");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
 
-test("患者への送信直後に元の会話で学習確認を出し、AI整理はバックグラウンドで続ける", () => {
+test("患者への送信直後に自動学習を開始し、AI整理はバックグラウンドで続ける", () => {
   assert.match(source, /queueStaffLearning\(t, c/);
   assert.match(source, /app\.get\("\/api\/learning-jobs"/);
-  assert.match(source, /immediateLearning=Object\.assign/);
-  assert.match(source, /if\(immediateLearning&&current===id\)showLearningScope\(immediateLearning\)/);
-  assert.match(source, /shownLearningDecisions\.add\(json\.learningJob\.id\)/);
-  assert.match(source, /job\.status==="awaiting_decision"/);
+  assert.match(source, /json\.learningJob\.status==="awaiting_decision"/);
+  assert.match(source, /else if\(json\.learningJob\)showLearningOutcome\(\{type:"processing",title:"送信しました・自動学習中"/);
   assert.match(source, /if \(job\.status !== "processing"\) return/);
-  assert.match(source, /showLearningOutcome\(\{type:"processing"/);
   assert.match(source, /duplicate:"重複統合"/);
   assert.match(source, /type:"conflict",title:"現在のルールと内容が異なります"/);
   assert.doesNotMatch(source, /学習案はバックグラウンドで整理中です/);
   assert.doesNotMatch(source, /window\.__sendBusy=true;showLearningProgress\(\)/);
 });
 
-test("学習を選ぶ前は対応例へ保存せず、選択後だけ安全確認を開始する", () => {
+test("送信済み回答だけを先に保存し、安全確認中と矛盾中は回答へ利用しない", () => {
   const queue = source.slice(source.indexOf("async function queueStaffLearning"), source.indexOf("// 2つのテキストがほぼ同内容か"));
-  assert.doesNotMatch(queue, /await exampleAdd\(/);
-  assert.match(queue, /status: "awaiting_decision"/);
-  const scope = source.slice(source.indexOf('app.post("/api/learning-scope"'), source.indexOf('app.post("/api/learning-conflict-consult"'));
-  assert.match(scope, /if \(scope === "none"\)/);
-  assert.match(scope, /if \(scope === "learn"\)/);
-  assert.match(scope, /ex = await exampleAdd\(/);
-  assert.match(scope, /job\.status = "processing"/);
+  assert.match(queue, /await exampleAdd\(/);
+  assert.match(queue, /status: "processing"/);
+  assert.match(queue, /setImmediate\(\(\) => processLearningJob\(t, job\.id\)\)/);
   assert.match(source, /安全確認が終わるまでは新規候補を患者回答へ使わない/);
   assert.match(source, /if \(job\.exampleId && !job\.reused\)/);
   assert.match(source, /await exampleDelete\(t, Number\(job\.exampleId\)\)/);
+});
+
+test("学習結果の通知は操作を塞がず3秒で自動的に閉じる", () => {
+  const result = source.slice(source.indexOf("let learningResultTimer"), source.indexOf("const pendingAttachmentsByConversation"));
+  assert.match(result, /learningResultTimer=setTimeout\(closeLearningResult,3000\)/);
+  assert.match(result, /clearTimeout\(learningResultTimer\)/);
+  assert.match(source, /showLearnResult[\s\S]{0,300}setTimeout\(\(\)=>\{b\.style\.display="none";\},3000\)/);
+  assert.match(source, /function showLearnToast[\s\S]{0,500}setTimeout\(\(\)=>\{b\.style\.display="none";\},3000\)/);
 });
 
 test("学習結果を新規・更新・重複・矛盾で色分けし、矛盾は会話形式で確認する", () => {
