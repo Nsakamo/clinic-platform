@@ -153,6 +153,14 @@ test("スマホで患者返信と右腕くん相談を色と送信先表示で�
   assert.match(source, /#dHead\{[\s\S]{0,300}background:#6d28d9/);
 });
 
+test("右腕くん本体のボタン・相談中表示・編集画面を💪へ統一する", () => {
+  assert.match(source, /💪 右腕くん<\/button>/);
+  assert.match(source, /💪 右腕くんに相談中/);
+  assert.match(source, /💪 右腕くん（ルールブック編集）/);
+  assert.doesNotMatch(source, /🤝 (?:みぎうで君|右腕くん)/);
+  assert.doesNotMatch(source, /みぎうで君/);
+});
+
 test("スマホのEnterは改行に使い、送信は明示ボタンだけで行う", () => {
   assert.doesNotMatch(source, /textarea id="dText"[^>]*onkeydown/);
   assert.doesNotMatch(source, /textarea id="asstText"[^>]*onkeydown/);
@@ -207,6 +215,10 @@ test("重要な更新APIはサーバー側でも同時実行を拒否する", ()
   assert.match(source, /rich-menu\/publish", guard, oneMutationAtATime\("rich-menu"\)/);
   assert.match(source, /staff-line\/test", guard, oneMutationAtATime\("staff-line"\)/);
   assert.match(source, /customer-appt-cancel", guard, oneMutationAtATime\("appointment-cancel"/);
+  assert.match(source, /req\.body\.confirmed !== true/);
+  assert.match(source, /channel: c\.channel === "mail" \? "mail" : "line", userId: c\.userId/);
+  assert.match(source, /実行後は元に戻せません/);
+  assert.match(source, /appointmentId:apptId,reason:reason,confirmed:true/);
   assert.match(source, /api\/share", guard, oneMutationAtATime\("clinic-share"/);
 });
 

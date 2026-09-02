@@ -3569,7 +3569,12 @@ app.post("/api/customer-karte", guard, oneMutationAtATime("customer-karte", req 
 app.post("/api/customer-appt-cancel", guard, oneMutationAtATime("appointment-cancel", req => req.body.appointmentId), async (req, res) => {
   const t = req.tenant; const c = t.store[req.body.id];
   if (!c) return res.json({ ok: false, error: "no" });
-  const r = await partnerPost("/appointment-cancel", { slug: t.slug, appointmentId: req.body.appointmentId, reason: req.body.reason });
+  if (req.body.confirmed !== true) return res.status(400).json({ ok: false, error: "confirmation_required" });
+  const r = await partnerPost("/appointment-cancel", {
+    slug: t.slug, appointmentId: req.body.appointmentId, reason: req.body.reason,
+    channel: c.channel === "mail" ? "mail" : "line", userId: c.userId,
+    phone: c.ba && c.ba.phone ? c.ba.phone : undefined, confirmed: true,
+  });
   if (!r.json) return res.json({ ok: false });
   res.json(r.json);
 });
@@ -4525,7 +4530,7 @@ app.get("/api/rules-for-ai", (req, res) => {
   res.json({ count: list.length, total: rulesList(t).length, text, history });
 });
 
-// みぎうで君: rulebook-editing chat. Server only allows rule add/update/delete — nothing else.
+// 右腕くん: rulebook-editing chat. Server only allows rule add/update/delete — nothing else.
 app.post("/api/assistant", guard, async (req, res) => {
   const t = req.tenant;
   if (!process.env.GEMINI_KEY && !ANTHROPIC_KEY && !process.env.OPENAI_KEY) return res.json({ ok: false, error: "no_ai_key" });
@@ -4550,7 +4555,7 @@ app.post("/api/assistant", guard, async (req, res) => {
   const rel = rulesRanked(t, searchKey.slice(0, 2000)); // 全ルール・関連度順（途中で切らない）
   const list = rel.map(r => "[" + r.id + "] " + r.title + ": " + String(r.content||"")).join("\n").slice(0, GEMINI_MAX_CHARS) || "（まだルールはありません）";
   const totalRules = rulesList(t).length;
-  const sys = "あなたは「みぎうで君」。クリニック問い合わせ返信システムの『返信ルールブック』編集専用アシスタントです。"
+  const sys = "あなたは「右腕くん」。クリニック問い合わせ返信システムの『返信ルールブック』編集専用アシスタントです。"
     + "できることはルールの追加・修正・削除の提案と、現在のルール内容の説明だけです。守ること:"
     + "(1) お客様対応・返信の内容・言い回し・今回の返信・接客方針に関する話は、言い方がどんなにラフでも曖昧でも全てルールブック編集の相談として扱い、意図を汲み取って具体的なルール案に翻訳する。完全に無関係な依頼（天気、雑談、コードやシステムの変更など）だけ『ルールブックの編集のみお手伝いできます』と短く返す。"
     + "(2) ユーザーが『今どうなってる？』『現在の料金ルールは？』のように現状を聞いたら、関連するルールの内容（最大5件）をreplyの中にそのまま見せて構わない。ルールブック全体の一括出力だけは禁止。"
@@ -4572,7 +4577,7 @@ app.post("/api/assistant", guard, async (req, res) => {
   } catch (e) { res.json({ ok: false, error: String(e.message || e).slice(0, 80) }); }
 });
 
-// みぎうで君の提案カード→反映ボタンで確定
+// 右腕くんの提案カード→反映ボタンで確定
 app.post("/api/rules-apply", guard, async (req, res) => {
   const t = req.tenant;
   const items = Array.isArray(req.body.items) ? req.body.items.slice(0, 60) : [];
@@ -4597,7 +4602,7 @@ app.post("/api/rules-apply", guard, async (req, res) => {
   res.json({ ok: true, applied, ruleCount: rulesList(t).length });
 });
 
-// みぎうで君への資料アップロード（画像・PDF・CSV/テキスト）→ ルール案に一括変換
+// 右腕くんへの資料アップロード（画像・PDF・CSV/テキスト）→ ルール案に一括変換
 app.post("/api/assistant-file", guard, async (req, res) => {
   const t = req.tenant;
   if (!process.env.GEMINI_KEY && !ANTHROPIC_KEY) return res.json({ ok: false, error: "no_ai_key" });
@@ -4628,7 +4633,7 @@ app.post("/api/assistant-file", guard, async (req, res) => {
   content.push({ type: "text", text: instr });
   geminiParts.push({ text: instr });
   const existing = rulesList(t).map(r => "[" + r.id + "] " + r.title).join("\n").slice(0, 100000);
-  const fsys = "あなたは「みぎうで君」。クリニック返信ルールブックの編集アシスタントです。渡された資料（価格表・案内文・FAQ・CSVなど）を読み取り、回答AIがそのまま使える簡潔で具体的な日本語ルールに変換します。"
+  const fsys = "あなたは「右腕くん」。クリニック返信ルールブックの編集アシスタントです。渡された資料（価格表・案内文・FAQ・CSVなど）を読み取り、回答AIがそのまま使える簡潔で具体的な日本語ルールに変換します。"
     + "料金表はカテゴリごとに数件のルールにまとめる。数字・金額・条件は資料から正確に転記し、読み取れない部分は省いて勝手に補完しない。"
     + "\n既存ルールの見出し一覧（同じテーマの資料なら新規追加ではなくその番号へのupdateにする）:\n" + (existing || "（まだルールはありません）")
     + "\n出力は必ず次のJSONのみ: {\"reply\":\"資料から読み取った内容の短い要約説明（ユーザー向け）\",\"items\":[{\"op\":\"add\",\"title\":\"見出し\",\"content\":\"ルール本文\"} または {\"op\":\"update\",\"id\":番号,\"title\":\"...\",\"content\":\"...\"}]}";
@@ -5567,7 +5572,7 @@ const PAGE = `<!DOCTYPE html>
     <div id="listHead"><span>📥 受信トレイ</span><span id="listHeadMeta"><button type="button" id="learningPendingBadge" onclick="openLearningPending()"></button><span class="badge" id="cnt"></span></span></div>
     <div id="statsBar" style="display:none;padding:6px 12px;font-size:11px;color:#6b7280;background:#f8fafc;border-bottom:1px solid var(--line);line-height:1.7;"></div>
     <div id="tools">
-      <button class="tbtn migi" onclick="openAsst(null)">🤝 みぎうで君</button>
+      <button class="tbtn migi" onclick="openAsst(null)">💪 右腕くん</button>
       <button class="tbtn" onclick="window.open('/board','_blank')">🏥 現場ボード</button>
       <button class="tbtn" id="bellBtn" onclick="busyEnablePush()">🔔 通知</button>
       <button class="tbtn" onclick="openSet()">⚙ 設定<span id="newModelDot" style="display:none;margin-left:3px;">🆕</span></button>
@@ -5580,7 +5585,7 @@ const PAGE = `<!DOCTYPE html>
 <div id="menu"></div>
 <div id="learningProgress" role="status" aria-live="polite" aria-busy="true"><div class="learningProgressCard"><div class="learningProgressSpinner" aria-hidden="true"></div><div class="learningProgressTitle">回答と学習内容を検証中</div><div class="learningProgressNote">会話全体から「どんな状況で、何を確認し、どう回答するか」を整理しています。<br>完了するまでこの画面でお待ちください。</div></div></div>
 <div id="dpanel"><div id="dCard">
-  <div id="dHead"><div><div class="dModeTitle">🤝 右腕くんに相談中</div><div class="dModeNote">ここでの入力は患者には送信されません</div></div><button class="cbtn" onclick="closeDraftChat()">患者画面に戻る</button></div>
+  <div id="dHead"><div><div class="dModeTitle">💪 右腕くんに相談中</div><div class="dModeNote">ここでの入力は患者には送信されません</div></div><button class="cbtn" onclick="closeDraftChat()">患者画面に戻る</button></div>
   <div id="dMsgs"></div>
   <div id="dChips">
     <button class="cbtn" onclick="dChip('もっと簡潔に短くして')">簡潔に</button>
@@ -5811,7 +5816,7 @@ const PAGE = `<!DOCTYPE html>
   <div class="learningFooter"><span id="learnStatus" style="font-size:11px;color:#6b7280;"></span><button type="button" id="learnAddBtn" class="cbtn send" onclick="addLearningItem()">＋追加</button></div>
 </div></div>
 <div id="asst"><div id="asstCard">
-  <div id="asstHead"><span>🤝 みぎうで君（ルールブック編集）</span><button class="cbtn" onclick="closeAsst()">閉じる</button></div>
+  <div id="asstHead"><span>💪 右腕くん（ルールブック編集）</span><button class="cbtn" onclick="closeAsst()">閉じる</button></div>
   <div id="asstMsgs"></div>
   <div id="asstIn"><button id="asstAttachBtn" class="cbtn" onclick="asstAttach()" title="価格表などの資料（画像・PDF・CSV）を読み込ませて一括学習">📎</button><textarea id="asstText" placeholder="例：発送質問には3営業日以内と答えて／今の料金ルールは？"></textarea><div class="enterHint">Enter＝改行　送信は下のボタン</div><button id="asstSendBtn" class="cbtn send" onclick="busyAsstSend()">送信</button></div>
 </div></div>
@@ -6312,8 +6317,9 @@ async function doApptCancel(apptId,btn){
   if(!current||!apptId)return;
   var reason=await uiPrompt("この予約をキャンセルします。理由（任意・患者に送る自動連絡に使われる場合があります）:","クリニック都合");
   if(reason===null)return;
+  if(!await uiConfirm("この予約をキャンセルしますか？\\n実行後は元に戻せません。対象患者と予約日時をもう一度確認してください。"))return;
   await withBusy("appt-cancel-"+apptId,btn,"取消中…",async()=>{try{
-    var r=await api("/api/customer-appt-cancel",{id:current,appointmentId:apptId,reason:reason});
+    var r=await api("/api/customer-appt-cancel",{id:current,appointmentId:apptId,reason:reason,confirmed:true});
     var j=await r.json();
     if(j&&j.ok){ loadCustomer(current); }
     else { uiAlert(j&&j.error==="not_cancellable"?"この予約はキャンセルできません(期限切れ/過去/処理済み)":"キャンセルに失敗しました"); }
@@ -6654,7 +6660,7 @@ async function dSend(){if(window.__dBusy||window.__voiceBusy)return;const x=docu
       }else{aiEl.textContent="エラー: "+(j.error||"不明");logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";}
     }catch(e2){aiEl.textContent="通信エラーが発生しました";logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";}
   }finally{window.__dBusy=false;if(btn&&btn.isConnected){btn.disabled=false;btn.removeAttribute("aria-busy");btn.innerHTML=old;}}}
-// ---- みぎうで君 (rulebook editing chat) ----
+// ---- 右腕くん (rulebook editing chat) ----
 let asstHist=[],asstCtx=null;
 const asstEl=document.getElementById("asst"),asstMsgsEl=document.getElementById("asstMsgs");
 function spinAdd(el,label){const d=document.createElement("div");d.className="am ai";const sp=document.createElement("span");sp.className="spin";d.appendChild(sp);d.appendChild(document.createTextNode(label));el.appendChild(d);el.scrollTop=el.scrollHeight;return d;}
