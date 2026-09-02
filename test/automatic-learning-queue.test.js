@@ -67,15 +67,16 @@ test("患者の質問または送信本文がない場合は学習データを�
 
 test("設定保存が一時失敗してもメモリ上の学習ジョブ処理を開始する", async () => {
   const tenant = { config: { learningJobs: [] } };
+  let processed = 0;
   const { context, scheduled } = createContext({
     saveTenantConfig: async () => { throw new Error("temporary_db_error"); },
+    processLearningJob: async () => { processed += 1; },
+    console: { error() {} },
   });
 
-  await assert.rejects(
-    context.queueStaffLearning(tenant, { id: "conversation-3" }, { q: "質問", final: "回答" }),
-    /temporary_db_error/,
-  );
+  const result = await context.queueStaffLearning(tenant, { id: "conversation-3" }, { q: "質問", final: "回答" });
 
-  assert.equal(tenant.config.learningJobs[0].status, "processing");
-  assert.equal(scheduled.length, 1);
+  assert.equal(result.learnedId, 41);
+  assert.equal(processed, 1);
+  assert.equal(scheduled.length, 0);
 });

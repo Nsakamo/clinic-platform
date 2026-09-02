@@ -8,7 +8,7 @@ const path = require("node:path");
 const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
 
 test("Web画面とスタッフLINEは送信成功後だけ確認済み対応例へ保存する", () => {
-  assert.match(source, /learnStaffOutcome\(t, found\.c,[\s\S]{0,300}source: "staff_line"/);
+  assert.match(source, /queueStaffLearning\(t, found\.c,[\s\S]{0,300}source: "staff_line"/);
   assert.match(source, /queueStaffLearning\(t, c,[\s\S]{0,300}source: "web"/);
   assert.match(source, /async function learnStaffOutcome[\s\S]{0,900}await exampleAdd\(t,/);
   assert.match(source, /async function queueStaffLearning[\s\S]{0,900}await exampleAdd\(t,/);
@@ -82,11 +82,11 @@ test("矛盾した回答を永続的な学習確認待ちへ保存して解決�
   assert.match(source, /data-tab="conflicts"/);
   assert.match(source, /pendingIds\.has\(Number\(example\.id\)\)/);
   assert.match(source, /filter\(example => Number\(example\.id\) !== Number\(excludeId\)/);
-  assert.match(source, /outcomeP\.then\(conflict => conflict \? \[\] : distillRules/);
+  assert.doesNotMatch(source.slice(source.indexOf("async function learnStaffOutcome"), source.indexOf("function learningJobs")), /distillRules\(/);
   assert.match(source, /if \(chosen && item\.kind !== "rule"\) await distillRules/);
   assert.match(source, /checkFormalRuleConflict/);
-  assert.match(source, /判定不能を「矛盾なし」と扱わない/);
-  assert.match(source, /正式ルールとの比較に失敗した時は自動更新を止め/);
+  assert.match(source, /判定不能を「矛盾なし」にも偽の矛盾にもせず/);
+  assert.match(source, /外部AI障害を偽の矛盾として大量登録せず/);
 });
 
 test("スタッフの修正過程を構造化した判断メモリとして保存して再利用する", () => {

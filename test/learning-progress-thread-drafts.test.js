@@ -23,8 +23,8 @@ test("送信済み回答だけを先に保存し、安全確認中と矛盾中�
   assert.match(queue, /status: "processing"/);
   assert.match(queue, /setImmediate\(\(\) => processLearningJob\(t, job\.id\)\)/);
   assert.match(source, /安全確認が終わるまでは新規候補を患者回答へ使わない/);
-  assert.match(source, /if \(job\.exampleId && !job\.reused\)/);
-  assert.match(source, /await exampleDelete\(t, Number\(job\.exampleId\)\)/);
+  assert.match(source, /exampleLearningMetaUpdate\(t, Number\(job\.exampleId\), \{ scope: "one_off" \}\)/);
+  assert.doesNotMatch(source.slice(source.indexOf("async function processLearningJob"), source.indexOf("async function queueStaffLearning")), /exampleDelete\(/);
 });
 
 test("学習結果の通知は操作を塞がず3秒で自動的に閉じる", () => {

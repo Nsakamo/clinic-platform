@@ -115,6 +115,25 @@ test("AI提案に患者名・日時・連絡先が残った場合は再利用し
   assert.equal(context.learningMetaContainsPatientSpecificData({ intent: "連絡", decision: "090-1234-5678へ連絡する" }, input), true);
 });
 
+test("再利用候補は独立した個人情報監査が明示承認した場合だけ通す", async () => {
+  const context = {
+    sanitizeLearningMeta: value => value,
+    aiChat: async () => '{"safe":true,"reason":"一般的な手順のみ"}',
+    console: { error() {} },
+  };
+  vm.runInNewContext(between("async function auditReusableLearningPrivacy", "async function proposeContextualLearning"), context);
+
+  assert.equal(await context.auditReusableLearningPrivacy({}, { q: "予約変更" }, { intent: "予約変更" }), true);
+  context.aiChat = async () => { throw new Error("audit_unavailable"); };
+  assert.equal(await context.auditReusableLearningPrivacy({}, { q: "予約変更" }, { intent: "予約変更" }), false);
+});
+
+test("自動学習エラーでも送信済み対応例を削除しない", () => {
+  const process = between("async function processLearningJob", "async function queueStaffLearning");
+  assert.match(process, /exampleLearningMetaUpdate\(t, Number\(job\.exampleId\), \{ scope: "one_off" \}\)/);
+  assert.doesNotMatch(process, /exampleDelete\(/);
+});
+
 test("学習確認履歴の整理で未解決項目を先に削除しない", () => {
   const add = between("async function learningConflictAdd", "function publicLearningConflict");
   assert.match(add, /findIndex\(conflict => conflict && conflict\.status !== "pending"\)/);

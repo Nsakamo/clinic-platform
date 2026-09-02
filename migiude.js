@@ -952,9 +952,9 @@ async function checkConflict(t, q, newFinal, excludeId) {
     if (typeof o.conflict !== "boolean") throw new Error("invalid_conflict_result");
     if (o && o.conflict === true) return { oldId: old.id, oldQ: old.originalQ || old.q, oldFinal: old.final };
   } catch (e) {
-    // 自動学習では判定不能を「矛盾なし」と扱わない。既存例を上書きせずスタッフ確認へ送る。
+    // 判定不能を「矛盾なし」にも偽の矛盾にもせず、自動学習全体を再利用不可で終了する。
     console.error("example conflict check:", e && e.message);
-    return { oldId: old.id, oldQ: old.originalQ || old.q, oldFinal: old.final };
+    throw new Error("learning_conflict_verification_unavailable");
   }
   return null;
 }
@@ -1105,6 +1105,25 @@ function learningMetaContainsPatientSpecificData(meta, input) {
   const names = Array.from(raw.matchAll(/([一-龯々ぁ-んァ-ヶーA-Za-z]{2,20})(?:様|さん)/g), match => match[1]);
   return names.some(name => name.length >= 2 && output.includes(name));
 }
+async function auditReusableLearningPrivacy(t, input, meta) {
+  const system = "あなたは医療機関の個人情報監査者です。学習候補が別患者の回答へ再利用可能かを厳格に判定してください。氏名、連絡先、住所、会員・保険・予約等の識別番号、具体的な予約日時、患者固有の症状・事情、今回限りの特例が候補に残る場合はsafe=falseです。一般的な画面名、業務手順、確認項目だけならsafe=trueです。迷う場合や判断材料不足はsafe=false。JSONのみ: {\"safe\":true|false,\"reason\":\"短い理由\"}";
+  const payload = {
+    source: {
+      inquiry: String(input && input.q || "").slice(0, 1200),
+      finalReply: String(input && input.final || "").slice(0, 1800),
+      staffInstruction: String(input && input.instr || "").slice(0, 800),
+    },
+    candidate: sanitizeLearningMeta(meta),
+  };
+  try {
+    const raw = await aiChat(t, system, [{ role: "user", content: JSON.stringify(payload) }], 240, "critical");
+    const match = String(raw || "").match(/\{[\s\S]*\}/), parsed = match ? JSON.parse(match[0]) : null;
+    return !!(parsed && parsed.safe === true);
+  } catch (e) {
+    console.error("learning privacy audit:", String(e && e.message || e).slice(0, 80));
+    return false;
+  }
+}
 async function proposeContextualLearning(t, input) {
   const fallback = contextualLearningFallback(input);
   const system = "あなたはクリニック受付AIの学習設計者です。スタッフの短い修正語だけを覚えず、患者の問い合わせ、元の下書き、修正チャット、実際に送った最終返信の流れを読み、次回再利用できる判断手順へ一般化してください。予約確認では、確認できていない予約を『問題ない』と断定するルールにしてはいけません。患者固有の氏名・会員ID・電話番号・予約日時は一般ルールへ入れず、必要なら『提示された本人確認情報』『予約日時』のように一般化します。今回限りの特例はscope=one_offとし、他患者へ再利用しません。確信がなければone_offにしてください。必ずJSONのみで {\"scope\":\"reusable|one_off\",\"intent\":\"問い合わせの種類\",\"situation\":\"どんな状況で使うか\",\"checks\":\"回答前に何を確認するか\",\"response\":\"確認結果ごとにどう回答するか\",\"exclusions\":\"他患者へ引き継がない情報\",\"searchTerms\":[\"同じ意図の言い換え\"]} を返してください。";
@@ -1132,7 +1151,11 @@ async function proposeContextualLearning(t, input) {
       updated: Date.now(),
     });
     if (!meta.intent || !meta.decision || !meta.conditions) throw new Error("invalid_learning_meta");
-    if (meta.scope === "reusable" && learningMetaContainsPatientSpecificData(meta, input)) meta.scope = "one_off";
+    if (meta.scope === "reusable") {
+      const containsSpecificData = learningMetaContainsPatientSpecificData(meta, input);
+      const privacyApproved = !containsSpecificData && await auditReusableLearningPrivacy(t, input, meta);
+      if (!privacyApproved) meta.scope = "one_off";
+    }
     return { text, meta };
   } catch (e) {
     console.error("learning proposal:", String(e && e.message || e).slice(0, 80));
@@ -1175,19 +1198,13 @@ async function learnStaffOutcome(t, c, opts) {
     try { await recordLearningPerformance(t, q, changed, !!conflict); } catch (e) { console.error("learning performance:", e && e.message); }
     return conflict;
   });
-  // 矛盾があるのに新回答を先に正式ルールへ蒸留しない。人が正解を選ぶまで両案を保留する。
-  // Web画面では適用範囲をスタッフが確認してから恒久ルールへ反映する。
-  // スタッフLINEは確認画面を出せないため、従来どおり安全条件を満たす内容だけ自動蒸留する。
-  const distillP = changed && !learningReview ? outcomeP.then(conflict => conflict ? [] : distillRules(t, c, { q, final: finalText, draft0, instr, learningChat, exampleId: ex.id })) : Promise.resolve([]);
-
   if (opts.waitForAi === false) {
-    distillP.catch((e) => console.error("learnStaffOutcome distill:", e && e.message));
     outcomeP.catch((e) => console.error("learnStaffOutcome conflict:", e && e.message));
     return { learnedId: ex.id, conflict: null, learnedRules: [], reused: !!ex.reused, learningReview };
   }
 
   const completed = await Promise.race([
-    Promise.all([distillP, outcomeP, proposalP]).then(([learnedRules, conflict, proposal]) => ({ learnedRules, conflict, proposal })),
+    Promise.all([outcomeP, proposalP]).then(([conflict, proposal]) => ({ learnedRules: [], conflict, proposal })),
     new Promise((resolve) => setTimeout(() => resolve({ learnedRules: [], conflict: null, proposal: learningReview && learningReview.text || "" }), 8000)),
   ]).catch(() => ({ learnedRules: [], conflict: null }));
   const contextualReview = learningReview ? Object.assign({}, learningReview, { text: completed.proposal || learningReview.text }) : null;
@@ -1246,13 +1263,9 @@ async function checkFormalRuleConflict(t, q, proposal, newId, source) {
       newId, newFinal: proposal, source,
     });
   } catch (e) {
-    // 正式ルールとの比較に失敗した時は自動更新を止め、最も関連する現行ルールとの確認待ちにする。
+    // 外部AI障害を偽の矛盾として大量登録せず、自動学習全体を再利用不可で終了する。
     console.error("formal rule conflict:", e && e.message);
-    const rule = related[0];
-    return learningConflictAdd(t, {
-      kind: "rule", q, oldId: rule.id, oldRuleId: rule.id, oldFinal: rule.title + "\n" + rule.content,
-      newId, newFinal: proposal, source: String(source || "web") + "-verify",
-    });
+    throw new Error("formal_rule_verification_unavailable");
   }
   return null;
 }
@@ -1305,16 +1318,19 @@ async function processLearningJob(t, jobId) {
     }
     job.payload = null; job.updatedAt = Date.now();
   } catch (e) {
-    if (job.exampleId && !job.reused) {
-      try { await exampleDelete(t, Number(job.exampleId)); }
-      catch (cleanupError) { console.error("learning example cleanup:", cleanupError && cleanupError.message); }
-    }
+    // 一時的なAI・DB障害でも送信済み対応例を削除しない。再利用不可のまま監査用に保持する。
+    if (job.exampleId) try { await exampleLearningMetaUpdate(t, Number(job.exampleId), { scope: "one_off" }); }
+    catch (preserveError) { console.error("learning example preserve:", preserveError && preserveError.message); }
     job.status = "completed"; job.resultType = "error"; job.error = String(e && e.message || e).slice(0, 120);
-    job.outcome = { type: "error", title: "学習内容を確認できませんでした", message: "学習データ管理からもう一度確認してください" };
+    job.outcome = { type: "error", title: "自動学習を完了できませんでした", message: "今回限りの対応として安全に保存し、他の患者への回答には利用しません" };
     job.payload = null; job.updatedAt = Date.now();
   } finally {
     runningLearningJobs.delete(key);
-    while (t.config.learningJobs.length > 80) t.config.learningJobs.shift();
+    while (t.config.learningJobs.length > 80) {
+      const removable = t.config.learningJobs.findIndex(item => item && ["done", "completed"].includes(item.status));
+      if (removable < 0) break;
+      t.config.learningJobs.splice(removable, 1);
+    }
     await saveTenantConfig(t).catch(e => console.error("learning job save:", e && e.message));
   }
 }
@@ -1332,10 +1348,20 @@ async function queueStaffLearning(t, c, opts) {
     exampleId: ex.id, reused: !!ex.reused, status: "processing", resultType: "", createdAt: now, updatedAt: now, learningReview: review, conflict: null, outcome: null,
     payload: { q, final, draft0, instr, learningChat, reviewText: opts.reviewText, source: opts.source || "web", changed: final !== draft0 || !!instr },
   };
-  learningJobs(t).push(job); while (t.config.learningJobs.length > 80) t.config.learningJobs.shift();
-  // 設定保存が一時失敗しても、メモリ上のジョブは必ず処理を開始し、完了時保存で再永続化を試みる。
-  try { await saveTenantConfig(t); }
-  finally { setImmediate(() => processLearningJob(t, job.id)); }
+  learningJobs(t).push(job);
+  while (t.config.learningJobs.length > 80) {
+    const removable = t.config.learningJobs.findIndex(item => item && ["done", "completed"].includes(item.status));
+    if (removable < 0) break;
+    t.config.learningJobs.splice(removable, 1);
+  }
+  try {
+    await saveTenantConfig(t);
+    setImmediate(() => processLearningJob(t, job.id));
+  } catch (e) {
+    // ジョブを永続化できない時は、再起動で失う前にこの要求内で安全判定まで完了させる。
+    console.error("learning job initial save:", e && e.message);
+    await processLearningJob(t, job.id);
+  }
   return { learnedId: ex.id, job: publicLearningJob(job) };
 }
 // 2つのテキストがほぼ同内容か（bigram重なり率）。ルールの二重登録ガード用。
@@ -2638,8 +2664,10 @@ app.post("/webhook/staff-line", async (req, res) => {
         await finishLearningUsageTrace(t, found.c, outgoing, "staff_line");
         found.c.msgs.push({ from: "us", text: outgoing, auto: false, approvedVia: "staff_line", approvedBy: userId, approvedByName: staff.name, learningRefs: found.c.learningRefs || [], time: nowt() });
         found.c.draft = ""; found.c.draft0 = ""; found.c.learningRefs = []; found.c.status = "done"; found.c.flag = false; found.c.lastAuto = false; found.c.time = nowt(); found.c.ts = Date.now(); found.c.last = lastText(found.c); found.approval.status = "sent"; dbSave(t, found.c); statBump(t, "staff");
-        const learned = await learnStaffOutcome(t, found.c, { q: question, final: outgoing, draft0: initialDraft, instr: editInstruction, source: "staff_line", waitForAi: false });
-        await staffLineReply(t, ev.replyToken, [staffLineText("✅ " + staff.name + "さんの承認内容を患者様へ送信しました。" + (learned.learnedId ? "\n🧠 この対応を次回以降の類似問い合わせに反映します。" : ""))]);
+        let learned = null;
+        try { learned = await queueStaffLearning(t, found.c, { q: question, final: outgoing, draft0: initialDraft, instr: editInstruction, source: "staff_line" }); }
+        catch (learningError) { console.error("staff line learning queue:", learningError && learningError.message); }
+        await staffLineReply(t, ev.replyToken, [staffLineText("✅ " + staff.name + "さんの承認内容を患者様へ送信しました。" + (learned && learned.learnedId ? "\n🧠 この対応を次回以降の類似問い合わせに反映します。" : ""))]);
       } catch (e) {
         // 通信例外などでも承認を再試行可能な状態へ戻す。sending のまま残すと以後の操作が全て拒否される。
         found.approval.status = "pending"; dbSave(t, found.c);
