@@ -153,6 +153,14 @@ test("スマホで患者返信と右腕くん相談を色と送信先表示で�
   assert.match(source, /#dHead\{[\s\S]{0,300}background:#6d28d9/);
 });
 
+test("右腕くん本体のボタン・相談中表示・編集画面を💪へ統一する", () => {
+  assert.match(source, /💪 右腕くん<\/button>/);
+  assert.match(source, /💪 右腕くんに相談中/);
+  assert.match(source, /💪 右腕くん（ルールブック編集）/);
+  assert.doesNotMatch(source, /🤝 (?:みぎうで君|右腕くん)/);
+  assert.doesNotMatch(source, /みぎうで君/);
+});
+
 test("スマホのEnterは改行に使い、送信は明示ボタンだけで行う", () => {
   assert.doesNotMatch(source, /textarea id="dText"[^>]*onkeydown/);
   assert.doesNotMatch(source, /textarea id="asstText"[^>]*onkeydown/);
