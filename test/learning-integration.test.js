@@ -95,7 +95,7 @@ test("スタッフの修正過程を構造化した判断メモリとして保�
   assert.match(source, /判断手順memory/);
   assert.match(source, /exampleLearningMetaUpdate\(t, opts\.exampleId, memory\)/);
   assert.match(source, /learningMetaSearchText\(example\)/);
-  assert.match(source, /学習した判断:/);
+  assert.match(source, /判断手順:/);
 });
 
 test("Web送信後は送信済み回答を自動学習し、AIが安全確認と用途別整理を行う", () => {

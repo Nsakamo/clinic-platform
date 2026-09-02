@@ -750,7 +750,14 @@ function sanitizeLearningChat(value) {
 }
 function learningMetaSearchText(example) {
   const m = sanitizeLearningMeta(example && example.learningMeta);
-  return [example && example.q, m.intent, m.decision, m.conditions, m.searchTerms.join(" ")].filter(Boolean).join(" ").slice(0, 1800);
+  return [m.intent, m.decision, m.conditions, m.searchTerms.join(" ")].filter(Boolean).join(" ").slice(0, 1800);
+}
+function reusableLearningSummary(example) {
+  const m = sanitizeLearningMeta(example && example.learningMeta);
+  if (m.scope !== "reusable" || !m.intent || !m.decision) return "";
+  return "問い合わせ種類: " + m.intent + " / 判断手順: " + m.decision
+    + (m.conditions ? " / 適用条件: " + m.conditions : "")
+    + (m.avoid ? " / 引き継がない情報: " + m.avoid : "");
 }
 async function exampleLearningMetaUpdate(t, id, value) {
   const ex = t.examples && t.examples[Number(id)]; if (!ex) return null;
@@ -913,8 +920,10 @@ function examplesRanked(t, query, k, context) {
   const pendingIds = new Set(learningConflicts(t, true).flatMap(item => item.kind === "rule" ? [Number(item.newId)] : [Number(item.oldId), Number(item.newId)]));
   // 「学習する」選択後も、安全確認が終わるまでは新規候補を患者回答へ使わない。
   learningJobs(t).filter(job => job.status === "processing" && !job.reused && Number(job.exampleId)).forEach(job => pendingIds.add(Number(job.exampleId)));
-  // 構造化した問い合わせ意図・判断・検索語も検索対象にし、表現が違う質問から同じ対応を取り出す。
-  const list = Object.values(t.examples || {}).filter(example => !pendingIds.has(Number(example.id))).map(example => Object.assign({}, example, { originalQ: example.q, q: learningMetaSearchText(example) }));
+  // 別患者の生の質問・返信は再利用しない。安全確認済みの一般化メモリだけを検索・下書き根拠に使う。
+  const list = Object.values(t.examples || {})
+    .filter(example => !pendingIds.has(Number(example.id)) && reusableLearningSummary(example))
+    .map(example => Object.assign({}, example, { q: learningMetaSearchText(example) }));
   if (!list.length) return [];
   return rankLearningExamples(list, { latest: query, context: context || query }, k || 4);
 }
@@ -1184,6 +1193,12 @@ function finishLearningJobFor(t, id, exampleId, conflictId) {
   if (job) { job.status = "done"; job.updatedAt = Date.now(); }
   return job;
 }
+function resumeLearningJobs(t) {
+  learningJobs(t).filter(job => job.status === "processing").forEach(job => setImmediate(() => processLearningJob(t, job.id)));
+}
+function processAllLearningJobs() {
+  Object.values(TEN).forEach(resumeLearningJobs);
+}
 async function checkFormalRuleConflict(t, q, proposal, newId, source) {
   const related = rulesSearch(t, q + " " + proposal, 6);
   if (!related.length) return null;
@@ -1285,8 +1300,9 @@ async function queueStaffLearning(t, c, opts) {
     payload: { q, final, draft0, instr, learningChat, reviewText: opts.reviewText, source: opts.source || "web", changed: final !== draft0 || !!instr },
   };
   learningJobs(t).push(job); while (t.config.learningJobs.length > 80) t.config.learningJobs.shift();
-  await saveTenantConfig(t);
-  setImmediate(() => processLearningJob(t, job.id));
+  // 設定保存が一時失敗しても、メモリ上のジョブは必ず処理を開始し、完了時保存で再永続化を試みる。
+  try { await saveTenantConfig(t); }
+  finally { setImmediate(() => processLearningJob(t, job.id)); }
   return { learnedId: ex.id, job: publicLearningJob(job) };
 }
 // 2つのテキストがほぼ同内容か（bigram重なり率）。ルールの二重登録ガード用。
@@ -2004,11 +2020,7 @@ async function genDraft(t, c, opts) {
     const confirmed = Math.max(1, Number(e.confirmedCount || 1));
     const date = Number(e.ts || 0) ? new Date(Number(e.ts)).toLocaleDateString("ja-JP") : "日時不明";
     const role = trustedLearningPrecedent(e) ? "再利用できる確定例" : "参考例";
-    const meta = sanitizeLearningMeta(e.learningMeta);
-    const learnedDecision = meta.scope === "reusable" && meta.decision
-      ? "（学習した判断: " + meta.decision + (meta.conditions ? " / 条件: " + meta.conditions : "") + (meta.avoid ? " / 避ける: " + meta.avoid : "") + "）"
-      : "";
-    return "・[対応例#" + e.id + " / " + role + " / " + date + " / 類似" + score + "% / スタッフ確認" + confirmed + "回] お客様「" + String(e.originalQ || e.q).slice(0, 220) + "」→ スタッフの最終返信「" + String(e.final).slice(0, 500) + "」" + (e.instr ? "（修正方針: " + String(e.instr).slice(0, 180) + "）" : "") + learnedDecision;
+    return "・[対応例#" + e.id + " / " + role + " / " + date + " / 類似" + score + "% / スタッフ確認" + confirmed + "回] " + reusableLearningSummary(e);
   }).join("\n") : "";
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = channel === "mail" ? "メールなので返信本文の最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
@@ -2096,7 +2108,7 @@ async function genDraft(t, c, opts) {
         && (confidence === "high" || confidence === "medium");
       if (validationCandidate) {
         const relevantRulesTxt = evidenceRuleMatches.slice(0, 8).map(r => "・" + r.title + ": " + r.content.slice(0, 1200)).join("\n");
-        const precedentsTxt = trustedPrecedents.slice(0, 4).map(e => "・[" + new Date(Number(e.ts || Date.now())).toLocaleDateString("ja-JP") + "] お客様「" + String(e.originalQ || e.q).slice(0, 220) + "」→ スタッフ確定返信「" + String(e.final).slice(0, 700) + "」").join("\n");
+        const precedentsTxt = trustedPrecedents.slice(0, 4).map(e => "・[" + new Date(Number(e.ts || Date.now())).toLocaleDateString("ja-JP") + "] " + reusableLearningSummary(e)).join("\n");
         out.validation = await validateDraftAgainstEvidence(t, {
           query: lastQ,
           draft: out.draft,
@@ -3295,7 +3307,7 @@ app.post("/api/example-update", guard, oneMutationAtATime("learning"), async (re
 app.post("/api/example-delete", guard, oneMutationAtATime("learning"), async (req, res) => { const t = req.tenant; try { await exampleDelete(t, req.body.id); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false, error: "delete" }); } });
 app.get("/api/learning-jobs", guard, (req, res) => {
   const t = req.tenant;
-  learningJobs(t).filter(job => job.status === "processing").forEach(job => setImmediate(() => processLearningJob(t, job.id)));
+  resumeLearningJobs(t);
   res.json({ ok: true, jobs: learningJobs(t).filter(job => job.status !== "done").slice(-30).map(publicLearningJob) });
 });
 function learningMutationResource(req) {
@@ -5063,6 +5075,7 @@ app.get("/board", (req, res) => { res.set("Content-Type", "text/html; charset=ut
   setInterval(() => { processLineWebhookQueue().catch(() => {}); }, 5000); setTimeout(() => { processLineWebhookQueue().catch(() => {}); }, 1000);
   setInterval(() => { if (pool) pool.query("DELETE FROM line_webhook_events WHERE (status='done' AND updated_at<$1) OR (status='dead' AND updated_at<$2)", [Date.now() - 30 * 86400000, Date.now() - 90 * 86400000]).catch(() => {}); }, 6 * 60 * 60 * 1000);
   setInterval(() => { processAllScheduledMessages().catch(() => {}); }, 15000); setTimeout(() => { processAllScheduledMessages().catch(() => {}); }, 3000);
+  setInterval(processAllLearningJobs, 15000); setTimeout(processAllLearningJobs, 1000);
   setTimeout(() => { Object.values(TEN).forEach(t => ensureLineBotId(t).catch(() => {})); }, 3000);
   const server = app.listen(PORT, () => console.log("clinic-inbox platform listening on " + PORT));
   // Railwayの前段プロキシよりNodeが先にkeep-alive接続を切ると、切断直後のPOST(LINE Webhook等)が

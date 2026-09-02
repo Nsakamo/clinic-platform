@@ -64,3 +64,18 @@ test("患者の質問または送信本文がない場合は学習データを�
   assert.equal(added, 0);
   assert.equal(scheduled.length, 0);
 });
+
+test("設定保存が一時失敗してもメモリ上の学習ジョブ処理を開始する", async () => {
+  const tenant = { config: { learningJobs: [] } };
+  const { context, scheduled } = createContext({
+    saveTenantConfig: async () => { throw new Error("temporary_db_error"); },
+  });
+
+  await assert.rejects(
+    context.queueStaffLearning(tenant, { id: "conversation-3" }, { q: "質問", final: "回答" }),
+    /temporary_db_error/,
+  );
+
+  assert.equal(tenant.config.learningJobs[0].status, "processing");
+  assert.equal(scheduled.length, 1);
+});
