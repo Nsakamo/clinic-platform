@@ -1094,9 +1094,6 @@ function learningReviewPayload(ex, opts) {
   };
 }
 
-async function proposeContextualLearningText(t, input) {
-  return (await proposeContextualLearning(t, input)).text;
-}
 function learningMetaContainsPatientSpecificData(meta, input) {
   const output = [meta && meta.intent, meta && meta.decision, meta && meta.conditions, meta && meta.avoid]
     .concat(meta && Array.isArray(meta.searchTerms) ? meta.searchTerms : []).join(" ");
@@ -1168,47 +1165,6 @@ async function proposeContextualLearning(t, input) {
 // 会話履歴自体は監査・閲覧用に残し、AIへ渡す作業中の文脈だけを区切る。
 function activeConversationMessages(c) {
   return selectConversationContext(c, { maxCurrent: 30, maxOlder: 12 }).current;
-}
-
-// Web画面・スタッフLINEのどちらから送っても、同じ経路で「人が確認した返信」を学習する。
-// 対応例の保存は先に完了させ、AIを使う一般化・矛盾判定だけを待ち時間付きで実行する。
-async function learnStaffOutcome(t, c, opts) {
-  opts = opts || {};
-  const q = String(opts.q || recentCustomerQuestion(c)).trim();
-  const finalText = String(opts.final || "").trim();
-  const draft0 = String(opts.draft0 || "").trim();
-  const instr = String(opts.instr || "").trim();
-  if (!q || !finalText) return { learnedId: null, conflict: null, learnedRules: [] };
-
-  const learningChat = sanitizeLearningChat(opts.learningChat);
-  const ex = await exampleAdd(t, { q, final: finalText, draft0, instr, learningChat, source: opts.source || "web" });
-  if (!ex) return { learnedId: null, conflict: null, learnedRules: [] };
-  const changed = finalText !== draft0 || !!instr;
-  const learningReview = opts.reviewScope === true ? learningReviewPayload(ex, {
-    q, final: finalText, draft0, instr, reviewText: opts.reviewText, conversationId: c && c.id
-  }) : null;
-  const proposalP = learningReview && opts.waitForAi !== false
-    ? proposeContextualLearningText(t, { q, final: finalText, draft0, instr, reviewText: opts.reviewText, learningChat })
-    : Promise.resolve(learningReview && learningReview.text || "");
-  const conflictP = (changed ? checkConflict(t, q, finalText, ex.id) : Promise.resolve(null)).then(conflict => {
-    if (!conflict) return null;
-    return learningConflictAdd(t, { q, oldId: conflict.oldId, oldFinal: conflict.oldFinal, newId: ex.id, newFinal: finalText, source: opts.source || "web" });
-  });
-  const outcomeP = conflictP.then(async conflict => {
-    try { await recordLearningPerformance(t, q, changed, !!conflict); } catch (e) { console.error("learning performance:", e && e.message); }
-    return conflict;
-  });
-  if (opts.waitForAi === false) {
-    outcomeP.catch((e) => console.error("learnStaffOutcome conflict:", e && e.message));
-    return { learnedId: ex.id, conflict: null, learnedRules: [], reused: !!ex.reused, learningReview };
-  }
-
-  const completed = await Promise.race([
-    Promise.all([outcomeP, proposalP]).then(([conflict, proposal]) => ({ learnedRules: [], conflict, proposal })),
-    new Promise((resolve) => setTimeout(() => resolve({ learnedRules: [], conflict: null, proposal: learningReview && learningReview.text || "" }), 8000)),
-  ]).catch(() => ({ learnedRules: [], conflict: null }));
-  const contextualReview = learningReview ? Object.assign({}, learningReview, { text: completed.proposal || learningReview.text }) : null;
-  return { learnedId: ex.id, conflict: completed.conflict, learnedRules: completed.learnedRules, reused: !!ex.reused, learningReview: contextualReview };
 }
 
 function learningJobs(t) {
@@ -1304,11 +1260,10 @@ async function processLearningJob(t, jobId) {
       job.conflict = publicLearningConflict(conflict); job.outcome = null;
     } else {
       // 自動学習は一般化済み判断メモリまで。最優先の店舗ルールは明示確認なしに追加・更新しない。
-      const existingMeta = sanitizeLearningMeta(ex.learningMeta);
-      const learningMeta = job.reused && existingMeta.scope === "reusable" && proposed.meta.scope !== "reusable" ? existingMeta : proposed.meta;
+      const learningMeta = proposed.meta;
       await exampleLearningMetaUpdate(t, ex.id, learningMeta);
       const reusable = learningMeta.scope === "reusable";
-      const type = job.reused ? "duplicate" : (reusable ? "new" : "ignored");
+      const type = !reusable ? "ignored" : (job.reused ? "duplicate" : "new");
       job.status = "completed"; job.resultType = type; job.learningReview = review; job.conflict = null;
       job.outcome = type === "duplicate"
         ? { type, title: "既存の学習へ統合しました", message: "同じ内容を増やさず、既存の対応例の確認回数を更新しました" }
@@ -3359,8 +3314,14 @@ app.post("/api/example-update", guard, oneMutationAtATime("learning"), async (re
   if (!ex) return res.status(404).json({ ok: false, error: "not_found" });
   const q = String(req.body.q || "").trim().slice(0, 600); const final = String(req.body.final || "").trim().slice(0, 1500); const instr = String(req.body.instr || "").trim().slice(0, 800);
   if (!q || !final) return res.status(400).json({ ok: false, error: "required" });
-  ex.q = q; ex.final = final; ex.instr = instr;
-  if (req.body.learningMeta && typeof req.body.learningMeta === "object") ex.learningMeta = sanitizeLearningMeta(Object.assign({}, req.body.learningMeta, { scope: "reusable", updated: Date.now() }));
+  let nextMeta = sanitizeLearningMeta(ex.learningMeta);
+  if (req.body.learningMeta && typeof req.body.learningMeta === "object") {
+    nextMeta = sanitizeLearningMeta(Object.assign({}, req.body.learningMeta, { scope: "reusable", updated: Date.now() }));
+    const safe = !learningMetaContainsPatientSpecificData(nextMeta, { q, final, draft0: ex.draft0, instr })
+      && await auditReusableLearningPrivacy(t, { q, final, draft0: ex.draft0, instr }, nextMeta);
+    if (!safe) return res.status(400).json({ ok: false, error: "privacy_review_failed" });
+  }
+  ex.q = q; ex.final = final; ex.instr = instr; ex.learningMeta = nextMeta;
   try { if (pool) await pool.query("UPDATE examples SET q=$1,final=$2,instr=$3,learning_meta=$4 WHERE tenant=$5 AND id=$6", [q, final, instr, sanitizeLearningMeta(ex.learningMeta), t.slug, id]); }
   catch (e) { return res.status(500).json({ ok: false, error: "save" }); }
   res.json({ ok: true, example: ex });
@@ -3383,7 +3344,7 @@ app.post("/api/learning-job-ack", guard, oneMutationAtATime("learning", learning
 // 送信後の学習確認。AIの自動判定ではなく、スタッフが選んだ適用範囲を正本として保存する。
 app.post("/api/learning-scope", guard, oneMutationAtATime("learning", learningMutationResource), async (req, res) => {
   const t = req.tenant, requestedId = Number(req.body.exampleId), scope = String(req.body.scope || "");
-  const job = learningJobs(t).find(item => item.id === String(req.body.learningJobId || ""));
+  let job = learningJobs(t).find(item => item.id === String(req.body.learningJobId || ""));
   const id = requestedId || Number(job && job.exampleId || 0);
   let ex = t.examples && t.examples[id];
   if (!["none", "learn", "patient", "similar", "all"].includes(scope)) return res.status(400).json({ ok: false, error: "bad_scope" });
@@ -3435,11 +3396,18 @@ app.post("/api/learning-scope", guard, oneMutationAtATime("learning", learningMu
         job.updatedAt = Date.now();
       }
       if (!ex) return res.status(404).json({ ok: false, error: "example_not_found" });
-      const meta = sanitizeLearningMeta({ scope: "reusable", intent: learningIntentKey(ex.q), decision: text, conditions: "同じ状況・問い合わせに適用", avoid: "患者固有の事実と今回限りの特例は他の患者へ引き継がない", searchTerms: [String(ex.q || "").slice(0, 120)], updated: Date.now() });
-      await exampleLearningMetaUpdate(t, ex.id, meta);
+      if (!job) {
+        const now = Date.now();
+        job = {
+          id: "lj-" + now.toString(36) + "-" + crypto.randomBytes(3).toString("hex"), conversationId: String(req.body.conversationId || ""),
+          exampleId: ex.id, reused: !!ex.reused, status: "processing", resultType: "", createdAt: now, updatedAt: now,
+          learningReview: learningReviewPayload(ex, { q: ex.q, final: ex.final, draft0: ex.draft0, instr: ex.instr, reviewText: text, conversationId: req.body.conversationId }), conflict: null, outcome: null,
+          payload: { q: ex.q, final: ex.final, draft0: ex.draft0, instr: ex.instr, learningChat: ex.learningChat, reviewText: text, source: ex.source || "web-recovered", changed: ex.final !== ex.draft0 || !!ex.instr },
+        };
+        learningJobs(t).push(job);
+      }
       await saveTenantConfig(t);
-      if (job) setImmediate(() => processLearningJob(t, job.id));
-      else setImmediate(async () => { try { await distillRules(t, t.store[String(req.body.conversationId || "")] || null, { q: ex.q, final: ex.final, draft0: ex.draft0, instr: ex.instr, learningChat: ex.learningChat, exampleId: ex.id }); } catch (e) {} });
+      setImmediate(() => processLearningJob(t, job.id));
       return res.json({ ok: true, scope, processing: true, message: "学習内容を裏側で確認しています" });
     }
     if (scope === "patient") {
@@ -3450,19 +3418,13 @@ app.post("/api/learning-scope", guard, oneMutationAtATime("learning", learningMu
       await exampleDelete(t, id);
       return res.json({ ok: true, scope, message: "この患者だけの対応方針として保存しました" });
     }
-    const meta = sanitizeLearningMeta({
-      scope: "reusable",
-      intent: learningIntentKey(ex.q),
-      decision: text,
-      conditions: scope === "similar" ? "同じ種類の問い合わせに適用" : "すべての返信に適用",
-      avoid: "",
-      searchTerms: [String(ex.q || "").slice(0, 120)],
-      updated: Date.now(),
-    });
-    await exampleLearningMetaUpdate(t, id, meta);
+    const proposed = await proposeContextualLearning(t, { q: ex.q, final: ex.final, draft0: ex.draft0, instr: ex.instr, learningChat: ex.learningChat, reviewText: text });
+    if (proposed.meta.scope !== "reusable") return res.status(400).json({ ok: false, error: "privacy_review_failed" });
+    await exampleLearningMetaUpdate(t, id, proposed.meta);
     if (scope === "all") {
-      const memory = draftChatSaveMemory(t, text);
-      return res.json({ ok: true, scope, memory: memory || text, message: "今後の全返信に適用する方針として保存しました" });
+      const safeText = reusableLearningSummary({ learningMeta: proposed.meta });
+      const memory = draftChatSaveMemory(t, safeText);
+      return res.json({ ok: true, scope, memory: memory || safeText, message: "今後の全返信に適用する方針として保存しました" });
     }
     res.json({ ok: true, scope, message: "同じ種類の問い合わせへ使う学習として保存しました" });
   } catch (e) {

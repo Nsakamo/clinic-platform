@@ -10,7 +10,6 @@ const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8")
 test("Web画面とスタッフLINEは送信成功後だけ確認済み対応例へ保存する", () => {
   assert.match(source, /queueStaffLearning\(t, found\.c,[\s\S]{0,300}source: "staff_line"/);
   assert.match(source, /queueStaffLearning\(t, c,[\s\S]{0,300}source: "web"/);
-  assert.match(source, /async function learnStaffOutcome[\s\S]{0,900}await exampleAdd\(t,/);
   assert.match(source, /async function queueStaffLearning[\s\S]{0,900}await exampleAdd\(t,/);
 });
 
@@ -82,7 +81,7 @@ test("矛盾した回答を永続的な学習確認待ちへ保存して解決�
   assert.match(source, /data-tab="conflicts"/);
   assert.match(source, /pendingIds\.has\(Number\(example\.id\)\)/);
   assert.match(source, /filter\(example => Number\(example\.id\) !== Number\(excludeId\)/);
-  assert.doesNotMatch(source.slice(source.indexOf("async function learnStaffOutcome"), source.indexOf("function learningJobs")), /distillRules\(/);
+  assert.doesNotMatch(source, /async function learnStaffOutcome/);
   assert.match(source, /if \(chosen && item\.kind !== "rule"\) await distillRules/);
   assert.match(source, /checkFormalRuleConflict/);
   assert.match(source, /判定不能を「矛盾なし」にも偽の矛盾にもせず/);
@@ -106,7 +105,7 @@ test("Web送信後は送信済み回答を自動学習し、AIが安全確認と
   assert.doesNotMatch(queue, /status: "awaiting_decision"/);
   assert.match(source, /app\.post\("\/api\/learning-scope", guard/);
   assert.match(source, /\["none", "learn", "patient", "similar", "all"\]/);
-  assert.match(source, /proposeContextualLearningText/);
+  assert.match(source, /async function proposeContextualLearning/);
   assert.match(source, /患者へ実際に送信できた回答を人の確認済み結果として自動学習する/);
   assert.match(source, /送信しました・自動学習中/);
   assert.match(source, /learningChat:learning\.learningChat/);

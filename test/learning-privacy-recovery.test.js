@@ -78,7 +78,7 @@ test("下書き生成と送信前監査には一般化済み要約だけを渡�
 test("自動学習は一般化済み判断メモリだけを保存し店舗ルールを変更しない", () => {
   const process = between("async function processLearningJob", "async function queueStaffLearning");
   assert.match(process, /await exampleLearningMetaUpdate\(t, ex\.id, learningMeta\)/);
-  assert.match(process, /job\.reused && existingMeta\.scope === "reusable"/);
+  assert.match(process, /const learningMeta = proposed\.meta/);
   assert.match(process, /最優先の店舗ルールは明示確認なしに追加・更新しない/);
   assert.doesNotMatch(process, /distillRules\(/);
   assert.doesNotMatch(process, /ruleAdd\(|ruleUpdate\(/);
@@ -97,7 +97,7 @@ test("一般化AIが失敗した対応は今回限りに倒して再利用しな
     sanitizeLearningChat: () => [],
     console: { error() {} },
   };
-  vm.runInNewContext(between("async function proposeContextualLearningText", "// 「送信しない」で対応終了した問い合わせ"), context);
+  vm.runInNewContext(between("function learningMetaContainsPatientSpecificData", "// 「送信しない」で対応終了した問い合わせ"), context);
 
   const result = await context.proposeContextualLearning({}, { q: "予約変更" });
 
@@ -132,6 +132,23 @@ test("自動学習エラーでも送信済み対応例を削除しない", () =>
   const process = between("async function processLearningJob", "async function queueStaffLearning");
   assert.match(process, /exampleLearningMetaUpdate\(t, Number\(job\.exampleId\), \{ scope: "one_off" \}\)/);
   assert.doesNotMatch(process, /exampleDelete\(/);
+});
+
+test("旧学習範囲APIも個人情報監査キューを迂回しない", () => {
+  const route = between('app.post("/api/learning-scope"', 'app.post("/api/learning-conflict-consult"');
+  assert.match(route, /if \(!job\) \{/);
+  assert.match(route, /status: "processing"/);
+  assert.match(route, /setImmediate\(\(\) => processLearningJob\(t, job\.id\)\)/);
+  assert.doesNotMatch(route, /distillRules\(/);
+  assert.match(route, /const proposed = await proposeContextualLearning/);
+  assert.match(route, /proposed\.meta\.scope !== "reusable"/);
+});
+
+test("学習データ管理からの再利用化も個人情報監査を必須にする", () => {
+  const route = between('app.post("/api/example-update"', 'app.post("/api/example-delete"');
+  assert.match(route, /learningMetaContainsPatientSpecificData/);
+  assert.match(route, /await auditReusableLearningPrivacy/);
+  assert.match(route, /privacy_review_failed/);
 });
 
 test("学習確認履歴の整理で未解決項目を先に削除しない", () => {
