@@ -207,6 +207,10 @@ test("重要な更新APIはサーバー側でも同時実行を拒否する", ()
   assert.match(source, /rich-menu\/publish", guard, oneMutationAtATime\("rich-menu"\)/);
   assert.match(source, /staff-line\/test", guard, oneMutationAtATime\("staff-line"\)/);
   assert.match(source, /customer-appt-cancel", guard, oneMutationAtATime\("appointment-cancel"/);
+  assert.match(source, /req\.body\.confirmed !== true/);
+  assert.match(source, /channel: c\.channel === "mail" \? "mail" : "line", userId: c\.userId/);
+  assert.match(source, /実行後は元に戻せません/);
+  assert.match(source, /appointmentId:apptId,reason:reason,confirmed:true/);
   assert.match(source, /api\/share", guard, oneMutationAtATime\("clinic-share"/);
 });
 

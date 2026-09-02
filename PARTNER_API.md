@@ -32,6 +32,8 @@ API を変える／足すときは、まず正本を更新し、右腕くん（`
 - `POST /api/partner/appointment-actions` … 予約自動受付（context/slots/propose/confirm）。
   テナント設定 `settings.bookingActions`（既定OFF）が有効なときのみ呼ぶ。本人確認と
   患者の「はい」承認（二段階）はうけつけるん側が強制する。詳細は正本 docs/19 の B-2。
+- `POST /api/partner/appointment-cancel` … 顧客情報パネルからのスタッフ取消。画面で最終確認後、
+  `channel + userId (+ mail時phone) + confirmed:true` を渡し、うけつけるん側で会話相手と予約患者を再照合する。
 
 詳細な各リクエスト/レスポンス形は正本（うけつけるん `docs/19`）を参照。
 
