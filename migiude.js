@@ -3569,7 +3569,12 @@ app.post("/api/customer-karte", guard, oneMutationAtATime("customer-karte", req 
 app.post("/api/customer-appt-cancel", guard, oneMutationAtATime("appointment-cancel", req => req.body.appointmentId), async (req, res) => {
   const t = req.tenant; const c = t.store[req.body.id];
   if (!c) return res.json({ ok: false, error: "no" });
-  const r = await partnerPost("/appointment-cancel", { slug: t.slug, appointmentId: req.body.appointmentId, reason: req.body.reason });
+  if (req.body.confirmed !== true) return res.status(400).json({ ok: false, error: "confirmation_required" });
+  const r = await partnerPost("/appointment-cancel", {
+    slug: t.slug, appointmentId: req.body.appointmentId, reason: req.body.reason,
+    channel: c.channel === "mail" ? "mail" : "line", userId: c.userId,
+    phone: c.ba && c.ba.phone ? c.ba.phone : undefined, confirmed: true,
+  });
   if (!r.json) return res.json({ ok: false });
   res.json(r.json);
 });
@@ -6312,8 +6317,9 @@ async function doApptCancel(apptId,btn){
   if(!current||!apptId)return;
   var reason=await uiPrompt("この予約をキャンセルします。理由（任意・患者に送る自動連絡に使われる場合があります）:","クリニック都合");
   if(reason===null)return;
+  if(!await uiConfirm("この予約をキャンセルしますか？\\n実行後は元に戻せません。対象患者と予約日時をもう一度確認してください。"))return;
   await withBusy("appt-cancel-"+apptId,btn,"取消中…",async()=>{try{
-    var r=await api("/api/customer-appt-cancel",{id:current,appointmentId:apptId,reason:reason});
+    var r=await api("/api/customer-appt-cancel",{id:current,appointmentId:apptId,reason:reason,confirmed:true});
     var j=await r.json();
     if(j&&j.ok){ loadCustomer(current); }
     else { uiAlert(j&&j.error==="not_cancellable"?"この予約はキャンセルできません(期限切れ/過去/処理済み)":"キャンセルに失敗しました"); }
