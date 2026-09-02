@@ -74,3 +74,50 @@ test("下書き生成と送信前監査には一般化済み要約だけを渡�
   assert.doesNotMatch(draft, /String\(e\.originalQ \|\| e\.q\)/);
   assert.doesNotMatch(draft, /String\(e\.final\)/);
 });
+
+test("自動学習は一般化済み判断メモリだけを保存し店舗ルールを変更しない", () => {
+  const process = between("async function processLearningJob", "async function queueStaffLearning");
+  assert.match(process, /await exampleLearningMetaUpdate\(t, ex\.id, learningMeta\)/);
+  assert.match(process, /job\.reused && existingMeta\.scope === "reusable"/);
+  assert.match(process, /最優先の店舗ルールは明示確認なしに追加・更新しない/);
+  assert.doesNotMatch(process, /distillRules\(/);
+  assert.doesNotMatch(process, /ruleAdd\(|ruleUpdate\(/);
+});
+
+test("一般化AIが失敗した対応は今回限りに倒して再利用しない", async () => {
+  const context = {
+    contextualLearningFallback: () => "安全な既定案",
+    formatLearningProposal: () => "一般化済み案",
+    aiChat: async () => { throw new Error("ai_unavailable"); },
+    sanitizeLearningMeta: value => ({
+      intent: String(value.intent || ""), decision: String(value.decision || ""), conditions: String(value.conditions || ""),
+      avoid: String(value.avoid || ""), searchTerms: value.searchTerms || [], scope: value.scope === "reusable" ? "reusable" : "one_off", updated: Number(value.updated || 0),
+    }),
+    learningIntentKey: () => "booking_change",
+    sanitizeLearningChat: () => [],
+    console: { error() {} },
+  };
+  vm.runInNewContext(between("async function proposeContextualLearningText", "// 「送信しない」で対応終了した問い合わせ"), context);
+
+  const result = await context.proposeContextualLearning({}, { q: "予約変更" });
+
+  assert.equal(result.text, "安全な既定案");
+  assert.equal(result.meta.scope, "one_off");
+});
+
+test("AI提案に患者名・日時・連絡先が残った場合は再利用しない", () => {
+  const context = {};
+  vm.runInNewContext(between("function learningMetaContainsPatientSpecificData", "async function proposeContextualLearning"), context);
+  const input = { q: "田中様の9月8日14:30の予約を変更してください" };
+
+  assert.equal(context.learningMetaContainsPatientSpecificData({ intent: "予約変更", decision: "田中様の9月8日14:30の予約を確認する" }, input), true);
+  assert.equal(context.learningMetaContainsPatientSpecificData({ intent: "予約変更", decision: "提示された本人確認情報と予約日時を確認する" }, input), false);
+  assert.equal(context.learningMetaContainsPatientSpecificData({ intent: "連絡", decision: "090-1234-5678へ連絡する" }, input), true);
+});
+
+test("学習確認履歴の整理で未解決項目を先に削除しない", () => {
+  const add = between("async function learningConflictAdd", "function publicLearningConflict");
+  assert.match(add, /findIndex\(conflict => conflict && conflict\.status !== "pending"\)/);
+  assert.match(add, /if \(resolvedIndex < 0\) break/);
+  assert.doesNotMatch(add, /\.shift\(\)/);
+});

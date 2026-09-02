@@ -975,7 +975,12 @@ async function learningConflictAdd(t, data) {
     status: "pending", createdAt: Date.now(), resolvedAt: 0, resolution: "",
   };
   t.config.learningConflicts.push(item);
-  while (t.config.learningConflicts.length > 100) t.config.learningConflicts.shift();
+  // 件数整理では未解決を消さず、解決済みの古いものから先に除去する。
+  while (t.config.learningConflicts.length > 100) {
+    const resolvedIndex = t.config.learningConflicts.findIndex(conflict => conflict && conflict.status !== "pending");
+    if (resolvedIndex < 0) break;
+    t.config.learningConflicts.splice(resolvedIndex, 1);
+  }
   try { await saveTenantConfig(t); } catch (e) { console.error("learningConflictAdd:", e && e.message); }
   return item;
 }
@@ -1090,8 +1095,19 @@ function learningReviewPayload(ex, opts) {
 }
 
 async function proposeContextualLearningText(t, input) {
+  return (await proposeContextualLearning(t, input)).text;
+}
+function learningMetaContainsPatientSpecificData(meta, input) {
+  const output = [meta && meta.intent, meta && meta.decision, meta && meta.conditions, meta && meta.avoid]
+    .concat(meta && Array.isArray(meta.searchTerms) ? meta.searchTerms : []).join(" ");
+  if (/(?:\b[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}\b)|(?:\b0\d{1,4}[-ー−]?\d{1,4}[-ー−]?\d{3,4}\b)|(?:\b\d{4,}\b)|(?:\d{1,2}[\/.-]\d{1,2})|(?:\d{1,2}月\d{1,2}日)|(?:\d{1,2}[:：]\d{2})/.test(output)) return true;
+  const raw = [input && input.q, input && input.final, input && input.draft0, input && input.instr].join(" ");
+  const names = Array.from(raw.matchAll(/([一-龯々ぁ-んァ-ヶーA-Za-z]{2,20})(?:様|さん)/g), match => match[1]);
+  return names.some(name => name.length >= 2 && output.includes(name));
+}
+async function proposeContextualLearning(t, input) {
   const fallback = contextualLearningFallback(input);
-  const system = "あなたはクリニック受付AIの学習設計者です。スタッフの短い修正語だけを覚えず、患者の問い合わせ、元の下書き、修正チャット、実際に送った最終返信の流れを読み、次回再利用できる判断手順へ一般化してください。予約確認では、確認できていない予約を『問題ない』と断定するルールにしてはいけません。患者固有の氏名・会員ID・電話番号・予約日時は一般ルールへ入れず、必要なら『提示された本人確認情報』『予約日時』のように一般化します。今回限りの特例も一般化しません。必ずJSONのみで {\"situation\":\"どんな状況で使うか\",\"checks\":\"回答前に何を確認するか\",\"response\":\"確認結果ごとにどう回答するか\",\"exclusions\":\"他患者へ引き継がない情報\"} を返してください。";
+  const system = "あなたはクリニック受付AIの学習設計者です。スタッフの短い修正語だけを覚えず、患者の問い合わせ、元の下書き、修正チャット、実際に送った最終返信の流れを読み、次回再利用できる判断手順へ一般化してください。予約確認では、確認できていない予約を『問題ない』と断定するルールにしてはいけません。患者固有の氏名・会員ID・電話番号・予約日時は一般ルールへ入れず、必要なら『提示された本人確認情報』『予約日時』のように一般化します。今回限りの特例はscope=one_offとし、他患者へ再利用しません。確信がなければone_offにしてください。必ずJSONのみで {\"scope\":\"reusable|one_off\",\"intent\":\"問い合わせの種類\",\"situation\":\"どんな状況で使うか\",\"checks\":\"回答前に何を確認するか\",\"response\":\"確認結果ごとにどう回答するか\",\"exclusions\":\"他患者へ引き継がない情報\",\"searchTerms\":[\"同じ意図の言い換え\"]} を返してください。";
   const payload = {
     inquiry: String(input && input.q || "").slice(0, 1200),
     originalDraft: String(input && input.draft0 || "").slice(0, 1800),
@@ -1103,10 +1119,25 @@ async function proposeContextualLearningText(t, input) {
   try {
     const raw = await aiChat(t, system, [{ role: "user", content: JSON.stringify(payload) }], 1200, "learning");
     const match = String(raw || "").match(/\{[\s\S]*\}/);
-    return formatLearningProposal(match ? JSON.parse(match[0]) : null, fallback);
+    const parsed = match ? JSON.parse(match[0]) : null;
+    if (!parsed || !["reusable", "one_off"].includes(parsed.scope)) throw new Error("invalid_learning_scope");
+    const text = formatLearningProposal(parsed, fallback);
+    const meta = sanitizeLearningMeta({
+      scope: parsed.scope,
+      intent: String(parsed.intent || learningIntentKey(input && input.q)).slice(0, 80),
+      decision: [parsed.checks, parsed.response].filter(Boolean).map(value => String(value)).join(" / ").slice(0, 600),
+      conditions: String(parsed.situation || "").slice(0, 400),
+      avoid: String(parsed.exclusions || "患者固有の情報と今回限りの特例").slice(0, 400),
+      searchTerms: Array.isArray(parsed.searchTerms) ? parsed.searchTerms : [],
+      updated: Date.now(),
+    });
+    if (!meta.intent || !meta.decision || !meta.conditions) throw new Error("invalid_learning_meta");
+    if (meta.scope === "reusable" && learningMetaContainsPatientSpecificData(meta, input)) meta.scope = "one_off";
+    return { text, meta };
   } catch (e) {
     console.error("learning proposal:", String(e && e.message || e).slice(0, 80));
-    return fallback;
+    // 一般化に失敗した生の対応は保存しても、別患者へは再利用しない。
+    return { text: fallback, meta: sanitizeLearningMeta({ scope: "one_off", updated: Date.now() }) };
   }
 }
 
@@ -1117,7 +1148,7 @@ function activeConversationMessages(c) {
 }
 
 // Web画面・スタッフLINEのどちらから送っても、同じ経路で「人が確認した返信」を学習する。
-// 対応例の保存は先に完了させ、AIを使うルール蒸留・矛盾判定だけを待ち時間付きで実行する。
+// 対応例の保存は先に完了させ、AIを使う一般化・矛盾判定だけを待ち時間付きで実行する。
 async function learnStaffOutcome(t, c, opts) {
   opts = opts || {};
   const q = String(opts.q || recentCustomerQuestion(c)).trim();
@@ -1244,7 +1275,7 @@ async function processLearningJob(t, jobId) {
   try {
     const p = job.payload || {}, ex = t.examples && t.examples[Number(job.exampleId)];
     if (!ex) throw new Error("example_not_found");
-    const proposal = await proposeContextualLearningText(t, p);
+    const proposed = await proposeContextualLearning(t, p), proposal = proposed.text;
     if (job.status !== "processing") return;
     const review = Object.assign({}, job.learningReview || {}, { text: proposal });
     const exampleConflict = p.changed ? await checkConflict(t, p.q, p.final, ex.id) : null;
@@ -1259,15 +1290,17 @@ async function processLearningJob(t, jobId) {
       job.status = "ready"; job.resultType = "conflict"; job.learningReview = null;
       job.conflict = publicLearningConflict(conflict); job.outcome = null;
     } else {
-      const c = t.store[String(job.conversationId || "")] || null;
-      const learnedRules = await distillRules(t, c, { q: p.q, final: p.final, draft0: p.draft0, instr: p.instr, learningChat: p.learningChat, exampleId: ex.id });
-      const updated = learnedRules.some(item => item.action === "update"), added = learnedRules.some(item => item.action === "add");
-      const type = job.reused && !updated && !added ? "duplicate" : (updated ? "updated" : "new");
+      // 自動学習は一般化済み判断メモリまで。最優先の店舗ルールは明示確認なしに追加・更新しない。
+      const existingMeta = sanitizeLearningMeta(ex.learningMeta);
+      const learningMeta = job.reused && existingMeta.scope === "reusable" && proposed.meta.scope !== "reusable" ? existingMeta : proposed.meta;
+      await exampleLearningMetaUpdate(t, ex.id, learningMeta);
+      const reusable = learningMeta.scope === "reusable";
+      const type = job.reused ? "duplicate" : (reusable ? "new" : "ignored");
       job.status = "completed"; job.resultType = type; job.learningReview = review; job.conflict = null;
       job.outcome = type === "duplicate"
         ? { type, title: "既存の学習へ統合しました", message: "同じ内容を増やさず、既存の対応例の確認回数を更新しました" }
-        : type === "updated"
-          ? { type, title: "既存のルールを更新しました", message: "新しい内容を既存ルールへ反映しました" }
+        : type === "ignored"
+          ? { type, title: "今回限りの対応として整理しました", message: "患者固有・特例の内容は他の患者への回答に利用しません" }
           : { type, title: "新しい学習として保存しました", message: "今後、同じ種類の問い合わせで回答判断に利用します" };
     }
     job.payload = null; job.updatedAt = Date.now();
