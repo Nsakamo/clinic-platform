@@ -78,9 +78,13 @@ function requestPublicBase(req) {
   return "http://" + host;
 }
 function isAllowedAppOrigin(req, origin) {
+  const expected = requestPublicBase(req);
+  // ローカル実ブラウザ確認だけは同一localhost/127.0.0.1のHTTP Originを許可する。
+  // 管理環境ではrequestPublicBaseがHTTPS固定値になるため、この分岐には入らない。
+  if (/^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(String(origin || "")) && origin === expected) return true;
   const normalized = normalizePublicBase(origin);
   if (!normalized) return false;
-  return normalized === requestPublicBase(req) || ADDITIONAL_APP_ORIGINS.has(normalized);
+  return normalized === expected || ADDITIONAL_APP_ORIGINS.has(normalized);
 }
 // パスワード再設定メールは患者対応用メールとは分離できる。未設定時だけ当該テナントのSMTPへ後方互換フォールバック。
 const RESET_SMTP = {
@@ -746,7 +750,14 @@ function sanitizeLearningChat(value) {
 }
 function learningMetaSearchText(example) {
   const m = sanitizeLearningMeta(example && example.learningMeta);
-  return [example && example.q, m.intent, m.decision, m.conditions, m.searchTerms.join(" ")].filter(Boolean).join(" ").slice(0, 1800);
+  return [m.intent, m.decision, m.conditions, m.searchTerms.join(" ")].filter(Boolean).join(" ").slice(0, 1800);
+}
+function reusableLearningSummary(example) {
+  const m = sanitizeLearningMeta(example && example.learningMeta);
+  if (m.scope !== "reusable" || !m.intent || !m.decision) return "";
+  return "問い合わせ種類: " + m.intent + " / 判断手順: " + m.decision
+    + (m.conditions ? " / 適用条件: " + m.conditions : "")
+    + (m.avoid ? " / 引き継がない情報: " + m.avoid : "");
 }
 async function exampleLearningMetaUpdate(t, id, value) {
   const ex = t.examples && t.examples[Number(id)]; if (!ex) return null;
@@ -909,8 +920,10 @@ function examplesRanked(t, query, k, context) {
   const pendingIds = new Set(learningConflicts(t, true).flatMap(item => item.kind === "rule" ? [Number(item.newId)] : [Number(item.oldId), Number(item.newId)]));
   // 「学習する」選択後も、安全確認が終わるまでは新規候補を患者回答へ使わない。
   learningJobs(t).filter(job => job.status === "processing" && !job.reused && Number(job.exampleId)).forEach(job => pendingIds.add(Number(job.exampleId)));
-  // 構造化した問い合わせ意図・判断・検索語も検索対象にし、表現が違う質問から同じ対応を取り出す。
-  const list = Object.values(t.examples || {}).filter(example => !pendingIds.has(Number(example.id))).map(example => Object.assign({}, example, { originalQ: example.q, q: learningMetaSearchText(example) }));
+  // 別患者の生の質問・返信は再利用しない。安全確認済みの一般化メモリだけを検索・下書き根拠に使う。
+  const list = Object.values(t.examples || {})
+    .filter(example => !pendingIds.has(Number(example.id)) && reusableLearningSummary(example))
+    .map(example => Object.assign({}, example, { q: learningMetaSearchText(example) }));
   if (!list.length) return [];
   return rankLearningExamples(list, { latest: query, context: context || query }, k || 4);
 }
@@ -936,8 +949,13 @@ async function checkConflict(t, q, newFinal, excludeId) {
     const raw = await aiChat(t, sys, [{ role: "user", content: u }], 100, "critical");
     const m = raw && raw.match(/\{[\s\S]*\}/);
     const o = m ? JSON.parse(m[0]) : {};
+    if (typeof o.conflict !== "boolean") throw new Error("invalid_conflict_result");
     if (o && o.conflict === true) return { oldId: old.id, oldQ: old.originalQ || old.q, oldFinal: old.final };
-  } catch (e) {}
+  } catch (e) {
+    // 判定不能を「矛盾なし」にも偽の矛盾にもせず、自動学習全体を再利用不可で終了する。
+    console.error("example conflict check:", e && e.message);
+    throw new Error("learning_conflict_verification_unavailable");
+  }
   return null;
 }
 function learningConflicts(t, pendingOnly) {
@@ -957,7 +975,12 @@ async function learningConflictAdd(t, data) {
     status: "pending", createdAt: Date.now(), resolvedAt: 0, resolution: "",
   };
   t.config.learningConflicts.push(item);
-  while (t.config.learningConflicts.length > 100) t.config.learningConflicts.shift();
+  // 件数整理では未解決を消さず、解決済みの古いものから先に除去する。
+  while (t.config.learningConflicts.length > 100) {
+    const resolvedIndex = t.config.learningConflicts.findIndex(conflict => conflict && conflict.status !== "pending");
+    if (resolvedIndex < 0) break;
+    t.config.learningConflicts.splice(resolvedIndex, 1);
+  }
   try { await saveTenantConfig(t); } catch (e) { console.error("learningConflictAdd:", e && e.message); }
   return item;
 }
@@ -1071,9 +1094,36 @@ function learningReviewPayload(ex, opts) {
   };
 }
 
-async function proposeContextualLearningText(t, input) {
+function learningMetaContainsPatientSpecificData(meta, input) {
+  const output = [meta && meta.intent, meta && meta.decision, meta && meta.conditions, meta && meta.avoid]
+    .concat(meta && Array.isArray(meta.searchTerms) ? meta.searchTerms : []).join(" ");
+  if (/(?:\b[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}\b)|(?:\b0\d{1,4}[-ー−]?\d{1,4}[-ー−]?\d{3,4}\b)|(?:\b\d{4,}\b)|(?:\d{1,2}[\/.-]\d{1,2})|(?:\d{1,2}月\d{1,2}日)|(?:\d{1,2}[:：]\d{2})/.test(output)) return true;
+  const raw = [input && input.q, input && input.final, input && input.draft0, input && input.instr].join(" ");
+  const names = Array.from(raw.matchAll(/([一-龯々ぁ-んァ-ヶーA-Za-z]{2,20})(?:様|さん)/g), match => match[1]);
+  return names.some(name => name.length >= 2 && output.includes(name));
+}
+async function auditReusableLearningPrivacy(t, input, meta) {
+  const system = "あなたは医療機関の個人情報監査者です。学習候補が別患者の回答へ再利用可能かを厳格に判定してください。氏名、連絡先、住所、会員・保険・予約等の識別番号、具体的な予約日時、患者固有の症状・事情、今回限りの特例が候補に残る場合はsafe=falseです。一般的な画面名、業務手順、確認項目だけならsafe=trueです。迷う場合や判断材料不足はsafe=false。JSONのみ: {\"safe\":true|false,\"reason\":\"短い理由\"}";
+  const payload = {
+    source: {
+      inquiry: String(input && input.q || "").slice(0, 1200),
+      finalReply: String(input && input.final || "").slice(0, 1800),
+      staffInstruction: String(input && input.instr || "").slice(0, 800),
+    },
+    candidate: sanitizeLearningMeta(meta),
+  };
+  try {
+    const raw = await aiChat(t, system, [{ role: "user", content: JSON.stringify(payload) }], 240, "critical");
+    const match = String(raw || "").match(/\{[\s\S]*\}/), parsed = match ? JSON.parse(match[0]) : null;
+    return !!(parsed && parsed.safe === true);
+  } catch (e) {
+    console.error("learning privacy audit:", String(e && e.message || e).slice(0, 80));
+    return false;
+  }
+}
+async function proposeContextualLearning(t, input) {
   const fallback = contextualLearningFallback(input);
-  const system = "あなたはクリニック受付AIの学習設計者です。スタッフの短い修正語だけを覚えず、患者の問い合わせ、元の下書き、修正チャット、実際に送った最終返信の流れを読み、次回再利用できる判断手順へ一般化してください。予約確認では、確認できていない予約を『問題ない』と断定するルールにしてはいけません。患者固有の氏名・会員ID・電話番号・予約日時は一般ルールへ入れず、必要なら『提示された本人確認情報』『予約日時』のように一般化します。今回限りの特例も一般化しません。必ずJSONのみで {\"situation\":\"どんな状況で使うか\",\"checks\":\"回答前に何を確認するか\",\"response\":\"確認結果ごとにどう回答するか\",\"exclusions\":\"他患者へ引き継がない情報\"} を返してください。";
+  const system = "あなたはクリニック受付AIの学習設計者です。スタッフの短い修正語だけを覚えず、患者の問い合わせ、元の下書き、修正チャット、実際に送った最終返信の流れを読み、次回再利用できる判断手順へ一般化してください。予約確認では、確認できていない予約を『問題ない』と断定するルールにしてはいけません。患者固有の氏名・会員ID・電話番号・予約日時は一般ルールへ入れず、必要なら『提示された本人確認情報』『予約日時』のように一般化します。今回限りの特例はscope=one_offとし、他患者へ再利用しません。確信がなければone_offにしてください。必ずJSONのみで {\"scope\":\"reusable|one_off\",\"intent\":\"問い合わせの種類\",\"situation\":\"どんな状況で使うか\",\"checks\":\"回答前に何を確認するか\",\"response\":\"確認結果ごとにどう回答するか\",\"exclusions\":\"他患者へ引き継がない情報\",\"searchTerms\":[\"同じ意図の言い換え\"]} を返してください。";
   const payload = {
     inquiry: String(input && input.q || "").slice(0, 1200),
     originalDraft: String(input && input.draft0 || "").slice(0, 1800),
@@ -1085,10 +1135,29 @@ async function proposeContextualLearningText(t, input) {
   try {
     const raw = await aiChat(t, system, [{ role: "user", content: JSON.stringify(payload) }], 1200, "learning");
     const match = String(raw || "").match(/\{[\s\S]*\}/);
-    return formatLearningProposal(match ? JSON.parse(match[0]) : null, fallback);
+    const parsed = match ? JSON.parse(match[0]) : null;
+    if (!parsed || !["reusable", "one_off"].includes(parsed.scope)) throw new Error("invalid_learning_scope");
+    const text = formatLearningProposal(parsed, fallback);
+    const meta = sanitizeLearningMeta({
+      scope: parsed.scope,
+      intent: String(parsed.intent || learningIntentKey(input && input.q)).slice(0, 80),
+      decision: [parsed.checks, parsed.response].filter(Boolean).map(value => String(value)).join(" / ").slice(0, 600),
+      conditions: String(parsed.situation || "").slice(0, 400),
+      avoid: String(parsed.exclusions || "患者固有の情報と今回限りの特例").slice(0, 400),
+      searchTerms: Array.isArray(parsed.searchTerms) ? parsed.searchTerms : [],
+      updated: Date.now(),
+    });
+    if (!meta.intent || !meta.decision || !meta.conditions) throw new Error("invalid_learning_meta");
+    if (meta.scope === "reusable") {
+      const containsSpecificData = learningMetaContainsPatientSpecificData(meta, input);
+      const privacyApproved = !containsSpecificData && await auditReusableLearningPrivacy(t, input, meta);
+      if (!privacyApproved) meta.scope = "one_off";
+    }
+    return { text, meta };
   } catch (e) {
     console.error("learning proposal:", String(e && e.message || e).slice(0, 80));
-    return fallback;
+    // 一般化に失敗した生の対応は保存しても、別患者へは再利用しない。
+    return { text: fallback, meta: sanitizeLearningMeta({ scope: "one_off", updated: Date.now() }) };
   }
 }
 
@@ -1096,53 +1165,6 @@ async function proposeContextualLearningText(t, input) {
 // 会話履歴自体は監査・閲覧用に残し、AIへ渡す作業中の文脈だけを区切る。
 function activeConversationMessages(c) {
   return selectConversationContext(c, { maxCurrent: 30, maxOlder: 12 }).current;
-}
-
-// Web画面・スタッフLINEのどちらから送っても、同じ経路で「人が確認した返信」を学習する。
-// 対応例の保存は先に完了させ、AIを使うルール蒸留・矛盾判定だけを待ち時間付きで実行する。
-async function learnStaffOutcome(t, c, opts) {
-  opts = opts || {};
-  const q = String(opts.q || recentCustomerQuestion(c)).trim();
-  const finalText = String(opts.final || "").trim();
-  const draft0 = String(opts.draft0 || "").trim();
-  const instr = String(opts.instr || "").trim();
-  if (!q || !finalText) return { learnedId: null, conflict: null, learnedRules: [] };
-
-  const learningChat = sanitizeLearningChat(opts.learningChat);
-  const ex = await exampleAdd(t, { q, final: finalText, draft0, instr, learningChat, source: opts.source || "web" });
-  if (!ex) return { learnedId: null, conflict: null, learnedRules: [] };
-  const changed = finalText !== draft0 || !!instr;
-  const learningReview = opts.reviewScope === true ? learningReviewPayload(ex, {
-    q, final: finalText, draft0, instr, reviewText: opts.reviewText, conversationId: c && c.id
-  }) : null;
-  const proposalP = learningReview && opts.waitForAi !== false
-    ? proposeContextualLearningText(t, { q, final: finalText, draft0, instr, reviewText: opts.reviewText, learningChat })
-    : Promise.resolve(learningReview && learningReview.text || "");
-  const conflictP = (changed ? checkConflict(t, q, finalText, ex.id) : Promise.resolve(null)).then(conflict => {
-    if (!conflict) return null;
-    return learningConflictAdd(t, { q, oldId: conflict.oldId, oldFinal: conflict.oldFinal, newId: ex.id, newFinal: finalText, source: opts.source || "web" });
-  });
-  const outcomeP = conflictP.then(async conflict => {
-    try { await recordLearningPerformance(t, q, changed, !!conflict); } catch (e) { console.error("learning performance:", e && e.message); }
-    return conflict;
-  });
-  // 矛盾があるのに新回答を先に正式ルールへ蒸留しない。人が正解を選ぶまで両案を保留する。
-  // Web画面では適用範囲をスタッフが確認してから恒久ルールへ反映する。
-  // スタッフLINEは確認画面を出せないため、従来どおり安全条件を満たす内容だけ自動蒸留する。
-  const distillP = changed && !learningReview ? outcomeP.then(conflict => conflict ? [] : distillRules(t, c, { q, final: finalText, draft0, instr, learningChat, exampleId: ex.id })) : Promise.resolve([]);
-
-  if (opts.waitForAi === false) {
-    distillP.catch((e) => console.error("learnStaffOutcome distill:", e && e.message));
-    outcomeP.catch((e) => console.error("learnStaffOutcome conflict:", e && e.message));
-    return { learnedId: ex.id, conflict: null, learnedRules: [], reused: !!ex.reused, learningReview };
-  }
-
-  const completed = await Promise.race([
-    Promise.all([distillP, outcomeP, proposalP]).then(([learnedRules, conflict, proposal]) => ({ learnedRules, conflict, proposal })),
-    new Promise((resolve) => setTimeout(() => resolve({ learnedRules: [], conflict: null, proposal: learningReview && learningReview.text || "" }), 8000)),
-  ]).catch(() => ({ learnedRules: [], conflict: null }));
-  const contextualReview = learningReview ? Object.assign({}, learningReview, { text: completed.proposal || learningReview.text }) : null;
-  return { learnedId: ex.id, conflict: completed.conflict, learnedRules: completed.learnedRules, reused: !!ex.reused, learningReview: contextualReview };
 }
 
 function learningJobs(t) {
@@ -1175,6 +1197,12 @@ function finishLearningJobFor(t, id, exampleId, conflictId) {
   if (job) { job.status = "done"; job.updatedAt = Date.now(); }
   return job;
 }
+function resumeLearningJobs(t) {
+  learningJobs(t).filter(job => job.status === "processing").forEach(job => setImmediate(() => processLearningJob(t, job.id)));
+}
+function processAllLearningJobs() {
+  Object.values(TEN).forEach(resumeLearningJobs);
+}
 async function checkFormalRuleConflict(t, q, proposal, newId, source) {
   const related = rulesSearch(t, q + " " + proposal, 6);
   if (!related.length) return null;
@@ -1183,12 +1211,18 @@ async function checkFormalRuleConflict(t, q, proposal, newId, source) {
   try {
     const raw = await aiChat(t, system, [{ role: "user", content: user.slice(0, 10000) }], 180, "critical");
     const match = String(raw || "").match(/\{[\s\S]*\}/), out = match ? JSON.parse(match[0]) : {};
+    if (typeof out.conflict !== "boolean") throw new Error("invalid_conflict_result");
     const rule = related.find(item => Number(item.id) === Number(out.ruleId));
+    if (out.conflict === true && !rule) throw new Error("invalid_conflict_rule");
     if (out.conflict === true && rule) return learningConflictAdd(t, {
       kind: "rule", q, oldId: rule.id, oldRuleId: rule.id, oldFinal: rule.title + "\n" + rule.content,
       newId, newFinal: proposal, source,
     });
-  } catch (e) { console.error("formal rule conflict:", e && e.message); }
+  } catch (e) {
+    // 外部AI障害を偽の矛盾として大量登録せず、自動学習全体を再利用不可で終了する。
+    console.error("formal rule conflict:", e && e.message);
+    throw new Error("formal_rule_verification_unavailable");
+  }
   return null;
 }
 async function proposeConflictResolution(t, item, instruction) {
@@ -1210,7 +1244,7 @@ async function processLearningJob(t, jobId) {
   try {
     const p = job.payload || {}, ex = t.examples && t.examples[Number(job.exampleId)];
     if (!ex) throw new Error("example_not_found");
-    const proposal = await proposeContextualLearningText(t, p);
+    const proposed = await proposeContextualLearning(t, p), proposal = proposed.text;
     if (job.status !== "processing") return;
     const review = Object.assign({}, job.learningReview || {}, { text: proposal });
     const exampleConflict = p.changed ? await checkConflict(t, p.q, p.final, ex.id) : null;
@@ -1225,29 +1259,33 @@ async function processLearningJob(t, jobId) {
       job.status = "ready"; job.resultType = "conflict"; job.learningReview = null;
       job.conflict = publicLearningConflict(conflict); job.outcome = null;
     } else {
-      const c = t.store[String(job.conversationId || "")] || null;
-      const learnedRules = await distillRules(t, c, { q: p.q, final: p.final, draft0: p.draft0, instr: p.instr, learningChat: p.learningChat, exampleId: ex.id });
-      const updated = learnedRules.some(item => item.action === "update"), added = learnedRules.some(item => item.action === "add");
-      const type = job.reused && !updated && !added ? "duplicate" : (updated ? "updated" : "new");
+      // 自動学習は一般化済み判断メモリまで。最優先の店舗ルールは明示確認なしに追加・更新しない。
+      const learningMeta = proposed.meta;
+      await exampleLearningMetaUpdate(t, ex.id, learningMeta);
+      const reusable = learningMeta.scope === "reusable";
+      const type = !reusable ? "ignored" : (job.reused ? "duplicate" : "new");
       job.status = "completed"; job.resultType = type; job.learningReview = review; job.conflict = null;
       job.outcome = type === "duplicate"
         ? { type, title: "既存の学習へ統合しました", message: "同じ内容を増やさず、既存の対応例の確認回数を更新しました" }
-        : type === "updated"
-          ? { type, title: "既存のルールを更新しました", message: "新しい内容を既存ルールへ反映しました" }
+        : type === "ignored"
+          ? { type, title: "今回限りの対応として整理しました", message: "患者固有・特例の内容は他の患者への回答に利用しません" }
           : { type, title: "新しい学習として保存しました", message: "今後、同じ種類の問い合わせで回答判断に利用します" };
     }
     job.payload = null; job.updatedAt = Date.now();
   } catch (e) {
-    if (job.exampleId && !job.reused) {
-      try { await exampleDelete(t, Number(job.exampleId)); }
-      catch (cleanupError) { console.error("learning example cleanup:", cleanupError && cleanupError.message); }
-    }
+    // 一時的なAI・DB障害でも送信済み対応例を削除しない。再利用不可のまま監査用に保持する。
+    if (job.exampleId) try { await exampleLearningMetaUpdate(t, Number(job.exampleId), { scope: "one_off" }); }
+    catch (preserveError) { console.error("learning example preserve:", preserveError && preserveError.message); }
     job.status = "completed"; job.resultType = "error"; job.error = String(e && e.message || e).slice(0, 120);
-    job.outcome = { type: "error", title: "学習内容を確認できませんでした", message: "学習データ管理からもう一度確認してください" };
+    job.outcome = { type: "error", title: "自動学習を完了できませんでした", message: "今回限りの対応として安全に保存し、他の患者への回答には利用しません" };
     job.payload = null; job.updatedAt = Date.now();
   } finally {
     runningLearningJobs.delete(key);
-    while (t.config.learningJobs.length > 80) t.config.learningJobs.shift();
+    while (t.config.learningJobs.length > 80) {
+      const removable = t.config.learningJobs.findIndex(item => item && ["done", "completed"].includes(item.status));
+      if (removable < 0) break;
+      t.config.learningJobs.splice(removable, 1);
+    }
     await saveTenantConfig(t).catch(e => console.error("learning job save:", e && e.message));
   }
 }
@@ -1255,18 +1293,31 @@ async function queueStaffLearning(t, c, opts) {
   const q = String(opts.q || recentCustomerQuestion(c)).trim(), final = String(opts.final || "").trim();
   if (!q || !final) return null;
   const draft0 = String(opts.draft0 || "").trim(), instr = String(opts.instr || "").trim(), learningChat = sanitizeLearningChat(opts.learningChat);
-  // スタッフが「学習する」を選ぶまでは対応例へ保存せず、候補だけを保持する。
-  // これにより「学習しない」で既存の重複例を誤って削除することもない。
-  const review = learningReviewPayload({ id: 0 }, { q, final, draft0, instr, reviewText: opts.reviewText, conversationId: c && c.id });
-  if (!review) return { learnedId: null, job: null };
+  // 患者へ実際に送信できた回答を人の確認済み結果として自動学習する。
+  // AIの下書きや未送信の修正途中は保存せず、処理中の候補は安全確認が終わるまで回答生成へ使わない。
+  const ex = await exampleAdd(t, { q, final, draft0, instr, learningChat, source: opts.source || "web" });
+  if (!ex) return { learnedId: null, job: null };
+  const review = learningReviewPayload(ex, { q, final, draft0, instr, reviewText: opts.reviewText, conversationId: c && c.id });
   const now = Date.now(), job = {
     id: "lj-" + now.toString(36) + "-" + crypto.randomBytes(3).toString("hex"), conversationId: String(c && c.id || ""),
-    exampleId: 0, reused: false, status: "awaiting_decision", resultType: "", createdAt: now, updatedAt: now, learningReview: review, conflict: null, outcome: null,
+    exampleId: ex.id, reused: !!ex.reused, status: "processing", resultType: "", createdAt: now, updatedAt: now, learningReview: review, conflict: null, outcome: null,
     payload: { q, final, draft0, instr, learningChat, reviewText: opts.reviewText, source: opts.source || "web", changed: final !== draft0 || !!instr },
   };
-  learningJobs(t).push(job); while (t.config.learningJobs.length > 80) t.config.learningJobs.shift();
-  await saveTenantConfig(t);
-  return { learnedId: null, job: publicLearningJob(job) };
+  learningJobs(t).push(job);
+  while (t.config.learningJobs.length > 80) {
+    const removable = t.config.learningJobs.findIndex(item => item && ["done", "completed"].includes(item.status));
+    if (removable < 0) break;
+    t.config.learningJobs.splice(removable, 1);
+  }
+  try {
+    await saveTenantConfig(t);
+    setImmediate(() => processLearningJob(t, job.id));
+  } catch (e) {
+    // ジョブを永続化できない時は、再起動で失う前にこの要求内で安全判定まで完了させる。
+    console.error("learning job initial save:", e && e.message);
+    await processLearningJob(t, job.id);
+  }
+  return { learnedId: ex.id, job: publicLearningJob(job) };
 }
 // 2つのテキストがほぼ同内容か（bigram重なり率）。ルールの二重登録ガード用。
 function similarEnough(a, b) {
@@ -1983,11 +2034,7 @@ async function genDraft(t, c, opts) {
     const confirmed = Math.max(1, Number(e.confirmedCount || 1));
     const date = Number(e.ts || 0) ? new Date(Number(e.ts)).toLocaleDateString("ja-JP") : "日時不明";
     const role = trustedLearningPrecedent(e) ? "再利用できる確定例" : "参考例";
-    const meta = sanitizeLearningMeta(e.learningMeta);
-    const learnedDecision = meta.scope === "reusable" && meta.decision
-      ? "（学習した判断: " + meta.decision + (meta.conditions ? " / 条件: " + meta.conditions : "") + (meta.avoid ? " / 避ける: " + meta.avoid : "") + "）"
-      : "";
-    return "・[対応例#" + e.id + " / " + role + " / " + date + " / 類似" + score + "% / スタッフ確認" + confirmed + "回] お客様「" + String(e.originalQ || e.q).slice(0, 220) + "」→ スタッフの最終返信「" + String(e.final).slice(0, 500) + "」" + (e.instr ? "（修正方針: " + String(e.instr).slice(0, 180) + "）" : "") + learnedDecision;
+    return "・[対応例#" + e.id + " / " + role + " / " + date + " / 類似" + score + "% / スタッフ確認" + confirmed + "回] " + reusableLearningSummary(e);
   }).join("\n") : "";
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = channel === "mail" ? "メールなので返信本文の最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
@@ -2075,7 +2122,7 @@ async function genDraft(t, c, opts) {
         && (confidence === "high" || confidence === "medium");
       if (validationCandidate) {
         const relevantRulesTxt = evidenceRuleMatches.slice(0, 8).map(r => "・" + r.title + ": " + r.content.slice(0, 1200)).join("\n");
-        const precedentsTxt = trustedPrecedents.slice(0, 4).map(e => "・[" + new Date(Number(e.ts || Date.now())).toLocaleDateString("ja-JP") + "] お客様「" + String(e.originalQ || e.q).slice(0, 220) + "」→ スタッフ確定返信「" + String(e.final).slice(0, 700) + "」").join("\n");
+        const precedentsTxt = trustedPrecedents.slice(0, 4).map(e => "・[" + new Date(Number(e.ts || Date.now())).toLocaleDateString("ja-JP") + "] " + reusableLearningSummary(e)).join("\n");
         out.validation = await validateDraftAgainstEvidence(t, {
           query: lastQ,
           draft: out.draft,
@@ -2572,8 +2619,10 @@ app.post("/webhook/staff-line", async (req, res) => {
         await finishLearningUsageTrace(t, found.c, outgoing, "staff_line");
         found.c.msgs.push({ from: "us", text: outgoing, auto: false, approvedVia: "staff_line", approvedBy: userId, approvedByName: staff.name, learningRefs: found.c.learningRefs || [], time: nowt() });
         found.c.draft = ""; found.c.draft0 = ""; found.c.learningRefs = []; found.c.status = "done"; found.c.flag = false; found.c.lastAuto = false; found.c.time = nowt(); found.c.ts = Date.now(); found.c.last = lastText(found.c); found.approval.status = "sent"; dbSave(t, found.c); statBump(t, "staff");
-        const learned = await learnStaffOutcome(t, found.c, { q: question, final: outgoing, draft0: initialDraft, instr: editInstruction, source: "staff_line", waitForAi: false });
-        await staffLineReply(t, ev.replyToken, [staffLineText("✅ " + staff.name + "さんの承認内容を患者様へ送信しました。" + (learned.learnedId ? "\n🧠 この対応を次回以降の類似問い合わせに反映します。" : ""))]);
+        let learned = null;
+        try { learned = await queueStaffLearning(t, found.c, { q: question, final: outgoing, draft0: initialDraft, instr: editInstruction, source: "staff_line" }); }
+        catch (learningError) { console.error("staff line learning queue:", learningError && learningError.message); }
+        await staffLineReply(t, ev.replyToken, [staffLineText("✅ " + staff.name + "さんの承認内容を患者様へ送信しました。" + (learned && learned.learnedId ? "\n🧠 この対応を次回以降の類似問い合わせに反映します。" : ""))]);
       } catch (e) {
         // 通信例外などでも承認を再試行可能な状態へ戻す。sending のまま残すと以後の操作が全て拒否される。
         found.approval.status = "pending"; dbSave(t, found.c);
@@ -2843,9 +2892,14 @@ app.post("/api/send", guard, async (req, res) => {
     appendDeliveredBundle(c, text, files, baseUrl, { learningRefs: c.learningRefs || [] }); c.draft = ""; c.draft0 = ""; c.learningRefs = []; c.status = "done"; c.flag = false; c.lastAuto = false; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
     statBump(t, "staff");
     if (text) {
-      const queued = await queueStaffLearning(t, c, { q: q0, final: text, draft0, instr, learningChat, reviewText, source: "web" });
-      learnedId = queued && queued.learnedId;
-      learningJob = queued && queued.job;
+      try {
+        const queued = await queueStaffLearning(t, c, { q: q0, final: text, draft0, instr, learningChat, reviewText, source: "web" });
+        learnedId = queued && queued.learnedId;
+        learningJob = queued && queued.job;
+      } catch (e) {
+        // 患者への送信完了後に学習保存だけ失敗しても、500を返して再送を誘発しない。
+        console.error("web learning queue:", t.slug, c.id, String(e && e.message || e).slice(0, 120));
+      }
     }
   }
   res.json({ ok: true, sent, sendErr, learnedId, learningJob });
@@ -3260,8 +3314,14 @@ app.post("/api/example-update", guard, oneMutationAtATime("learning"), async (re
   if (!ex) return res.status(404).json({ ok: false, error: "not_found" });
   const q = String(req.body.q || "").trim().slice(0, 600); const final = String(req.body.final || "").trim().slice(0, 1500); const instr = String(req.body.instr || "").trim().slice(0, 800);
   if (!q || !final) return res.status(400).json({ ok: false, error: "required" });
-  ex.q = q; ex.final = final; ex.instr = instr;
-  if (req.body.learningMeta && typeof req.body.learningMeta === "object") ex.learningMeta = sanitizeLearningMeta(Object.assign({}, req.body.learningMeta, { scope: "reusable", updated: Date.now() }));
+  let nextMeta = sanitizeLearningMeta(ex.learningMeta);
+  if (req.body.learningMeta && typeof req.body.learningMeta === "object") {
+    nextMeta = sanitizeLearningMeta(Object.assign({}, req.body.learningMeta, { scope: "reusable", updated: Date.now() }));
+    const safe = !learningMetaContainsPatientSpecificData(nextMeta, { q, final, draft0: ex.draft0, instr })
+      && await auditReusableLearningPrivacy(t, { q, final, draft0: ex.draft0, instr }, nextMeta);
+    if (!safe) return res.status(400).json({ ok: false, error: "privacy_review_failed" });
+  }
+  ex.q = q; ex.final = final; ex.instr = instr; ex.learningMeta = nextMeta;
   try { if (pool) await pool.query("UPDATE examples SET q=$1,final=$2,instr=$3,learning_meta=$4 WHERE tenant=$5 AND id=$6", [q, final, instr, sanitizeLearningMeta(ex.learningMeta), t.slug, id]); }
   catch (e) { return res.status(500).json({ ok: false, error: "save" }); }
   res.json({ ok: true, example: ex });
@@ -3269,7 +3329,7 @@ app.post("/api/example-update", guard, oneMutationAtATime("learning"), async (re
 app.post("/api/example-delete", guard, oneMutationAtATime("learning"), async (req, res) => { const t = req.tenant; try { await exampleDelete(t, req.body.id); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false, error: "delete" }); } });
 app.get("/api/learning-jobs", guard, (req, res) => {
   const t = req.tenant;
-  learningJobs(t).filter(job => job.status === "processing").forEach(job => setImmediate(() => processLearningJob(t, job.id)));
+  resumeLearningJobs(t);
   res.json({ ok: true, jobs: learningJobs(t).filter(job => job.status !== "done").slice(-30).map(publicLearningJob) });
 });
 function learningMutationResource(req) {
@@ -3284,7 +3344,7 @@ app.post("/api/learning-job-ack", guard, oneMutationAtATime("learning", learning
 // 送信後の学習確認。AIの自動判定ではなく、スタッフが選んだ適用範囲を正本として保存する。
 app.post("/api/learning-scope", guard, oneMutationAtATime("learning", learningMutationResource), async (req, res) => {
   const t = req.tenant, requestedId = Number(req.body.exampleId), scope = String(req.body.scope || "");
-  const job = learningJobs(t).find(item => item.id === String(req.body.learningJobId || ""));
+  let job = learningJobs(t).find(item => item.id === String(req.body.learningJobId || ""));
   const id = requestedId || Number(job && job.exampleId || 0);
   let ex = t.examples && t.examples[id];
   if (!["none", "learn", "patient", "similar", "all"].includes(scope)) return res.status(400).json({ ok: false, error: "bad_scope" });
@@ -3336,11 +3396,18 @@ app.post("/api/learning-scope", guard, oneMutationAtATime("learning", learningMu
         job.updatedAt = Date.now();
       }
       if (!ex) return res.status(404).json({ ok: false, error: "example_not_found" });
-      const meta = sanitizeLearningMeta({ scope: "reusable", intent: learningIntentKey(ex.q), decision: text, conditions: "同じ状況・問い合わせに適用", avoid: "患者固有の事実と今回限りの特例は他の患者へ引き継がない", searchTerms: [String(ex.q || "").slice(0, 120)], updated: Date.now() });
-      await exampleLearningMetaUpdate(t, ex.id, meta);
+      if (!job) {
+        const now = Date.now();
+        job = {
+          id: "lj-" + now.toString(36) + "-" + crypto.randomBytes(3).toString("hex"), conversationId: String(req.body.conversationId || ""),
+          exampleId: ex.id, reused: !!ex.reused, status: "processing", resultType: "", createdAt: now, updatedAt: now,
+          learningReview: learningReviewPayload(ex, { q: ex.q, final: ex.final, draft0: ex.draft0, instr: ex.instr, reviewText: text, conversationId: req.body.conversationId }), conflict: null, outcome: null,
+          payload: { q: ex.q, final: ex.final, draft0: ex.draft0, instr: ex.instr, learningChat: ex.learningChat, reviewText: text, source: ex.source || "web-recovered", changed: ex.final !== ex.draft0 || !!ex.instr },
+        };
+        learningJobs(t).push(job);
+      }
       await saveTenantConfig(t);
-      if (job) setImmediate(() => processLearningJob(t, job.id));
-      else setImmediate(async () => { try { await distillRules(t, t.store[String(req.body.conversationId || "")] || null, { q: ex.q, final: ex.final, draft0: ex.draft0, instr: ex.instr, learningChat: ex.learningChat, exampleId: ex.id }); } catch (e) {} });
+      setImmediate(() => processLearningJob(t, job.id));
       return res.json({ ok: true, scope, processing: true, message: "学習内容を裏側で確認しています" });
     }
     if (scope === "patient") {
@@ -3351,19 +3418,13 @@ app.post("/api/learning-scope", guard, oneMutationAtATime("learning", learningMu
       await exampleDelete(t, id);
       return res.json({ ok: true, scope, message: "この患者だけの対応方針として保存しました" });
     }
-    const meta = sanitizeLearningMeta({
-      scope: "reusable",
-      intent: learningIntentKey(ex.q),
-      decision: text,
-      conditions: scope === "similar" ? "同じ種類の問い合わせに適用" : "すべての返信に適用",
-      avoid: "",
-      searchTerms: [String(ex.q || "").slice(0, 120)],
-      updated: Date.now(),
-    });
-    await exampleLearningMetaUpdate(t, id, meta);
+    const proposed = await proposeContextualLearning(t, { q: ex.q, final: ex.final, draft0: ex.draft0, instr: ex.instr, learningChat: ex.learningChat, reviewText: text });
+    if (proposed.meta.scope !== "reusable") return res.status(400).json({ ok: false, error: "privacy_review_failed" });
+    await exampleLearningMetaUpdate(t, id, proposed.meta);
     if (scope === "all") {
-      const memory = draftChatSaveMemory(t, text);
-      return res.json({ ok: true, scope, memory: memory || text, message: "今後の全返信に適用する方針として保存しました" });
+      const safeText = reusableLearningSummary({ learningMeta: proposed.meta });
+      const memory = draftChatSaveMemory(t, safeText);
+      return res.json({ ok: true, scope, memory: memory || safeText, message: "今後の全返信に適用する方針として保存しました" });
     }
     res.json({ ok: true, scope, message: "同じ種類の問い合わせへ使う学習として保存しました" });
   } catch (e) {
@@ -4272,7 +4333,7 @@ async function processScheduledMessagesForTenant(t) {
           try { await alertAdd(t, "システム", "予約メッセージは送信済みですが、履歴保存を確認できませんでした。二重送信せず管理者へ確認してください。", ""); } catch (_) {}
         }
         if (item.text) {
-          learnStaffOutcome(t, c, { q: item.question, final: item.text, draft0: item.draft0, instr: item.instr, learningChat: item.learningChat, reviewText: item.learningText, source: "web", waitForAi: false, reviewScope: true }).catch(e => console.error("scheduled learning:", e && e.message));
+          queueStaffLearning(t, c, { q: item.question, final: item.text, draft0: item.draft0, instr: item.instr, learningChat: item.learningChat, reviewText: item.learningText, source: "web-scheduled" }).catch(e => console.error("scheduled learning:", e && e.message));
         }
       } catch (e) {
         await scheduledMessageFailure(t, item, e && e.message || "send_failed");
@@ -5037,6 +5098,7 @@ app.get("/board", (req, res) => { res.set("Content-Type", "text/html; charset=ut
   setInterval(() => { processLineWebhookQueue().catch(() => {}); }, 5000); setTimeout(() => { processLineWebhookQueue().catch(() => {}); }, 1000);
   setInterval(() => { if (pool) pool.query("DELETE FROM line_webhook_events WHERE (status='done' AND updated_at<$1) OR (status='dead' AND updated_at<$2)", [Date.now() - 30 * 86400000, Date.now() - 90 * 86400000]).catch(() => {}); }, 6 * 60 * 60 * 1000);
   setInterval(() => { processAllScheduledMessages().catch(() => {}); }, 15000); setTimeout(() => { processAllScheduledMessages().catch(() => {}); }, 3000);
+  setInterval(processAllLearningJobs, 15000); setTimeout(processAllLearningJobs, 1000);
   setTimeout(() => { Object.values(TEN).forEach(t => ensureLineBotId(t).catch(() => {})); }, 3000);
   const server = app.listen(PORT, () => console.log("clinic-inbox platform listening on " + PORT));
   // Railwayの前段プロキシよりNodeが先にkeep-alive接続を切ると、切断直後のPOST(LINE Webhook等)が
@@ -6363,9 +6425,10 @@ function openRuleLearning(){
   const ctx={customer:data.q||"",draft0:data.draft0||"",finalText:data.final||"",instructions:text||data.instr||"",confirmedGeneral:true};
   closeLearningScope();openAsst(ctx);
 }
-function showLearnResult(message){const b=document.getElementById("learnToast");if(!b)return;b.textContent="✓ "+message;b.style.display="block";clearTimeout(learnToastTimer);learnToastTimer=setTimeout(()=>{b.style.display="none";},4500);}
-function showLearningOutcome(outcome,jobId){const o=outcome||{},type=String(o.type||"new"),b=document.getElementById("learningResultBanner"),icons={processing:"⋯",new:"✓",updated:"✓",duplicate:"⇄",conflict:"⚠",ignored:"−",error:"!"},labels={processing:"確認中",new:"新規保存",updated:"更新完了",duplicate:"重複統合",conflict:"要確認",ignored:"学習なし",error:"エラー"};if(!b)return;b.className="show "+type;document.getElementById("learningResultIcon").textContent=icons[type]||"✓";document.getElementById("learningResultTitle").textContent=o.title||"学習処理が完了しました";document.getElementById("learningResultMessage").textContent=o.message||"";document.getElementById("learningResultLabel").textContent=labels[type]||"完了";b.onclick=type==="conflict"?()=>openLearningPending():null;if(jobId)api("/api/learning-job-ack",{id:jobId}).catch(()=>{});}
-function closeLearningResult(){const b=document.getElementById("learningResultBanner");if(b){b.className="";b.onclick=null;}}
+function showLearnResult(message){const b=document.getElementById("learnToast");if(!b)return;b.textContent="✓ "+message;b.style.display="block";clearTimeout(learnToastTimer);learnToastTimer=setTimeout(()=>{b.style.display="none";},3000);}
+let learningResultTimer=null;
+function showLearningOutcome(outcome,jobId){const o=outcome||{},type=String(o.type||"new"),b=document.getElementById("learningResultBanner"),icons={processing:"⋯",new:"✓",updated:"✓",duplicate:"⇄",conflict:"⚠",ignored:"−",error:"!"},labels={processing:"確認中",new:"新規保存",updated:"更新完了",duplicate:"重複統合",conflict:"要確認",ignored:"学習なし",error:"エラー"};if(!b)return;clearTimeout(learningResultTimer);b.className="show "+type;document.getElementById("learningResultIcon").textContent=icons[type]||"✓";document.getElementById("learningResultTitle").textContent=o.title||"学習処理が完了しました";document.getElementById("learningResultMessage").textContent=o.message||"";document.getElementById("learningResultLabel").textContent=labels[type]||"完了";b.onclick=type==="conflict"?()=>openLearningPending():null;learningResultTimer=setTimeout(closeLearningResult,3000);if(jobId)api("/api/learning-job-ack",{id:jobId}).catch(()=>{});}
+function closeLearningResult(){const b=document.getElementById("learningResultBanner");clearTimeout(learningResultTimer);learningResultTimer=null;if(b){b.className="";b.onclick=null;}}
 const pendingAttachmentsByConversation={};
 function pendingAttachments(id){id=id||current;if(!id)return[];if(!Array.isArray(pendingAttachmentsByConversation[id]))pendingAttachmentsByConversation[id]=[];return pendingAttachmentsByConversation[id];}
 function messageFileAccepted(file){const mime=String(file&&file.type||"").toLowerCase(),name=String(file&&file.name||"").toLowerCase(),mimes=["image/jpeg","image/png","image/gif","image/webp","video/mp4","video/quicktime","application/pdf","application/msword","application/vnd.ms-excel","application/vnd.openxmlformats-officedocument.wordprocessingml.document","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet","text/plain","text/csv"],extensions=[".jpg",".jpeg",".png",".gif",".webp",".mp4",".mov",".pdf",".doc",".docx",".xls",".xlsx",".txt",".csv"];return mimes.includes(mime)||extensions.some(ext=>name.endsWith(ext));}
@@ -6408,7 +6471,7 @@ function showLearningProgress(){const p=document.getElementById("learningProgres
 function hideLearningProgress(){const p=document.getElementById("learningProgress");if(p)p.style.display="none";}
 function showReadyLearningFor(id){const job=learningJobsByConversation[id];if(!job||current!==id)return;const decision=job.status==="awaiting_decision"||(job.status==="ready"&&job.resultType==="review");if(decision&&job.learningReview&&!shownLearningDecisions.has(job.id)){shownLearningDecisions.add(job.id);showLearningScope(Object.assign({},job.learningReview,{learningJobId:job.id}));}}
 async function pollLearningJobs(){try{const r=await fetch("/api/learning-jobs"),j=await r.json();if(!r.ok||!j.ok)return;learningJobList=j.jobs||[];Object.keys(learningJobsByConversation).forEach(k=>delete learningJobsByConversation[k]);learningJobList.forEach(job=>{const old=learningJobsByConversation[job.conversationId];if(!old||Number(job.updatedAt)>=Number(old.updatedAt))learningJobsByConversation[job.conversationId]=job;});const result=learningJobList.find(job=>job.status==="completed"&&!shownLearningResults.has(job.id));if(result){shownLearningResults.add(result.id);showLearningOutcome(result.outcome||{type:result.resultType,title:"学習処理が完了しました",message:""},result.id);}const conflict=learningJobList.find(job=>job.status==="ready"&&job.resultType==="conflict"&&!shownLearningResults.has(job.id));if(conflict){shownLearningResults.add(conflict.id);showLearningOutcome({type:"conflict",title:"現在のルールと内容が異なります",message:"自動反映していません。右上の要確認から右腕くんと確認してください"});}renderList();if(current)showReadyLearningFor(current);refreshLearningBadge();}catch(e){}}
-async function sendMsg(){if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="患者へ送信中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat});let json={};try{json=await response.json();}catch(e){}if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";let immediateLearning=null;if(json.learningJob&&json.learningJob.learningReview){learningJobsByConversation[id]=json.learningJob;shownLearningDecisions.add(json.learningJob.id);immediateLearning=Object.assign({},json.learningJob.learningReview,{learningJobId:json.learningJob.id});}await load();if(immediateLearning&&current===id)showLearningScope(immediateLearning);else if(!immediateLearning)showLearnResult("送信しました");pollLearningJobs();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
+async function sendMsg(){if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="患者へ送信中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat});let json={};try{json=await response.json();}catch(e){}if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";let legacyLearning=null;if(json.learningJob){learningJobsByConversation[id]=json.learningJob;if(json.learningJob.status==="awaiting_decision"&&json.learningJob.learningReview){shownLearningDecisions.add(json.learningJob.id);legacyLearning=Object.assign({},json.learningJob.learningReview,{learningJobId:json.learningJob.id});}}await load();if(legacyLearning&&current===id)showLearningScope(legacyLearning);else if(json.learningJob)showLearningOutcome({type:"processing",title:"送信しました・自動学習中",message:"重複・矛盾・患者固有情報を裏側で確認しています"});else showLearnResult("送信しました");pollLearningJobs();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
 let scheduledMessageDraft=null;
 function localDateTimeValue(date){const pad=n=>String(n).padStart(2,"0");return date.getFullYear()+"-"+pad(date.getMonth()+1)+"-"+pad(date.getDate())+"T"+pad(date.getHours())+":"+pad(date.getMinutes());}
 function openScheduledMessage(){
@@ -6722,9 +6785,9 @@ async function learnMutate(path,body,done){
 function addLearningItem(){if(learnTab==="rules")LEARN.rules.unshift({id:null,title:"",content:""});else if(learnTab==="prefs")LEARN.prefs.unshift({key:"",text:""});renderLearning();const list=document.getElementById("learnList");if(list)list.scrollTop=0;}
 // 学習トースト：下書きを修正して送った直後だけ「✓学習しました」と控えめに表示。特例だった場合は「学習しない」で今保存した例を取り消せる。
 let learnToastTimer=null;
-function showLearnToast(id){ const b=document.getElementById("learnToast"); if(!b)return; b.innerHTML='✓ この対応を学習しました'+(id?' ・ <span style="text-decoration:underline;cursor:pointer;color:#a7f3d0;" onclick="undoLearn('+id+')">特例だった（学習しない）</span>':''); b.style.display="block"; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";}, id?6000:2500); }
+function showLearnToast(id){ const b=document.getElementById("learnToast"); if(!b)return; b.innerHTML='✓ この対応を学習しました'+(id?' ・ <span style="text-decoration:underline;cursor:pointer;color:#a7f3d0;" onclick="undoLearn('+id+')">特例だった（学習しない）</span>':''); b.style.display="block"; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";},3000); }
 // ルール蒸留の結果トースト。何を覚えたかを具体的に見せる（addのみ取り消し可。updateは店舗ルール画面で編集）。
-function showRuleToast(rules){ const b=document.getElementById("learnToast"); if(!b||!rules||!rules.length)return; const r=rules[0]; const more=rules.length>1?(" 他"+(rules.length-1)+"件"):""; const undo=(r.action==="add")?' ・ <span style="text-decoration:underline;cursor:pointer;color:#a7f3d0;" onclick="undoRule('+r.id+')">取り消す</span>':'（既存ルールを更新）'; b.innerHTML='📚 ルールを学習：「'+esc(r.title)+'」'+more+undo; b.style.display="block"; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";}, 9000); }
+function showRuleToast(rules){ const b=document.getElementById("learnToast"); if(!b||!rules||!rules.length)return; const r=rules[0]; const more=rules.length>1?(" 他"+(rules.length-1)+"件"):""; const undo=(r.action==="add")?' ・ <span style="text-decoration:underline;cursor:pointer;color:#a7f3d0;" onclick="undoRule('+r.id+')">取り消す</span>':'（既存ルールを更新）'; b.innerHTML='📚 ルールを学習：「'+esc(r.title)+'」'+more+undo; b.style.display="block"; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";},3000); }
 async function undoRule(id){ return withBusy("undo-rule-"+id,null,"",async()=>{let ok=false; try{ const r=await api("/api/rule-undo",{id}); const j=await r.json(); ok=!!j.ok; }catch(e){} const b=document.getElementById("learnToast"); if(b){ b.innerHTML=ok?'ルールを取り消しました':'取り消せませんでした（設定→学習データ管理 から削除できます）'; clearTimeout(learnToastTimer); learnToastTimer=setTimeout(()=>{b.style.display="none";},2500); }}); }
 
 // ---- 患者向けLINE リッチメニューエディター ----

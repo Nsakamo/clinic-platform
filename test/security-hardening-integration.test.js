@@ -99,3 +99,10 @@ test("監査で指摘された旧経路と危険なURL許可を残さない", ()
   assert.match(source, /&quot;/);
   assert.match(source, /rel="noopener noreferrer"/);
 });
+
+test("ローカル実ブラウザだけ同一HTTP Originを許可し、管理環境のHTTPS制約は維持する", () => {
+  assert.match(source, /\^http:\\\/\\\/\(localhost\|127\\\.0\\\.0\\\.1\|\\\[::1\\\]\)/);
+  assert.match(source, /origin === expected/);
+  assert.match(source, /if \(isManagedRuntime\(\)\) return ""/);
+  assert.match(source, /url\.protocol !== "https:"/);
+});
