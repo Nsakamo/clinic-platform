@@ -50,6 +50,11 @@ test("実HTTPで認証・Origin・テナント分離・固定公開URLを検証�
 
     const unauthenticated = await json("/api/account");
     assert.equal(unauthenticated.response.status, 401);
+    const asyncFailure = await fetch(BASE + "/__test/async-error");
+    assert.equal(asyncFailure.status, 500);
+    const asyncFailureText = await asyncFailure.text();
+    assert.equal(asyncFailureText, '{"ok":false,"error":"internal"}');
+    assert.doesNotMatch(asyncFailureText, /private-test-stack-marker|migiude\.js/);
     const wrongPartner = await json("/api/partner/tenants", { headers: { "x-partner-key": "wrong" } });
     assert.equal(wrongPartner.response.status, 401);
 

@@ -5086,6 +5086,14 @@ app.post("/api/reset", async (req,res)=>{
 app.get("/", (req, res) => { res.set("Content-Type", "text/html; charset=utf-8"); res.set("Cache-Control", "no-store"); res.send(pageWithEnvironmentBanner(req, tenantFromReq(req) ? PAGE : LOGIN_PAGE)); });
 app.get("/signup", (req, res) => res.redirect("/")); // 申込みは営業契約後に運営が作成
 app.get("/board", (req, res) => { res.set("Content-Type", "text/html; charset=utf-8"); res.set("Cache-Control", "no-store"); res.send(pageWithEnvironmentBanner(req, tenantFromReq(req) ? BOARD_PAGE : LOGIN_PAGE)); });
+if (process.env.NODE_ENV === "test") {
+  app.get("/__test/async-error", async () => { throw new Error("private-test-stack-marker"); });
+}
+app.use((err, req, res, next) => {
+  console.error("request failed:", req.method, req.path, err && err.message ? err.message : "unknown");
+  if (res.headersSent) return next(err);
+  res.status(500).json({ ok: false, error: "internal" });
+});
 (async () => {
   if (isManagedRuntime() && !CRED_KEY) {
     console.error("起動を中止しました: 本番環境では有効なCRED_KEYが必須です");
