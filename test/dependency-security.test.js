@@ -6,6 +6,17 @@ const { simpleParser } = require("mailparser");
 const { convert } = require("html-to-text");
 const nodemailer = require("nodemailer");
 
+test("公開HTTPサーバーは脆弱性修正版のExpress系依存を使う", () => {
+  const expressVersion = require("express/package.json").version;
+  const bodyParserVersion = require("body-parser/package.json").version;
+  const qsVersion = require("qs/package.json").version;
+
+  assert.ok(Number(expressVersion.split(".")[0]) >= 5, `express=${expressVersion}`);
+  assert.ok(Number(bodyParserVersion.split(".")[0]) >= 2, `body-parser=${bodyParserVersion}`);
+  const [qsMajor, qsMinor] = qsVersion.split(".").map(Number);
+  assert.ok(qsMajor > 6 || (qsMajor === 6 && qsMinor >= 16), `qs=${qsVersion}`);
+});
+
 test("更新後のメール解析で日本語HTML本文と添付を読み取れる", async () => {
   const raw = [
     "From: patient@example.test",

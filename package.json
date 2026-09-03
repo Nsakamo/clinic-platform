@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
-    "express": "^4.19.2",
+    "express": "^5.2.1",
     "imapflow": "^1.0.164",
     "mailparser": "^3.7.1",
     "nodemailer": "^9.0.3",
@@ -21,7 +21,7 @@
     "web-push": "^3.6.7"
   },
   "overrides": {
-    "body-parser": "1.20.6",
+    "body-parser": "2.3.0",
     "deepmerge-ts": "8.0.1",
     "ip-address": "10.5.0"
   }
