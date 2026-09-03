@@ -5092,7 +5092,9 @@ if (process.env.NODE_ENV === "test") {
 app.use((err, req, res, next) => {
   console.error("request failed:", req.method, req.path, err && err.message ? err.message : "unknown");
   if (res.headersSent) return next(err);
-  res.status(500).json({ ok: false, error: "internal" });
+  const candidateStatus = Number(err && (err.statusCode || err.status));
+  const status = candidateStatus >= 400 && candidateStatus < 500 ? candidateStatus : 500;
+  res.status(status).json({ ok: false, error: status === 500 ? "internal" : "bad_request" });
 });
 (async () => {
   if (isManagedRuntime() && !CRED_KEY) {

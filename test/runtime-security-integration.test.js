@@ -55,6 +55,13 @@ test("実HTTPで認証・Origin・テナント分離・固定公開URLを検証�
     const asyncFailureText = await asyncFailure.text();
     assert.equal(asyncFailureText, '{"ok":false,"error":"internal"}');
     assert.doesNotMatch(asyncFailureText, /private-test-stack-marker|migiude\.js/);
+    const malformedJson = await fetch(BASE + "/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{",
+    });
+    assert.equal(malformedJson.status, 400);
+    assert.equal(await malformedJson.text(), '{"ok":false,"error":"bad_request"}');
     const wrongPartner = await json("/api/partner/tenants", { headers: { "x-partner-key": "wrong" } });
     assert.equal(wrongPartner.response.status, 401);
 
