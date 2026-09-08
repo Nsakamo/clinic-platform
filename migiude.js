@@ -18,6 +18,7 @@ const { normalizeAiRoutes, resolveAiRoute, publicModelCatalog } = require("./lib
 const { contextualLearningFallback, formatLearningProposal } = require("./lib/learning-context");
 const { selectConversationContext } = require("./lib/conversation-context");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
+const { uketsukeLoginUrl } = require("./lib/uketsuke-login");
 const app = express();
 app.use(express.json({ limit: "16mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: false, limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
@@ -5038,6 +5039,12 @@ function pageWithEnvironmentBanner(req, html) {
   const banner = '<style>body{padding-top:30px!important;box-sizing:border-box!important}</style><div id="test-environment-banner" role="status" style="position:fixed;z-index:2147483647;top:0;left:0;right:0;height:30px;display:flex;align-items:center;justify-content:center;background:#facc15;color:#713f12;font:700 13px/1 -apple-system,BlinkMacSystemFont,\'Hiragino Kaku Gothic ProN\',sans-serif;box-shadow:0 1px 3px rgba(0,0,0,.18);">テスト環境</div>';
   return String(html || "").replace(/<body([^>]*)>/i, "<body$1>" + banner);
 }
+app.get("/login/email", (req,res)=>{
+  res.set("Cache-Control", "no-store");
+  const url = uketsukeLoginUrl(requestPublicBase(req));
+  if (!url) return res.status(503).send("メール認証の接続先を確認できません。運営へお問い合わせください。");
+  res.redirect(303, url);
+});
 app.get("/forgot", (req,res)=>{ res.set("Content-Type","text/html; charset=utf-8"); res.set("Cache-Control","no-store"); res.send(pageWithEnvironmentBanner(req, FORGOT_PAGE)); });
 app.post("/api/forgot", async (req,res)=>{
   const email = normalizeEmail(req.body.email);
@@ -5127,6 +5134,9 @@ const LOGIN_PAGE = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><
 <div style="background:#fff;padding:28px 24px;border-radius:14px;width:min(90vw,320px);box-shadow:0 2px 14px rgba(0,0,0,.08);">
 <div style="font-size:18px;font-weight:600;margin-bottom:4px;">📥 受信トレイ</div>
 <div style="font-size:13px;color:#6b7280;margin-bottom:18px;">ログイン</div>
+<a href="/login/email" style="display:block;text-align:center;padding:12px;border-radius:8px;background:#06c755;color:#fff;font-size:15px;font-weight:600;text-decoration:none;">メール認証でログイン</a>
+<p style="font-size:12px;color:#6b7280;line-height:1.6;">うけつけるんに登録済みのメールで認証すると、連携中の右腕くんが開きます。パスワードは不要です。</p>
+<div style="font-size:12px;color:#6b7280;margin:16px 0 10px;border-top:1px solid #e5e7eb;padding-top:12px;">右腕くん単独利用・従来のログイン</div>
 <input id="lid" placeholder="ログインID" autocapitalize="off" autofocus style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;">
 <input id="p" type="password" placeholder="パスワード" style="width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;margin-bottom:10px;" onkeydown="if(event.key==='Enter'&&!event.isComposing&&event.keyCode!==229)go()">
 <button id="sb" onclick="go()" style="width:100%;padding:11px;border:none;border-radius:8px;background:#06c755;color:#fff;font-size:15px;font-weight:600;cursor:pointer;">ログイン</button>
