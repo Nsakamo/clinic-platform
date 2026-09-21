@@ -1177,17 +1177,21 @@ function learningJobs(t) {
 }
 const LEARNING_PROMPT_MS = 3000;
 const LEARNING_CONSENT_TTL_MS = 10000;
+const LEARNING_ACCEPTING_TTL_MS = 5 * 60 * 1000;
 const NON_LEARNING_REPLY_CORES = new Set([
   "はい", "いいえ", "了解", "了解です", "了解しました", "承知しました", "かしこまりました",
-  "ありがとうございます", "ありがとうございました", "どういたしまして", "よろしくお願いします",
-  "お待ちください", "少々お待ちください", "確認します", "確認いたします", "お大事になさってください",
+  "承知いたしました", "はい承知しました", "ありがとうございます", "ありがとうございました", "どういたしまして",
+  "よろしくお願いします", "よろしくお願いいたします", "お待ちください", "少々お待ちください", "お待ちしております",
+  "確認します", "確認いたします", "お大事になさってください",
 ]);
 function learningReplyCore(value) {
   return String(value || "")
     .normalize("NFKC")
     .toLowerCase()
     .replace(/(?:https?:\/\/|www\.|mailto:|tel:)[^\s<>"']+/giu, " ")
-    .replace(/[\p{P}\p{S}\s]+/gu, "");
+    .replace(/(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/[^\s<>"']*)?/giu, " ")
+    .replace(/[\d#*]\ufe0f?\u20e3/gu, " ")
+    .replace(/[\p{P}\p{S}\p{M}\p{Cf}\s]+/gu, "");
 }
 function shouldOfferLearningConsent(q, final) {
   const questionCore = learningReplyCore(q), replyCore = learningReplyCore(final);
@@ -1200,7 +1204,9 @@ function expireLearningConsents(t, now) {
   const jobs = learningJobs(t); let removed = 0;
   for (let index = jobs.length - 1; index >= 0; index--) {
     const job = jobs[index];
-    if (job && job.status === "awaiting_consent" && Number(job.expiresAt || 0) <= now) {
+    const promptExpired = job && job.status === "awaiting_consent" && Number(job.expiresAt || 0) <= now;
+    const acceptanceAbandoned = job && job.status === "accepting_consent" && Number(job.updatedAt || 0) + LEARNING_ACCEPTING_TTL_MS <= now;
+    if (promptExpired || acceptanceAbandoned) {
       jobs.splice(index, 1); removed += 1;
     }
   }
@@ -1374,6 +1380,32 @@ async function prepareStaffLearningConsent(t, c, opts) {
   jobs.push(job);
   await saveTenantConfig(t);
   return publicLearningJob(job);
+}
+async function acceptLearningConsentJob(t, job, text) {
+  if (!job || !["awaiting_decision", "awaiting_consent"].includes(job.status)) return null;
+  const explicitConsent = job.status === "awaiting_consent", p = job.payload || {};
+  // awaitの前に同期的に状態を進める。同じ会話への次の送信や期限切れ整理が、
+  // 「はい」を処理中のジョブを awaiting_consent と誤認して削除しないための所有権確保。
+  if (explicitConsent) {
+    job.status = "accepting_consent";
+    job.updatedAt = Date.now();
+    delete job.expiresAt;
+  }
+  try {
+    const ex = await exampleAdd(t, { q: p.q, final: p.final, draft0: p.draft0, instr: p.instr, learningChat: p.learningChat, source: p.source || "web" });
+    if (!ex) throw new Error("example_save");
+    job.exampleId = ex.id; job.reused = !!ex.reused; job.status = "processing"; job.resultType = "";
+    job.learningReview = Object.assign({}, job.learningReview || {}, { exampleId: ex.id, text });
+    job.payload = Object.assign({}, p, { reviewText: text }); job.updatedAt = Date.now();
+    return ex;
+  } catch (e) {
+    // 明示同意後の保存が失敗した候補を中途半端な状態で残さず、学習しない側へ倒す。
+    if (explicitConsent && job.status === "accepting_consent") {
+      const index = learningJobs(t).indexOf(job); if (index >= 0) learningJobs(t).splice(index, 1);
+      await saveTenantConfig(t).catch(() => {});
+    }
+    throw e;
+  }
 }
 // 2つのテキストがほぼ同内容か（bigram重なり率）。ルールの二重登録ガード用。
 function similarEnough(a, b) {
@@ -3446,13 +3478,7 @@ app.post("/api/learning-scope", guard, oneMutationAtATime("learning", learningMu
         return res.json({ ok: true, scope, processing: false, duplicate: true, message: "学習内容は保存済みです" });
       }
       if (job && ["awaiting_decision", "awaiting_consent"].includes(job.status)) {
-        const p = job.payload || {};
-        ex = await exampleAdd(t, { q: p.q, final: p.final, draft0: p.draft0, instr: p.instr, learningChat: p.learningChat, source: p.source || "web" });
-        if (!ex) throw new Error("example_save");
-        job.exampleId = ex.id; job.reused = !!ex.reused; job.status = "processing"; job.resultType = "";
-        delete job.expiresAt;
-        job.learningReview = Object.assign({}, job.learningReview || {}, { exampleId: ex.id, text });
-        job.payload = Object.assign({}, p, { reviewText: text }); job.updatedAt = Date.now();
+        ex = await acceptLearningConsentJob(t, job, text);
       } else if (job && job.status === "ready" && job.resultType === "review" && ex) {
         // 旧バージョンでAI整理済み・判断待ちになっていた案件も、新しい安全確認フローへ移行する。
         job.status = "processing"; job.resultType = ""; job.reused = !!ex.reused;
@@ -6571,7 +6597,7 @@ function showLearningConsent(prompt){
   if(learningConsentData)decideLearningConsent(false,true);
   learningConsentData=Object.assign({},prompt.learningReview,{learningJobId:prompt.id,expiresAt:prompt.expiresAt});
   const toast=document.getElementById("learningConsentToast");if(toast)toast.className="show";
-  const remaining=Math.max(0,Math.min(Number(prompt.promptMs||3000),Number(prompt.expiresAt||0)-Date.now()));
+  const remaining=Math.max(0,Number(prompt.promptMs||3000));
   learningConsentTimer=setTimeout(()=>decideLearningConsent(false,true),remaining);
 }
 async function decideLearningConsent(learn,silent){
