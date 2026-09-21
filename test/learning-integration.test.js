@@ -7,15 +7,16 @@ const path = require("node:path");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
 
-test("Web画面とスタッフLINEは送信成功後だけ確認済み対応例へ保存する", () => {
-  assert.match(source, /queueStaffLearning\(t, found\.c,[\s\S]{0,300}source: "staff_line"/);
-  assert.match(source, /queueStaffLearning\(t, c,[\s\S]{0,300}source: "web"/);
+test("Web画面は送信成功後に確認候補だけを作り、はいの後だけ対応例へ保存する", () => {
+  assert.match(source, /prepareStaffLearningConsent\(t, c,[\s\S]{0,300}source: "web"/);
+  assert.match(source, /status: "awaiting_consent"/);
   assert.match(source, /async function queueStaffLearning[\s\S]{0,900}await exampleAdd\(t,/);
+  assert.match(source, /\["awaiting_decision", "awaiting_consent"\]\.includes\(job\.status\)/);
 });
 
-test("スタッフLINEの修正指示を学習へ引き渡す", () => {
+test("スタッフLINEの既存学習経路は維持し、修正指示を引き渡す", () => {
   assert.match(source, /found\.approval\.editInstruction = text\.slice/);
-  assert.match(source, /instr: editInstruction, source: "staff_line"/);
+  assert.match(source, /queueStaffLearning\(t, found\.c,[\s\S]{0,300}instr: editInstruction, source: "staff_line"/);
 });
 
 test("生成した返信に過去の対応・学習例の参照情報を残す", () => {
@@ -97,17 +98,18 @@ test("スタッフの修正過程を構造化した判断メモリとして保�
   assert.match(source, /判断手順:/);
 });
 
-test("Web送信後は送信済み回答を自動学習し、AIが安全確認と用途別整理を行う", () => {
-  const queue = source.slice(source.indexOf("async function queueStaffLearning"), source.indexOf("// 2つのテキストがほぼ同内容か"));
+test("Web送信後は明示同意がある時だけ安全確認と用途別整理を開始する", () => {
+  const queue = source.slice(source.indexOf("async function queueStaffLearning"), source.indexOf("async function prepareStaffLearningConsent"));
   assert.match(queue, /await exampleAdd\(t,/);
   assert.match(queue, /status: "processing"/);
   assert.match(queue, /setImmediate\(\(\) => processLearningJob\(t, job\.id\)\)/);
-  assert.doesNotMatch(queue, /status: "awaiting_decision"/);
+  assert.doesNotMatch(queue, /status: "awaiting_consent"/);
   assert.match(source, /app\.post\("\/api\/learning-scope", guard/);
   assert.match(source, /\["none", "learn", "patient", "similar", "all"\]/);
   assert.match(source, /async function proposeContextualLearning/);
-  assert.match(source, /患者へ実際に送信できた回答を人の確認済み結果として自動学習する/);
-  assert.match(source, /送信しました・自動学習中/);
+  assert.match(source, /prepareStaffLearningConsent/);
+  assert.match(source, /decideLearningConsent\(true\)/);
+  assert.match(source, /scope:learn\?"learn":"none"/);
   assert.match(source, /learningChat:learning\.learningChat/);
   assert.match(source, /右腕くんとの修正チャット/);
   assert.match(source, /checkFormalRuleConflict/);

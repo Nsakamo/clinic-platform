@@ -55,6 +55,9 @@ test("再起動後と定期ワーカーでprocessing学習ジョブだけを再�
     learningJobs: tenant => tenant.config.learningJobs,
     setImmediate: callback => scheduled.push(callback),
     processLearningJob: (_tenant, id) => processed.push(id),
+    expireLearningConsents: () => 0,
+    saveTenantConfig: async () => {},
+    console: { error() {} },
     TEN: {},
   };
   vm.runInNewContext(between("function resumeLearningJobs", "async function checkFormalRuleConflict"), context);
