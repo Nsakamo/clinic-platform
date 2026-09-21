@@ -1175,10 +1175,41 @@ function learningJobs(t) {
   for (let index = jobs.length - 1; index >= 0; index--) if (!jobs[index]) jobs.splice(index, 1);
   return jobs;
 }
+const LEARNING_PROMPT_MS = 3000;
+const LEARNING_CONSENT_TTL_MS = 10000;
+const NON_LEARNING_REPLY_CORES = new Set([
+  "はい", "いいえ", "了解", "了解です", "了解しました", "承知しました", "かしこまりました",
+  "ありがとうございます", "ありがとうございました", "どういたしまして", "よろしくお願いします",
+  "お待ちください", "少々お待ちください", "確認します", "確認いたします", "お大事になさってください",
+]);
+function learningReplyCore(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/(?:https?:\/\/|www\.|mailto:|tel:)[^\s<>"']+/giu, " ")
+    .replace(/[\p{P}\p{S}\s]+/gu, "");
+}
+function shouldOfferLearningConsent(q, final) {
+  const questionCore = learningReplyCore(q), replyCore = learningReplyCore(final);
+  if (!questionCore || !replyCore) return false;
+  if (NON_LEARNING_REPLY_CORES.has(replyCore)) return false;
+  if (/^(?:こちら|こちらから|以下|下記)(?:です|になります|をご確認ください|からご確認ください)?$/u.test(replyCore)) return false;
+  return true;
+}
+function expireLearningConsents(t, now) {
+  const jobs = learningJobs(t); let removed = 0;
+  for (let index = jobs.length - 1; index >= 0; index--) {
+    const job = jobs[index];
+    if (job && job.status === "awaiting_consent" && Number(job.expiresAt || 0) <= now) {
+      jobs.splice(index, 1); removed += 1;
+    }
+  }
+  return removed;
+}
 function publicLearningJob(job) {
   return {
     id: String(job.id || ""), conversationId: String(job.conversationId || ""), status: String(job.status || "processing"),
-    createdAt: Number(job.createdAt || 0), updatedAt: Number(job.updatedAt || 0), resultType: String(job.resultType || ""),
+    createdAt: Number(job.createdAt || 0), updatedAt: Number(job.updatedAt || 0), expiresAt: Number(job.expiresAt || 0), promptMs: Number(job.promptMs || 0), resultType: String(job.resultType || ""),
     learningReview: job.learningReview || null, conflict: job.conflict || null, outcome: job.outcome || null,
     error: String(job.error || ""),
   };
@@ -1199,6 +1230,7 @@ function finishLearningJobFor(t, id, exampleId, conflictId) {
   return job;
 }
 function resumeLearningJobs(t) {
+  if (expireLearningConsents(t, Date.now())) saveTenantConfig(t).catch(e => console.error("learning consent expiry save:", e && e.message));
   learningJobs(t).filter(job => job.status === "processing").forEach(job => setImmediate(() => processLearningJob(t, job.id)));
 }
 function processAllLearningJobs() {
@@ -1319,6 +1351,29 @@ async function queueStaffLearning(t, c, opts) {
     await processLearningJob(t, job.id);
   }
   return { learnedId: ex.id, job: publicLearningJob(job) };
+}
+async function prepareStaffLearningConsent(t, c, opts) {
+  const q = String(opts.q || recentCustomerQuestion(c)).trim(), final = String(opts.final || "").trim();
+  if (!shouldOfferLearningConsent(q, final)) return null;
+  const draft0 = String(opts.draft0 || "").trim(), instr = String(opts.instr || "").trim(), learningChat = sanitizeLearningChat(opts.learningChat);
+  const review = learningReviewPayload({ id: 0 }, { q, final, draft0, instr, reviewText: opts.reviewText, conversationId: c && c.id }) || {
+    exampleId: 0, conversationId: String(c && c.id || ""), q: q.slice(0, 600), final: final.slice(0, 1500),
+    draft0: draft0.slice(0, 1500), instr: instr.slice(0, 800),
+    text: contextualLearningFallback({ q, final, draft0, instr, reviewText: opts.reviewText }).slice(0, 2400), suggestedScope: "learn",
+  };
+  const jobs = learningJobs(t);
+  for (let index = jobs.length - 1; index >= 0; index--) {
+    if (jobs[index] && jobs[index].status === "awaiting_consent" && jobs[index].conversationId === String(c && c.id || "")) jobs.splice(index, 1);
+  }
+  const now = Date.now(), job = {
+    id: "lc-" + now.toString(36) + "-" + crypto.randomBytes(3).toString("hex"), conversationId: String(c && c.id || ""),
+    exampleId: 0, reused: false, status: "awaiting_consent", resultType: "", createdAt: now, updatedAt: now,
+    expiresAt: now + LEARNING_CONSENT_TTL_MS, promptMs: LEARNING_PROMPT_MS, learningReview: review, conflict: null, outcome: null,
+    payload: { q, final, draft0, instr, learningChat, reviewText: opts.reviewText, source: opts.source || "web", changed: final !== draft0 || !!instr },
+  };
+  jobs.push(job);
+  await saveTenantConfig(t);
+  return publicLearningJob(job);
 }
 // 2つのテキストがほぼ同内容か（bigram重なり率）。ルールの二重登録ガード用。
 function similarEnough(a, b) {
@@ -2882,7 +2937,7 @@ app.post("/api/send", guard, async (req, res) => {
   const baseUrl = messagePublicBase(req);
   try { ({ sent, sendErr } = await deliverMessageBundle(t, c, text, files, baseUrl)); }
   finally { sendLocks.delete(sendLockKey); }
-  let learnedId = null, learningJob = null;
+  let learningPrompt = null;
   if (sent) {
     const draft0 = String(c.draft0 || "").trim(); // 学習判定用に、消す前のAI初回下書きを確保
     const q0 = recentCustomerQuestion(c);
@@ -2894,16 +2949,14 @@ app.post("/api/send", guard, async (req, res) => {
     statBump(t, "staff");
     if (text) {
       try {
-        const queued = await queueStaffLearning(t, c, { q: q0, final: text, draft0, instr, learningChat, reviewText, source: "web" });
-        learnedId = queued && queued.learnedId;
-        learningJob = queued && queued.job;
+        learningPrompt = await prepareStaffLearningConsent(t, c, { q: q0, final: text, draft0, instr, learningChat, reviewText, source: "web" });
       } catch (e) {
-        // 患者への送信完了後に学習保存だけ失敗しても、500を返して再送を誘発しない。
-        console.error("web learning queue:", t.slug, c.id, String(e && e.message || e).slice(0, 120));
+        // 患者への送信完了後に確認候補の準備だけ失敗しても、500を返して再送を誘発しない。
+        console.error("web learning consent:", t.slug, c.id, String(e && e.message || e).slice(0, 120));
       }
     }
   }
-  res.json({ ok: true, sent, sendErr, learnedId, learningJob });
+  res.json({ ok: true, sent, sendErr, learningPrompt });
 });
 
 function scheduledMessages(t) {
@@ -3110,6 +3163,7 @@ function publicSettings(t) {
 }
 app.get("/api/settings", guard, (req, res) => res.json(publicSettings(req.tenant)));
 app.get("/api/learning-pending-count", guard, (req, res) => {
+  if (expireLearningConsents(req.tenant, Date.now())) saveTenantConfig(req.tenant).catch(() => {});
   const jobs = learningJobs(req.tenant);
   res.json({
     ok: true,
@@ -3330,6 +3384,7 @@ app.post("/api/example-update", guard, oneMutationAtATime("learning"), async (re
 app.post("/api/example-delete", guard, oneMutationAtATime("learning"), async (req, res) => { const t = req.tenant; try { await exampleDelete(t, req.body.id); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false, error: "delete" }); } });
 app.get("/api/learning-jobs", guard, (req, res) => {
   const t = req.tenant;
+  if (expireLearningConsents(t, Date.now())) saveTenantConfig(t).catch(() => {});
   resumeLearningJobs(t);
   res.json({ ok: true, jobs: learningJobs(t).filter(job => job.status !== "done").slice(-30).map(publicLearningJob) });
 });
@@ -3346,9 +3401,15 @@ app.post("/api/learning-job-ack", guard, oneMutationAtATime("learning", learning
 app.post("/api/learning-scope", guard, oneMutationAtATime("learning", learningMutationResource), async (req, res) => {
   const t = req.tenant, requestedId = Number(req.body.exampleId), scope = String(req.body.scope || "");
   let job = learningJobs(t).find(item => item.id === String(req.body.learningJobId || ""));
+  if (job && job.status === "awaiting_consent" && Number(job.expiresAt || 0) <= Date.now()) {
+    const index = learningJobs(t).indexOf(job); if (index >= 0) learningJobs(t).splice(index, 1);
+    await saveTenantConfig(t).catch(() => {});
+    return res.status(410).json({ ok: false, error: "consent_expired" });
+  }
   const id = requestedId || Number(job && job.exampleId || 0);
   let ex = t.examples && t.examples[id];
   if (!["none", "learn", "patient", "similar", "all"].includes(scope)) return res.status(400).json({ ok: false, error: "bad_scope" });
+  if (job && job.status === "awaiting_consent" && !["none", "learn"].includes(scope)) return res.status(400).json({ ok: false, error: "bad_scope" });
   const text = String(req.body.text || (job && job.learningReview && job.learningReview.text) || (ex && ex.instr) || "").trim().slice(0, 2400);
   if (scope !== "none" && !text) return res.status(400).json({ ok: false, error: "required" });
   try {
@@ -3367,7 +3428,9 @@ app.post("/api/learning-scope", guard, oneMutationAtATime("learning", learningMu
     if (scope === "none") {
       // 新方式では未確定候補を捨てるだけ。旧方式の保存済み例だけ後方互換で削除する。
       if (ex && (!job || Number(job.exampleId))) await exampleDelete(t, id);
-      if (job) { job.status = "done"; job.resultType = "ignored"; job.payload = null; job.updatedAt = Date.now(); }
+      if (job && job.status === "awaiting_consent") {
+        const index = learningJobs(t).indexOf(job); if (index >= 0) learningJobs(t).splice(index, 1);
+      } else if (job) { job.status = "done"; job.resultType = "ignored"; job.payload = null; job.updatedAt = Date.now(); }
       else finishLearningJobFor(t, req.body.learningJobId, id, "");
       await saveTenantConfig(t);
       return res.json({ ok: true, scope, message: "今回は学習しません" });
@@ -3382,11 +3445,12 @@ app.post("/api/learning-scope", guard, oneMutationAtATime("learning", learningMu
       if (job && ["completed", "done"].includes(job.status)) {
         return res.json({ ok: true, scope, processing: false, duplicate: true, message: "学習内容は保存済みです" });
       }
-      if (job && job.status === "awaiting_decision") {
+      if (job && ["awaiting_decision", "awaiting_consent"].includes(job.status)) {
         const p = job.payload || {};
         ex = await exampleAdd(t, { q: p.q, final: p.final, draft0: p.draft0, instr: p.instr, learningChat: p.learningChat, source: p.source || "web" });
         if (!ex) throw new Error("example_save");
         job.exampleId = ex.id; job.reused = !!ex.reused; job.status = "processing"; job.resultType = "";
+        delete job.expiresAt;
         job.learningReview = Object.assign({}, job.learningReview || {}, { exampleId: ex.id, text });
         job.payload = Object.assign({}, p, { reviewText: text }); job.updatedAt = Date.now();
       } else if (job && job.status === "ready" && job.resultType === "review" && ex) {
@@ -5249,9 +5313,11 @@ const PAGE = `<!DOCTYPE html>
   #listHeadMeta{display:flex;align-items:center;gap:7px;}
   #learningPendingBadge{display:none;border:1px solid #f59e0b;background:#fffbeb;color:#92400e;border-radius:999px;padding:4px 8px;font-size:10.5px;font-weight:800;cursor:pointer;white-space:nowrap;}
   #learningPendingBadge.hasConflict{border-color:#ef4444;background:#fef2f2;color:#b91c1c;}
-  #learningResultBanner{display:none;position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:91;width:min(92vw,620px);align-items:center;gap:10px;padding:12px 14px;border:1px solid;border-radius:13px;box-shadow:0 14px 38px rgba(15,23,42,.2);}
+  #learningResultBanner{display:none;position:fixed;left:50%;top:calc(10px + env(safe-area-inset-top));transform:translateX(-50%);z-index:91;width:min(92vw,620px);align-items:center;gap:10px;padding:12px 14px;border:1px solid;border-radius:13px;box-shadow:0 14px 38px rgba(15,23,42,.2);}
   #learningResultBanner.show{display:flex;}#learningResultBanner.processing{background:#f5f3ff;border-color:#c4b5fd;color:#5b21b6;}#learningResultBanner.new,#learningResultBanner.updated{background:#ecfdf5;border-color:#86efac;color:#166534;}#learningResultBanner.duplicate{background:#eff6ff;border-color:#93c5fd;color:#1d4ed8;}#learningResultBanner.conflict{background:#fff7ed;border-color:#fdba74;color:#9a3412;}#learningResultBanner.ignored{background:#f8fafc;border-color:#cbd5e1;color:#475569;}#learningResultBanner.error{background:#fef2f2;border-color:#fca5a5;color:#b91c1c;}
   .learningResultIcon{width:34px;height:34px;border-radius:10px;background:rgba(255,255,255,.72);display:grid;place-items:center;font-size:17px;flex:0 0 auto;}.learningResultCopy{min-width:0;flex:1;}.learningResultCopy strong{display:block;font-size:13px;}.learningResultCopy small{display:block;font-size:11px;line-height:1.45;margin-top:2px;opacity:.82;}.learningResultLabel{border:1px solid currentColor;border-radius:999px;padding:4px 8px;background:rgba(255,255,255,.55);font-size:10px;font-weight:800;white-space:nowrap;}.learningResultClose{border:0;background:transparent;color:currentColor;font-size:19px;cursor:pointer;padding:2px;}
+  #learningConsentToast{display:none;position:fixed;left:50%;top:calc(10px + env(safe-area-inset-top));transform:translateX(-50%);z-index:93;width:min(92vw,430px);align-items:center;gap:10px;padding:10px 11px 10px 13px;border:1px solid #c4b5fd;border-radius:13px;background:#fff;box-shadow:0 12px 32px rgba(15,23,42,.2);}
+  #learningConsentToast.show{display:flex;}.learningConsentCopy{min-width:0;flex:1;font-size:12px;font-weight:700;color:#4c1d95;line-height:1.4;}.learningConsentActions{display:flex;gap:6px;flex:0 0 auto;}.learningConsentActions button{min-width:54px;min-height:40px;border-radius:10px;border:1px solid #d1d5db;background:#fff;color:#475569;font-size:13px;font-weight:800;cursor:pointer;}.learningConsentActions .yes{border-color:#7c3aed;background:#7c3aed;color:#fff;}
   .learningConflictCard{width:min(94vw,720px);height:min(90vh,760px);background:#fff;border-radius:16px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 22px 65px rgba(15,23,42,.28);}.learningConflictHead{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:14px 16px;border-bottom:1px solid var(--line);}.learningConflictHead h3{margin:0;font-size:15px;}.learningConflictThread{flex:1;overflow-y:auto;padding:16px;background:#f8fafc;}.learningConflictLine{display:flex;align-items:flex-start;gap:8px;margin-bottom:12px;}.learningConflictAvatar{width:30px;height:30px;border-radius:9px;background:#0f766e;color:#fff;display:grid;place-items:center;font-size:10px;font-weight:800;flex:0 0 auto;}.learningConflictMessage{max-width:calc(100% - 40px);padding:11px 12px;border:1px solid #dbe4e1;border-radius:4px 13px 13px 13px;background:#fff;font-size:12px;line-height:1.6;}.learningConflictDiff{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0;}.learningConflictRule{padding:9px;border:1px solid #d1d5db;border-radius:9px;background:#f8fafc;white-space:pre-wrap;}.learningConflictRule.old{border-top:4px solid #94a3b8;}.learningConflictRule.new{border-top:4px solid #f59e0b;background:#fffbeb;}.learningConflictRule b{display:block;font-size:10px;margin-bottom:4px;}.learningConflictQuick{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px;}.learningConflictQuick .cbtn{font-size:11px;padding:7px 9px;}.learningConflictUser{display:none;justify-content:flex-end;margin:8px 0 12px;}.learningConflictUser.show{display:flex;}.learningConflictUser div{max-width:82%;padding:10px 12px;border-radius:13px 4px 13px 13px;background:#dcfce7;font-size:12px;white-space:pre-wrap;}.learningConflictProposal{display:none;}.learningConflictProposal.show{display:flex;}.learningConflictCompose{padding:10px 13px calc(10px + env(safe-area-inset-bottom));border-top:1px solid var(--line);background:#fff;}.learningConflictCompose textarea{box-sizing:border-box;width:100%;min-height:64px;border:1px solid #a7c7c0;border-radius:9px;padding:9px;font:13px/1.5 inherit;resize:vertical;}.learningConflictComposeActions{display:flex;justify-content:flex-end;margin-top:6px;}
   #tools{display:flex;gap:6px;padding:4px 12px 10px;border-bottom:1px solid var(--line);}
   .tbtn{flex:1;font-size:11px;padding:7px 2px;border:1px solid var(--line);background:#fff;border-radius:9px;cursor:pointer;white-space:nowrap;color:var(--text);}
@@ -5582,7 +5648,7 @@ const PAGE = `<!DOCTYPE html>
     .rmFooter{padding:8px 9px calc(8px + env(safe-area-inset-bottom));}
     .rmFooter .cbtn{min-height:42px;}
     .learningFooter #learnAddBtn{min-width:132px;}
-    #learningResultBanner{left:8px;right:8px;bottom:calc(8px + env(safe-area-inset-bottom));transform:none;width:auto;padding:10px;}.learningResultLabel{display:none;}.learningConflictCard{width:100vw;height:100vh;height:100dvh;border-radius:0;}.learningConflictHead{padding:calc(10px + env(safe-area-inset-top)) 11px 10px;}.learningConflictThread{padding:11px;}.learningConflictDiff{grid-template-columns:1fr;}.learningConflictMessage{max-width:calc(100% - 38px);}.learningConflictCompose textarea{font-size:16px;}
+    #learningResultBanner,#learningConsentToast{left:8px;right:8px;top:calc(8px + env(safe-area-inset-top));transform:none;width:auto;padding:10px;}.learningResultLabel{display:none;}.learningConsentCopy{font-size:11.5px;}.learningConsentActions button{min-width:52px;min-height:44px;}.learningConflictCard{width:100vw;height:100vh;height:100dvh;border-radius:0;}.learningConflictHead{padding:calc(10px + env(safe-area-inset-top)) 11px 10px;}.learningConflictThread{padding:11px;}.learningConflictDiff{grid-template-columns:1fr;}.learningConflictMessage{max-width:calc(100% - 38px);}.learningConflictCompose textarea{font-size:16px;}
   }
 </style>
 </head>
@@ -5866,7 +5932,8 @@ const PAGE = `<!DOCTYPE html>
     <div style="padding:10px 17px 14px;border-top:1px solid #e5e7eb;display:flex;gap:8px;justify-content:flex-end;"><button type="button" class="cbtn" onclick="closeScheduledMessage()">戻る</button><button type="button" id="scheduledMessageSave" class="cbtn send" onclick="saveScheduledMessage()">この日時で予約</button></div>
   </div>
 </div>
-<div id="learnToast" style="display:none;position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:75;background:#065f46;color:#fff;border-radius:10px;padding:8px 14px;font-size:12px;box-shadow:0 6px 20px rgba(0,0,0,.25);">✓ この対応を学習しました</div>
+<div id="learnToast" style="display:none;position:fixed;left:50%;top:calc(10px + env(safe-area-inset-top));transform:translateX(-50%);z-index:75;background:#065f46;color:#fff;border-radius:10px;padding:8px 14px;font-size:12px;box-shadow:0 6px 20px rgba(0,0,0,.25);">✓ この対応を学習しました</div>
+<div id="learningConsentToast" role="dialog" aria-live="polite" aria-label="学習するか確認"><div class="learningConsentCopy">この送信内容を学習しますか？</div><div class="learningConsentActions"><button type="button" onclick="decideLearningConsent(false)">いいえ</button><button type="button" class="yes" onclick="decideLearningConsent(true)">はい</button></div></div>
 <div id="learningResultBanner" role="status"><span id="learningResultIcon" class="learningResultIcon"></span><span class="learningResultCopy"><strong id="learningResultTitle"></strong><small id="learningResultMessage"></small></span><span id="learningResultLabel" class="learningResultLabel"></span><button type="button" class="learningResultClose" aria-label="閉じる" onclick="event.stopPropagation();closeLearningResult()">×</button></div>
 <div id="conflictPop" style="position:fixed;inset:0;background:rgba(15,23,42,.48);z-index:92;display:none;align-items:center;justify-content:center;">
   <div class="learningConflictCard">
@@ -6497,7 +6564,32 @@ function showLearningProgress(){const p=document.getElementById("learningProgres
 function hideLearningProgress(){const p=document.getElementById("learningProgress");if(p)p.style.display="none";}
 function showReadyLearningFor(id){const job=learningJobsByConversation[id];if(!job||current!==id)return;const decision=job.status==="awaiting_decision"||(job.status==="ready"&&job.resultType==="review");if(decision&&job.learningReview&&!shownLearningDecisions.has(job.id)){shownLearningDecisions.add(job.id);showLearningScope(Object.assign({},job.learningReview,{learningJobId:job.id}));}}
 async function pollLearningJobs(){try{const r=await fetch("/api/learning-jobs"),j=await r.json();if(!r.ok||!j.ok)return;learningJobList=j.jobs||[];Object.keys(learningJobsByConversation).forEach(k=>delete learningJobsByConversation[k]);learningJobList.forEach(job=>{const old=learningJobsByConversation[job.conversationId];if(!old||Number(job.updatedAt)>=Number(old.updatedAt))learningJobsByConversation[job.conversationId]=job;});const result=learningJobList.find(job=>job.status==="completed"&&!shownLearningResults.has(job.id));if(result){shownLearningResults.add(result.id);showLearningOutcome(result.outcome||{type:result.resultType,title:"学習処理が完了しました",message:""},result.id);}const conflict=learningJobList.find(job=>job.status==="ready"&&job.resultType==="conflict"&&!shownLearningResults.has(job.id));if(conflict){shownLearningResults.add(conflict.id);showLearningOutcome({type:"conflict",title:"現在のルールと内容が異なります",message:"自動反映していません。右上の要確認から右腕くんと確認してください"});}renderList();if(current)showReadyLearningFor(current);refreshLearningBadge();}catch(e){}}
-async function sendMsg(){if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="患者へ送信中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat});let json={};try{json=await response.json();}catch(e){}if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";let legacyLearning=null;if(json.learningJob){learningJobsByConversation[id]=json.learningJob;if(json.learningJob.status==="awaiting_decision"&&json.learningJob.learningReview){shownLearningDecisions.add(json.learningJob.id);legacyLearning=Object.assign({},json.learningJob.learningReview,{learningJobId:json.learningJob.id});}}await load();if(legacyLearning&&current===id)showLearningScope(legacyLearning);else if(json.learningJob)showLearningOutcome({type:"processing",title:"送信しました・自動学習中",message:"重複・矛盾・患者固有情報を裏側で確認しています"});else showLearnResult("送信しました");pollLearningJobs();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
+let learningConsentData=null,learningConsentTimer=null;
+function dismissLearningConsent(){const toast=document.getElementById("learningConsentToast");clearTimeout(learningConsentTimer);learningConsentTimer=null;if(toast)toast.className="";learningConsentData=null;}
+function showLearningConsent(prompt){
+  if(!prompt||prompt.status!=="awaiting_consent"||!prompt.learningReview)return;
+  if(learningConsentData)decideLearningConsent(false,true);
+  learningConsentData=Object.assign({},prompt.learningReview,{learningJobId:prompt.id,expiresAt:prompt.expiresAt});
+  const toast=document.getElementById("learningConsentToast");if(toast)toast.className="show";
+  const remaining=Math.max(0,Math.min(Number(prompt.promptMs||3000),Number(prompt.expiresAt||0)-Date.now()));
+  learningConsentTimer=setTimeout(()=>decideLearningConsent(false,true),remaining);
+}
+async function decideLearningConsent(learn,silent){
+  const data=learningConsentData;if(!data)return;
+  dismissLearningConsent();
+  const payload={learningJobId:data.learningJobId,conversationId:data.conversationId,scope:learn?"learn":"none",text:data.text,q:data.q,final:data.final,draft0:data.draft0,instr:data.instr};
+  try{
+    let response=await api("/api/learning-scope",payload),json=await response.json().catch(()=>({}));
+    if(response.status===409&&json.error==="already_processing"){
+      await new Promise(resolve=>setTimeout(resolve,300));
+      response=await api("/api/learning-scope",payload);json=await response.json().catch(()=>({}));
+    }
+    if(!response.ok||!json.ok){if(!learn&&(response.status===404||response.status===410))return;throw new Error(json.error||"save");}
+    if(learn){showLearningOutcome({type:"processing",title:"学習内容を確認しています",message:"重複・矛盾・患者固有情報を裏側で確認中です"});pollLearningJobs();}
+    refreshLearningBadge();
+  }catch(e){if(learn&&!silent)showLearningOutcome({type:"error",title:"学習を開始できませんでした",message:e.message==="consent_expired"?"3秒を過ぎたため、今回は記録していません":"患者への送信は完了しています。今回は学習していません"});}
+}
+async function sendMsg(){if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="患者へ送信中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat});let json={};try{json=await response.json();}catch(e){}if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";if(json.learningPrompt)showLearningConsent(json.learningPrompt);else showLearnResult("送信しました");await load();pollLearningJobs();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
 let scheduledMessageDraft=null;
 function localDateTimeValue(date){const pad=n=>String(n).padStart(2,"0");return date.getFullYear()+"-"+pad(date.getMonth()+1)+"-"+pad(date.getDate())+"T"+pad(date.getHours())+":"+pad(date.getMinutes());}
 function openScheduledMessage(){

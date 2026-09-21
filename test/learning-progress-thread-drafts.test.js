@@ -5,11 +5,13 @@ const path = require("node:path");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
 
-test("患者への送信直後に自動学習を開始し、AI整理はバックグラウンドで続ける", () => {
-  assert.match(source, /queueStaffLearning\(t, c/);
+test("患者への送信直後は3秒の確認だけを表示し、はいで学習を開始する", () => {
+  assert.match(source, /prepareStaffLearningConsent\(t, c/);
   assert.match(source, /app\.get\("\/api\/learning-jobs"/);
-  assert.match(source, /json\.learningJob\.status==="awaiting_decision"/);
-  assert.match(source, /else if\(json\.learningJob\)showLearningOutcome\(\{type:"processing",title:"送信しました・自動学習中"/);
+  assert.match(source, /id="learningConsentToast"/);
+  assert.match(source, /learningConsentTimer=setTimeout\(\(\)=>decideLearningConsent\(false,true\),remaining\)/);
+  assert.match(source, /onclick="decideLearningConsent\(false\)"[\s\S]{0,180}onclick="decideLearningConsent\(true\)"/);
+  assert.match(source, /scope:learn\?"learn":"none"/);
   assert.match(source, /if \(job\.status !== "processing"\) return/);
   assert.match(source, /duplicate:"重複統合"/);
   assert.match(source, /type:"conflict",title:"現在のルールと内容が異なります"/);
