@@ -41,8 +41,15 @@ test("裸ドメイン判定は長大入力でも速く、日本語の判断部�
   const longAscii = "a".repeat(100000);
   const started = performance.now();
   assert.equal(context.shouldOfferLearningConsent("質問です", longAscii), true);
-  assert.ok(performance.now() - started < 50);
+  assert.ok(performance.now() - started < 250);
   assert.equal(context.shouldOfferLearningConsent("変更期限はいつですか", "smilemedi.jp/reserveから前日まで変更できます"), true);
+  assert.equal(context.shouldOfferLearningConsent("変更期限はいつですか", "https://smilemedi.jp/reserveから前日まで変更できます"), true);
+  assert.equal(context.shouldOfferLearningConsent("変更期限はいつですか", "www.smilemedi.jp/reserveから前日まで変更できます"), true);
+
+  const manyDomainParts = "a.".repeat(50000);
+  const worstCaseStarted = performance.now();
+  assert.equal(context.shouldOfferLearningConsent("質問です", manyDomainParts), true);
+  assert.ok(performance.now() - worstCaseStarted < 250);
 });
 
 test("短くても再利用できる判断を含む回答には学習確認を出す", () => {

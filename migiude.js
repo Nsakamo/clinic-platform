@@ -1188,7 +1188,8 @@ function learningReplyCore(value) {
   return String(value || "").slice(0, 5000)
     .normalize("NFKC")
     .toLowerCase()
-    .replace(/(?:https?:\/\/|www\.|mailto:|tel:)[^\s<>"']+/giu, " ")
+    .replace(/(?:https?:\/\/|www\.)[a-z0-9._~:/?#@!$&'()*+,;=%-]+/giu, " ")
+    .replace(/(?:mailto:|tel:)[^\s<>"']+/giu, " ")
     .replace(/(?<![a-z0-9-])(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/[a-z0-9._~:/?#@!$&'()*+,;=%-]*)?/giu, " ")
     .replace(/[\d#*]\ufe0f?\u20e3/gu, " ")
     .replace(/[\p{P}\p{S}\p{M}\p{Cf}\s]+/gu, "");
