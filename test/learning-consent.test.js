@@ -33,6 +33,16 @@ test("URLだけ・絵文字だけ・短い定型応答には学習確認を出�
   }
   assert.equal(context.shouldOfferLearningConsent("確認をお願いします", "承知しました。"), false);
   assert.equal(context.shouldOfferLearningConsent("確認をお願いします", "よろしくお願いいたします。"), false);
+  assert.equal(context.shouldOfferLearningConsent("確認をお願いします", "はい、承知いたしました。"), false);
+});
+
+test("裸ドメイン判定は長大入力でも速く、日本語の判断部分を消さない", () => {
+  const context = eligibilityContext();
+  const longAscii = "a".repeat(100000);
+  const started = performance.now();
+  assert.equal(context.shouldOfferLearningConsent("質問です", longAscii), true);
+  assert.ok(performance.now() - started < 50);
+  assert.equal(context.shouldOfferLearningConsent("変更期限はいつですか", "smilemedi.jp/reserveから前日まで変更できます"), true);
 });
 
 test("短くても再利用できる判断を含む回答には学習確認を出す", () => {

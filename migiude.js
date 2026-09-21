@@ -1180,16 +1180,16 @@ const LEARNING_CONSENT_TTL_MS = 10000;
 const LEARNING_ACCEPTING_TTL_MS = 5 * 60 * 1000;
 const NON_LEARNING_REPLY_CORES = new Set([
   "はい", "いいえ", "了解", "了解です", "了解しました", "承知しました", "かしこまりました",
-  "承知いたしました", "はい承知しました", "ありがとうございます", "ありがとうございました", "どういたしまして",
+  "承知いたしました", "はい承知しました", "はい承知いたしました", "了解いたしました", "ありがとうございます", "ありがとうございました", "どういたしまして",
   "よろしくお願いします", "よろしくお願いいたします", "お待ちください", "少々お待ちください", "お待ちしております",
-  "確認します", "確認いたします", "お大事になさってください",
+  "確認します", "確認いたします", "お大事に", "お大事になさってください",
 ]);
 function learningReplyCore(value) {
-  return String(value || "")
+  return String(value || "").slice(0, 5000)
     .normalize("NFKC")
     .toLowerCase()
     .replace(/(?:https?:\/\/|www\.|mailto:|tel:)[^\s<>"']+/giu, " ")
-    .replace(/(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/[^\s<>"']*)?/giu, " ")
+    .replace(/(?<![a-z0-9-])(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/[a-z0-9._~:/?#@!$&'()*+,;=%-]*)?/giu, " ")
     .replace(/[\d#*]\ufe0f?\u20e3/gu, " ")
     .replace(/[\p{P}\p{S}\p{M}\p{Cf}\s]+/gu, "");
 }
