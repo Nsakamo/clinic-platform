@@ -11,6 +11,7 @@ const express = require("express");
 const crypto = require("crypto");
 const { intentTokens, rankLearningExamples, sameLearningExample } = require("./lib/learning-retrieval");
 const { evaluateResponseGrounding } = require("./lib/response-grounding");
+const { normalizeReplyTone, replyToneInstruction, toneRewriteInstruction } = require("./lib/reply-tone");
 const { compareConversations, compareConversationsRecent } = require("./lib/conversation-order");
 const { MAX_ATTACHMENTS, normalizeFileIds, normalizeScheduledMessageInput, pruneScheduledMessages } = require("./lib/scheduled-message");
 const { lineWebhookEventId, lineWebhookRetryDelay, isProcessableLineEvent } = require("./lib/line-webhook-queue");
@@ -494,10 +495,13 @@ async function staffLineRequestApproval(t, c, reason, opts) {
 async function staffLineReviseDraft(t, c, instruction) {
   const history = staffLineHistoryText(c);
   let booking = ""; try { booking = await fetchBooking(t, c); } catch (e) {}
-  const sys = "あなたは店舗の受付スタッフ。会話、現在の返信案、スタッフの修正指示を踏まえ、患者へ送る返信本文だけを作る。医療判断や情報の推測はしない。" + (booking ? "\n予約システムの確認結果:\n" + booking : "");
+  const sys = "あなたは店舗の受付スタッフ。会話、現在の返信案、スタッフの修正指示を踏まえ、患者へ送る返信本文だけを作る。医療判断や情報の推測はしない。"
+    + (booking ? "\n予約システムの確認結果:\n" + booking : "")
+    + (replyToneInstruction(S(t).tone) ? "\n\n" + replyToneInstruction(S(t).tone) : "");
   const content = "会話:\n" + history + "\n\n現在の返信案:\n" + String(c.draft || "") + "\n\nスタッフの修正指示:\n" + String(instruction || "").slice(0, 1200);
   const out = await aiChat(t, sys, [{ role: "user", content }], 1800, "chat");
-  return String(out || "").trim();
+  if (!String(out || "").trim()) return "";
+  return (await finalizeGeneratedDraft(t, out, c.channel)).text;
 }
 const staffLineInFlight = new Set();
 async function staffLineEscalate(t, c, reason) {
@@ -1681,14 +1685,21 @@ function draftQualityIssues(text){
 }
 async function finalizeGeneratedDraft(t, raw, channel){
   let text = cleanDraftText(raw), issues = draftQualityIssues(text);
-  if(!issues.length) return { text, issues:[] };
-  const sys = "患者へ送る日本語文の校正者。事実・日時・料金・URL・可否・固有名詞・謝罪の有無を変えず、不自然な敬語、過剰な格式、重複だけを直す。新しい情報を足さない。" + (channel==="mail" ? "メールの署名は残す。" : "LINE本文として簡潔にする。") + "返信本文だけを出力する。";
+  const tone = normalizeReplyTone(S(t).tone);
+  if(!issues.length && !tone) return { text, issues:[] };
+  const sys = "患者へ送る日本語文の最終校正者。事実・日時・料金・URL・可否・固有名詞・謝罪の有無を変えず、不自然な敬語、過剰な格式、重複だけを直す。新しい情報を足さない。"
+    + (channel==="mail" ? "メールの署名は残す。" : "LINE本文として簡潔にする。")
+    + toneRewriteInstruction(tone, channel)
+    + "返信本文だけを出力する。";
   const revised = await aiChat(t, sys, [{role:"user",content:text.slice(0,5000)}], 1800, "finalize");
   if(revised){
     const candidate = cleanDraftText(revised);
-    if(candidate && !draftQualityIssues(candidate).includes("empty")) text = candidate;
+    if(candidate && !draftQualityIssues(candidate).includes("empty")) {
+      if(tone) issues.push("tone_reviewed");
+      text = candidate;
+    }
   }
-  return { text, issues };
+  return { text, issues:Array.from(new Set(issues)) };
 }
 async function validateDraftAgainstEvidence(t, input){
   input = input || {};
@@ -1698,7 +1709,9 @@ async function validateDraftAgainstEvidence(t, input){
     input.slots ? "【リアルタイム空き枠】\n" + input.slots : "",
     input.precedents ? "【類似するスタッフ確定例】\n" + input.precedents : "",
   ].filter(Boolean).join("\n\n") || "（事実の根拠資料なし）";
-  const sys = "あなたは患者返信の送信前監査兼、日本語編集者です。根拠の優先順位は、最新の店舗ルール > 本人確認済みシステムデータ > 類似するスタッフ確定例。同種の店舗ルールが複数あり食い違う場合は更新日が最も新しいものを採用する。新しい店舗ルールと古い確定例が食い違えば必ず店舗ルールを採用する。類似するスタッフ確定例は、同種問い合わせへの結論・案内手順・必要確認・通常の料金や規定の根拠として使えるが、個別患者の予約・体調・特例は引き継がない。根拠にない事実、数字、可否、完了報告、医療判断があればpass:false。回答漏れ、会話との矛盾、別患者情報の混入もpass:false。内容が正しく日本語だけが不自然・冗長な場合は、事実を一切変えず自然で簡潔な受付文へ直してrevised_draftに入れ、pass:trueにできる。一般的な挨拶、謝意、確認する旨、必要情報を尋ねる文は根拠なしでも可。必ずJSONのみ: {\"pass\":true|false,\"answered\":true|false,\"natural\":true|false,\"revised_draft\":\"修正不要なら空文字\",\"unsupported_claims\":[\"\"],\"contradictions\":[\"\"],\"reason\":\"短い日本語\"}";
+  const sys = "あなたは患者返信の送信前監査兼、日本語編集者です。根拠の優先順位は、最新の店舗ルール > 本人確認済みシステムデータ > 類似するスタッフ確定例。同種の店舗ルールが複数あり食い違う場合は更新日が最も新しいものを採用する。新しい店舗ルールと古い確定例が食い違えば必ず店舗ルールを採用する。類似するスタッフ確定例は、同種問い合わせへの結論・案内手順・必要確認・通常の料金や規定の根拠として使えるが、個別患者の予約・体調・特例は引き継がない。根拠にない事実、数字、可否、完了報告、医療判断があればpass:false。回答漏れ、会話との矛盾、別患者情報の混入もpass:false。内容が正しく日本語だけが不自然・冗長な場合は、事実を一切変えず自然で簡潔な受付文へ直してrevised_draftに入れ、pass:trueにできる。一般的な挨拶、謝意、確認する旨、必要情報を尋ねる文は根拠なしでも可。"
+    + (replyToneInstruction(S(t).tone) ? "\n\n" + replyToneInstruction(S(t).tone) + "\n監査で文章を修正する場合も、このトーンを弱めてはいけない。" : "")
+    + "必ずJSONのみ: {\"pass\":true|false,\"answered\":true|false,\"natural\":true|false,\"revised_draft\":\"修正不要なら空文字\",\"unsupported_claims\":[\"\"],\"contradictions\":[\"\"],\"reason\":\"短い日本語\"}";
   const user = "【問い合わせ・直近文脈】\n" + String(input.query || "").slice(0, 2500)
     + "\n\n" + evidence
     + "\n\n【返信案】\n" + String(input.draft || "").slice(0, 5000);
@@ -2165,7 +2178,7 @@ async function genDraft(t, c, opts) {
     + "医療判断・診断はしない。「絶対」「完治」など断定的表現は使わない。絵文字は使わない。" + sig
     + (rulesTxt ? "\n\n【店舗ルール（最優先で従う。料金・規定・対応可否はここに従い、推測で答えない。同じ内容が食い違う場合は更新日が新しいルールを使う）】\n" + rulesTxt : "")
     + (examplesTxt ? "\n\n【今回の問い合わせに近い、スタッフ確認済みの過去対応】\n『再利用できる確定例』は、同じ状況ならスタッフが確定した結論・案内順序・必要な確認事項・通常の料金や規定を次の回答にも引き継ぐ。これが右腕くんの対応学習である。ただし優先順位は、最新の店舗ルール > 本人確認済みシステムデータ > 再利用できる確定例 > 参考例。新しいルールと古い例が矛盾したら必ず新しいルールを使う。個別患者の予約日時・体調・例外対応は他の患者へ引き継がない。『参考例』は文章と手順だけ参考にする。\n" + examplesTxt : "")
-    + (S(t).tone && S(t).tone.trim() ? "\n\n【トーン指示（最優先）】\n" + S(t).tone.trim().slice(0, 1200) : "")
+    + (replyToneInstruction(S(t).tone) ? "\n\n" + replyToneInstruction(S(t).tone) : "")
     + (prefsBlock(t) ? "\n\n【スタッフが記憶させた指示（全返信で必ず守る。トーン指示と同格で最優先）】\n" + prefsBlock(t) : "")
     + (notesBlock(c) ? "\n\n【このお客様への対応でスタッフが出した指示メモ（編集チャットでの指示。今回の返信でも引き続き従う。ただし明らかに“その時限り”の内容は無視してよい）】\n" + notesBlock(c) : "")
     + (bookingTxt ? "\n\n【この方の情報（うけつけるん＝予約システムからの照会結果。氏名・会員ランク・ポイント・予約・回数券・最終来院などの参考。日付判断・キャンセル可否・来院案内に使う。ここに無い内容は推測しない。カルテ・診療内容は含まれない）】\n" + bookingTxt : "")
@@ -3212,7 +3225,7 @@ app.post("/api/quality-preview", guard, async (req,res)=>{
   const c={id:"quality-preview",userId:"quality-preview",name:"テスト患者",channel,msgs:[{from:"them",text:inquiry,time:nowt()}],draft:""};
   const out=await genDraft(t,c,{skipExternal:true});
   if(!out||!String(out.draft||"").trim()) return res.status(502).json({ok:false,error:"ai_failed"});
-  res.json({ok:true,draft:String(out.draft).slice(0,5000),confidence:String(out.confidence||""),qualityIssues:Array.isArray(out.qualityIssues)?out.qualityIssues:[],learningRefs:Array.isArray(out.learningRefs)?out.learningRefs:[],learningUsage:out.learningUsage||null,grounding:out.grounding||null,validation:out.validation||null,learningReadiness:out.learningReadiness||null,engine:activeAiEngine(t)});
+  res.json({ok:true,draft:String(out.draft).slice(0,5000),confidence:String(out.confidence||""),qualityIssues:Array.isArray(out.qualityIssues)?out.qualityIssues:[],toneApplied:Array.isArray(out.qualityIssues)&&out.qualityIssues.includes("tone_reviewed"),learningRefs:Array.isArray(out.learningRefs)?out.learningRefs:[],learningUsage:out.learningUsage||null,grounding:out.grounding||null,validation:out.validation||null,learningReadiness:out.learningReadiness||null,engine:activeAiEngine(t)});
 });
 // 新モデルを本番回答へ使わず、同じ問い合わせで比較する並行テスト。
 // 会話・学習・予約・送信状態は一切保存せず、候補モデルの出力だけを返す。
@@ -3768,7 +3781,7 @@ app.post("/api/ai-regen", guard, async (req, res) => {
     + "お客様が複数の質問・依頼をしている場合は、その全てにもれなく答えること。1つも取りこぼさない。"
     + "お客様への敬意と心配りが自然に伝わる表現を選び、ご不便にはお詫びや労いの一言を添える。ただし慇懃無礼にならず、簡潔さと読みやすさも保つ。絵文字は使わない。断定や医療判断は避ける。" + sig
     + (rulesTxt ? "\n【店舗ルール（従うこと）】\n" + rulesTxt : "")
-    + (S(t).tone && S(t).tone.trim() ? "\n【トーン指示（最優先）】" + S(t).tone.trim().slice(0, 1000) : "")
+    + (replyToneInstruction(S(t).tone, 1000) ? "\n\n" + replyToneInstruction(S(t).tone, 1000) : "")
     + (c && notesBlock(c) ? "\n【このお客様への対応でスタッフが以前出した指示メモ（引き続き守る）】\n" + notesBlock(c) : "")
     + "\n" + JP_QUALITY
     + "\n出力はそのままお客様に送信される。だからお客様に送る返信文だけを出力すること。【】付きの見出し、状況の説明、会話の引用、区切り線(---)、前置き、かぎ括弧は一切含めてはいけない。1文字目から返信本文で始めること。";
@@ -3836,7 +3849,7 @@ async function draftChatPrep(t, body) {
     + "\n\n本日は" + today + "です。キャンセル料など日付が関わる案内は、本日と予約日の差から判断する。憶測で日付を決めない。"
     + "医療判断・診断はしない。断定的表現や絵文字は使わない。" + sig
     + (rulesTxt ? "\n\n【店舗ルール（料金・規定・対応可否はここに従い、推測で答えない）】\n" + rulesTxt : "")
-    + (S(t).tone && S(t).tone.trim() ? "\n\n【トーン指示】\n" + S(t).tone.trim().slice(0, 1000) : "")
+    + (replyToneInstruction(S(t).tone, 1000) ? "\n\n" + replyToneInstruction(S(t).tone, 1000) : "")
     + (prefsBlock(t) ? "\n\n【スタッフが記憶させた指示（全返信で必ず守る）】\n" + prefsBlock(t) : "")
     + (notesBlock(c) ? "\n\n【このお客様への対応でスタッフが以前出した指示メモ（引き続き守る）】\n" + notesBlock(c) : "")
     + staffBookingPrompt(baCtx)
@@ -3926,6 +3939,7 @@ app.post("/api/draft-chat", guard, async (req, res) => {
     if (!raw) return res.json({ ok: false, error: "ai_failed" });
     let out = { reply: "", draft: "" };
     try { const m = raw.match(/\{[\s\S]*\}/); out = JSON.parse(m ? m[0] : raw); } catch (e) { out = { reply: "", draft: salvageDraft(raw) }; }
+    if (String(out.draft || "").trim()) out.draft = (await finalizeGeneratedDraft(t, out.draft, p.c.channel)).text;
     // 文章作成中は学習候補の抽出だけ行う。恒久保存は患者への送信後にスタッフが適用範囲を選んで確定する。
     const savedMem = String(out.memory || "").trim().slice(0, 200);
     let savedRule = null;
@@ -3937,6 +3951,14 @@ app.post("/api/draft-chat", guard, async (req, res) => {
     res.json({ ok: true, reply: String(out.reply || "").slice(0, 600) + " 〔" + p.engLabel + "で作成〕", draft: String(out.draft || "").slice(0, 4000), memory: savedMem, rule: savedRule, action: staffAction });
   } catch (e) { res.json({ ok: false, error: String(e.message || e).slice(0, 80) }); }
 });
+
+async function finalizeDraftChatEnvelope(t, full, channel) {
+  const source = String(full || "");
+  const match = source.match(/(@@DRAFT@@\s*)([\s\S]*?)(?=\n@@(?:MEMORY|RULE|ACTION)@@|$)/);
+  if (!match || !String(match[2] || "").trim()) return source;
+  const finalized = await finalizeGeneratedDraft(t, match[2], channel);
+  return source.slice(0, match.index) + match[1] + finalized.text + source.slice(match.index + match[0].length);
+}
 
 // ストリーミング版（GPT風にリアルタイムで文字が流れる）。@@REPLY@@/@@DRAFT@@/@@MEMORY@@ のマーカー区切りテキストを
 // chunked responseでそのまま流し、最後に @@META@@{json} を1行付ける。クライアントは逐次パースして表示する。
@@ -3956,8 +3978,12 @@ app.post("/api/draft-chat-stream", guard, async (req, res) => {
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("X-Accel-Buffering", "no");
   try {
-    let full = await aiChatStream(t, sys, p.edits, 4000, (d) => { try { res.write(d); } catch (e) {} }, "chat");
-    if (!full) { // ストリーム不可時は非ストリームで生成して一括送信
+    const enforceTone = !!normalizeReplyTone(S(t).tone);
+    let full = enforceTone ? await aiChat(t, sys, p.edits, 4000, "chat") : await aiChatStream(t, sys, p.edits, 4000, (d) => { try { res.write(d); } catch (e) {} }, "chat");
+    if (enforceTone && full) {
+      full = await finalizeDraftChatEnvelope(t, full, p.c.channel);
+      res.write(full);
+    } else if (!full) { // ストリーム不可時は非ストリームで生成して一括送信
       full = await aiChat(t, sys, p.edits, 4000, "chat");
       if (full) res.write(full);
     }
@@ -4608,7 +4634,7 @@ app.get("/api/rules-for-ai", (req, res) => {
   const q = String(req.query.q || "").slice(0, 1000);
   const list = rulesSearch(t, q, 40); // 40件以下なら全件、超えたら質問に関連する40件
   let text = list.map(r => "■" + r.title + "\n" + r.content).join("\n\n");
-  if (S(t).tone && S(t).tone.trim()) text = "■回答全体のトーン・文体（最優先で従う）\n" + S(t).tone.trim() + "\n\n" + text;
+  if (replyToneInstruction(S(t).tone)) text = replyToneInstruction(S(t).tone) + "\n\n" + text;
   // conversation history from this app (full log) for the requesting customer
   let history = "";
   const uid = String(req.query.uid || "");
@@ -5804,8 +5830,8 @@ const PAGE = `<!DOCTYPE html>
   </div>
   <div class="settingsSection">
     <div style="font-size:13px;margin-bottom:4px;">🎨 回答全体のトーン・文体</div>
-    <textarea id="setTone" placeholder="例：少し柔らかめで親しみやすい敬語にする。文章は短めに。「〜でございます」は使わない。" style="width:100%;box-sizing:border-box;min-height:70px;border:1px solid #d1d5db;border-radius:8px;padding:8px;font-size:13px;font-family:inherit;"></textarea>
-    <div style="font-size:11px;color:#6b7280;margin-top:2px;">ここに書いた指示は、AI下書き・自動返信・AIで作り直す、すべてに最優先で反映されます。空欄なら標準のトーンです。</div>
+    <textarea id="setTone" placeholder="例：非常に相手に寄り添い、丁寧で安心感のあるカスタマーサービスとして返信してください。" style="width:100%;box-sizing:border-box;min-height:70px;border:1px solid #d1d5db;border-radius:8px;padding:8px;font-size:13px;font-family:inherit;"></textarea>
+    <div style="font-size:11px;color:#6b7280;margin-top:2px;">ここに書いた指示は、AI下書き・自動返信・AIで作り直す返信の全文へ必須条件として反映し、生成後にもトーンを確認します。空欄なら標準のトーンです。</div>
   </div>
   <div class="settingsSection">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
@@ -7073,7 +7099,7 @@ async function testStaffLine(){const btn=document.getElementById("staffLineTestB
 async function disconnectStaffLine(){if(!await uiConfirm("右腕くんとスタッフLINEの連携を解除しますか？\\n通知・承認は停止し、登録スタッフも解除されます。"))return;const btn=document.getElementById("staffLineDisconnectBtn");await withBusy("staff-line-disconnect",btn,"解除中…",async()=>{try{const r=await api("/api/staff-line/disconnect",{}),j=await r.json();if(!r.ok||!j.ok)throw new Error("disconnect");document.getElementById("setStaffLineEnabled").checked=false;uiAlert("スタッフLINE連携を解除しました");await loadStaffLine();}catch(e){uiAlert("連携解除に失敗しました");}});}
 async function changeStaffLineRole(id,role,select){await withBusy("staff-line-role-"+id,select,"変更中…",async()=>{try{const r=await api("/api/staff-line/staff-role",{id,role}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");renderStaffLineStaff(j.staff||[]);}catch(e){uiAlert(e.message==="last_admin"?"最後の管理者は変更できません。先に別の管理者を指定してください":"権限を変更できませんでした");await loadStaffLine();}});}
 async function deleteStaffLineStaff(id,btn){if(!await uiConfirm("このスタッフのLINE操作権限を解除しますか？"))return;await withBusy("staff-line-delete-"+id,btn,"解除中…",async()=>{try{const r=await api("/api/staff-line/staff-delete",{id}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"delete");renderStaffLineStaff(j.staff||[]);}catch(e){uiAlert(e.message==="last_admin"?"最後の管理者は解除できません":"登録を解除できませんでした");await loadStaffLine();}});}
-async function runQualityPreview(){const input=document.getElementById("qualityPreviewInput"),out=document.getElementById("qualityPreviewResult"),btn=document.getElementById("qualityPreviewBtn"),inquiry=input.value.trim();if(!inquiry){uiAlert("テストする問い合わせ文を入力してください");return;}btn.disabled=true;btn.textContent="生成中…";out.style.display="block";out.textContent="返信案を生成しています…";try{const r=await api("/api/quality-preview",{inquiry,channel:document.getElementById("qualityPreviewChannel").value}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"failed");const label=({gpt:"GPT",gemini:"Gemini",claude:"Claude"})[j.engine]||j.engine;const refs=Array.isArray(j.learningRefs)?j.learningRefs:[];const g=j.grounding||{},v=j.validation||{};const audit=g.autoSendAllowed&&v.pass?" / 根拠監査OK":" / スタッフ確認: "+((g.reasons&&g.reasons[0])||v.reason||"根拠不足");out.textContent=j.draft+"\\n\\n―― "+label+" / 確信率 "+(j.confidence||"不明")+(j.qualityIssues&&j.qualityIssues.length?" / 自動校正済み":"")+(refs.length?" / 過去対応 "+refs.length+"件参照":" / 過去対応の該当なし")+audit;}catch(e){out.textContent=e.message==="no_ai_key"?"AIキーが未設定のため生成できません。運営にAI接続設定を依頼してください。":e.message==="ai_failed"?"登録済みのAIキーを確認できませんでした。キーの失効・利用上限・モデル権限を運営側で確認してください。患者やLINEには送信されていません。":"生成できませんでした。時間をおいて再度お試しください。";}finally{btn.disabled=false;btn.textContent="返信案をテスト生成";}}
+async function runQualityPreview(){const input=document.getElementById("qualityPreviewInput"),out=document.getElementById("qualityPreviewResult"),btn=document.getElementById("qualityPreviewBtn"),inquiry=input.value.trim();if(!inquiry){uiAlert("テストする問い合わせ文を入力してください");return;}btn.disabled=true;btn.textContent="生成中…";out.style.display="block";out.textContent="返信案を生成しています…";try{const r=await api("/api/quality-preview",{inquiry,channel:document.getElementById("qualityPreviewChannel").value}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"failed");const label=({gpt:"GPT",gemini:"Gemini",claude:"Claude"})[j.engine]||j.engine;const refs=Array.isArray(j.learningRefs)?j.learningRefs:[];const g=j.grounding||{},v=j.validation||{};const audit=g.autoSendAllowed&&v.pass?" / 根拠監査OK":" / スタッフ確認: "+((g.reasons&&g.reasons[0])||v.reason||"根拠不足");out.textContent=j.draft+"\\n\\n―― "+label+" / 確信率 "+(j.confidence||"不明")+(j.toneApplied?" / 設定トーン確認済み":j.qualityIssues&&j.qualityIssues.length?" / 自動校正済み":"")+(refs.length?" / 過去対応 "+refs.length+"件参照":" / 過去対応の該当なし")+audit;}catch(e){out.textContent=e.message==="no_ai_key"?"AIキーが未設定のため生成できません。運営にAI接続設定を依頼してください。":e.message==="ai_failed"?"登録済みのAIキーを確認できませんでした。キーの失効・利用上限・モデル権限を運営側で確認してください。患者やLINEには送信されていません。":"生成できませんでした。時間をおいて再度お試しください。";}finally{btn.disabled=false;btn.textContent="返信案をテスト生成";}}
 async function runShadowPreview(){const inquiry=document.getElementById("qualityPreviewInput").value.trim(),out=document.getElementById("qualityPreviewResult"),btn=document.getElementById("shadowPreviewBtn"),routes=collectAiRoutes();if(!inquiry){uiAlert("テストする問い合わせ文を入力してください");return;}btn.disabled=true;btn.textContent="2つのモデルを比較中…";out.style.display="block";out.textContent="本番回答には使わず、並行テストしています…";try{const r=await api("/api/model-shadow-preview",{inquiry,channel:document.getElementById("qualityPreviewChannel").value,candidate:routes.draft}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"failed");out.textContent="【現在のモデル "+j.active.route.model+"】\\n"+j.active.draft+"\\n\\n【候補モデル "+j.candidate.route.model+"】\\n"+j.candidate.draft+"\\n\\n※患者への送信・会話保存・学習は行っていません。";}catch(e){out.textContent=e.message==="no_openai_key"?"OpenAI APIが未接続です。":"並行テストを実行できませんでした。";}finally{btn.disabled=false;btn.textContent="候補モデルを並行テスト（回答には使用しない）";}}
 let settingsSaveBusy=false;
 async function saveSet(){if(settingsSaveBusy)return;const btn=document.getElementById("saveSettingsBtn");settingsSaveBusy=true;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>保存中…';}const autoReply=document.getElementById("setAuto").checked;const bookingActions=document.getElementById("setBookingActions").checked;const inboxOrder=document.getElementById("setInboxOrder").value;const staffLineEnabled=document.getElementById("setStaffLineEnabled").checked;const staffLineReplyMode=document.getElementById("setStaffLineReplyMode").value;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;const aiRoutes=collectAiRoutes();const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{const r=await api("/api/settings",{autoReply,bookingActions,inboxOrder,staffLineEnabled,staffLineReplyMode,level,tone,engine,aiRoutes,autoDelayMin});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");await load();uiAlert("設定を保存しました");closeSet();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"先に法人専用スタッフLINEと通知グループを接続してください":e.message==="no_ai_key"?"AIキーが未設定のため自動返信を有効にできません。運営へ接続設定を依頼してください":"保存に失敗しました");}finally{settingsSaveBusy=false;if(btn){btn.disabled=false;btn.removeAttribute("aria-busy");btn.textContent="設定を保存";}}}
