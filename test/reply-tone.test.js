@@ -34,8 +34,23 @@ test("トーン設定は上限を超えてプロンプトへ入れない", () =>
 
 test("下書き・作り直し・送信前監査が共通のトーン指示と最終確認を使う", () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
-  assert.ok((source.match(/replyToneInstruction\(S\(t\)\.tone/g) || []).length >= 5);
+  assert.ok((source.match(/replyToneInstruction\(S\(t\)\.tone/g) || []).length >= 7);
   assert.match(source, /toneRewriteInstruction\(tone, channel\)/);
   assert.match(source, /finalizeDraftChatEnvelope/);
   assert.doesNotMatch(source, /【トーン指示(?:（最優先）)?】/);
+});
+
+test("スタッフLINEの返信修正にも共通トーン指示と生成後の確認を適用する", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
+  const start = source.indexOf("async function staffLineReviseDraft");
+  const end = source.indexOf("const staffLineInFlight", start);
+  const body = source.slice(start, end);
+  assert.match(body, /replyToneInstruction\(S\(t\)\.tone\)/);
+  assert.match(body, /finalizeGeneratedDraft\(t, out, c\.channel\)/);
+});
+
+test("品質テストは最終トーン確認が成功した場合だけ確認済みと返す", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
+  assert.match(source, /toneApplied:Array\.isArray\(out\.qualityIssues\)&&out\.qualityIssues\.includes\("tone_reviewed"\)/);
+  assert.doesNotMatch(source, /toneApplied:!!normalizeReplyTone/);
 });

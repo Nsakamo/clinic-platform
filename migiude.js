@@ -495,10 +495,13 @@ async function staffLineRequestApproval(t, c, reason, opts) {
 async function staffLineReviseDraft(t, c, instruction) {
   const history = staffLineHistoryText(c);
   let booking = ""; try { booking = await fetchBooking(t, c); } catch (e) {}
-  const sys = "あなたは店舗の受付スタッフ。会話、現在の返信案、スタッフの修正指示を踏まえ、患者へ送る返信本文だけを作る。医療判断や情報の推測はしない。" + (booking ? "\n予約システムの確認結果:\n" + booking : "");
+  const sys = "あなたは店舗の受付スタッフ。会話、現在の返信案、スタッフの修正指示を踏まえ、患者へ送る返信本文だけを作る。医療判断や情報の推測はしない。"
+    + (booking ? "\n予約システムの確認結果:\n" + booking : "")
+    + (replyToneInstruction(S(t).tone) ? "\n\n" + replyToneInstruction(S(t).tone) : "");
   const content = "会話:\n" + history + "\n\n現在の返信案:\n" + String(c.draft || "") + "\n\nスタッフの修正指示:\n" + String(instruction || "").slice(0, 1200);
   const out = await aiChat(t, sys, [{ role: "user", content }], 1800, "chat");
-  return String(out || "").trim();
+  if (!String(out || "").trim()) return "";
+  return (await finalizeGeneratedDraft(t, out, c.channel)).text;
 }
 const staffLineInFlight = new Set();
 async function staffLineEscalate(t, c, reason) {
@@ -3222,7 +3225,7 @@ app.post("/api/quality-preview", guard, async (req,res)=>{
   const c={id:"quality-preview",userId:"quality-preview",name:"テスト患者",channel,msgs:[{from:"them",text:inquiry,time:nowt()}],draft:""};
   const out=await genDraft(t,c,{skipExternal:true});
   if(!out||!String(out.draft||"").trim()) return res.status(502).json({ok:false,error:"ai_failed"});
-  res.json({ok:true,draft:String(out.draft).slice(0,5000),confidence:String(out.confidence||""),qualityIssues:Array.isArray(out.qualityIssues)?out.qualityIssues:[],toneApplied:!!normalizeReplyTone(S(t).tone),learningRefs:Array.isArray(out.learningRefs)?out.learningRefs:[],learningUsage:out.learningUsage||null,grounding:out.grounding||null,validation:out.validation||null,learningReadiness:out.learningReadiness||null,engine:activeAiEngine(t)});
+  res.json({ok:true,draft:String(out.draft).slice(0,5000),confidence:String(out.confidence||""),qualityIssues:Array.isArray(out.qualityIssues)?out.qualityIssues:[],toneApplied:Array.isArray(out.qualityIssues)&&out.qualityIssues.includes("tone_reviewed"),learningRefs:Array.isArray(out.learningRefs)?out.learningRefs:[],learningUsage:out.learningUsage||null,grounding:out.grounding||null,validation:out.validation||null,learningReadiness:out.learningReadiness||null,engine:activeAiEngine(t)});
 });
 // 新モデルを本番回答へ使わず、同じ問い合わせで比較する並行テスト。
 // 会話・学習・予約・送信状態は一切保存せず、候補モデルの出力だけを返す。
