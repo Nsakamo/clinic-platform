@@ -21,6 +21,7 @@ const { contextualLearningFallback, formatLearningProposal } = require("./lib/le
 const { selectConversationContext } = require("./lib/conversation-context");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
+const { AiUsageSpool } = require("./lib/ai-usage-spool");
 const app = express();
 const aiUsageContext = new AsyncLocalStorage();
 app.use(express.json({ limit: "16mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
@@ -1544,20 +1545,22 @@ async function recordAiUsage(t, usage, source){
     if(await writeAiUsage(entry)) return;
   }catch(e){ console.error("ai usage persist:", String(e.message||e).slice(0,120)); }
   // 計測障害で生成済み回答を捨てたり別providerへ再送しない。キーを保ったまま後で再試行する。
-  if(pendingAiUsageWrites.length >= 10000) pendingAiUsageWrites.shift();
-  pendingAiUsageWrites.push(entry);
+  try{ aiUsageSpool.enqueue(entry); }
+  catch(e){ console.error("ai usage spool:", String(e.message||e).slice(0,120)); }
 }
-const pendingAiUsageWrites = [];
+const aiUsageSpoolPath = process.env.AI_USAGE_SPOOL_PATH || require("path").join(process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd(), "data", "ai-usage-spool.json");
+const aiUsageSpool = new AiUsageSpool(aiUsageSpoolPath);
 async function writeAiUsage(entry){
   if(!pool) return false;
   await pool.query("INSERT INTO ai_usage_events (event_key,tenant,source,provider,model,input_tokens,output_tokens,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (event_key) DO NOTHING", [entry.eventKey,entry.tenant,entry.source,entry.provider,entry.model,entry.input,entry.output,entry.createdAt]);
   return true;
 }
 async function flushPendingAiUsage(){
-  while(pendingAiUsageWrites.length){
+  while(aiUsageSpool.size){
+    const entry = aiUsageSpool.peek();
     try{
-      if(!(await writeAiUsage(pendingAiUsageWrites[0]))) return;
-      pendingAiUsageWrites.shift();
+      if(!(await writeAiUsage(entry))) return;
+      aiUsageSpool.remove(entry.eventKey);
     }catch(e){ console.error("ai usage retry:", String(e.message||e).slice(0,120)); return; }
   }
 }
