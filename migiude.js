@@ -9,6 +9,7 @@ process.on("uncaughtException", (e) => console.error("uncaught:", e && e.message
 process.on("unhandledRejection", (e) => console.error("unhandled:", e && (e.message || e)));
 const express = require("express");
 const crypto = require("crypto");
+const { AsyncLocalStorage } = require("async_hooks");
 const { intentTokens, rankLearningExamples, sameLearningExample } = require("./lib/learning-retrieval");
 const { evaluateResponseGrounding } = require("./lib/response-grounding");
 const { normalizeReplyTone, replyToneInstruction, toneRewriteInstruction } = require("./lib/reply-tone");
@@ -20,7 +21,9 @@ const { contextualLearningFallback, formatLearningProposal } = require("./lib/le
 const { selectConversationContext } = require("./lib/conversation-context");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
+const { AiUsageSpool, resolveAiUsageSpoolPath } = require("./lib/ai-usage-spool");
 const app = express();
+const aiUsageContext = new AsyncLocalStorage();
 app.use(express.json({ limit: "16mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: false, limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 const API_RATE_WINDOW_MS = 60 * 1000;
@@ -114,7 +117,7 @@ function newTenant(slug, name, config) {
   config = config || {};
   if (!config.conn || typeof config.conn !== "object") config.conn = {};
   if (!config.settings || typeof config.settings !== "object") config.settings = { autoReply: false, level: "high", tone: "", autoDelayMin: 0, engine: "gpt" };
-  if (!["claude", "gpt", "gemini"].includes(config.settings.engine)) config.settings.engine = "gpt"; // 文章作成の既定はGPT-5.6用途別ルーター
+  if (!["claude", "gpt", "gemini"].includes(config.settings.engine)) config.settings.engine = "gpt"; // 文章作成の既定はGPT-6用途別ルーター
   if (typeof config.settings.autoReply !== "boolean") config.settings.autoReply = false;
   if (!["unanswered_first", "recent"].includes(config.settings.inboxOrder)) config.settings.inboxOrder = "unanswered_first";
   if (config.settings.level !== "high" && config.settings.level !== "medium") config.settings.level = "high";
@@ -210,6 +213,10 @@ async function dbInit() {
   await pool.query("ALTER TABLE examples ADD COLUMN IF NOT EXISTS learning_chat jsonb DEFAULT '[]'::jsonb");
   await pool.query("CREATE TABLE IF NOT EXISTS learning_usage_events (tenant text not null, trace_id text not null, conversation_id text not null default '', generated_at bigint not null, usage jsonb not null default '{}'::jsonb, sent_at bigint, send_mode text, edited boolean, PRIMARY KEY(tenant,trace_id))");
   await pool.query("CREATE INDEX IF NOT EXISTS learning_usage_events_tenant_generated_idx ON learning_usage_events(tenant,generated_at DESC)");
+  await pool.query("CREATE TABLE IF NOT EXISTS ai_usage_events (id bigserial primary key, event_key text, tenant text not null, source text not null, provider text not null, model text not null, input_tokens bigint not null, output_tokens bigint not null, created_at bigint not null)");
+  await pool.query("ALTER TABLE ai_usage_events ADD COLUMN IF NOT EXISTS event_key text");
+  await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS ai_usage_events_event_key_idx ON ai_usage_events(event_key) WHERE event_key IS NOT NULL");
+  await pool.query("CREATE INDEX IF NOT EXISTS ai_usage_events_tenant_created_idx ON ai_usage_events(tenant,created_at DESC)");
   await pool.query("CREATE TABLE IF NOT EXISTS alerts (id serial primary key, tenant text, type text, summary text, name text, ts bigint, done boolean default false)");
   await pool.query("CREATE TABLE IF NOT EXISTS files (id text primary key, tenant text, name text, mime text, data bytea, ts bigint)");
   await pool.query("CREATE TABLE IF NOT EXISTS push_subs (tenant text, endpoint text primary key, sub jsonb)");
@@ -1527,14 +1534,46 @@ function aiEngineOrder(t){
   return [selected,"gpt","gemini","claude"].filter((x,i,a)=>a.indexOf(x)===i && aiEngineAvailable(x));
 }
 function activeAiEngine(t){ return aiEngineOrder(t)[0] || ""; }
+async function recordAiUsage(t, usage, source){
+  if(!usage) return;
+  const input = Number(usage.input_tokens || 0), output = Number(usage.output_tokens || 0);
+  if(!Number.isSafeInteger(input) || !Number.isSafeInteger(output) || input < 0 || output < 0 || input > 10000000 || output > 10000000 || input + output <= 0) return;
+  const provider = String(usage.provider || "unknown").replace(/[^a-z0-9._:-]/gi, "_").slice(0, 40) || "unknown";
+  const model = String(usage.model || "unknown").replace(/[^a-z0-9._:-]/gi, "_").slice(0, 80) || "unknown";
+  const entry = { eventKey:crypto.randomUUID(), tenant:t.slug, source:String(source || "chat").slice(0,40), provider, model, input, output, createdAt:Date.now() };
+  try{
+    if(await writeAiUsage(entry)) return;
+  }catch(e){ console.error("ai usage persist:", String(e.message||e).slice(0,120)); }
+  // 計測障害で生成済み回答を捨てたり別providerへ再送しない。キーを保ったまま後で再試行する。
+  try{ aiUsageSpool.enqueue(entry); }
+  catch(e){ console.error("ai usage spool:", String(e.message||e).slice(0,120)); }
+}
+let aiUsageSpool = null;
+async function writeAiUsage(entry){
+  if(!pool) return false;
+  await pool.query("INSERT INTO ai_usage_events (event_key,tenant,source,provider,model,input_tokens,output_tokens,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (event_key) DO NOTHING", [entry.eventKey,entry.tenant,entry.source,entry.provider,entry.model,entry.input,entry.output,entry.createdAt]);
+  return true;
+}
+async function flushPendingAiUsage(){
+  if(!aiUsageSpool) return;
+  while(aiUsageSpool.size){
+    const entry = aiUsageSpool.peek();
+    try{
+      if(!(await writeAiUsage(entry))) return;
+      aiUsageSpool.remove(entry.eventKey);
+    }catch(e){ console.error("ai usage retry:", String(e.message||e).slice(0,120)); return; }
+  }
+}
+const aiUsageRetryTimer = setInterval(() => { flushPendingAiUsage().catch(() => {}); }, 30000);
+if(aiUsageRetryTimer.unref) aiUsageRetryTimer.unref();
 async function aiChatOne(eng, system, messages, maxTokens, route){
   if(eng === "gpt"){
-    route = route || { model: process.env.OPENAI_MODEL || "gpt-5.6-terra", reasoningEffort: "medium" };
+    route = route || { model: process.env.OPENAI_MODEL || "gpt-6-sol", reasoningEffort: "medium" };
     const r = await fetch("https://api.openai.com/v1/chat/completions", { method:"POST",
       headers: { "Content-Type":"application/json", "Authorization":"Bearer "+process.env.OPENAI_KEY },
       body: JSON.stringify({ model:route.model, max_completion_tokens:maxTokens, reasoning_effort:route.reasoningEffort, messages:[{role:"system",content:system}].concat(messages) }) });
     if(!r.ok) throw new Error("openai_"+r.status);
-    const d = await r.json(); return d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
+    const d = await r.json(); return { text: d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content, usage: { input_tokens: Number(d.usage && d.usage.prompt_tokens || 0), output_tokens: Number(d.usage && d.usage.completion_tokens || 0), provider: "openai", model: route.model } };
   }
   if(eng === "gemini"){
     const model = process.env.GEMINI_MODEL || "gemini-3-flash";
@@ -1547,22 +1586,30 @@ async function aiChatOne(eng, system, messages, maxTokens, route){
       // OpenAI互換APIはモデル更新時に一部パラメータの受付が先に変わることがある。
       // 同じGemini公式のネイティブAPIへ切り替え、返信生成を止めない。
       const userText = messages.map(m => String((m && m.content) || "")).join("\n\n");
-      const native = await geminiGenerate(system, [{ text:userText }], maxTokens);
-      if(native) return native;
+      const native = await geminiGenerate(system, [{ text:userText }], maxTokens, true);
+      if(native && native.text) return native;
       throw new Error("gemini_"+r.status);
     }
-    const d = await r.json(); return d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
+    const d = await r.json(); return { text: d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content, usage: { input_tokens: Number(d.usage && d.usage.prompt_tokens || 0), output_tokens: Number(d.usage && d.usage.completion_tokens || 0), provider: "gemini", model } };
   }
   const r = await fetch("https://api.anthropic.com/v1/messages", { method:"POST",
     headers: { "Content-Type":"application/json", "x-api-key":ANTHROPIC_KEY, "anthropic-version":"2023-06-01" },
     body: JSON.stringify({ model:"claude-sonnet-4-6", max_tokens:maxTokens, system, messages }) });
   if(!r.ok) throw new Error("anthropic_"+r.status);
-  const d = await r.json(); return (d.content && d.content[0] && d.content[0].text) || null;
+  const d = await r.json(); return { text: (d.content && d.content[0] && d.content[0].text) || null, usage: { input_tokens: Number(d.usage && d.usage.input_tokens || 0), output_tokens: Number(d.usage && d.usage.output_tokens || 0), provider: "anthropic", model: "claude-sonnet-4-6" } };
 }
 async function aiChat(t, system, messages, maxTokens, task, routeOverride){
   const route = openAiRoute(t, task || "draft", routeOverride);
   for(const eng of aiEngineOrder(t)){
-    try{ const text = await aiChatOne(eng, system, messages, maxTokens, eng === "gpt" ? route : null); if(text) return text; }
+    try{
+      const result = await aiChatOne(eng, system, messages, maxTokens, eng === "gpt" ? route : null);
+      if(result && result.text){
+        await recordAiUsage(t, result.usage, task || "draft");
+        const store = aiUsageContext.getStore();
+        if(store && Array.isArray(store.entries)) store.entries.push(result.usage);
+        return result.text;
+      }
+    }
     catch(e){ console.error("ai provider:", eng, String(e.message||e).slice(0,80)); }
   }
   return null;
@@ -1572,12 +1619,14 @@ async function aiChat(t, system, messages, maxTokens, task, routeOverride){
 // gpt/gemini はOpenAI互換SSE、Claude(保険)はAnthropic SSE。ストリーム不可ならnullを返し、呼び出し側がaiChatにフォールバックする。
 async function aiChatStream(t, system, messages, maxTokens, onDelta, task){
   const eng = (S(t).engine || "gpt");
-  async function openaiCompat(url, key, model, extra){
+  async function openaiCompat(url, key, model, extra, provider, includeUsage){
+    const body = Object.assign({ model, stream: true, messages: [{role:"system",content:system}].concat(messages) }, extra);
+    if(includeUsage) body.stream_options = { include_usage: true };
     const r = await fetch(url, { method:"POST",
       headers: { "Content-Type":"application/json", "Authorization":"Bearer "+key },
-      body: JSON.stringify(Object.assign({ model, stream: true, messages: [{role:"system",content:system}].concat(messages) }, extra)) });
+      body: JSON.stringify(body) });
     if(!r.ok || !r.body){ console.error("stream:", r.status, (await r.text().catch(()=>"")).slice(0,200)); return null; }
-    let full = "", buf = ""; const dec = new TextDecoder();
+    let full = "", buf = "", usage = null; const dec = new TextDecoder();
     for await (const chunk of r.body){
       buf += dec.decode(chunk, { stream: true });
       let i;
@@ -1586,37 +1635,38 @@ async function aiChatStream(t, system, messages, maxTokens, onDelta, task){
         if(!line.startsWith("data:")) continue;
         const data = line.slice(5).trim();
         if(!data || data === "[DONE]") continue;
-        try{ const d = JSON.parse(data); const tx = d.choices && d.choices[0] && d.choices[0].delta && d.choices[0].delta.content; if(tx){ full += tx; onDelta(tx); } }catch(e){}
+        try{ const d = JSON.parse(data); const tx = d.choices && d.choices[0] && d.choices[0].delta && d.choices[0].delta.content; if(tx){ full += tx; onDelta(tx); } if(d.usage) usage = { input_tokens:Number(d.usage.prompt_tokens||0), output_tokens:Number(d.usage.completion_tokens||0), provider, model }; }catch(e){}
       }
     }
-    return full || null;
+    return full ? { text:full, usage } : null;
   }
   try{
     if(eng === "gpt" && process.env.OPENAI_KEY){
       const route = openAiRoute(t, task || "chat");
-      const out = await openaiCompat("https://api.openai.com/v1/chat/completions", process.env.OPENAI_KEY, route.model, { max_completion_tokens: maxTokens, reasoning_effort: route.reasoningEffort });
-      if(out) return out;
+      const out = await openaiCompat("https://api.openai.com/v1/chat/completions", process.env.OPENAI_KEY, route.model, { max_completion_tokens: maxTokens, reasoning_effort: route.reasoningEffort }, "openai", true);
+      if(out){ await recordAiUsage(t, out.usage, "stream:"+(task||"chat")); return out.text; }
     }
     if(eng === "gemini" && process.env.GEMINI_KEY){
       const model = process.env.GEMINI_MODEL || "gemini-3-flash";
-      const out = await openaiCompat("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", process.env.GEMINI_KEY, model, { max_tokens: maxTokens, reasoning_effort: "medium" });
-      if(out) return out;
+      const out = await openaiCompat("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", process.env.GEMINI_KEY, model, { max_tokens: maxTokens, reasoning_effort: "medium" }, "gemini", true);
+      if(out){ await recordAiUsage(t, out.usage, "stream:"+(task||"chat")); return out.text; }
     }
     if(ANTHROPIC_KEY){
       const r = await fetch("https://api.anthropic.com/v1/messages", { method:"POST",
         headers: { "Content-Type":"application/json", "x-api-key":ANTHROPIC_KEY, "anthropic-version":"2023-06-01" },
         body: JSON.stringify({ model:"claude-sonnet-4-6", max_tokens:maxTokens, system, messages, stream: true }) });
       if(!r.ok || !r.body) return null;
-      let full = "", buf = ""; const dec = new TextDecoder();
+      let full = "", buf = "", inputTokens = 0, outputTokens = 0; const dec = new TextDecoder();
       for await (const chunk of r.body){
         buf += dec.decode(chunk, { stream: true });
         let i;
         while((i = buf.indexOf("\n")) >= 0){
           const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
           if(!line.startsWith("data:")) continue;
-          try{ const d = JSON.parse(line.slice(5).trim()); const tx = d.type === "content_block_delta" && d.delta && d.delta.text; if(tx){ full += tx; onDelta(tx); } }catch(e){}
+          try{ const d = JSON.parse(line.slice(5).trim()); const tx = d.type === "content_block_delta" && d.delta && d.delta.text; if(tx){ full += tx; onDelta(tx); } if(d.type === "message_start") inputTokens = Number(d.message && d.message.usage && d.message.usage.input_tokens || 0); if(d.type === "message_delta") outputTokens = Number(d.usage && d.usage.output_tokens || 0); }catch(e){}
         }
       }
+      if(full) await recordAiUsage(t, { input_tokens:inputTokens, output_tokens:outputTokens, provider:"anthropic", model:"claude-sonnet-4-6" }, "stream:"+(task||"chat"));
       return full || null;
     }
   }catch(e){ console.error("aiChatStream:", e.message); }
@@ -1642,7 +1692,7 @@ function notesBlock(c){
 }
 
 // Gemini ネイティブ generateContent（PDF・画像・大容量テキストの資料読み込み用。OpenAI互換のaiChatは添付不可のためこちらを使う）
-async function geminiGenerate(systemText, userParts, maxTokens) {
+async function geminiGenerate(systemText, userParts, maxTokens, withUsage) {
   if (!process.env.GEMINI_KEY) return null;
   const model = process.env.GEMINI_MODEL || "gemini-3-flash";
   try {
@@ -1660,7 +1710,9 @@ async function geminiGenerate(systemText, userParts, maxTokens) {
     const d = await r.json();
     const cand = d.candidates && d.candidates[0];
     const txt = cand && cand.content && cand.content.parts && cand.content.parts.map(p => p.text || "").join("");
-    return txt || null;
+    if(!txt) return null;
+    if(withUsage) return { text:txt, usage:{ input_tokens:Number(d.usageMetadata && d.usageMetadata.promptTokenCount || 0), output_tokens:Number(d.usageMetadata && d.usageMetadata.candidatesTokenCount || 0), provider:"gemini", model } };
+    return txt;
   } catch (e) { console.error("gemini-gen:", e.message); return null; }
 }
 
@@ -2307,6 +2359,9 @@ async function enrichStaffLineBookingPreview(t, c, generated) {
 
 // ===== shared inbound handler (LINE webhook / email poller / ingest all funnel here) =====
 async function handleInbound(t, opts) {
+  return aiUsageContext.run({ entries: [] }, () => handleInboundCore(t, opts));
+}
+async function handleInboundCore(t, opts) {
   const channel = opts.channel === "mail" ? "mail" : "line";
   const uid = String(opts.uid || "unknown");
   const id = channel + ":" + uid;
@@ -2403,7 +2458,9 @@ async function handleInbound(t, opts) {
     if (c.draft && c.draft.trim() && S(t).staffLineEnabled && S(t).staffLineReplyMode === "exceptions" && staffLineReady(t)) staffLineRequestApproval(t, c, reason).catch(() => {});
     else staffLineEscalate(t, c, reason).catch(() => {});
   }
-  try { await forwardToPartner(t, c, { autoSent: autoSent || baDone, autoScheduled }); } catch (e) { console.error("partner delivery failed: unexpected"); } // 受付くんへ受信イベントを転送
+  const usageStore = aiUsageContext.getStore();
+  const usageEntries = usageStore && Array.isArray(usageStore.entries) ? usageStore.entries.filter(x => x && (x.input_tokens > 0 || x.output_tokens > 0)) : [];
+  try { await forwardToPartner(t, c, { autoSent: autoSent || baDone, autoScheduled, ...(usageEntries.length ? { usage: { entries: usageEntries } } : {}) }); } catch (e) { console.error("partner delivery failed: unexpected"); } // 受付くんへ受信イベントを転送
   return { id, autoSent: autoSent || baDone, autoScheduled };
 }
 
@@ -3177,7 +3234,7 @@ async function checkNewerModel(t) {
   const ver=id=>{const m=/^gpt-(\d+(?:\.\d+)?)(?:-(?:sol|terra|luna))?$/.exec(String(id||""));return m?parseFloat(m[1]):null;};
   const currentVersion=Math.max(0,...currentModels.map(ver).filter(v=>v!=null));
   if (MODEL_CHECK_CACHE.ts && now - MODEL_CHECK_CACHE.ts < 24 * 60 * 60 * 1000) return Object.assign({},MODEL_CHECK_CACHE,{current:currentModels.join(" / "),newer:MODEL_CHECK_CACHE.latestVersion>currentVersion});
-  let latest = currentModels[0]||"gpt-5.6-terra", latestVersion=currentVersion, error = null;
+  let latest = currentModels[0]||"gpt-6-sol", latestVersion=currentVersion, error = null;
   try {
     if (process.env.OPENAI_KEY) {
       const r = await fetch("https://api.openai.com/v1/models", { headers: { "Authorization": "Bearer " + process.env.OPENAI_KEY } });
@@ -4756,12 +4813,14 @@ app.post("/api/assistant-file", guard, async (req, res) => {
     + "\n既存ルールの見出し一覧（同じテーマの資料なら新規追加ではなくその番号へのupdateにする）:\n" + (existing || "（まだルールはありません）")
     + "\n出力は必ず次のJSONのみ: {\"reply\":\"資料から読み取った内容の短い要約説明（ユーザー向け）\",\"items\":[{\"op\":\"add\",\"title\":\"見出し\",\"content\":\"ルール本文\"} または {\"op\":\"update\",\"id\":番号,\"title\":\"...\",\"content\":\"...\"}]}";
   try {
-    let raw = await geminiGenerate(fsys, geminiParts, 3500) || ""; // 資料読み込みはGemini優先（大容量・低コスト）
+    const geminiResult = await geminiGenerate(fsys, geminiParts, 3500, true); // 資料読み込みはGemini優先（大容量・低コスト）
+    let raw = geminiResult && geminiResult.text || "";
+    if(geminiResult && geminiResult.usage) await recordAiUsage(t, geminiResult.usage, "assistant-file");
     if (!raw && ANTHROPIC_KEY) { // Gemini失敗時のみClaudeにフォールバック
       const resp = await fetch("https://api.anthropic.com/v1/messages", { method: "POST",
         headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
         body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 3500, system: fsys, messages: [{ role: "user", content }] }) });
-      if (resp.ok) { const data = await resp.json(); raw = (data.content && data.content[0] && data.content[0].text) || ""; }
+      if (resp.ok) { const data = await resp.json(); raw = (data.content && data.content[0] && data.content[0].text) || ""; await recordAiUsage(t, { input_tokens:Number(data.usage && data.usage.input_tokens || 0), output_tokens:Number(data.usage && data.usage.output_tokens || 0), provider:"anthropic", model:"claude-sonnet-4-6" }, "assistant-file"); }
     }
     if (!raw) return res.json({ ok: false, error: "ai_error" });
     let out = { reply: "", items: [] };
@@ -5227,6 +5286,11 @@ app.use((err, req, res, next) => {
   }
   if (isManagedRuntime() && !PUBLIC_BASE_URL) {
     console.error("起動を中止しました: 本番環境では有効なPUBLIC_BASE_URLが必須です");
+    process.exit(1);
+  }
+  try { aiUsageSpool = new AiUsageSpool(resolveAiUsageSpoolPath()); }
+  catch (e) {
+    console.error("起動を中止しました:", e && e.message ? e.message : e);
     process.exit(1);
   }
   if (!CRED_KEY) console.warn("CRED_KEY 未設定: ローカル開発では起動できますが、資格情報の保存は拒否されます。");
@@ -5806,11 +5870,11 @@ const PAGE = `<!DOCTYPE html>
   <div class="settingsSection">
     <div style="font-size:13px;margin-bottom:4px;">🧠 返信文を作るAIエンジン</div>
     <select id="setEngine" onchange="renderRuleGauge()" style="width:100%;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:13px;">
-      <option value="gpt">GPT-5.6（用途別に自動切替）</option>
+      <option value="gpt">GPT-6（用途別に自動切替）</option>
       <option value="gemini">Gemini（gemini-3-flash）</option>
       <option value="claude">Claude（保険・安定）</option>
     </select>
-    <div id="engineNote" style="font-size:11px;color:#6b7280;margin-top:2px;">通常の下書き・学習はTerra、分類はLuna、予約など重要判断はSolを使います。1つのOpenAI APIキーで切り替わります。</div>
+    <div id="engineNote" style="font-size:11px;color:#6b7280;margin-top:2px;">通常の下書き・学習・予約など重要判断はSol、分類はLunaを使います。1つのOpenAI APIキーで切り替わります。</div>
     <details id="aiRouteDetails" style="margin-top:8px;"><summary style="font-size:12px;cursor:pointer;color:#047857;">モデルの役割別設定</summary><div id="aiRouteFields" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:7px;"></div><div style="font-size:10.5px;color:#6b7280;line-height:1.5;margin-top:5px;">将来のモデルは運営側の登録後、この一覧から役割ごとに切り替えられます。設定変更前は「並行テスト」で患者へ送らず比較できます。</div></details>
     <div id="modelAlert" style="display:none;font-size:11px;background:#fef3c7;border:1px solid #fcd34d;color:#92400e;border-radius:8px;padding:8px;margin-top:6px;line-height:1.5;"></div>
   </div>
