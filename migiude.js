@@ -114,7 +114,7 @@ function newTenant(slug, name, config) {
   config = config || {};
   if (!config.conn || typeof config.conn !== "object") config.conn = {};
   if (!config.settings || typeof config.settings !== "object") config.settings = { autoReply: false, level: "high", tone: "", autoDelayMin: 0, engine: "gpt" };
-  if (!["claude", "gpt", "gemini"].includes(config.settings.engine)) config.settings.engine = "gpt"; // 文章作成の既定はGPT-5.6用途別ルーター
+  if (!["claude", "gpt", "gemini"].includes(config.settings.engine)) config.settings.engine = "gpt"; // 文章作成の既定はGPT-6用途別ルーター
   if (typeof config.settings.autoReply !== "boolean") config.settings.autoReply = false;
   if (!["unanswered_first", "recent"].includes(config.settings.inboxOrder)) config.settings.inboxOrder = "unanswered_first";
   if (config.settings.level !== "high" && config.settings.level !== "medium") config.settings.level = "high";
@@ -1529,7 +1529,7 @@ function aiEngineOrder(t){
 function activeAiEngine(t){ return aiEngineOrder(t)[0] || ""; }
 async function aiChatOne(eng, system, messages, maxTokens, route){
   if(eng === "gpt"){
-    route = route || { model: process.env.OPENAI_MODEL || "gpt-5.6-terra", reasoningEffort: "medium" };
+    route = route || { model: process.env.OPENAI_MODEL || "gpt-6-sol", reasoningEffort: "medium" };
     const r = await fetch("https://api.openai.com/v1/chat/completions", { method:"POST",
       headers: { "Content-Type":"application/json", "Authorization":"Bearer "+process.env.OPENAI_KEY },
       body: JSON.stringify({ model:route.model, max_completion_tokens:maxTokens, reasoning_effort:route.reasoningEffort, messages:[{role:"system",content:system}].concat(messages) }) });
@@ -3177,7 +3177,7 @@ async function checkNewerModel(t) {
   const ver=id=>{const m=/^gpt-(\d+(?:\.\d+)?)(?:-(?:sol|terra|luna))?$/.exec(String(id||""));return m?parseFloat(m[1]):null;};
   const currentVersion=Math.max(0,...currentModels.map(ver).filter(v=>v!=null));
   if (MODEL_CHECK_CACHE.ts && now - MODEL_CHECK_CACHE.ts < 24 * 60 * 60 * 1000) return Object.assign({},MODEL_CHECK_CACHE,{current:currentModels.join(" / "),newer:MODEL_CHECK_CACHE.latestVersion>currentVersion});
-  let latest = currentModels[0]||"gpt-5.6-terra", latestVersion=currentVersion, error = null;
+  let latest = currentModels[0]||"gpt-6-sol", latestVersion=currentVersion, error = null;
   try {
     if (process.env.OPENAI_KEY) {
       const r = await fetch("https://api.openai.com/v1/models", { headers: { "Authorization": "Bearer " + process.env.OPENAI_KEY } });
@@ -5806,7 +5806,7 @@ const PAGE = `<!DOCTYPE html>
   <div class="settingsSection">
     <div style="font-size:13px;margin-bottom:4px;">🧠 返信文を作るAIエンジン</div>
     <select id="setEngine" onchange="renderRuleGauge()" style="width:100%;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:13px;">
-      <option value="gpt">GPT-5.6（用途別に自動切替）</option>
+      <option value="gpt">GPT-6（用途別に自動切替）</option>
       <option value="gemini">Gemini（gemini-3-flash）</option>
       <option value="claude">Claude（保険・安定）</option>
     </select>
