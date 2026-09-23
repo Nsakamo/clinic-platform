@@ -17,3 +17,13 @@ test("inbound usage is isolated per request and forwarded to the partner hook", 
   assert.match(source, /usage: \{ entries: usageEntries \}/);
   assert.match(source, /store\.entries\.push\(result\.usage\)/);
 });
+
+test("all AI paths persist provider/model usage locally", () => {
+  assert.match(source, /CREATE TABLE IF NOT EXISTS ai_usage_events/);
+  assert.match(source, /await recordAiUsage\(t, result\.usage, task \|\| "draft"\)/);
+  assert.match(source, /stream_options = \{ include_usage: true \}/);
+  assert.match(source, /await recordAiUsage\(t, out\.usage, "stream:"/);
+  assert.match(source, /usageMetadata && d\.usageMetadata\.promptTokenCount/);
+  assert.match(source, /d\.type === "message_start"/);
+  assert.match(source, /d\.type === "message_delta"/);
+});
