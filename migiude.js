@@ -21,7 +21,7 @@ const { contextualLearningFallback, formatLearningProposal } = require("./lib/le
 const { selectConversationContext } = require("./lib/conversation-context");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
-const { AiUsageSpool } = require("./lib/ai-usage-spool");
+const { AiUsageSpool, resolveAiUsageSpoolPath } = require("./lib/ai-usage-spool");
 const app = express();
 const aiUsageContext = new AsyncLocalStorage();
 app.use(express.json({ limit: "16mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
@@ -1548,7 +1548,7 @@ async function recordAiUsage(t, usage, source){
   try{ aiUsageSpool.enqueue(entry); }
   catch(e){ console.error("ai usage spool:", String(e.message||e).slice(0,120)); }
 }
-const aiUsageSpoolPath = process.env.AI_USAGE_SPOOL_PATH || require("path").join(process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd(), "data", "ai-usage-spool.json");
+const aiUsageSpoolPath = resolveAiUsageSpoolPath();
 const aiUsageSpool = new AiUsageSpool(aiUsageSpoolPath);
 async function writeAiUsage(entry){
   if(!pool) return false;
