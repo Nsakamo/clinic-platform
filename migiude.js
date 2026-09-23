@@ -1548,14 +1548,14 @@ async function recordAiUsage(t, usage, source){
   try{ aiUsageSpool.enqueue(entry); }
   catch(e){ console.error("ai usage spool:", String(e.message||e).slice(0,120)); }
 }
-const aiUsageSpoolPath = resolveAiUsageSpoolPath();
-const aiUsageSpool = new AiUsageSpool(aiUsageSpoolPath);
+let aiUsageSpool = null;
 async function writeAiUsage(entry){
   if(!pool) return false;
   await pool.query("INSERT INTO ai_usage_events (event_key,tenant,source,provider,model,input_tokens,output_tokens,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (event_key) DO NOTHING", [entry.eventKey,entry.tenant,entry.source,entry.provider,entry.model,entry.input,entry.output,entry.createdAt]);
   return true;
 }
 async function flushPendingAiUsage(){
+  if(!aiUsageSpool) return;
   while(aiUsageSpool.size){
     const entry = aiUsageSpool.peek();
     try{
@@ -5286,6 +5286,11 @@ app.use((err, req, res, next) => {
   }
   if (isManagedRuntime() && !PUBLIC_BASE_URL) {
     console.error("起動を中止しました: 本番環境では有効なPUBLIC_BASE_URLが必須です");
+    process.exit(1);
+  }
+  try { aiUsageSpool = new AiUsageSpool(resolveAiUsageSpoolPath()); }
+  catch (e) {
+    console.error("起動を中止しました:", e && e.message ? e.message : e);
     process.exit(1);
   }
   if (!CRED_KEY) console.warn("CRED_KEY 未設定: ローカル開発では起動できますが、資格情報の保存は拒否されます。");

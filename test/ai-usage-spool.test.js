@@ -37,8 +37,8 @@ test("本番では永続spoolパスの設定を必須にする", () => {
     /requires AI_USAGE_SPOOL_PATH or RAILWAY_VOLUME_MOUNT_PATH/,
   );
   assert.equal(
-    resolveAiUsageSpoolPath({ NODE_ENV: "production", RAILWAY_VOLUME_MOUNT_PATH: "/data" }),
-    "/data/ai-usage-spool.ndjson",
+    resolveAiUsageSpoolPath({ NODE_ENV: "production", RAILWAY_VOLUME_MOUNT_PATH: "/mnt/volume" }),
+    "/mnt/volume/data/ai-usage-spool.json",
   );
   assert.equal(
     resolveAiUsageSpoolPath({ NODE_ENV: "production", AI_USAGE_SPOOL_PATH: "/mnt/usage.ndjson" }),
@@ -59,4 +59,46 @@ test("削除journalが増えた場合は未送信分だけへcompactする", () 
   assert.ok(fs.statSync(file).size < 2000);
   assert.equal(fs.readdirSync(dir).filter((name) => name.endsWith(".tmp")).length, 0);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("旧JSON配列を読込時にjournalへ変換してから追記する", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-usage-spool-"));
+  const file = path.join(dir, "usage.ndjson");
+  fs.writeFileSync(file, JSON.stringify([{ eventKey: "old" }]));
+  const spool = new AiUsageSpool(file);
+  spool.enqueue({ eventKey: "new" });
+  const restarted = new AiUsageSpool(file);
+  assert.equal(restarted.size, 2);
+  assert.equal(fs.readFileSync(file, "utf8").startsWith("["), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("末尾の不完全recordを切り離して以後の追記を復元できる", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-usage-spool-"));
+  const file = path.join(dir, "usage.ndjson");
+  fs.writeFileSync(file, '{"op":"put","entry":{"eventKey":"one"}}\n{"op":"put"');
+  const recovered = new AiUsageSpool(file);
+  recovered.enqueue({ eventKey: "two" });
+  const restarted = new AiUsageSpool(file);
+  assert.equal(restarted.size, 2);
+  assert.equal(restarted.peek().eventKey, "one");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("未送信spoolは件数とbytes上限を越えて増えない", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-usage-spool-"));
+  const file = path.join(dir, "usage.ndjson");
+  const byCount = new AiUsageSpool(file, { maxEntries: 2, maxBytes: 4096 });
+  byCount.enqueue({ eventKey: "one" });
+  byCount.enqueue({ eventKey: "two" });
+  assert.throws(() => byCount.enqueue({ eventKey: "three" }), /capacity_exceeded/);
+  assert.equal(byCount.size, 2);
+  fs.rmSync(dir, { recursive: true, force: true });
+
+  const bytesDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-usage-spool-"));
+  const bytesFile = path.join(bytesDir, "usage.ndjson");
+  const byBytes = new AiUsageSpool(bytesFile, { maxEntries: 100, maxBytes: 120 });
+  assert.throws(() => byBytes.enqueue({ eventKey: "large", model: "x".repeat(200) }), /capacity_exceeded/);
+  assert.equal(byBytes.size, 0);
+  fs.rmSync(bytesDir, { recursive: true, force: true });
 });
