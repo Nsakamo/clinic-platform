@@ -212,7 +212,9 @@ async function dbInit() {
   await pool.query("ALTER TABLE examples ADD COLUMN IF NOT EXISTS learning_chat jsonb DEFAULT '[]'::jsonb");
   await pool.query("CREATE TABLE IF NOT EXISTS learning_usage_events (tenant text not null, trace_id text not null, conversation_id text not null default '', generated_at bigint not null, usage jsonb not null default '{}'::jsonb, sent_at bigint, send_mode text, edited boolean, PRIMARY KEY(tenant,trace_id))");
   await pool.query("CREATE INDEX IF NOT EXISTS learning_usage_events_tenant_generated_idx ON learning_usage_events(tenant,generated_at DESC)");
-  await pool.query("CREATE TABLE IF NOT EXISTS ai_usage_events (id bigserial primary key, tenant text not null, source text not null, provider text not null, model text not null, input_tokens bigint not null, output_tokens bigint not null, created_at bigint not null)");
+  await pool.query("CREATE TABLE IF NOT EXISTS ai_usage_events (id bigserial primary key, event_key text, tenant text not null, source text not null, provider text not null, model text not null, input_tokens bigint not null, output_tokens bigint not null, created_at bigint not null)");
+  await pool.query("ALTER TABLE ai_usage_events ADD COLUMN IF NOT EXISTS event_key text");
+  await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS ai_usage_events_event_key_idx ON ai_usage_events(event_key) WHERE event_key IS NOT NULL");
   await pool.query("CREATE INDEX IF NOT EXISTS ai_usage_events_tenant_created_idx ON ai_usage_events(tenant,created_at DESC)");
   await pool.query("CREATE TABLE IF NOT EXISTS alerts (id serial primary key, tenant text, type text, summary text, name text, ts bigint, done boolean default false)");
   await pool.query("CREATE TABLE IF NOT EXISTS files (id text primary key, tenant text, name text, mime text, data bytea, ts bigint)");
@@ -1537,8 +1539,30 @@ async function recordAiUsage(t, usage, source){
   if(!Number.isSafeInteger(input) || !Number.isSafeInteger(output) || input < 0 || output < 0 || input > 10000000 || output > 10000000 || input + output <= 0) return;
   const provider = String(usage.provider || "unknown").replace(/[^a-z0-9._:-]/gi, "_").slice(0, 40) || "unknown";
   const model = String(usage.model || "unknown").replace(/[^a-z0-9._:-]/gi, "_").slice(0, 80) || "unknown";
-  if(pool) await pool.query("INSERT INTO ai_usage_events (tenant,source,provider,model,input_tokens,output_tokens,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)", [t.slug, String(source || "chat").slice(0,40), provider, model, input, output, Date.now()]);
+  const entry = { eventKey:crypto.randomUUID(), tenant:t.slug, source:String(source || "chat").slice(0,40), provider, model, input, output, createdAt:Date.now() };
+  try{
+    if(await writeAiUsage(entry)) return;
+  }catch(e){ console.error("ai usage persist:", String(e.message||e).slice(0,120)); }
+  // 計測障害で生成済み回答を捨てたり別providerへ再送しない。キーを保ったまま後で再試行する。
+  if(pendingAiUsageWrites.length >= 10000) pendingAiUsageWrites.shift();
+  pendingAiUsageWrites.push(entry);
 }
+const pendingAiUsageWrites = [];
+async function writeAiUsage(entry){
+  if(!pool) return false;
+  await pool.query("INSERT INTO ai_usage_events (event_key,tenant,source,provider,model,input_tokens,output_tokens,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (event_key) DO NOTHING", [entry.eventKey,entry.tenant,entry.source,entry.provider,entry.model,entry.input,entry.output,entry.createdAt]);
+  return true;
+}
+async function flushPendingAiUsage(){
+  while(pendingAiUsageWrites.length){
+    try{
+      if(!(await writeAiUsage(pendingAiUsageWrites[0]))) return;
+      pendingAiUsageWrites.shift();
+    }catch(e){ console.error("ai usage retry:", String(e.message||e).slice(0,120)); return; }
+  }
+}
+const aiUsageRetryTimer = setInterval(() => { flushPendingAiUsage().catch(() => {}); }, 30000);
+if(aiUsageRetryTimer.unref) aiUsageRetryTimer.unref();
 async function aiChatOne(eng, system, messages, maxTokens, route){
   if(eng === "gpt"){
     route = route || { model: process.env.OPENAI_MODEL || "gpt-6-sol", reasoningEffort: "medium" };
@@ -1621,7 +1645,7 @@ async function aiChatStream(t, system, messages, maxTokens, onDelta, task){
     }
     if(eng === "gemini" && process.env.GEMINI_KEY){
       const model = process.env.GEMINI_MODEL || "gemini-3-flash";
-      const out = await openaiCompat("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", process.env.GEMINI_KEY, model, { max_tokens: maxTokens, reasoning_effort: "medium" }, "gemini", false);
+      const out = await openaiCompat("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", process.env.GEMINI_KEY, model, { max_tokens: maxTokens, reasoning_effort: "medium" }, "gemini", true);
       if(out){ await recordAiUsage(t, out.usage, "stream:"+(task||"chat")); return out.text; }
     }
     if(ANTHROPIC_KEY){
@@ -4786,12 +4810,14 @@ app.post("/api/assistant-file", guard, async (req, res) => {
     + "\n既存ルールの見出し一覧（同じテーマの資料なら新規追加ではなくその番号へのupdateにする）:\n" + (existing || "（まだルールはありません）")
     + "\n出力は必ず次のJSONのみ: {\"reply\":\"資料から読み取った内容の短い要約説明（ユーザー向け）\",\"items\":[{\"op\":\"add\",\"title\":\"見出し\",\"content\":\"ルール本文\"} または {\"op\":\"update\",\"id\":番号,\"title\":\"...\",\"content\":\"...\"}]}";
   try {
-    let raw = await geminiGenerate(fsys, geminiParts, 3500) || ""; // 資料読み込みはGemini優先（大容量・低コスト）
+    const geminiResult = await geminiGenerate(fsys, geminiParts, 3500, true); // 資料読み込みはGemini優先（大容量・低コスト）
+    let raw = geminiResult && geminiResult.text || "";
+    if(geminiResult && geminiResult.usage) await recordAiUsage(t, geminiResult.usage, "assistant-file");
     if (!raw && ANTHROPIC_KEY) { // Gemini失敗時のみClaudeにフォールバック
       const resp = await fetch("https://api.anthropic.com/v1/messages", { method: "POST",
         headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
         body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 3500, system: fsys, messages: [{ role: "user", content }] }) });
-      if (resp.ok) { const data = await resp.json(); raw = (data.content && data.content[0] && data.content[0].text) || ""; }
+      if (resp.ok) { const data = await resp.json(); raw = (data.content && data.content[0] && data.content[0].text) || ""; await recordAiUsage(t, { input_tokens:Number(data.usage && data.usage.input_tokens || 0), output_tokens:Number(data.usage && data.usage.output_tokens || 0), provider:"anthropic", model:"claude-sonnet-4-6" }, "assistant-file"); }
     }
     if (!raw) return res.json({ ok: false, error: "ai_error" });
     let out = { reply: "", items: [] };

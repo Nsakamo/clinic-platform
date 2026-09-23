@@ -26,4 +26,14 @@ test("all AI paths persist provider/model usage locally", () => {
   assert.match(source, /usageMetadata && d\.usageMetadata\.promptTokenCount/);
   assert.match(source, /d\.type === "message_start"/);
   assert.match(source, /d\.type === "message_delta"/);
+  assert.match(source, /geminiGenerate\(fsys, geminiParts, 3500, true\)/);
+  assert.match(source, /"assistant-file"/);
+});
+
+test("metering failures are retried without entering provider fallback", () => {
+  assert.match(source, /pendingAiUsageWrites\.push\(entry\)/);
+  assert.match(source, /ON CONFLICT \(event_key\) DO NOTHING/);
+  assert.match(source, /setInterval\(\(\) => \{ flushPendingAiUsage\(\)/);
+  assert.match(source, /if\(await writeAiUsage\(entry\)\) return/);
+  assert.doesNotMatch(source, /async function recordAiUsage[\s\S]*?if\(pool\) await pool\.query/);
 });
