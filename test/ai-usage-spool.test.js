@@ -85,6 +85,17 @@ test("末尾の不完全recordを切り離して以後の追記を復元でき�
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test("末尾改行だけ欠けた完全recordを次のrecordと連結しない", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-usage-spool-"));
+  const file = path.join(dir, "usage.ndjson");
+  fs.writeFileSync(file, '{"op":"put","entry":{"eventKey":"one"}}');
+  const recovered = new AiUsageSpool(file);
+  recovered.enqueue({ eventKey: "two" });
+  const restarted = new AiUsageSpool(file);
+  assert.equal(restarted.size, 2);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test("未送信spoolは件数とbytes上限を越えて増えない", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-usage-spool-"));
   const file = path.join(dir, "usage.ndjson");
