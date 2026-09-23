@@ -9,6 +9,7 @@ process.on("uncaughtException", (e) => console.error("uncaught:", e && e.message
 process.on("unhandledRejection", (e) => console.error("unhandled:", e && (e.message || e)));
 const express = require("express");
 const crypto = require("crypto");
+const { AsyncLocalStorage } = require("async_hooks");
 const { intentTokens, rankLearningExamples, sameLearningExample } = require("./lib/learning-retrieval");
 const { evaluateResponseGrounding } = require("./lib/response-grounding");
 const { normalizeReplyTone, replyToneInstruction, toneRewriteInstruction } = require("./lib/reply-tone");
@@ -21,6 +22,7 @@ const { selectConversationContext } = require("./lib/conversation-context");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
 const app = express();
+const aiUsageContext = new AsyncLocalStorage();
 app.use(express.json({ limit: "16mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: false, limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 const API_RATE_WINDOW_MS = 60 * 1000;
@@ -1534,7 +1536,7 @@ async function aiChatOne(eng, system, messages, maxTokens, route){
       headers: { "Content-Type":"application/json", "Authorization":"Bearer "+process.env.OPENAI_KEY },
       body: JSON.stringify({ model:route.model, max_completion_tokens:maxTokens, reasoning_effort:route.reasoningEffort, messages:[{role:"system",content:system}].concat(messages) }) });
     if(!r.ok) throw new Error("openai_"+r.status);
-    const d = await r.json(); return d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
+    const d = await r.json(); return { text: d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content, usage: { input_tokens: Number(d.usage && d.usage.prompt_tokens || 0), output_tokens: Number(d.usage && d.usage.completion_tokens || 0), provider: "openai", model: route.model } };
   }
   if(eng === "gemini"){
     const model = process.env.GEMINI_MODEL || "gemini-3-flash";
@@ -1548,21 +1550,28 @@ async function aiChatOne(eng, system, messages, maxTokens, route){
       // 同じGemini公式のネイティブAPIへ切り替え、返信生成を止めない。
       const userText = messages.map(m => String((m && m.content) || "")).join("\n\n");
       const native = await geminiGenerate(system, [{ text:userText }], maxTokens);
-      if(native) return native;
+      if(native) return { text: native, usage: { input_tokens: 0, output_tokens: 0, provider: "gemini", model } };
       throw new Error("gemini_"+r.status);
     }
-    const d = await r.json(); return d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
+    const d = await r.json(); return { text: d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content, usage: { input_tokens: Number(d.usage && d.usage.prompt_tokens || 0), output_tokens: Number(d.usage && d.usage.completion_tokens || 0), provider: "gemini", model } };
   }
   const r = await fetch("https://api.anthropic.com/v1/messages", { method:"POST",
     headers: { "Content-Type":"application/json", "x-api-key":ANTHROPIC_KEY, "anthropic-version":"2023-06-01" },
     body: JSON.stringify({ model:"claude-sonnet-4-6", max_tokens:maxTokens, system, messages }) });
   if(!r.ok) throw new Error("anthropic_"+r.status);
-  const d = await r.json(); return (d.content && d.content[0] && d.content[0].text) || null;
+  const d = await r.json(); return { text: (d.content && d.content[0] && d.content[0].text) || null, usage: { input_tokens: Number(d.usage && d.usage.input_tokens || 0), output_tokens: Number(d.usage && d.usage.output_tokens || 0), provider: "anthropic", model: "claude-sonnet-4-6" } };
 }
 async function aiChat(t, system, messages, maxTokens, task, routeOverride){
   const route = openAiRoute(t, task || "draft", routeOverride);
   for(const eng of aiEngineOrder(t)){
-    try{ const text = await aiChatOne(eng, system, messages, maxTokens, eng === "gpt" ? route : null); if(text) return text; }
+    try{
+      const result = await aiChatOne(eng, system, messages, maxTokens, eng === "gpt" ? route : null);
+      if(result && result.text){
+        const store = aiUsageContext.getStore();
+        if(store && Array.isArray(store.entries)) store.entries.push(result.usage);
+        return result.text;
+      }
+    }
     catch(e){ console.error("ai provider:", eng, String(e.message||e).slice(0,80)); }
   }
   return null;
@@ -2307,6 +2316,9 @@ async function enrichStaffLineBookingPreview(t, c, generated) {
 
 // ===== shared inbound handler (LINE webhook / email poller / ingest all funnel here) =====
 async function handleInbound(t, opts) {
+  return aiUsageContext.run({ entries: [] }, () => handleInboundCore(t, opts));
+}
+async function handleInboundCore(t, opts) {
   const channel = opts.channel === "mail" ? "mail" : "line";
   const uid = String(opts.uid || "unknown");
   const id = channel + ":" + uid;
@@ -2403,7 +2415,9 @@ async function handleInbound(t, opts) {
     if (c.draft && c.draft.trim() && S(t).staffLineEnabled && S(t).staffLineReplyMode === "exceptions" && staffLineReady(t)) staffLineRequestApproval(t, c, reason).catch(() => {});
     else staffLineEscalate(t, c, reason).catch(() => {});
   }
-  try { await forwardToPartner(t, c, { autoSent: autoSent || baDone, autoScheduled }); } catch (e) { console.error("partner delivery failed: unexpected"); } // 受付くんへ受信イベントを転送
+  const usageStore = aiUsageContext.getStore();
+  const usageEntries = usageStore && Array.isArray(usageStore.entries) ? usageStore.entries.filter(x => x && (x.input_tokens > 0 || x.output_tokens > 0)) : [];
+  try { await forwardToPartner(t, c, { autoSent: autoSent || baDone, autoScheduled, ...(usageEntries.length ? { usage: { entries: usageEntries } } : {}) }); } catch (e) { console.error("partner delivery failed: unexpected"); } // 受付くんへ受信イベントを転送
   return { id, autoSent: autoSent || baDone, autoScheduled };
 }
 
@@ -5810,7 +5824,7 @@ const PAGE = `<!DOCTYPE html>
       <option value="gemini">Gemini（gemini-3-flash）</option>
       <option value="claude">Claude（保険・安定）</option>
     </select>
-    <div id="engineNote" style="font-size:11px;color:#6b7280;margin-top:2px;">通常の下書き・学習はTerra、分類はLuna、予約など重要判断はSolを使います。1つのOpenAI APIキーで切り替わります。</div>
+    <div id="engineNote" style="font-size:11px;color:#6b7280;margin-top:2px;">通常の下書き・学習・予約など重要判断はSol、分類はLunaを使います。1つのOpenAI APIキーで切り替わります。</div>
     <details id="aiRouteDetails" style="margin-top:8px;"><summary style="font-size:12px;cursor:pointer;color:#047857;">モデルの役割別設定</summary><div id="aiRouteFields" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:7px;"></div><div style="font-size:10.5px;color:#6b7280;line-height:1.5;margin-top:5px;">将来のモデルは運営側の登録後、この一覧から役割ごとに切り替えられます。設定変更前は「並行テスト」で患者へ送らず比較できます。</div></details>
     <div id="modelAlert" style="display:none;font-size:11px;background:#fef3c7;border:1px solid #fcd34d;color:#92400e;border-radius:8px;padding:8px;margin-top:6px;line-height:1.5;"></div>
   </div>
