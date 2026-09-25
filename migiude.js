@@ -12,7 +12,7 @@ const crypto = require("crypto");
 const { AsyncLocalStorage } = require("async_hooks");
 const { intentTokens, rankLearningExamples, sameLearningExample } = require("./lib/learning-retrieval");
 const { evaluateResponseGrounding } = require("./lib/response-grounding");
-const { normalizeReplyTone, replyToneInstruction, toneRewriteInstruction } = require("./lib/reply-tone");
+const { PATIENT_COURTESY, applyCourtesyGate, hasConversationalTone, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction } = require("./lib/reply-tone");
 const { compareConversations, compareConversationsRecent } = require("./lib/conversation-order");
 const { MAX_ATTACHMENTS, normalizeFileIds, normalizeScheduledMessageInput, pruneScheduledMessages } = require("./lib/scheduled-message");
 const { lineWebhookEventId, lineWebhookRetryDelay, isProcessableLineEvent } = require("./lib/line-webhook-queue");
@@ -502,7 +502,7 @@ async function staffLineRequestApproval(t, c, reason, opts) {
 async function staffLineReviseDraft(t, c, instruction) {
   const history = staffLineHistoryText(c);
   let booking = ""; try { booking = await fetchBooking(t, c); } catch (e) {}
-  const sys = "あなたは店舗の受付スタッフ。会話、現在の返信案、スタッフの修正指示を踏まえ、患者へ送る返信本文だけを作る。医療判断や情報の推測はしない。"
+  const sys = "あなたは店舗の受付スタッフ。会話、現在の返信案、スタッフの修正指示を踏まえ、患者へ送る返信本文だけを作る。医療判断や情報の推測はしない。" + PATIENT_COURTESY
     + (booking ? "\n予約システムの確認結果:\n" + booking : "")
     + (replyToneInstruction(S(t).tone) ? "\n\n" + replyToneInstruction(S(t).tone) : "");
   const content = "会話:\n" + history + "\n\n現在の返信案:\n" + String(c.draft || "") + "\n\nスタッフの修正指示:\n" + String(instruction || "").slice(0, 1200);
@@ -1717,7 +1717,7 @@ async function geminiGenerate(systemText, userParts, maxTokens, withUsage) {
 }
 
 // ===== AI brain: shared draft generator (used by LINE + email, in-app) =====
-const JP_QUALITY = "【自然な日本語（最優先）】普通の日本人受付スタッフが実際に送る、簡潔で温かい敬語にする。結論や回答を先に書き、必要事項、次の行動の順にまとめる。LINEは原則2〜6文、メールも必要以上に長くしない。会話の途中では毎回あいさつを繰り返さない。『ございます』『くださいませ』『させていただきます』を重ねて格式張らない。不自然な二重敬語（拝見させていただく、ご確認していただく、お伺いさせていただく）は使わない。同じ結論・謝罪・締めを言い換えて繰り返さない。1文ごとの空行、説明を始める宣言、不要な保険表現、機械翻訳調を避ける。出力前に一度読み直し、口に出して不自然な箇所を直す。";
+const JP_QUALITY = "【自然な日本語（最優先）】普通の日本人受付スタッフが実際に送る、簡潔で温かい敬語にする。" + PATIENT_COURTESY + "結論や回答を先に書き、必要事項、次の行動の順にまとめる。LINEは原則2〜6文、メールも必要以上に長くしない。会話の途中では毎回あいさつを繰り返さない。『ございます』『くださいませ』『させていただきます』を重ねて格式張らない。不自然な二重敬語（拝見させていただく、ご確認していただく、お伺いさせていただく）は使わない。同じ結論・謝罪・締めを言い換えて繰り返さない。1文ごとの空行、説明を始める宣言、不要な保険表現、機械翻訳調を避ける。出力前に一度読み直し、口に出して不自然な箇所を直す。";
 function cleanDraftText(raw){
   let text = String(raw||"").trim().replace(/^```(?:json|text)?\s*/i,"").replace(/```$/i,"").trim();
   text = text.replace(/^(?:【(?:返信案|返信文|回答)】|返信(?:案|文)[:：])\s*/i,"").trim();
@@ -1727,6 +1727,7 @@ function cleanDraftText(raw){
 function draftQualityIssues(text){
   text = String(text||""); const issues = [];
   if(!text.trim()) issues.push("empty");
+  if(hasConversationalTone(text)) issues.push("conversational_tone");
   if(/拝見させていただ|ご確認していただ|お伺いさせていただ|大変良かったでございます/.test(text)) issues.push("wrong_honorific");
   const formal = (text.match(/ございます|くださいませ|させていただき/g)||[]).length;
   if(formal >= 3) issues.push("over_formal");
@@ -1739,16 +1740,17 @@ async function finalizeGeneratedDraft(t, raw, channel){
   let text = cleanDraftText(raw), issues = draftQualityIssues(text);
   const tone = normalizeReplyTone(S(t).tone);
   if(!issues.length && !tone) return { text, issues:[] };
-  const sys = "患者へ送る日本語文の最終校正者。事実・日時・料金・URL・可否・固有名詞・謝罪の有無を変えず、不自然な敬語、過剰な格式、重複だけを直す。新しい情報を足さない。"
+  const sys = "患者へ送る日本語文の最終校正者。事実・日時・料金・URL・可否・固有名詞・謝罪の有無を変えず、不自然な敬語、過剰な格式、重複、馴れ馴れしい言い回しを直す。新しい情報を足さない。" + PATIENT_COURTESY
     + (channel==="mail" ? "メールの署名は残す。" : "LINE本文として簡潔にする。")
     + toneRewriteInstruction(tone, channel)
     + "返信本文だけを出力する。";
   const revised = await aiChat(t, sys, [{role:"user",content:text.slice(0,5000)}], 1800, "finalize");
   if(revised){
     const candidate = cleanDraftText(revised);
-    if(candidate && !draftQualityIssues(candidate).includes("empty")) {
+    if(candidate && !draftQualityIssues(candidate).some(issue => issue === "empty" || issue === "conversational_tone")) {
       if(tone) issues.push("tone_reviewed");
       text = candidate;
+      issues = issues.filter(issue => issue !== "conversational_tone");
     }
   }
   return { text, issues:Array.from(new Set(issues)) };
@@ -1761,7 +1763,7 @@ async function validateDraftAgainstEvidence(t, input){
     input.slots ? "【リアルタイム空き枠】\n" + input.slots : "",
     input.precedents ? "【類似するスタッフ確定例】\n" + input.precedents : "",
   ].filter(Boolean).join("\n\n") || "（事実の根拠資料なし）";
-  const sys = "あなたは患者返信の送信前監査兼、日本語編集者です。根拠の優先順位は、最新の店舗ルール > 本人確認済みシステムデータ > 類似するスタッフ確定例。同種の店舗ルールが複数あり食い違う場合は更新日が最も新しいものを採用する。新しい店舗ルールと古い確定例が食い違えば必ず店舗ルールを採用する。類似するスタッフ確定例は、同種問い合わせへの結論・案内手順・必要確認・通常の料金や規定の根拠として使えるが、個別患者の予約・体調・特例は引き継がない。根拠にない事実、数字、可否、完了報告、医療判断があればpass:false。回答漏れ、会話との矛盾、別患者情報の混入もpass:false。内容が正しく日本語だけが不自然・冗長な場合は、事実を一切変えず自然で簡潔な受付文へ直してrevised_draftに入れ、pass:trueにできる。一般的な挨拶、謝意、確認する旨、必要情報を尋ねる文は根拠なしでも可。"
+  const sys = "あなたは患者返信の送信前監査兼、日本語編集者です。根拠の優先順位は、最新の店舗ルール > 本人確認済みシステムデータ > 類似するスタッフ確定例。同種の店舗ルールが複数あり食い違う場合は更新日が最も新しいものを採用する。新しい店舗ルールと古い確定例が食い違えば必ず店舗ルールを採用する。類似するスタッフ確定例は、同種問い合わせへの結論・案内手順・必要確認・通常の料金や規定の根拠として使えるが、個別患者の予約・体調・特例は引き継がない。根拠にない事実、数字、可否、完了報告、医療判断があればpass:false。回答漏れ、会話との矛盾、別患者情報の混入もpass:false。内容が正しく日本語だけが不自然・冗長な場合は、事実を一切変えず自然で簡潔な受付文へ直してrevised_draftに入れ、pass:trueにできる。一般的な挨拶、謝意、確認する旨、必要情報を尋ねる文は根拠なしでも可。" + PATIENT_COURTESY
     + (replyToneInstruction(S(t).tone) ? "\n\n" + replyToneInstruction(S(t).tone) + "\n監査で文章を修正する場合も、このトーンを弱めてはいけない。" : "")
     + "必ずJSONのみ: {\"pass\":true|false,\"answered\":true|false,\"natural\":true|false,\"revised_draft\":\"修正不要なら空文字\",\"unsupported_claims\":[\"\"],\"contradictions\":[\"\"],\"reason\":\"短い日本語\"}";
   const user = "【問い合わせ・直近文脈】\n" + String(input.query || "").slice(0, 2500)
@@ -1775,9 +1777,16 @@ async function validateDraftAgainstEvidence(t, input){
     const unsupportedClaims = Array.isArray(parsed.unsupported_claims) ? parsed.unsupported_claims.map(String).filter(Boolean).slice(0, 8) : [];
     const contradictions = Array.isArray(parsed.contradictions) ? parsed.contradictions.map(String).filter(Boolean).slice(0, 8) : [];
     const answered = parsed.answered === true;
-    const pass = parsed.pass === true && answered && !unsupportedClaims.length && !contradictions.length;
-    const revisedDraft = pass ? cleanDraftText(String(parsed.revised_draft || "")).slice(0, 5000) : "";
-    return { pass, answered, natural: parsed.natural === true, revisedDraft, unsupportedClaims, contradictions, reason: String(parsed.reason || (pass ? "根拠監査済み" : "送信前確認が必要です")).slice(0, 300) };
+    const candidateDraft = cleanDraftText(String(parsed.revised_draft || "")).slice(0, 5000);
+    const revisedDraft = candidateDraft && !hasConversationalTone(candidateDraft) ? candidateDraft : "";
+    const courteous = !hasConversationalTone(revisedDraft || input.draft);
+    const pass = parsed.pass === true && answered && !unsupportedClaims.length && !contradictions.length && courteous;
+    const reasons = [];
+    if (unsupportedClaims.length || contradictions.length) reasons.push("根拠や内容に確認が必要です");
+    if (parsed.reason) reasons.push(String(parsed.reason));
+    if (!reasons.length) reasons.push(pass ? "根拠監査済み" : "送信前確認が必要です");
+    if (!courteous) reasons.push("文体にスタッフ確認が必要です");
+    return { pass, answered, natural: parsed.natural === true, revisedDraft: pass ? revisedDraft : "", unsupportedClaims, contradictions, reason: reasons.join("／").slice(0, 300) };
   } catch (e) {
     return { pass: false, answered: false, unsupportedClaims: [], contradictions: [], reason: "送信前監査の結果を確認できませんでした" };
   }
@@ -2253,6 +2262,7 @@ async function genDraft(t, c, opts) {
     if (out && typeof out === "object") {
       const finalized = await finalizeGeneratedDraft(t, out.draft, channel);
       out.draft = finalized.text; out.qualityIssues = finalized.issues;
+      applyCourtesyGate(out, finalized.issues);
       out.baCtx = baCtx; // 予約自動受付: actionの対象特定に使う
       out.learningRefs = exRel.map((e) => ({ id: e.id, score: Math.round(Number(e.matchScore || 0) * 100), confirmedCount: Math.max(1, Number(e.confirmedCount || 1)) }));
       // 問い合わせだけでは「いくらですか」のように語が足りない場合があるため、返信案に現れた事実語も使って根拠ルールを再抽出する。
@@ -2268,6 +2278,10 @@ async function genDraft(t, c, opts) {
         verifiedSlots: !!opts.baSlotsTxt,
         learningExampleCount: exRel.length,
       });
+      if (finalized.issues.includes("conversational_tone")) {
+        out.grounding.autoSendAllowed = false;
+        out.grounding.reasons.push("返信の文体にスタッフ確認が必要です");
+      }
       out.learningReadiness = applyLearningReadinessGate(t, lastQ, out.grounding);
       const confidence = String(out.confidence || "").toLowerCase();
       const validationCandidate = out.grounding.autoSendAllowed
