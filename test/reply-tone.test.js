@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const { normalizeReplyTone, replyToneInstruction, toneRewriteInstruction } = require("../lib/reply-tone");
+const { PATIENT_COURTESY, hasConversationalTone, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction } = require("../lib/reply-tone");
 
 test("空欄なら標準トーンのままにする", () => {
   assert.equal(replyToneInstruction("   "), "");
@@ -15,10 +15,19 @@ test("設定したトーンを参考情報ではなく返信全文の必須条�
   const block = replyToneInstruction("非常に相手に寄り添い、丁寧に返信してください。");
   assert.match(block, /最終回答の必須条件/);
   assert.match(block, /返信全文を書き直してください/);
-  assert.match(block, /状況や気持ちを受け止める一言/);
-  assert.match(block, /書き出し、説明、お願い、締めまで一貫/);
+  assert.match(block, /気持ちを決めつける/);
+  assert.match(block, /気になりますよね/);
+  assert.match(block, /書き出しから締めまで一貫/);
   assert.match(block, /店舗ルール、確認済み情報、安全上の制約、出力形式を上書きしてはいけません/);
   assert.match(block, /非常に相手に寄り添い、丁寧に返信してください/);
+});
+
+test("標準文体は患者様への礼儀を求め、馴れ馴れしい相づちを検出する", () => {
+  assert.match(PATIENT_COURTESY, /礼儀正しく/);
+  assert.match(PATIENT_COURTESY, /お問い合わせの内容を正確に受け止め/);
+  assert.equal(hasConversationalTone("保定装置がある中でのホワイトニングは、気になりますよね。"), true);
+  assert.equal(hasConversationalTone("ご心配ですよね。確認いたします。"), true);
+  assert.equal(hasConversationalTone("固定式の保定装置が歯の裏側にある場合は、状態を確認してご案内いたします。"), false);
 });
 
 test("生成後の再確認でも事実を変えずにトーンを反映させる", () => {
@@ -37,6 +46,9 @@ test("下書き・作り直し・送信前監査が共通のトーン指示と�
   assert.ok((source.match(/replyToneInstruction\(S\(t\)\.tone/g) || []).length >= 7);
   assert.match(source, /toneRewriteInstruction\(tone, channel\)/);
   assert.match(source, /finalizeDraftChatEnvelope/);
+  assert.match(source, /const JP_QUALITY = .*PATIENT_COURTESY/);
+  assert.match(source, /if \(finalized\.issues\.includes\("conversational_tone"\)\) out\.needs_human = true/);
+  assert.match(source, /const courteous = !hasConversationalTone\(candidateDraft \|\| input\.draft\)/);
   assert.doesNotMatch(source, /【トーン指示(?:（最優先）)?】/);
 });
 
