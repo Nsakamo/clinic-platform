@@ -12,7 +12,7 @@ const crypto = require("crypto");
 const { AsyncLocalStorage } = require("async_hooks");
 const { intentTokens, rankLearningExamples, sameLearningExample } = require("./lib/learning-retrieval");
 const { evaluateResponseGrounding } = require("./lib/response-grounding");
-const { PATIENT_COURTESY, hasConversationalTone, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction } = require("./lib/reply-tone");
+const { PATIENT_COURTESY, applyCourtesyGate, hasConversationalTone, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction } = require("./lib/reply-tone");
 const { compareConversations, compareConversationsRecent } = require("./lib/conversation-order");
 const { MAX_ATTACHMENTS, normalizeFileIds, normalizeScheduledMessageInput, pruneScheduledMessages } = require("./lib/scheduled-message");
 const { lineWebhookEventId, lineWebhookRetryDelay, isProcessableLineEvent } = require("./lib/line-webhook-queue");
@@ -1717,7 +1717,7 @@ async function geminiGenerate(systemText, userParts, maxTokens, withUsage) {
 }
 
 // ===== AI brain: shared draft generator (used by LINE + email, in-app) =====
-const JP_QUALITY = "【自然な日本語（最優先）】" + PATIENT_COURTESY + "結論や回答を先に書き、必要事項、次の行動の順にまとめる。LINEは原則2〜6文、メールも必要以上に長くしない。会話の途中では毎回あいさつを繰り返さない。『ございます』『くださいませ』『させていただきます』を重ねて格式張らない。不自然な二重敬語（拝見させていただく、ご確認していただく、お伺いさせていただく）は使わない。同じ結論・謝罪・締めを言い換えて繰り返さない。1文ごとの空行、説明を始める宣言、不要な保険表現、機械翻訳調を避ける。出力前に一度読み直し、口に出して不自然な箇所を直す。";
+const JP_QUALITY = "【自然な日本語（最優先）】普通の日本人受付スタッフが実際に送る、簡潔で温かい敬語にする。" + PATIENT_COURTESY + "結論や回答を先に書き、必要事項、次の行動の順にまとめる。LINEは原則2〜6文、メールも必要以上に長くしない。会話の途中では毎回あいさつを繰り返さない。『ございます』『くださいませ』『させていただきます』を重ねて格式張らない。不自然な二重敬語（拝見させていただく、ご確認していただく、お伺いさせていただく）は使わない。同じ結論・謝罪・締めを言い換えて繰り返さない。1文ごとの空行、説明を始める宣言、不要な保険表現、機械翻訳調を避ける。出力前に一度読み直し、口に出して不自然な箇所を直す。";
 function cleanDraftText(raw){
   let text = String(raw||"").trim().replace(/^```(?:json|text)?\s*/i,"").replace(/```$/i,"").trim();
   text = text.replace(/^(?:【(?:返信案|返信文|回答)】|返信(?:案|文)[:：])\s*/i,"").trim();
@@ -1778,10 +1778,15 @@ async function validateDraftAgainstEvidence(t, input){
     const contradictions = Array.isArray(parsed.contradictions) ? parsed.contradictions.map(String).filter(Boolean).slice(0, 8) : [];
     const answered = parsed.answered === true;
     const candidateDraft = cleanDraftText(String(parsed.revised_draft || "")).slice(0, 5000);
-    const courteous = !hasConversationalTone(candidateDraft || input.draft);
+    const revisedDraft = candidateDraft && !hasConversationalTone(candidateDraft) ? candidateDraft : "";
+    const courteous = !hasConversationalTone(revisedDraft || input.draft);
     const pass = parsed.pass === true && answered && !unsupportedClaims.length && !contradictions.length && courteous;
-    const revisedDraft = pass ? candidateDraft : "";
-    return { pass, answered, natural: parsed.natural === true, revisedDraft, unsupportedClaims, contradictions, reason: String(!courteous ? "文体にスタッフ確認が必要です" : (parsed.reason || (pass ? "根拠監査済み" : "送信前確認が必要です"))).slice(0, 300) };
+    const reasons = [];
+    if (unsupportedClaims.length || contradictions.length) reasons.push("根拠や内容に確認が必要です");
+    if (parsed.reason) reasons.push(String(parsed.reason));
+    if (!reasons.length) reasons.push(pass ? "根拠監査済み" : "送信前確認が必要です");
+    if (!courteous) reasons.push("文体にスタッフ確認が必要です");
+    return { pass, answered, natural: parsed.natural === true, revisedDraft: pass ? revisedDraft : "", unsupportedClaims, contradictions, reason: reasons.join("／").slice(0, 300) };
   } catch (e) {
     return { pass: false, answered: false, unsupportedClaims: [], contradictions: [], reason: "送信前監査の結果を確認できませんでした" };
   }
@@ -2257,7 +2262,7 @@ async function genDraft(t, c, opts) {
     if (out && typeof out === "object") {
       const finalized = await finalizeGeneratedDraft(t, out.draft, channel);
       out.draft = finalized.text; out.qualityIssues = finalized.issues;
-      if (finalized.issues.includes("conversational_tone")) out.needs_human = true;
+      out = applyCourtesyGate(out, finalized.issues);
       out.baCtx = baCtx; // 予約自動受付: actionの対象特定に使う
       out.learningRefs = exRel.map((e) => ({ id: e.id, score: Math.round(Number(e.matchScore || 0) * 100), confirmedCount: Math.max(1, Number(e.confirmedCount || 1)) }));
       // 問い合わせだけでは「いくらですか」のように語が足りない場合があるため、返信案に現れた事実語も使って根拠ルールを再抽出する。
