@@ -35,6 +35,8 @@ test("標準文体は患者様への礼儀を求め、馴れ馴れしい相づ�
     "気になりますよね😊",
     "ご不安ですよね〜",
     "ご心配ですよね」",
+    "気になりますよね～",
+    "ご心配ですよね♪",
     "気になりますね。",
     "ご心配ですね。",
     "ご不安になりますね。",
@@ -67,8 +69,11 @@ test("初回下書きの口語表現は校正失敗・再発時に残してス�
   const clean = await qualityFunctions("保定装置の状態を確認したうえでご案内いたします。").finalizeGeneratedDraft({}, original, "line");
   assert.equal(clean.text, "保定装置の状態を確認したうえでご案内いたします。");
   assert.equal(clean.issues.includes("conversational_tone"), false);
-  assert.equal(applyCourtesyGate({ needs_human: false }, clean.issues).needs_human, false);
-  assert.equal(applyCourtesyGate({ needs_human: false }, ["conversational_tone"]).needs_human, true);
+  const originalState = { needs_human: false };
+  assert.strictEqual(applyCourtesyGate(originalState, clean.issues), originalState);
+  assert.equal(originalState.needs_human, false);
+  assert.strictEqual(applyCourtesyGate(originalState, ["conversational_tone"]), originalState);
+  assert.equal(originalState.needs_human, true);
 });
 
 test("送信前監査は口語の修正案を捨て、元の文が口語なら送信を止める", async () => {
@@ -84,6 +89,37 @@ test("送信前監査は口語の修正案を捨て、元の文が口語なら�
   assert.equal(unsupported.pass, false);
   assert.match(unsupported.reason, /根拠や内容に確認/);
   assert.match(unsupported.reason, /文体にスタッフ確認/);
+});
+
+test("初回生成から自動送信判定まで口語のままなら送信候補にしない", async () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
+  const qualityStart = source.indexOf("function cleanDraftText(raw){");
+  const qualityEnd = source.indexOf("// 出力が途中で切れる", qualityStart);
+  const draftStart = source.indexOf("async function genDraft(t, c, opts) {");
+  const draftEnd = source.indexOf("// 毎回承認モード", draftStart);
+  assert.ok(qualityStart > 0 && qualityEnd > qualityStart && draftStart > qualityEnd && draftEnd > draftStart);
+  let calls = 0;
+  const functions = vm.runInNewContext(source.slice(qualityStart, qualityEnd) + source.slice(draftStart, draftEnd) + "\n({genDraft})", {
+    PATIENT_COURTESY, JP_QUALITY: PATIENT_COURTESY,
+    hasConversationalTone, applyCourtesyGate, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction,
+    S: () => ({ tone: "", prefs: [] }), activeConversationMessages: c => c.msgs,
+    rulesRankedWithScores: () => [], rulesBlock: () => "", ruleBudget: () => 0,
+    examplesRanked: () => [], trustedLearningPrecedent: () => false,
+    prefsBlock: () => "", notesBlock: () => "", baEnabled: () => false,
+    staffLineReviewAll: () => false, PARTNER_KEY: "",
+    evaluateResponseGrounding: () => ({ autoSendAllowed: true, reasons: [], ruleRefs: [] }),
+    applyLearningReadinessGate: () => ({}),
+    aiChat: async () => ++calls === 1
+      ? JSON.stringify({ draft: "保定装置は気になりますよね。状態を確認します。", confidence: "high", needs_human: false, is_urgent: false, site_alert: "none" })
+      : null,
+  });
+  const result = await functions.genDraft({ name: "テスト医院" }, { channel: "line", msgs: [{ from: "them", text: "テスト：保定装置のままホワイトニングできますか" }] }, { skipExternal: true });
+  assert.ok(result);
+  assert.equal(result.needs_human, true);
+  assert.equal(result.validation.skipped, true);
+  assert.equal(result.validation.pass, false);
+  assert.equal(result.grounding.autoSendAllowed, false);
+  assert.match(result.grounding.reasons.join(" "), /文体にスタッフ確認/);
 });
 
 test("生成後の再確認でも事実を変えずにトーンを反映させる", () => {
@@ -103,7 +139,7 @@ test("下書き・作り直し・送信前監査が共通のトーン指示と�
   assert.match(source, /toneRewriteInstruction\(tone, channel\)/);
   assert.match(source, /finalizeDraftChatEnvelope/);
   assert.match(source, /const JP_QUALITY = .*PATIENT_COURTESY/);
-  assert.match(source, /out = applyCourtesyGate\(out, finalized\.issues\)/);
+  assert.match(source, /applyCourtesyGate\(out, finalized\.issues\)/);
   assert.match(source, /const courteous = !hasConversationalTone\(revisedDraft \|\| input\.draft\)/);
   assert.doesNotMatch(source, /【トーン指示(?:（最優先）)?】/);
 });

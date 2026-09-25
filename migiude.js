@@ -2262,7 +2262,7 @@ async function genDraft(t, c, opts) {
     if (out && typeof out === "object") {
       const finalized = await finalizeGeneratedDraft(t, out.draft, channel);
       out.draft = finalized.text; out.qualityIssues = finalized.issues;
-      out = applyCourtesyGate(out, finalized.issues);
+      applyCourtesyGate(out, finalized.issues);
       out.baCtx = baCtx; // 予約自動受付: actionの対象特定に使う
       out.learningRefs = exRel.map((e) => ({ id: e.id, score: Math.round(Number(e.matchScore || 0) * 100), confirmedCount: Math.max(1, Number(e.confirmedCount || 1)) }));
       // 問い合わせだけでは「いくらですか」のように語が足りない場合があるため、返信案に現れた事実語も使って根拠ルールを再抽出する。
@@ -2278,6 +2278,10 @@ async function genDraft(t, c, opts) {
         verifiedSlots: !!opts.baSlotsTxt,
         learningExampleCount: exRel.length,
       });
+      if (finalized.issues.includes("conversational_tone")) {
+        out.grounding.autoSendAllowed = false;
+        out.grounding.reasons.push("返信の文体にスタッフ確認が必要です");
+      }
       out.learningReadiness = applyLearningReadinessGate(t, lastQ, out.grounding);
       const confidence = String(out.confidence || "").toLowerCase();
       const validationCandidate = out.grounding.autoSendAllowed
