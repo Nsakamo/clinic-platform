@@ -148,6 +148,15 @@ test("確定後の別ターンで旧い可否確認へ戻る案はAI監査が通
   for (const unrelated of ["予約確定メールをご確認のうえご来院くださいと添えて", "チケットは1回分お戻ししますと添えて", "チケットの残り回数をご確認いただくよう添えて", "次回のご利用日をご確認のうえと添えて"]) {
     assert.match(explicitEditMismatch(unrelated, regressed, decided), /前の下書きで確定/, unrelated);
   }
+  for (const [instruction, correct] of [
+    ["チケットの残り回数をご確認いただくよう添えて", decided + "チケットの残り回数はマイページでご確認ください。"],
+    ["次回のご利用日をご確認のうえと添えて", decided + "次回のご利用日をご確認のうえご来院ください。"],
+    ["キャンセルに充てて、ご確認お願いしますと添えて", decided + "ご確認をお願いいたします。"],
+  ]) {
+    assert.equal(explicitEditMismatch(instruction, correct, decided), "", instruction);
+    assert.match(explicitEditMismatch(instruction, regressed, decided), /前の下書きで確定|適用する指示/, instruction);
+  }
+  assert.match(explicitEditMismatch("キャンセルに充てて、ご確認お願いしますと添えて", regressed), /適用する指示/);
   assert.match(explicitEditMismatch("もっと短く", regressed, "今回のキャンセルに充てて対応いたします。"), /前の下書きで確定/);
   assert.match(explicitEditMismatch("適用可否を確認して", "今回のキャンセルに充てて対応いたします。"), /確約/);
 });
