@@ -77,6 +77,12 @@ test("編集履歴は会話単位で保存され、一覧に一括で含めな�
   assert.match(source, /const \{ draftChatSession, \.\.\.publicConversation \} = c/);
 });
 
+test("監査や通信が失敗したらスタッフの入力を残して再試行できる", () => {
+  const ui = source.slice(source.indexOf("async function dSend()"), source.indexOf("// ---- 右腕くん (rulebook editing chat)", source.indexOf("async function dSend()")));
+  assert.match(ui, /if\(meta\.ok===false\)[\s\S]*?x\.value=txt;dComposerDrafts\[owner\]=txt/);
+  assert.match(ui, /通信エラーが発生しました[\s\S]*?x\.value=txt;dComposerDrafts\[owner\]=txt/);
+});
+
 test("編集履歴は患者の新着後に旧話題へ上書きせず、同じ話題なら復元する", async () => {
   const sessionStart = source.indexOf('app.get("/api/draft-chat-history"');
   const sessionEnd = source.indexOf("function normalizeStaffBookingAction", sessionStart);
