@@ -59,6 +59,10 @@ test("確認を求める指示は確約に変えず、確認不要の指示だ�
   assert.equal(explicitEditMismatch("充てるか要確認", checking), "");
   assert.equal(explicitEditMismatch("充てるか確認お願い", checking), "");
   assert.equal(explicitEditMismatch("確認済みなのでキャンセルに充てる", checking).includes("適用する指示"), true);
+  for (const decided of ["確認取れたのでキャンセルに充てる", "確認できたので充てて", "確認はいらない、キャンセルに充てる", "確認なしで充てて", "確認はしないで充てる"]) {
+    assert.match(explicitEditMismatch(decided, checking), /適用する指示|確認を不要/, decided);
+    assert.equal(explicitEditMismatch(decided, "今回のキャンセルに充当いたします。"), "", decided);
+  }
   assert.match(explicitEditMismatch("充てるかどうか確認して", "今回のキャンセルに充当いたします。"), /確約/);
   assert.match(explicitEditMismatch("充てるか要確認", "今回のキャンセルに充当いたします。"), /確約/);
   assert.match(explicitEditMismatch("確認しないといけないと伝えて", "今回のキャンセルに充当いたします。"), /確約/);
@@ -83,6 +87,9 @@ test("相談と編集指示を区別し、長い編集履歴の先頭に孤立�
   assert.equal(isDraftChatConsultation("どっちの言い方がいいと思う？"), true);
   assert.equal(isDraftChatConsultation("この文で失礼はないでしょうか"), true);
   assert.equal(isDraftChatConsultation("充てますと伝えられますか？"), false);
+  for (const edit of ["どちらの日程でも大丈夫ですと返して", "教えてくれてありがとうございますと添えて", "キャンセル料がいくらかも書き足して", "どっちの院か記載して"]) {
+    assert.equal(isDraftChatConsultation(edit), false, edit);
+  }
   assert.equal(isDraftChatConsultation("キャンセルに充てるかどうか確認して"), false);
   assert.equal(isDraftChatConsultation("もっと丁寧にできる？"), false);
   const edits = normalizeDraftEditHistory([
