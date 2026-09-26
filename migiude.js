@@ -4025,9 +4025,9 @@ async function reviewDraftChatCandidate(t, p, raw) {
   let text = (await finalizeGeneratedDraft(t, raw, p.c.channel)).text;
   const instruction = String(p.latestInstruction || "").slice(0, 1500);
   if (!instruction) return { text, error: "" };
-  const auditSystem = "あなたは受付スタッフの編集指示と患者向け下書きの照合担当です。最新のスタッフ指示が文面へ正確に反映されたかだけを判定する。スタッフが今回の扱いを決めた場合、可否を改めて確認する案内へ戻してはいけない。スタッフが可否の確認を指示した場合は、適用を確約してはいけない。未実施のシステム操作を実施済みとは書かない。指示と無関係な確認や個人情報の要求を新しく足さない。元の下書きにある文でも、最新指示に矛盾する前提やそれに付随する要求は残さない。患者様には丁寧な敬語を使う。店舗ルール・医学的安全性に明らかな矛盾があれば理由で示す。必ずJSONのみで {\"pass\":true|false,\"reason\":\"短い理由\"} と答える。";
+  const auditSystem = "あなたは受付スタッフの編集指示と患者向け下書きの照合担当です。最新のスタッフ指示を文面へ正確に反映し、前の下書きにあるスタッフの確定判断は最新指示が明示的に変更しない限り維持されたか判定する。スタッフが今回の扱いを決めた場合、可否を改めて確認する案内へ戻してはいけない。スタッフが可否の確認を指示した場合は、適用を確約してはいけない。未実施のシステム操作を実施済みとは書かない。指示と無関係な確認や個人情報の要求を新しく足さない。元の下書きにある文でも、最新指示に矛盾する前提やそれに付随する要求は残さない。患者様には丁寧な敬語を使う。店舗ルール・医学的安全性に明らかな矛盾があれば理由で示す。必ずJSONのみで {\"pass\":true|false,\"reason\":\"短い理由\"} と答える。";
   async function audit(candidate) {
-    const mismatch = explicitEditMismatch(instruction, candidate);
+    const mismatch = explicitEditMismatch(instruction, candidate, p.previousDraft);
     const prompt = "【患者様の直近の内容】\n" + String(p.lastQ || "").slice(0, 1200)
       + "\n【編集前の下書き】\n" + String(p.previousDraft || "").slice(0, 4000)
       + "\n【最新のスタッフ指示】\n" + instruction
@@ -4043,7 +4043,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
   }
   let checked = await audit(text);
   if (checked.pass) return { text, error: "" };
-  const repairSystem = "患者様向け返信文の編集者です。最新のスタッフ指示をそのまま反映して、返信本文の完成形だけを出力する。スタッフが『充てる』と確定した場合は可否確認に戻さず、確認するよう指示した場合は充当を確約しない。未実施の操作を実施済みと書かない。指示と矛盾する確認待ち表現や不要な追加質問は削る。新しい事実・条件・個人情報の依頼は加えない。医療判断や店舗ルールへの明らかな違反はしない。礼儀正しく簡潔な敬語にする。" + PATIENT_COURTESY;
+  const repairSystem = "患者様向け返信文の編集者です。最新のスタッフ指示をそのまま反映して、返信本文の完成形だけを出力する。前の下書きにあるスタッフの確定判断は、最新指示が明示的に変更しない限り維持する。スタッフが『充てる』と確定した場合は可否確認に戻さず、適用可否を確認するよう明示した場合は充当を確約しない。未実施の操作を実施済みと書かない。指示と矛盾する確認待ち表現や不要な追加質問は削る。新しい事実・条件・個人情報の依頼は加えない。医療判断や店舗ルールへの明らかな違反はしない。礼儀正しく簡潔な敬語にする。" + PATIENT_COURTESY;
   const repairPrompt = "【患者様の直近の内容】\n" + String(p.lastQ || "").slice(0, 1200)
     + "\n【編集前の下書き】\n" + String(p.previousDraft || "").slice(0, 4000)
     + "\n【最新のスタッフ指示】\n" + instruction

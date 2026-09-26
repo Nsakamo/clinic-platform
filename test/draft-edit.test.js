@@ -107,6 +107,26 @@ test("確定後の別ターンで患者様への確認依頼を加えても確�
   assert.equal(calls.length, 1);
 });
 
+test("確定後の別ターンで旧い可否確認へ戻る案はAI監査が通しても修正する", async () => {
+  const decided = "以前誤って消化されたチケット分は、今回のキャンセルに充当いたします。";
+  const regressed = "以前誤って消化されたチケット分を、今回のキャンセルに充てられるか確認いたします。お手数ですがご確認をお願いいたします。";
+  for (const instruction of ["ご確認お願いしますと添えて", "もっと短く"]) {
+    assert.match(explicitEditMismatch(instruction, regressed, decided), /前の下書きで確定/);
+    const p = { ...input(instruction), previousDraft: decided };
+    const { review, calls } = reviewer([
+      '{"pass":true,"reason":"問題なし"}',
+      decided + (instruction.includes("ご確認") ? "お手数ですがご確認をお願いいたします。" : ""),
+      '{"pass":true,"reason":"確定判断を維持"}',
+    ]);
+    const result = await review({}, p, regressed);
+    assert.match(result.text, /充当いたします/);
+    assert.doesNotMatch(result.text, /充てられるか確認/);
+    assert.equal(result.error, "");
+    assert.equal(calls.length, 3);
+  }
+  assert.equal(explicitEditMismatch("やっぱり充てるかどうか確認して", regressed, decided), "");
+});
+
 test("相談と編集指示を区別し、長い編集履歴の先頭に孤立したAI回答を残さない", () => {
   assert.equal(isDraftChatConsultation("キャンセル料っていくらだっけ？"), true);
   assert.equal(isDraftChatConsultation("どっちの言い方がいいと思う？"), true);
