@@ -3910,7 +3910,7 @@ async function draftChatPrep(t, body) {
   const olderConv = context.olderRelevant.map(line).join("\n").slice(0, 3000);
   const lastQ = context.current.filter(m => m.from === "them").slice(-1).map(m => m.text || "").join("");
   const editTxt = (latestInstruction + " " + previousDraft).slice(0, 3000);
-  const latestStaffInput = edits.slice().reverse().find(e => e.role === "user");
+  const latestStaffInput = requestedEdits.slice().reverse().find(e => e.role === "user");
   const voiceInputNote = latestStaffInput && latestStaffInput.inputMode === "voice"
     ? "\n\n【音声入力されたスタッフ指示】最新のスタッフ指示は音声認識から変換された文章です。誤字、同音異義語、助詞抜け、途中の言い直しがあっても、お客様との会話、現在の下書き、店舗ルール、院内用語から意図を復元し、明らかな変換ミスをスタッフに直させず反映する。意味不明な語をそのまま患者向け下書きへ転記しない。ただし患者名、医院、予約日時、金額、回数、予約の変更・取消など重要情報に複数の解釈が残る場合は推測せず、replyで短く確認し、actionはnone、下書きは変更しない。"
     : "";

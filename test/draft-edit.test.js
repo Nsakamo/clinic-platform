@@ -36,6 +36,7 @@ function input(instruction) {
 test("確定指示を可否確認へ戻す案は監査が通しても採用しない", async () => {
   const bad = input("").previousDraft;
   assert.match(explicitEditMismatch("キャンセルに充てる", bad), /適用する指示/);
+  assert.match(explicitEditMismatch("キャンセルに当てる", bad), /適用する指示/);
   assert.match(explicitEditMismatch("確認するんじゃなくていい", bad), /確認を不要/);
   const { review, calls } = reviewer([
     '{"pass":true,"reason":"問題なし"}',
