@@ -54,7 +54,13 @@ test("確認を求める指示は確約に変えず、確認不要の指示だ�
   assert.equal(explicitEditMismatch("充てるかどうか確認して", checking), "");
   assert.equal(explicitEditMismatch("適用するか確認すると伝えて", checking), "");
   assert.equal(explicitEditMismatch("確認しないといけないと伝えて", "確認いたします。"), "");
+  assert.equal(explicitEditMismatch("キャンセルに充てるか確認中と伝えて", checking), "");
+  assert.equal(explicitEditMismatch("充てるか確認でき次第連絡すると伝えて", checking), "");
+  assert.equal(explicitEditMismatch("充てるか要確認", checking), "");
+  assert.equal(explicitEditMismatch("充てるか確認お願い", checking), "");
+  assert.equal(explicitEditMismatch("確認済みなのでキャンセルに充てる", checking).includes("適用する指示"), true);
   assert.match(explicitEditMismatch("充てるかどうか確認して", "今回のキャンセルに充当いたします。"), /確約/);
+  assert.match(explicitEditMismatch("充てるか要確認", "今回のキャンセルに充当いたします。"), /確約/);
   assert.match(explicitEditMismatch("確認しないといけないと伝えて", "今回のキャンセルに充当いたします。"), /確約/);
   assert.match(explicitEditMismatch("確認しないでキャンセルに充てる", checking), /確認を不要/);
   assert.match(explicitEditMismatch("キャンセルに充てる", checking), /適用する指示/);
@@ -76,6 +82,7 @@ test("相談と編集指示を区別し、長い編集履歴の先頭に孤立�
   assert.equal(isDraftChatConsultation("キャンセル料っていくらだっけ？"), true);
   assert.equal(isDraftChatConsultation("どっちの言い方がいいと思う？"), true);
   assert.equal(isDraftChatConsultation("この文で失礼はないでしょうか"), true);
+  assert.equal(isDraftChatConsultation("充てますと伝えられますか？"), false);
   assert.equal(isDraftChatConsultation("キャンセルに充てるかどうか確認して"), false);
   assert.equal(isDraftChatConsultation("もっと丁寧にできる？"), false);
   const edits = normalizeDraftEditHistory([
@@ -172,8 +179,9 @@ test("編集履歴は会話単位で保存され、一覧に一括で含めな�
 
 test("監査や通信が失敗したらスタッフの入力を残して再試行できる", () => {
   const ui = source.slice(source.indexOf("async function dSend()"), source.indexOf("// ---- 右腕くん (rulebook editing chat)", source.indexOf("async function dSend()")));
-  assert.match(ui, /if\(meta\.ok===false\)[\s\S]*?x\.value=txt;dComposerDrafts\[owner\]=txt/);
-  assert.match(ui, /通信エラーが発生しました[\s\S]*?x\.value=txt;dComposerDrafts\[owner\]=txt/);
+  assert.match(ui, /function restoreFailedInput\(\)[\s\S]*?dHist\.pop\(\)[\s\S]*?x\.value=txt;dComposerDrafts\[owner\]=txt/);
+  assert.match(ui, /if\(meta\.ok===false\)[\s\S]*?restoreFailedInput\(\)/);
+  assert.match(ui, /通信エラーが発生しました[\s\S]*?restoreFailedInput\(\)/);
 });
 
 test("編集履歴は患者の新着後に旧話題へ上書きせず、同じ話題なら復元する", async () => {
