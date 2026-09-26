@@ -1551,7 +1551,7 @@ async function recordAiUsage(t, usage, source){
 let aiUsageSpool = null;
 async function writeAiUsage(entry){
   if(!pool) return false;
-  await pool.query("INSERT INTO ai_usage_events (event_key,tenant,source,provider,model,input_tokens,output_tokens,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (event_key) DO NOTHING", [entry.eventKey,entry.tenant,entry.source,entry.provider,entry.model,entry.input,entry.output,entry.createdAt]);
+  await pool.query("INSERT INTO ai_usage_events (event_key,tenant,source,provider,model,input_tokens,output_tokens,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (event_key) WHERE event_key IS NOT NULL DO NOTHING", [entry.eventKey,entry.tenant,entry.source,entry.provider,entry.model,entry.input,entry.output,entry.createdAt]);
   return true;
 }
 async function flushPendingAiUsage(){

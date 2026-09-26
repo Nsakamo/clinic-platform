@@ -32,7 +32,8 @@ test("all AI paths persist provider/model usage locally", () => {
 
 test("metering failures are retried without entering provider fallback", () => {
   assert.match(source, /aiUsageSpool\.enqueue\(entry\)/);
-  assert.match(source, /ON CONFLICT \(event_key\) DO NOTHING/);
+  assert.match(source, /CREATE UNIQUE INDEX IF NOT EXISTS ai_usage_events_event_key_idx ON ai_usage_events\(event_key\) WHERE event_key IS NOT NULL/);
+  assert.match(source, /ON CONFLICT \(event_key\) WHERE event_key IS NOT NULL DO NOTHING/);
   assert.match(source, /setInterval\(\(\) => \{ flushPendingAiUsage\(\)/);
   assert.match(source, /if\(await writeAiUsage\(entry\)\) return/);
   assert.doesNotMatch(source, /async function recordAiUsage[\s\S]*?if\(pool\) await pool\.query/);
