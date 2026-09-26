@@ -7,11 +7,14 @@ const path = require("node:path");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
 
-test("Web画面は送信成功後に確認候補だけを作り、はいの後だけ対応例へ保存する", () => {
-  assert.match(source, /prepareStaffLearningConsent\(t, c,[\s\S]{0,300}source: "web"/);
-  assert.match(source, /status: "awaiting_consent"/);
+test("Web画面は送信成功後に対象返信だけを安全な学習キューへ入れる", () => {
+  const send = source.slice(source.indexOf('app.post("/api/send"'), source.indexOf('function scheduledMessages', source.indexOf('app.post("/api/send"')));
+  assert.match(send, /if \(sent\)/);
+  assert.match(send, /if \(text && shouldOfferLearningConsent\(q0, text\)\)/);
+  assert.match(send, /queueStaffLearning\(t, c,[\s\S]{0,300}source: "web"/);
+  assert.doesNotMatch(send, /prepareStaffLearningConsent/);
   assert.match(source, /async function queueStaffLearning[\s\S]{0,900}await exampleAdd\(t,/);
-  assert.match(source, /\["awaiting_decision", "awaiting_consent"\]\.includes\(job\.status\)/);
+  assert.match(source, /learningJob: learningJob && learningJob\.job/);
 });
 
 test("スタッフLINEの既存学習経路は維持し、修正指示を引き渡す", () => {
@@ -98,7 +101,7 @@ test("スタッフの修正過程を構造化した判断メモリとして保�
   assert.match(source, /判断手順:/);
 });
 
-test("Web送信後は明示同意がある時だけ安全確認と用途別整理を開始する", () => {
+test("Web送信後は一般化済み判断だけを再利用し、旧同意ジョブも扱える", () => {
   const queue = source.slice(source.indexOf("async function queueStaffLearning"), source.indexOf("async function prepareStaffLearningConsent"));
   assert.match(queue, /await exampleAdd\(t,/);
   assert.match(queue, /status: "processing"/);

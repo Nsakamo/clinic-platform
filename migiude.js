@@ -19,6 +19,7 @@ const { lineWebhookEventId, lineWebhookRetryDelay, isProcessableLineEvent } = re
 const { normalizeAiRoutes, resolveAiRoute, publicModelCatalog } = require("./lib/ai-model-router");
 const { contextualLearningFallback, formatLearningProposal } = require("./lib/learning-context");
 const { selectConversationContext } = require("./lib/conversation-context");
+const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("./lib/draft-edit");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
 const { AiUsageSpool, resolveAiUsageSpoolPath } = require("./lib/ai-usage-spool");
@@ -2908,7 +2909,7 @@ app.get("/api/conversations", guard, (req, res) => {
   const staffLineReviewAvailable = !!(S(req.tenant).staffLineEnabled && staffLineReady(req.tenant));
   const inboxOrder = S(req.tenant).inboxOrder === "recent" ? "recent" : "unanswered_first";
   const arr = Object.values(req.tenant.store).sort(inboxOrder === "recent" ? compareConversationsRecent : compareConversations);
-  res.json(arr.map(c => Object.assign({}, c, { staffLineReviewAvailable, inboxOrder, scheduledMessages: scheduledForConversation(req.tenant, c.id) })));
+  res.json(arr.map(c => { const { draftChatSession, ...publicConversation } = c; return Object.assign(publicConversation, { staffLineReviewAvailable, inboxOrder, scheduledMessages: scheduledForConversation(req.tenant, c.id) }); }));
 });
 app.get("/api/conversation-updates", guard, (req, res) => {
   const t = req.tenant;
@@ -2917,7 +2918,7 @@ app.get("/api/conversation-updates", guard, (req, res) => {
   const inboxOrder = S(t).inboxOrder === "recent" ? "recent" : "unanswered_first";
   const arr = Object.values(t.store).sort(inboxOrder === "recent" ? compareConversationsRecent : compareConversations);
   const updates = arr.filter(c => Number(c._rev || c.ts || 0) > since)
-    .map(c => Object.assign({}, c, { staffLineReviewAvailable, inboxOrder, scheduledMessages: scheduledForConversation(t, c.id) }));
+    .map(c => { const { draftChatSession, ...publicConversation } = c; return Object.assign(publicConversation, { staffLineReviewAvailable, inboxOrder, scheduledMessages: scheduledForConversation(t, c.id) }); });
   res.json({
     ok: true,
     version: Math.max(Number(t._convRev || 0), ...arr.map(c => Number(c._rev || c.ts || 0))),
@@ -3054,26 +3055,30 @@ app.post("/api/send", guard, async (req, res) => {
   const baseUrl = messagePublicBase(req);
   try { ({ sent, sendErr } = await deliverMessageBundle(t, c, text, files, baseUrl)); }
   finally { sendLocks.delete(sendLockKey); }
-  let learningPrompt = null;
+  let learningJob = null;
   if (sent) {
     const draft0 = String(c.draft0 || "").trim(); // 学習判定用に、消す前のAI初回下書きを確保
     const q0 = recentCustomerQuestion(c);
-    const instr = String(req.body.instr || "").trim();
-    const learningChat = sanitizeLearningChat(req.body.learningChat);
+    const savedSession = c.draftChatSession && Number(c.draftChatSession.topicTs || 0) === Number(c.ts || 0) ? c.draftChatSession : null;
+    const savedMessages = savedSession && Array.isArray(savedSession.messages) ? savedSession.messages : [];
+    const savedFinalDraft = (savedMessages.slice().reverse().find(m => m && m.role === "assistant" && m.kind !== "reply") || {}).content || "";
+    const useSavedEdits = !!savedFinalDraft && savedFinalDraft.trim() === text;
+    const instr = String(req.body.instr || (useSavedEdits ? savedMessages.filter(m => m && m.role === "user").map(m => m.content).join(" / ") : "")).trim().slice(0, 1500);
+    const learningChat = sanitizeLearningChat(Array.isArray(req.body.learningChat) && req.body.learningChat.length ? req.body.learningChat : (useSavedEdits ? savedMessages : []));
     const reviewText = String(req.body.learningText || "").trim().slice(0, 800);
     await finishLearningUsageTrace(t, c, text, "staff");
-    appendDeliveredBundle(c, text, files, baseUrl, { learningRefs: c.learningRefs || [] }); c.draft = ""; c.draft0 = ""; c.learningRefs = []; c.status = "done"; c.flag = false; c.lastAuto = false; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
+    appendDeliveredBundle(c, text, files, baseUrl, { learningRefs: c.learningRefs || [] }); c.draft = ""; c.draft0 = ""; c.learningRefs = []; delete c.draftChatSession; c.status = "done"; c.flag = false; c.lastAuto = false; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
     statBump(t, "staff");
-    if (text) {
+    if (text && shouldOfferLearningConsent(q0, text)) {
       try {
-        learningPrompt = await prepareStaffLearningConsent(t, c, { q: q0, final: text, draft0, instr, learningChat, reviewText, source: "web" });
+        learningJob = await queueStaffLearning(t, c, { q: q0, final: text, draft0, instr, learningChat, reviewText, source: "web" });
       } catch (e) {
-        // 患者への送信完了後に確認候補の準備だけ失敗しても、500を返して再送を誘発しない。
-        console.error("web learning consent:", t.slug, c.id, String(e && e.message || e).slice(0, 120));
+        // 患者への送信完了後に学習が失敗しても、500を返して再送を誘発しない。
+        console.error("web learning queue:", t.slug, c.id, String(e && e.message || e).slice(0, 120));
       }
     }
   }
-  res.json({ ok: true, sent, sendErr, learningPrompt });
+  res.json({ ok: true, sent, sendErr, learningJob: learningJob && learningJob.job });
 });
 
 function scheduledMessages(t) {
@@ -3886,27 +3891,27 @@ function staffBookingPrompt(ctx) {
 async function draftChatPrep(t, body) {
   const c = t.store[body.id] || null;
   if (!c) return { error: "no_conv" };
-  const edits = (Array.isArray(body.messages) ? body.messages : []).slice(-14)
+  const topicTs = Number(c.ts || 0);
+  const requestedEdits = (Array.isArray(body.messages) ? body.messages : []).slice(-14)
     .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
-    .map(m => ({ role: m.role, content: m.content.slice(0, 4000), inputMode: m.inputMode === "voice" ? "voice" : "text" }));
-  while (edits.length && edits[0].role === "assistant") {
-    edits[0] = { role: "user", content: "【現在の下書き（あなたが既に作成済み）】\n" + edits[0].content };
-    if (edits[1] && edits[1].role === "user") { edits[0].content += "\n\n" + edits[1].content; edits.splice(1, 1); }
-    break;
-  }
+    .map(m => ({ role: m.role, content: m.content.slice(0, 4000), inputMode: m.inputMode === "voice" ? "voice" : "text", kind: m.kind === "reply" ? "reply" : "draft" }));
+  const latestInstruction = (requestedEdits.slice().reverse().find(m => m.role === "user") || {}).content || "";
+  const previousDraft = (requestedEdits.slice().reverse().find(m => m.role === "assistant" && m.kind !== "reply") || {}).content || "";
+  const edits = normalizeDraftEditHistory(requestedEdits);
   if (!edits.length || edits[edits.length - 1].role !== "user") return { error: "empty" };
   const context = selectConversationContext(c, { maxCurrent: 20, maxOlder: 10 });
   const line = m => (m.from === "them" ? "お客様" : "クリニック") + ": " + (m.text || (m.media ? "［" + m.media + "］" : ""));
   const conv = context.current.map(line).join("\n").slice(0, 6000);
   const olderConv = context.olderRelevant.map(line).join("\n").slice(0, 3000);
   const lastQ = context.current.filter(m => m.from === "them").slice(-1).map(m => m.text || "").join("");
-  const editTxt = edits.map(e => e.content).join(" ");
-  const latestStaffInput = edits.slice().reverse().find(e => e.role === "user");
+  const editTxt = (latestInstruction + " " + previousDraft).slice(0, 3000);
+  const latestStaffInput = requestedEdits.slice().reverse().find(e => e.role === "user");
   const voiceInputNote = latestStaffInput && latestStaffInput.inputMode === "voice"
     ? "\n\n【音声入力されたスタッフ指示】最新のスタッフ指示は音声認識から変換された文章です。誤字、同音異義語、助詞抜け、途中の言い直しがあっても、お客様との会話、現在の下書き、店舗ルール、院内用語から意図を復元し、明らかな変換ミスをスタッフに直させず反映する。意味不明な語をそのまま患者向け下書きへ転記しない。ただし患者名、医院、予約日時、金額、回数、予約の変更・取消など重要情報に複数の解釈が残る場合は推測せず、replyで短く確認し、actionはnone、下書きは変更しない。"
     : "";
-  const rel = rulesRanked(t, (lastQ + " " + editTxt).slice(0, 1500));
-  const rulesTxt = rel.length ? rulesBlock(rel, ruleBudget(t)) : "";
+  const rel = rulesRankedWithScores(t, (lastQ + " " + editTxt).slice(0, 3000))
+    .filter(x => x.n > 0).slice(0, 20).map(x => x.r);
+  const rulesTxt = rel.length ? rulesBlock(rel, 16000) : "";
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = c.channel === "mail" ? "メールなので下書きの最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
   let baCtx = null;
@@ -3928,9 +3933,29 @@ async function draftChatPrep(t, body) {
     + "\n\nスタッフの指示がどんなに短くても（「あってる」「もっと短く」「優しく」等）、お客様との会話の文脈に当てはめて意味を解釈すること。"
     + voiceInputNote
     + "\n\n【会話の仕方】ChatGPTのような自然な会話相手として振る舞う。スタッフが指示ではなく質問・相談をしてきた場合（例:「キャンセル料っていくらだっけ？」「どっちの言い方がいいと思う？」）は、店舗ルールと会話文脈を踏まえて返事で普通に答え、下書きは変えなくてよい。指示が曖昧なら、解釈した上で作りつつ、返事で一言確認する。"
-    + "\n\n【書き方の最重要方針】(1)スタッフの指示は的確に反映する。(2)指示されていない部分の内容・構成・言い回しは、むやみに書き換えない（前の下書きを土台に、指示箇所だけ直す。つながりが不自然になる場合の最小限の調整は可）。勝手に情報を足したり削ったりしない。(3)全体は優秀な受付スタッフが書くような、自然で読みやすく簡潔な文にする。形式的な前置き・保険表現を詰め込まない（店舗ルールで必須の情報がある時だけ補う）。";
+    + "\n\n【書き方の最重要方針】(1)最新のスタッフ指示を、直前の下書きより優先して的確に反映する。スタッフが『充てる』『適用する』と確定した場合は可否確認へ戻さず、適用できるか確認するよう指示した場合は充当を約束しない。システム操作が完了したと確認できない限り『充当しました』と過去の完了を主張せず、確定指示がある場合だけ『充当いたします』など今後の対応として書く。明らかに店舗ルール・確認済み情報・医療安全に反する指示はスタッフへ理由を伝え、下書きを確定しない。(2)指示されていない部分の内容・構成・言い回しは、むやみに書き換えない。ただし最新の指示と矛盾する確認待ち表現や、それに付随する不要な依頼は取り除く。新しい情報を足さない。(3)全体は礼儀正しく自然で簡潔な患者様向けの文にする。形式的な前置き・保険表現を詰め込まない（店舗ルールで必須の情報がある時だけ補う）。"
+    + "\n\n【今回の最新スタッフ指示（編集の最優先対象）】\n" + latestInstruction.slice(0, 1500);
   const engLabel = (S(t).engine === "gpt" && process.env.OPENAI_KEY) ? "GPT" : (S(t).engine === "gemini" && process.env.GEMINI_KEY) ? "Gemini" : (ANTHROPIC_KEY ? "Claude(保険)" : "AI");
-  return { c, edits: edits.map(e => ({ role: e.role, content: e.content })), base, engLabel, baCtx };
+  return { c, topicTs, edits: edits.map(e => ({ role: e.role, content: e.content })), base, engLabel, baCtx, latestInstruction, previousDraft, lastQ, consultation: isDraftChatConsultation(latestInstruction) };
+}
+
+app.get("/api/draft-chat-history", guard, (req, res) => {
+  const c = req.tenant.store[String(req.query.id || "")];
+  if (!c) return res.status(404).json({ ok: false, error: "no_conv" });
+  const session = c.draftChatSession;
+  const messages = session && Number(session.topicTs || 0) === Number(c.ts || 0) && Array.isArray(session.messages)
+    ? session.messages : [];
+  res.json({ ok: true, messages, draftAtSave: messages.length ? String(session.draftAtSave || "") : "" });
+});
+
+async function saveDraftChatSession(t, p, body, assistantContent, kind) {
+  if (Number(p.c.ts || 0) !== p.topicTs) return false;
+  const messages = (Array.isArray(body.messages) ? body.messages : []).slice(-19)
+    .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+    .map(m => ({ role: m.role, content: m.content.slice(0, 4000), inputMode: m.inputMode === "voice" ? "voice" : "text", kind: m.kind === "reply" ? "reply" : "draft" }));
+  messages.push({ role: "assistant", content: String(assistantContent || "").slice(0, 4000), kind: kind === "reply" ? "reply" : "draft" });
+  p.c.draftChatSession = { topicTs: p.topicTs, messages: messages.slice(-20), draftAtSave: String(p.c.draft || "").slice(0, 4000), updatedAt: Date.now() };
+  return dbSave(t, p.c);
 }
 
 function normalizeStaffBookingAction(p, raw) {
@@ -3994,13 +4019,52 @@ function draftChatNote(t, c, edits) {
   dbSave(t, c);
 }
 
-app.post("/api/draft-chat", guard, async (req, res) => {
+async function reviewDraftChatCandidate(t, p, raw) {
+  if (p.consultation) return { text: "", error: "" };
+  if (!String(raw || "").trim()) return { text: "", error: "" };
+  let text = (await finalizeGeneratedDraft(t, raw, p.c.channel)).text;
+  const instruction = String(p.latestInstruction || "").slice(0, 1500);
+  if (!instruction) return { text, error: "" };
+  const auditSystem = "あなたは受付スタッフの編集指示と患者向け下書きの照合担当です。最新のスタッフ指示を文面へ正確に反映し、前の下書きにあるスタッフの確定判断は最新指示が明示的に変更しない限り維持されたか判定する。スタッフが今回の扱いを決めた場合、可否を改めて確認する案内へ戻してはいけない。スタッフが可否の確認を指示した場合は、適用を確約してはいけない。未実施のシステム操作を実施済みとは書かない。指示と無関係な確認や個人情報の要求を新しく足さない。元の下書きにある文でも、最新指示に矛盾する前提やそれに付随する要求は残さない。患者様には丁寧な敬語を使う。店舗ルール・医学的安全性に明らかな矛盾があれば理由で示す。必ずJSONのみで {\"pass\":true|false,\"reason\":\"短い理由\"} と答える。";
+  async function audit(candidate) {
+    const mismatch = explicitEditMismatch(instruction, candidate, p.previousDraft);
+    const prompt = "【患者様の直近の内容】\n" + String(p.lastQ || "").slice(0, 1200)
+      + "\n【編集前の下書き】\n" + String(p.previousDraft || "").slice(0, 4000)
+      + "\n【最新のスタッフ指示】\n" + instruction
+      + "\n【編集後の下書き】\n" + candidate;
+    const rawAudit = await aiChat(t, auditSystem, [{ role: "user", content: prompt }], 500, "audit");
+    if (!rawAudit) return { pass: false, reason: "編集指示の照合ができませんでした" };
+    try {
+      const match = rawAudit.match(/\{[\s\S]*\}/);
+      const result = JSON.parse(match ? match[0] : rawAudit);
+      const casual = hasConversationalTone(candidate);
+      return { pass: result.pass === true && !mismatch && !casual, reason: mismatch || (casual ? "患者様向けの敬語になっていません" : String(result.reason || "").slice(0, 200)) };
+    } catch (e) { return { pass: false, reason: "編集指示の照合結果を読み取れませんでした" }; }
+  }
+  let checked = await audit(text);
+  if (checked.pass) return { text, error: "" };
+  const repairSystem = "患者様向け返信文の編集者です。最新のスタッフ指示をそのまま反映して、返信本文の完成形だけを出力する。前の下書きにあるスタッフの確定判断は、最新指示が明示的に変更しない限り維持する。スタッフが『充てる』と確定した場合は可否確認に戻さず、適用可否を確認するよう明示した場合は充当を確約しない。未実施の操作を実施済みと書かない。指示と矛盾する確認待ち表現や不要な追加質問は削る。新しい事実・条件・個人情報の依頼は加えない。医療判断や店舗ルールへの明らかな違反はしない。礼儀正しく簡潔な敬語にする。" + PATIENT_COURTESY;
+  const repairPrompt = "【患者様の直近の内容】\n" + String(p.lastQ || "").slice(0, 1200)
+    + "\n【編集前の下書き】\n" + String(p.previousDraft || "").slice(0, 4000)
+    + "\n【最新のスタッフ指示】\n" + instruction
+    + "\n【修正が必要な案】\n" + text
+    + "\n【照合で見つかった問題】\n" + checked.reason;
+  const repaired = await aiChat(t, repairSystem, [{ role: "user", content: repairPrompt }], 1800, "chat");
+  if (repaired) {
+    const candidate = (await finalizeGeneratedDraft(t, repaired, p.c.channel)).text;
+    checked = await audit(candidate);
+    if (checked.pass) return { text: candidate, error: "" };
+  }
+  return { text: "", error: "編集指示を正確に反映できませんでした。内容を短く言い換えて、もう一度お試しください。" };
+}
+
+app.post("/api/draft-chat", guard, oneMutationAtATime("draft-chat", req => req.body.id), async (req, res) => {
   const t = req.tenant;
   if (!ANTHROPIC_KEY && !process.env.OPENAI_KEY && !process.env.GEMINI_KEY) return res.json({ ok: false, error: "no_ai_key" });
   const p = await draftChatPrep(t, req.body);
   if (p.error) return res.json({ ok: false, error: p.error });
   const sys = p.base
-    + "\n毎回、返信下書きの完成形の全文をdraftに入れる（下書きを変えない時は前と同じ全文）。replyにはスタッフへの返事（何をどう変えたか、または質問への答え。1〜3文。敬語でなくてよい）。"
+    + "\n編集を依頼された時は返信下書きの完成形の全文をdraftに入れる。質問・相談への回答だけで下書きを変えない時はdraftを空文字にする。replyにはスタッフへの返事（何をどう変えたか、または質問への答え。1〜3文。敬語でなくてよい）。"
     + "出力は必ず次のJSONのみ: {\"reply\":\"スタッフへの返事\",\"draft\":\"お客様への返信下書き全文\",\"memory\":\"\",\"rule\":null,\"action\":{\"type\":\"none|context|slots|cancel|reschedule\",\"appointmentId\":\"\",\"date\":\"YYYY-MM-DD\",\"newDateTime\":\"YYYY-MM-DDTHH:MM\"}}"
     + " actionは上のスタッフ用うけつけるん連携に該当する明確な依頼だけに使い、それ以外は必ずtype:none。"
     + "\n" + DRAFTCHAT_MEMORY_RULE
@@ -4010,7 +4074,10 @@ app.post("/api/draft-chat", guard, async (req, res) => {
     if (!raw) return res.json({ ok: false, error: "ai_failed" });
     let out = { reply: "", draft: "" };
     try { const m = raw.match(/\{[\s\S]*\}/); out = JSON.parse(m ? m[0] : raw); } catch (e) { out = { reply: "", draft: salvageDraft(raw) }; }
-    if (String(out.draft || "").trim()) out.draft = (await finalizeGeneratedDraft(t, out.draft, p.c.channel)).text;
+    if (p.consultation) out.draft = "";
+    const reviewed = await reviewDraftChatCandidate(t, p, out.draft);
+    if (reviewed.error) return res.json({ ok: false, error: reviewed.error });
+    out.draft = reviewed.text;
     // 文章作成中は学習候補の抽出だけ行う。恒久保存は患者への送信後にスタッフが適用範囲を選んで確定する。
     const savedMem = String(out.memory || "").trim().slice(0, 200);
     let savedRule = null;
@@ -4019,21 +4086,24 @@ app.post("/api/draft-chat", guard, async (req, res) => {
       if (title && content) savedRule = { title, content };
     }
     const staffAction = normalizeStaffBookingAction(p, out.action);
-    res.json({ ok: true, reply: String(out.reply || "").slice(0, 600) + " 〔" + p.engLabel + "で作成〕", draft: String(out.draft || "").slice(0, 4000), memory: savedMem, rule: savedRule, action: staffAction });
+    const historySaved = await saveDraftChatSession(t, p, req.body, out.draft || out.reply, out.draft ? "draft" : "reply");
+    res.json({ ok: true, reply: String(out.reply || "").slice(0, 600) + " 〔" + p.engLabel + "で作成〕", draft: String(out.draft || "").slice(0, 4000), memory: savedMem, rule: savedRule, action: staffAction, historySaved });
   } catch (e) { res.json({ ok: false, error: String(e.message || e).slice(0, 80) }); }
 });
 
-async function finalizeDraftChatEnvelope(t, full, channel) {
+async function finalizeDraftChatEnvelope(t, full, p) {
   const source = String(full || "");
   const match = source.match(/(@@DRAFT@@\s*)([\s\S]*?)(?=\n@@(?:MEMORY|RULE|ACTION)@@|$)/);
+  if (p.consultation) return match ? source.slice(0, match.index) + source.slice(match.index + match[0].length) : source;
   if (!match || !String(match[2] || "").trim()) return source;
-  const finalized = await finalizeGeneratedDraft(t, match[2], channel);
+  const finalized = await reviewDraftChatCandidate(t, p, match[2]);
+  if (finalized.error) throw new Error(finalized.error);
   return source.slice(0, match.index) + match[1] + finalized.text + source.slice(match.index + match[0].length);
 }
 
-// ストリーミング版（GPT風にリアルタイムで文字が流れる）。@@REPLY@@/@@DRAFT@@/@@MEMORY@@ のマーカー区切りテキストを
-// chunked responseでそのまま流し、最後に @@META@@{json} を1行付ける。クライアントは逐次パースして表示する。
-app.post("/api/draft-chat-stream", guard, async (req, res) => {
+// 互換API。編集指示と患者向け文体を確認した完成文だけをマーカー形式で返す。
+// 未確認の途中稿をブラウザへ送らないため、生成と校正が終わってから送信する。
+app.post("/api/draft-chat-stream", guard, oneMutationAtATime("draft-chat", req => req.body.id), async (req, res) => {
   const t = req.tenant;
   if (!ANTHROPIC_KEY && !process.env.OPENAI_KEY && !process.env.GEMINI_KEY) { res.status(400).end("no_ai_key"); return; }
   const p = await draftChatPrep(t, req.body);
@@ -4049,14 +4119,12 @@ app.post("/api/draft-chat-stream", guard, async (req, res) => {
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("X-Accel-Buffering", "no");
   try {
-    const enforceTone = !!normalizeReplyTone(S(t).tone);
-    let full = enforceTone ? await aiChat(t, sys, p.edits, 4000, "chat") : await aiChatStream(t, sys, p.edits, 4000, (d) => { try { res.write(d); } catch (e) {} }, "chat");
-    if (enforceTone && full) {
-      full = await finalizeDraftChatEnvelope(t, full, p.c.channel);
+    let full = await aiChat(t, sys, p.edits, 4000, "chat");
+    if (full) {
+      const replySection = full.match(/@@REPLY@@[ \t]*\r?\n([\s\S]*?)(?=\r?\n@@(?:DRAFT|MEMORY|RULE|ACTION)@@|$)/);
+      if (!replySection || !String(replySection[1] || "").trim()) throw new Error("invalid_edit_response");
+      full = await finalizeDraftChatEnvelope(t, full, p);
       res.write(full);
-    } else if (!full) { // ストリーム不可時は非ストリームで生成して一括送信
-      full = await aiChat(t, sys, p.edits, 4000, "chat");
-      if (full) res.write(full);
     }
     let savedMem = "", savedRule = null, staffAction = null;
     if (full) {
@@ -4080,7 +4148,11 @@ app.post("/api/draft-chat-stream", guard, async (req, res) => {
         if (aj) { try { staffAction = normalizeStaffBookingAction(p, JSON.parse(aj[0])); } catch (e) {} }
       }
     }
-    res.write("\n@@META@@" + JSON.stringify({ ok: !!full, memory: savedMem, rule: savedRule, engine: p.engLabel, action: staffAction }));
+    const dm = full && full.match(/@@DRAFT@@\s*([\s\S]*?)(?=\n@@(?:MEMORY|RULE|ACTION)@@|$)/);
+    const rm = full && full.match(/@@REPLY@@\s*([\s\S]*?)(?=\n@@(?:DRAFT|MEMORY|RULE|ACTION)@@|$)/);
+    const hasDraft = !!(dm && String(dm[1] || "").trim());
+    const historySaved = full ? await saveDraftChatSession(t, p, req.body, String(hasDraft ? dm[1] : rm ? rm[1] : "").trim(), hasDraft ? "draft" : "reply") : false;
+    res.write("\n@@META@@" + JSON.stringify({ ok: !!full, memory: savedMem, rule: savedRule, engine: p.engLabel, action: staffAction, historySaved }));
   } catch (e) {
     try { res.write("\n@@META@@" + JSON.stringify({ ok: false, error: String(e.message || e).slice(0, 80) })); } catch (e2) {}
   }
@@ -6720,7 +6792,7 @@ async function decideLearningConsent(learn,silent){
     refreshLearningBadge();
   }catch(e){if(learn&&!silent)showLearningOutcome({type:"error",title:"学習を開始できませんでした",message:e.message==="consent_expired"?"3秒を過ぎたため、今回は記録していません":"患者への送信は完了しています。今回は学習していません"});}
 }
-async function sendMsg(){if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="患者へ送信中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat});let json={};try{json=await response.json();}catch(e){}if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";if(json.learningPrompt)showLearningConsent(json.learningPrompt);else showLearnResult("送信しました");await load();pollLearningJobs();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
+async function sendMsg(){if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="患者へ送信中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat});let json={};try{json=await response.json();}catch(e){}if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";showLearnResult(json.learningJob?"送信しました。確認済みの返信を学習中です":"送信しました");await load();pollLearningJobs();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
 let scheduledMessageDraft=null;
 function localDateTimeValue(date){const pad=n=>String(n).padStart(2,"0");return date.getFullYear()+"-"+pad(date.getMonth()+1)+"-"+pad(date.getDate())+"T"+pad(date.getHours())+":"+pad(date.getMinutes());}
 function openScheduledMessage(){
@@ -6756,7 +6828,7 @@ async function resendStaffApproval(){if(!current)return;const b=document.getElem
 async function shareClinic(){const note=await uiPrompt("現場に伝える内容を入力してください（空欄のままOKを押すと、お客様の直近メッセージをそのまま共有します）","");if(note===null)return;const btn=document.getElementById("shareClinicBtn"),id=current;await withBusy("share-"+id,btn,"共有中…",async()=>{try{const r=await api("/api/share",{id,note:note||""});const j=await r.json();if(j.ok)uiAlert("現場ボードに共有しました");else uiAlert("共有に失敗しました");}catch(e){uiAlert("共有に失敗しました");}});}
 async function toggleFlag(){if(!current)return;const id=current,b=document.getElementById("flagBtn");let next=null;await withBusy("flag-"+id,b,"変更中…",async()=>{try{const r=await api("/api/tag",{id});const j=await r.json();next=!!j.flag;const cd=DATA.find(x=>x.id===id);if(cd)cd.flag=next;renderList();}catch(e){uiAlert("変更に失敗しました");}});if(b&&next!==null)b.textContent=next?"⚑ 要対応を外す":"⚑ 要対応";}
 // ---- AIで作り直す（会話型・下書きを会話で磨く。会話ごとにセッションを保持し再開可能）----
-let dHist=[],dLog=[],dSessions={},dComposerDrafts={},dComposerOwner="",dVoiceDerived={};
+let dHist=[],dLog=[],dSessions={},dComposerDrafts={},dComposerOwner="",dVoiceDerived={},dHistoryLoadingId="";
 let dVoiceRecorder=null,dVoiceStream=null,dVoiceChunks=[],dVoiceOwner="",dVoiceStopTimer=null;
 function dVoiceUi(label,recording,busy){const b=document.getElementById("dVoiceBtn"),s=document.getElementById("dVoiceStatus");if(b){b.textContent=label||"🎙 音声入力";b.classList.toggle("recording",!!recording);b.disabled=!!busy;}if(s)s.textContent=recording?"録音中です。話し終わったら停止を押してください":(busy?"音声を文字に変換しています…":"話した内容は文字になり、右腕くんが変換ミスも文脈から読み取ります");}
 function dVoiceCleanup(){if(dVoiceStopTimer){clearTimeout(dVoiceStopTimer);dVoiceStopTimer=null;}if(dVoiceStream){dVoiceStream.getTracks().forEach(track=>track.stop());dVoiceStream=null;}dVoiceRecorder=null;dVoiceChunks=[];dVoiceOwner="";window.__voiceBusy=false;}
@@ -6818,6 +6890,7 @@ function dBookingCard(info){const card=document.createElement("div");card.classN
   async function decide(approve){run.disabled=true;stop.disabled=true;run.textContent=approve?"実行中…":"取り消し中…";try{const r=await api("/api/staff-booking-confirm",{id:conversationId,requestId:info.requestId,approve});const j=await r.json();if(j.ok){dAdd("sysn",(j.done?"✅ ":"↩ ")+(j.text||"完了しました"));card.remove();await load();}else{dAdd("sysn","⚠ "+(j.text||staffBookingError(j.error)));run.disabled=false;stop.disabled=false;run.textContent="対象を確認して実行";stop.textContent="実行しない";}}catch(e){dAdd("sysn","通信エラーで結果を確認できません。うけつけるんの予約詳細を確認してください。");run.disabled=false;stop.disabled=false;run.textContent="対象を確認して実行";stop.textContent="実行しない";}}
   run.onclick=()=>decide(true);stop.onclick=()=>decide(false);row.appendChild(run);row.appendChild(stop);card.appendChild(row);dMsgsEl.appendChild(card);dMsgsEl.scrollTop=dMsgsEl.scrollHeight;}
 function staffBookingError(code){return ({not_linked:"うけつけるん連携が有効ではありません。",patient_not_verified:"この会話の患者を安全に特定できないため操作できません。",appointment_mismatch:"現在の患者の予約と一致しないため停止しました。",not_changeable:"この予約は変更・キャンセルできません。",patient_confirmation_pending:"患者様への確認待ち手続きがあるため、先にそちらを完了してください。",staff_confirmation_pending:"別の予約操作が確認待ちです。先に表示中の確認カードを実行または取り消してください。",slot_taken:"指定枠はすでに埋まっています。",bad_date:"日付を確認してください。",bad_datetime:"変更先の日時を確認してください。",expired:"確認期限が切れました。もう一度指示してください。",result_unknown:"実行結果を確認できません。うけつけるんの予約詳細で確認してください。"})[code]||"予約システムで処理できませんでした。";}
+function draftChatError(code){return ({invalid_edit_response:"回答を読み取れませんでした。もう一度お試しください。",ai_failed:"文章を作成できませんでした。もう一度お試しください。",no_conv:"会話を読み込めませんでした。画面を更新してください。",empty:"編集内容を入力してください。"})[code]||(/[ぁ-んァ-ン一-龠]/.test(String(code||""))?String(code):"文章を作成できませんでした。もう一度お試しください。");}
 async function dHandleBookingAction(action){if(!action||!action.type)return;dAdd("sysn","うけつけるんで対象患者と最新の予約状態を確認しています…");try{const r=await api("/api/staff-booking-action",Object.assign({id:current},action));const j=await r.json();if(j.ok&&j.kind==="info")dAdd("ai",j.text||"確認できました");else if(j.ok&&j.kind==="confirm")dBookingCard(j);else{let msg=j.text||staffBookingError(j.error);if(j.alternatives&&j.alternatives.length)msg+="\\n空き候補: "+j.alternatives.map(x=>x.label).join(" / ");dAdd("sysn","⚠ "+msg);}}catch(e){dAdd("sysn","うけつけるんへ接続できませんでした。予約操作は行っていません。");}}
 function openDraftChat(){if(!current)return;const openId=current;const c=DATA.find(x=>x.id===openId);if(!c)return;
   rememberDraftChatInput();dComposerOwner=openId;
@@ -6833,10 +6906,27 @@ function openDraftChat(){if(!current)return;const openId=current;const c=DATA.fi
       dAdd("ai","お客様とのやり取りを踏まえて、この下書きを用意しています。");
       dNewCard(cur);
       dAdd("ai","どう変えていきますか？（例：「もっと簡潔に」「予約確定メールに記載の院に来てと案内して」）");
-      dHist.push({role:"assistant",content:cur});
+      dHist.push({role:"assistant",content:cur,kind:"draft"});
     }else{
       dAdd("ai","まだ下書きがありません。どんな返信にしたいか教えてください。お客様との会話は読み込み済みです。");
     }
+    dHistoryLoadingId=openId;
+    const sendButton=document.getElementById("dSendBtn");if(sendButton)sendButton.disabled=true;
+    fetch("/api/draft-chat-history?id="+encodeURIComponent(openId)).then(r=>r.json()).then(j=>{
+      if(current!==openId||dComposerOwner!==openId||!j.ok||!Array.isArray(j.messages)||!j.messages.length)return;
+      const currentDraft=(document.getElementById("draft")?document.getElementById("draft").value:"").trim()||String(c.draft||"").trim();
+      const lastSavedDraft=j.messages.slice().reverse().find(m=>m&&m.role==="assistant"&&m.kind!=="reply");
+      if(currentDraft!==String(j.draftAtSave||"").trim()&&currentDraft!==String(lastSavedDraft&&lastSavedDraft.content||"").trim()){
+        dAdd("sysn","現在の下書きが前回の編集時から変わっているため、最新の下書きから開始します。");return;
+      }
+      dHist=j.messages.filter(m=>m&&["user","assistant"].includes(m.role)).map(m=>({role:m.role,content:String(m.content||"").slice(0,4000),inputMode:m.inputMode,kind:m.kind}));
+      dLog=[];dMsgsEl.innerHTML="";
+      dAdd("ai","前回の編集内容を引き継ぎました。");
+      dHist.forEach(m=>{if(m.role==="user")dAdd("user",m.content);else if(m.kind==="reply")dAdd("ai",m.content);else dNewCard(m.content);});
+      dSessions[openId]={hist:dHist,log:dLog,ts:c.ts,memory:"",rule:null};
+    }).catch(()=>{if(current===openId)dAdd("sysn","前回の編集履歴を読み込めませんでした。現在の下書きから編集できます。");}).finally(()=>{
+      if(dHistoryLoadingId===openId){dHistoryLoadingId="";const button=document.getElementById("dSendBtn");if(button)button.disabled=false;}
+    });
   }
   const composer=document.getElementById("dText");if(composer)composer.value=dComposerDrafts[openId]||"";
   document.getElementById("dpanel").style.display="block";
@@ -6849,12 +6939,13 @@ function slideClose(pid,cid){const p=document.getElementById(pid),c=document.get
   setTimeout(()=>{p.style.display="none";c.style.animation="";},220);}
 function closeDraftChat(){if(window.__voiceBusy){uiAlert("音声を処理中です。完了してから患者画面へ戻ってください");return;}rememberDraftChatInput();const app=document.getElementById("app");if(app)app.classList.remove("dopen");slideClose("dpanel","dCard");}
 function dChip(t){const x=document.getElementById("dText");x.value=t;rememberDraftChatInput();dSend();}
-// GPT風ストリーミング送信。返事が文字単位で流れ、下書きカードもリアルタイムに埋まる。失敗時は従来API(JSON)へ自動フォールバック。
-async function dSend(){if(window.__dBusy||window.__voiceBusy)return;const x=document.getElementById("dText");const txt=x.value.trim();if(!txt)return;const owner=dComposerOwner||current,fromVoice=!!dVoiceDerived[owner];window.__dBusy=true;const btn=document.getElementById("dSendBtn"),old=btn&&btn.innerHTML;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>作成中…';}x.value="";if(owner){dComposerDrafts[owner]="";delete dVoiceDerived[owner];}
+// サーバーで指示との一致と患者向け文体を確認した完成案だけを表示する。
+async function dSend(){if(window.__dBusy||window.__voiceBusy||dHistoryLoadingId===current)return;const x=document.getElementById("dText");const txt=x.value.trim();if(!txt)return;const owner=dComposerOwner||current,fromVoice=!!dVoiceDerived[owner];window.__dBusy=true;const btn=document.getElementById("dSendBtn"),old=btn&&btn.innerHTML;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>作成中…';}x.value="";if(owner){dComposerDrafts[owner]="";delete dVoiceDerived[owner];}
   dAdd("user",txt);dHist.push({role:"user",content:txt,inputMode:fromVoice?"voice":"text"});
   const logEntry={type:"ai",text:""};dLog.push(logEntry);
   const aiEl=dRender("ai","…");
   let cardEntry=null;
+  function restoreFailedInput(){if(dHist.length&&dHist[dHist.length-1].role==="user"&&dHist[dHist.length-1].content===txt)dHist.pop();if(current===owner){x.value=txt;dComposerDrafts[owner]=txt;}}
   const MK_D="@@DRAFT@@",MK_M="@@MEMORY@@",MK_R="@@RULE@@",MK_A="@@ACTION@@",MK_T="@@META@@";
   function applyAcc(acc){
     const mi=acc.indexOf(MK_T);const body=(mi>=0?acc.slice(0,mi):acc).replace("@@REPLY@@","");
@@ -6881,27 +6972,30 @@ async function dSend(){if(window.__dBusy||window.__voiceBusy)return;const x=docu
     while(true){const s=await reader.read();if(s.done)break;acc+=dec.decode(s.value,{stream:true});applyAcc(acc);}
     const fin=applyAcc(acc);
     let meta={};try{meta=fin.meta?JSON.parse(fin.meta):{};}catch(e){}
-    if(meta.ok===false||(!fin.reply&&!fin.draft))throw new Error("stream_empty");
+    if(meta.ok===false){aiEl.textContent=draftChatError(meta.error);logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";restoreFailedInput();return;}
+    if(!fin.reply&&!fin.draft)throw new Error("stream_empty");
     if(fin.reply&&meta.engine){aiEl.textContent=fin.reply+" 〔"+meta.engine+"で作成〕";logEntry.text=aiEl.textContent;}
-    dHist.push({role:"assistant",content:(fin.draft||fin.reply||"").slice(0,4000)});
-    if(meta.memory){if(dSessions[current])dSessions[current].memory=meta.memory;dAdd("sysn","🧠 学習候補：「"+meta.memory+"」（患者への送信後に、会話全体から判断手順へ整理して学習するか選べます）");}
+    dHist.push({role:"assistant",content:(fin.draft||fin.reply||"").slice(0,4000),kind:fin.draft?"draft":"reply"});
+    if(meta.memory){if(dSessions[current])dSessions[current].memory=meta.memory;dAdd("sysn","🧠 学習候補：「"+meta.memory+"」（患者への送信後に安全確認し、再利用できる判断手順だけを学習します）");}
     if(meta.rule){if(dSessions[current])dSessions[current].rule=meta.rule;dAdd("sysn","📚 店舗ルール候補：「"+meta.rule.title+"」（患者への送信後に内容を確認して反映できます）");}
     if(meta.action)await dHandleBookingAction(meta.action);
+    if(meta.historySaved===false)dAdd("sysn","編集履歴を保存できませんでした。画面を更新する前に下書きを控えてください。");
   }catch(e){
     // フォールバック: 従来のJSON API
     aiEl.textContent="書き直し中…";
     try{
       const r2=await api("/api/draft-chat",{id:current,messages:dHist});
       const j=await r2.json();
-      if(j.ok&&j.draft){
+      if(j.ok&&(j.draft||j.reply)){
         aiEl.textContent=j.reply||"できました";logEntry.text=aiEl.textContent;
-        if(!cardEntry)dNewCard(j.draft);else{cardEntry.draft=j.draft;const cEl=cardEntry._el?cardEntry._el.querySelector(".c"):null;if(cEl)cEl.textContent=j.draft;}
-        dHist.push({role:"assistant",content:j.draft});
-        if(j.memory){if(dSessions[current])dSessions[current].memory=j.memory;dAdd("sysn","🧠 学習候補：「"+j.memory+"」（患者への送信後に、会話全体から判断手順へ整理して学習するか選べます）");}
+        if(j.draft){if(!cardEntry)dNewCard(j.draft);else{cardEntry.draft=j.draft;const cEl=cardEntry._el?cardEntry._el.querySelector(".c"):null;if(cEl)cEl.textContent=j.draft;}}
+        dHist.push({role:"assistant",content:j.draft||j.reply,kind:j.draft?"draft":"reply"});
+        if(j.memory){if(dSessions[current])dSessions[current].memory=j.memory;dAdd("sysn","🧠 学習候補：「"+j.memory+"」（患者への送信後に安全確認し、再利用できる判断手順だけを学習します）");}
         if(j.rule){if(dSessions[current])dSessions[current].rule=j.rule;dAdd("sysn","📚 店舗ルール候補：「"+j.rule.title+"」（患者への送信後に内容を確認して反映できます）");}
         if(j.action)await dHandleBookingAction(j.action);
-      }else{aiEl.textContent="エラー: "+(j.error||"不明");logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";}
-    }catch(e2){aiEl.textContent="通信エラーが発生しました";logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";}
+        if(j.historySaved===false)dAdd("sysn","編集履歴を保存できませんでした。画面を更新する前に下書きを控えてください。");
+      }else{aiEl.textContent=draftChatError(j.error);logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";restoreFailedInput();}
+    }catch(e2){aiEl.textContent="通信エラーが発生しました";logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";restoreFailedInput();}
   }finally{window.__dBusy=false;if(btn&&btn.isConnected){btn.disabled=false;btn.removeAttribute("aria-busy");btn.innerHTML=old;}}}
 // ---- 右腕くん (rulebook editing chat) ----
 let asstHist=[],asstCtx=null;
