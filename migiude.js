@@ -6965,7 +6965,7 @@ async function dSend(){if(window.__dBusy||window.__voiceBusy||dHistoryLoadingId=
     while(true){const s=await reader.read();if(s.done)break;acc+=dec.decode(s.value,{stream:true});applyAcc(acc);}
     const fin=applyAcc(acc);
     let meta={};try{meta=fin.meta?JSON.parse(fin.meta):{};}catch(e){}
-    if(meta.ok===false){aiEl.textContent=meta.error||"編集指示を反映できませんでした。もう一度お試しください。";logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";return;}
+    if(meta.ok===false){aiEl.textContent=meta.error||"編集指示を反映できませんでした。もう一度お試しください。";logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";if(current===owner){x.value=txt;dComposerDrafts[owner]=txt;}return;}
     if(!fin.reply&&!fin.draft)throw new Error("stream_empty");
     if(fin.reply&&meta.engine){aiEl.textContent=fin.reply+" 〔"+meta.engine+"で作成〕";logEntry.text=aiEl.textContent;}
     dHist.push({role:"assistant",content:(fin.draft||fin.reply||"").slice(0,4000),kind:fin.draft?"draft":"reply"});
@@ -6987,8 +6987,8 @@ async function dSend(){if(window.__dBusy||window.__voiceBusy||dHistoryLoadingId=
         if(j.rule){if(dSessions[current])dSessions[current].rule=j.rule;dAdd("sysn","📚 店舗ルール候補：「"+j.rule.title+"」（患者への送信後に内容を確認して反映できます）");}
         if(j.action)await dHandleBookingAction(j.action);
         if(j.historySaved===false)dAdd("sysn","編集履歴を保存できませんでした。画面を更新する前に下書きを控えてください。");
-      }else{aiEl.textContent="エラー: "+(j.error||"不明");logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";}
-    }catch(e2){aiEl.textContent="通信エラーが発生しました";logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";}
+      }else{aiEl.textContent="エラー: "+(j.error||"不明");logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";if(current===owner){x.value=txt;dComposerDrafts[owner]=txt;}}
+    }catch(e2){aiEl.textContent="通信エラーが発生しました";logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";if(current===owner){x.value=txt;dComposerDrafts[owner]=txt;}}
   }finally{window.__dBusy=false;if(btn&&btn.isConnected){btn.disabled=false;btn.removeAttribute("aria-busy");btn.innerHTML=old;}}}
 // ---- 右腕くん (rulebook editing chat) ----
 let asstHist=[],asstCtx=null;
