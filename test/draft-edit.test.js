@@ -134,6 +134,8 @@ test("確定後の別ターンで旧い可否確認へ戻る案はAI監査が通
     "適用可能かを確認のうえご連絡いたします。", "充てることができるか確認いたします。",
     "充当の可否を確認いたします。", "適用されるか確認いたします。",
     "お使いになれるか確認いたします。", "チケットの充当につきましては、確認のうえご連絡いたします。",
+    "チケットの充当についてお調べのうえご連絡いたします。", "チケット分の充当を検討いたします。",
+    "チケット分の充当について相談いたします。", "チケットは今回のキャンセルの適用対象外となります。",
   ]) {
     assert.match(explicitEditMismatch("キャンセルに充てる", candidate), /適用する指示/, candidate);
     assert.match(explicitEditMismatch("もっと短く", candidate, decided), /前の下書きで確定/, candidate);
@@ -141,6 +143,9 @@ test("確定後の別ターンで旧い可否確認へ戻る案はAI監査が通
     assert.equal(explicitEditMismatch("もっと短く", "充てられるか確認いたします。", candidate), "", candidate);
   }
   for (const unrelated of ["来院時に保険証を確認させていただきますと添えて", "確認の上ご来院くださいと添えて", "院長に聞いたらOKだったので短くして"]) {
+    assert.match(explicitEditMismatch(unrelated, regressed, decided), /前の下書きで確定/, unrelated);
+  }
+  for (const unrelated of ["予約確定メールをご確認のうえご来院くださいと添えて", "チケットは1回分お戻ししますと添えて", "チケットの残り回数をご確認いただくよう添えて", "次回のご利用日をご確認のうえと添えて"]) {
     assert.match(explicitEditMismatch(unrelated, regressed, decided), /前の下書きで確定/, unrelated);
   }
   assert.match(explicitEditMismatch("もっと短く", regressed, "今回のキャンセルに充てて対応いたします。"), /前の下書きで確定/);
