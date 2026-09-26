@@ -68,7 +68,9 @@ test("確認を求める指示は確約に変えず、確認不要の指示だ�
   }
   assert.match(explicitEditMismatch("充てるかどうか確認して", "今回のキャンセルに充当いたします。"), /確約/);
   assert.match(explicitEditMismatch("充てるか要確認", "今回のキャンセルに充当いたします。"), /確約/);
-  assert.match(explicitEditMismatch("確認しないといけないと伝えて", "今回のキャンセルに充当いたします。"), /確約/);
+  assert.equal(explicitEditMismatch("確認しないといけないと伝えて", "今回のキャンセルに充当いたします。"), "");
+  assert.equal(explicitEditMismatch("ご確認お願いしますと添えて", "今回のキャンセルに充当いたします。お手数ですがご確認をお願いいたします。"), "");
+  assert.equal(explicitEditMismatch("予約内容を確認してもらってからキャンセルに充てると伝えて", "予約内容をご確認いただいた後、今回のキャンセルに充当いたします。"), "");
   assert.match(explicitEditMismatch("確認しないでキャンセルに充てる", checking), /確認を不要/);
   assert.match(explicitEditMismatch("キャンセルに充てる", checking), /適用する指示/);
 });
@@ -89,6 +91,17 @@ test("患者様へのご確認依頼を添えた確定案は誤って差し戻�
   const draft = "以前誤って消化されたチケット分は、今回のキャンセルに充当いたします。お手数ですがご確認をお願いいたします。";
   const { review, calls } = reviewer(['{"pass":true,"reason":"指示を反映"}']);
   const result = await review({}, input("キャンセルに充てて、ご確認お願いしますと添えて"), draft);
+  assert.equal(result.text, draft);
+  assert.equal(result.error, "");
+  assert.equal(calls.length, 1);
+});
+
+test("確定後の別ターンで患者様への確認依頼を加えても確定を保つ", async () => {
+  const decided = "以前誤って消化されたチケット分は、今回のキャンセルに充当いたします。";
+  const draft = decided + "お手数ですがご確認をお願いいたします。";
+  const p = { ...input("ご確認お願いしますと添えて"), previousDraft: decided };
+  const { review, calls } = reviewer(['{"pass":true,"reason":"患者様への確認依頼のみ追加"}']);
+  const result = await review({}, p, draft);
   assert.equal(result.text, draft);
   assert.equal(result.error, "");
   assert.equal(calls.length, 1);
