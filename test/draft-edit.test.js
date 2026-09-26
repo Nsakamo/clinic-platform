@@ -125,6 +125,19 @@ test("確定後の別ターンで旧い可否確認へ戻る案はAI監査が通
     assert.equal(calls.length, 3);
   }
   assert.equal(explicitEditMismatch("やっぱり充てるかどうか確認して", regressed, decided), "");
+  for (const reversal of ["やっぱり充てるのはやめて、確認中にして", "まだ決まってないので確認待ちにして", "元の下書きに戻して", "確認してから充てるか決めると伝えて", "院長に使えるか聞いてから連絡すると伝えて"]) {
+    assert.equal(explicitEditMismatch(reversal, regressed, decided), "", reversal);
+  }
+  for (const candidate of [
+    "充当可能か確認いたします。", "充当が可能かどうか確認いたします。",
+    "ご利用いただけるか確認いたします。", "お使いいただけるか確認いたします。",
+    "適用可能かを確認のうえご連絡いたします。", "充てることができるか確認いたします。",
+  ]) {
+    assert.match(explicitEditMismatch("キャンセルに充てる", candidate), /適用する指示/, candidate);
+    assert.match(explicitEditMismatch("もっと短く", candidate, decided), /前の下書きで確定/, candidate);
+  }
+  assert.match(explicitEditMismatch("もっと短く", regressed, "今回のキャンセルに充てて対応いたします。"), /前の下書きで確定/);
+  assert.match(explicitEditMismatch("適用可否を確認して", "今回のキャンセルに充てて対応いたします。"), /確約/);
 });
 
 test("相談と編集指示を区別し、長い編集履歴の先頭に孤立したAI回答を残さない", () => {
