@@ -63,6 +63,9 @@ test("確認を求める指示は確約に変えず、確認不要の指示だ�
     assert.match(explicitEditMismatch(decided, checking), /適用する指示|確認を不要/, decided);
     assert.equal(explicitEditMismatch(decided, "今回のキャンセルに充当いたします。"), "", decided);
   }
+  for (const patientCheck of ["キャンセルに充てて、ご確認お願いしますと添えて", "キャンセルに充てて、新しい予約日を確認してくださいと伝えて"]) {
+    assert.equal(explicitEditMismatch(patientCheck, "今回のキャンセルに充当いたします。お手数ですがご確認をお願いいたします。"), "", patientCheck);
+  }
   assert.match(explicitEditMismatch("充てるかどうか確認して", "今回のキャンセルに充当いたします。"), /確約/);
   assert.match(explicitEditMismatch("充てるか要確認", "今回のキャンセルに充当いたします。"), /確約/);
   assert.match(explicitEditMismatch("確認しないといけないと伝えて", "今回のキャンセルに充当いたします。"), /確約/);
@@ -80,6 +83,15 @@ test("確認指示への確約案はAI監査が通しても修正し、直らな
   assert.equal(result.text, "今回のキャンセルに充てられるか確認いたします。");
   assert.equal(result.error, "");
   assert.equal(calls.length, 3);
+});
+
+test("患者様へのご確認依頼を添えた確定案は誤って差し戻さない", async () => {
+  const draft = "以前誤って消化されたチケット分は、今回のキャンセルに充当いたします。お手数ですがご確認をお願いいたします。";
+  const { review, calls } = reviewer(['{"pass":true,"reason":"指示を反映"}']);
+  const result = await review({}, input("キャンセルに充てて、ご確認お願いしますと添えて"), draft);
+  assert.equal(result.text, draft);
+  assert.equal(result.error, "");
+  assert.equal(calls.length, 1);
 });
 
 test("相談と編集指示を区別し、長い編集履歴の先頭に孤立したAI回答を残さない", () => {
