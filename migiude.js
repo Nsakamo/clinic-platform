@@ -6945,6 +6945,7 @@ async function dSend(){if(window.__dBusy||window.__voiceBusy||dHistoryLoadingId=
   const logEntry={type:"ai",text:""};dLog.push(logEntry);
   const aiEl=dRender("ai","…");
   let cardEntry=null;
+  function restoreFailedInput(){if(dHist.length&&dHist[dHist.length-1].role==="user"&&dHist[dHist.length-1].content===txt)dHist.pop();if(current===owner){x.value=txt;dComposerDrafts[owner]=txt;}}
   const MK_D="@@DRAFT@@",MK_M="@@MEMORY@@",MK_R="@@RULE@@",MK_A="@@ACTION@@",MK_T="@@META@@";
   function applyAcc(acc){
     const mi=acc.indexOf(MK_T);const body=(mi>=0?acc.slice(0,mi):acc).replace("@@REPLY@@","");
@@ -6971,7 +6972,7 @@ async function dSend(){if(window.__dBusy||window.__voiceBusy||dHistoryLoadingId=
     while(true){const s=await reader.read();if(s.done)break;acc+=dec.decode(s.value,{stream:true});applyAcc(acc);}
     const fin=applyAcc(acc);
     let meta={};try{meta=fin.meta?JSON.parse(fin.meta):{};}catch(e){}
-    if(meta.ok===false){aiEl.textContent=draftChatError(meta.error);logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";if(current===owner){x.value=txt;dComposerDrafts[owner]=txt;}return;}
+    if(meta.ok===false){aiEl.textContent=draftChatError(meta.error);logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";restoreFailedInput();return;}
     if(!fin.reply&&!fin.draft)throw new Error("stream_empty");
     if(fin.reply&&meta.engine){aiEl.textContent=fin.reply+" 〔"+meta.engine+"で作成〕";logEntry.text=aiEl.textContent;}
     dHist.push({role:"assistant",content:(fin.draft||fin.reply||"").slice(0,4000),kind:fin.draft?"draft":"reply"});
@@ -6993,8 +6994,8 @@ async function dSend(){if(window.__dBusy||window.__voiceBusy||dHistoryLoadingId=
         if(j.rule){if(dSessions[current])dSessions[current].rule=j.rule;dAdd("sysn","📚 店舗ルール候補：「"+j.rule.title+"」（患者への送信後に内容を確認して反映できます）");}
         if(j.action)await dHandleBookingAction(j.action);
         if(j.historySaved===false)dAdd("sysn","編集履歴を保存できませんでした。画面を更新する前に下書きを控えてください。");
-      }else{aiEl.textContent=draftChatError(j.error);logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";if(current===owner){x.value=txt;dComposerDrafts[owner]=txt;}}
-    }catch(e2){aiEl.textContent="通信エラーが発生しました";logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";if(current===owner){x.value=txt;dComposerDrafts[owner]=txt;}}
+      }else{aiEl.textContent=draftChatError(j.error);logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";restoreFailedInput();}
+    }catch(e2){aiEl.textContent="通信エラーが発生しました";logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";restoreFailedInput();}
   }finally{window.__dBusy=false;if(btn&&btn.isConnected){btn.disabled=false;btn.removeAttribute("aria-busy");btn.innerHTML=old;}}}
 // ---- 右腕くん (rulebook editing chat) ----
 let asstHist=[],asstCtx=null;
