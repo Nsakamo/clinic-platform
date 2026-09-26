@@ -5,8 +5,9 @@ const path = require("node:path");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
 
-test("患者への送信直後は3秒の確認だけを表示し、はいで学習を開始する", () => {
-  assert.match(source, /prepareStaffLearningConsent\(t, c/);
+test("患者への送信直後は自動学習の進行を表示し、旧同意ジョブも扱える", () => {
+  assert.match(source, /queueStaffLearning\(t, c,[\s\S]{0,300}source: "web"/);
+  assert.match(source, /確認済みの返信を学習中です/);
   assert.match(source, /app\.get\("\/api\/learning-jobs"/);
   assert.match(source, /id="learningConsentToast"/);
   assert.match(source, /learningConsentTimer=setTimeout\(\(\)=>decideLearningConsent\(false,true\),remaining\)/);
