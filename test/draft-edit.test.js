@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
-const { explicitEditMismatch } = require("../lib/draft-edit");
+const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("../lib/draft-edit");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
 const start = source.indexOf("async function reviewDraftChatCandidate(");
@@ -49,6 +49,46 @@ test("確定指示を可否確認へ戻す案は監査が通しても採用し�
   assert.equal(calls.length, 3);
 });
 
+test("確認を求める指示は確約に変えず、確認不要の指示だけを確定扱いにする", () => {
+  const checking = "以前のチケットを今回のキャンセルに充てられるか確認いたします。";
+  assert.equal(explicitEditMismatch("充てるかどうか確認して", checking), "");
+  assert.equal(explicitEditMismatch("適用するか確認すると伝えて", checking), "");
+  assert.equal(explicitEditMismatch("確認しないといけないと伝えて", "確認いたします。"), "");
+  assert.match(explicitEditMismatch("充てるかどうか確認して", "今回のキャンセルに充当いたします。"), /確約/);
+  assert.match(explicitEditMismatch("確認しないといけないと伝えて", "今回のキャンセルに充当いたします。"), /確約/);
+  assert.match(explicitEditMismatch("確認しないでキャンセルに充てる", checking), /確認を不要/);
+  assert.match(explicitEditMismatch("キャンセルに充てる", checking), /適用する指示/);
+});
+
+test("確認指示への確約案はAI監査が通しても修正し、直らなければ表示しない", async () => {
+  const { review, calls } = reviewer([
+    '{"pass":true,"reason":"問題なし"}',
+    "今回のキャンセルに充てられるか確認いたします。",
+    '{"pass":true,"reason":"指示を反映"}',
+  ]);
+  const result = await review({}, input("充てるかどうか確認して"), "今回のキャンセルに充当いたします。");
+  assert.equal(result.text, "今回のキャンセルに充てられるか確認いたします。");
+  assert.equal(result.error, "");
+  assert.equal(calls.length, 3);
+});
+
+test("相談と編集指示を区別し、長い編集履歴の先頭に孤立したAI回答を残さない", () => {
+  assert.equal(isDraftChatConsultation("キャンセル料っていくらだっけ？"), true);
+  assert.equal(isDraftChatConsultation("どっちの言い方がいいと思う？"), true);
+  assert.equal(isDraftChatConsultation("この文で失礼はないでしょうか"), true);
+  assert.equal(isDraftChatConsultation("キャンセルに充てるかどうか確認して"), false);
+  assert.equal(isDraftChatConsultation("もっと丁寧にできる？"), false);
+  const edits = normalizeDraftEditHistory([
+    { role: "assistant", content: "確認が必要です", kind: "reply" },
+    { role: "user", content: "では丁寧にして" },
+    { role: "assistant", content: "下書き", kind: "draft" },
+    { role: "user", content: "もう少し短く" },
+  ]);
+  assert.equal(edits[0].role, "user");
+  assert.equal(edits[0].content, "では丁寧にして");
+  assert.equal(edits.at(-1).content, "もう少し短く");
+});
+
 test("修正しても指示に従わない場合は下書きカードへ渡さない", async () => {
   const bad = input("").previousDraft;
   const { review } = reviewer([
@@ -65,10 +105,63 @@ test("編集チャットは関連ルールだけを選び、両APIが同じ監�
   const prep = source.slice(source.indexOf("async function draftChatPrep("), source.indexOf("function normalizeStaffBookingAction", source.indexOf("async function draftChatPrep(")));
   assert.match(prep, /filter\(x => x\.n > 0\)\.slice\(0, 20\)/);
   assert.match(prep, /rulesBlock\(rel, 16000\)/);
+  assert.match(prep, /normalizeDraftEditHistory\(requestedEdits\)/);
   const routes = source.slice(source.indexOf('app.post("/api/draft-chat"'), source.indexOf("function staffAppointmentById", source.indexOf('app.post("/api/draft-chat"')));
   assert.match(routes, /reviewDraftChatCandidate\(t, p, out\.draft\)/);
   assert.match(routes, /reviewDraftChatCandidate\(t, p, match\[2\]\)/);
   assert.doesNotMatch(routes, /aiChatStream\(/);
+});
+
+test("相談への返事は患者向け下書きを作らず、返信だけのストリームを受け付ける", async () => {
+  const routeStart = source.indexOf('app.post("/api/draft-chat"');
+  const routeEnd = source.indexOf("function staffAppointmentById", routeStart);
+  const handlers = new Map();
+  const saved = [];
+  const context = {
+    app: { post: (route, ...handlersForRoute) => handlers.set(route, handlersForRoute.at(-1)) },
+    guard() {}, oneMutationAtATime: () => (_req, _res, next) => next(),
+    ANTHROPIC_KEY: "test", process: { env: {} },
+    draftChatPrep: async () => ({ c: { channel: "line" }, consultation: true, base: "", edits: [], engLabel: "テスト", topicTs: 1 }),
+    aiChat: async () => "@@REPLY@@\nキャンセル料は店舗ルールを確認してください。",
+    reviewDraftChatCandidate: async () => { throw new Error("consultation must not review a draft"); },
+    saveDraftChatSession: async (_t, _p, _body, text, kind) => { saved.push({ text, kind }); return true; },
+    normalizeStaffBookingAction: () => null,
+    DRAFTCHAT_MEMORY_RULE: "", DRAFTCHAT_RULE_RULE: "",
+  };
+  vm.runInNewContext(source.slice(routeStart, routeEnd), context);
+  let output = "";
+  const response = { setHeader() {}, write(text) { output += text; }, end() {}, status() { return this; } };
+  await handlers.get("/api/draft-chat-stream")({ tenant: {}, body: { id: "テスト会話", messages: [] } }, response);
+  assert.match(output, /キャンセル料は店舗ルールを確認してください/);
+  assert.match(output, /"ok":true/);
+  assert.doesNotMatch(output, /invalid_edit_response/);
+  assert.deepEqual(saved, [{ text: "キャンセル料は店舗ルールを確認してください。", kind: "reply" }]);
+  const unwantedDraft = "@@REPLY@@\n確認が必要です。\n@@DRAFT@@\n今回のキャンセルに充当いたします。\n@@ACTION@@\n{\"type\":\"none\"}";
+  const stripped = await context.finalizeDraftChatEnvelope({}, unwantedDraft, { consultation: true });
+  assert.match(stripped, /確認が必要です/);
+  assert.doesNotMatch(stripped, /充当いたします/);
+});
+
+test("相談のJSON回答にAIが旧下書きを含めても、患者向け案として採用しない", async () => {
+  const routeStart = source.indexOf('app.post("/api/draft-chat"');
+  const routeEnd = source.indexOf("function staffAppointmentById", routeStart);
+  const handlers = new Map();
+  const context = {
+    app: { post: (route, ...handlersForRoute) => handlers.set(route, handlersForRoute.at(-1)) },
+    guard() {}, oneMutationAtATime: () => (_req, _res, next) => next(),
+    ANTHROPIC_KEY: "test", process: { env: {} },
+    draftChatPrep: async () => ({ c: { channel: "line" }, consultation: true, base: "", edits: [], engLabel: "テスト", topicTs: 1 }),
+    aiChat: async () => JSON.stringify({ reply: "確認が必要です", draft: "患者様へ確約する誤った案", action: { type: "none" } }),
+    reviewDraftChatCandidate: async (_t, p, draft) => ({ text: p.consultation ? "" : draft, error: "" }),
+    saveDraftChatSession: async () => true, normalizeStaffBookingAction: () => null,
+    DRAFTCHAT_MEMORY_RULE: "", DRAFTCHAT_RULE_RULE: "",
+  };
+  vm.runInNewContext(source.slice(routeStart, routeEnd), context);
+  let result;
+  await handlers.get("/api/draft-chat")({ tenant: {}, body: { id: "テスト会話", messages: [] } }, { json(value) { result = value; } });
+  assert.equal(result.ok, true);
+  assert.equal(result.draft, "");
+  assert.match(result.reply, /確認が必要です/);
 });
 
 test("編集履歴は会話単位で保存され、一覧に一括で含めない", () => {
@@ -107,6 +200,7 @@ test("編集履歴は患者の新着後に旧話題へ上書きせず、同じ�
   let response;
   handlers.get("/api/draft-chat-history")({ tenant: t, query: { id: c.id } }, { json: value => { response = value; } });
   assert.equal(response.messages.length, 3);
+  assert.equal(response.draftAtSave, "");
   c.ts = 101;
   handlers.get("/api/draft-chat-history")({ tenant: t, query: { id: c.id } }, { json: value => { response = value; } });
   assert.equal(response.messages.length, 0);
