@@ -19,6 +19,14 @@ test("a tenant can switch one role without changing the other roles", () => {
   assert.equal(routes.classify.model, "gpt-6-luna");
 });
 
+test("既存法人が下書き用に選んだモデルを文体校正へ引き継ぐ", () => {
+  const migrated = normalizeAiRoutes({ draft: { model: "gpt-6-luna", reasoningEffort: "medium" } });
+  assert.equal(migrated.finalize.model, "gpt-6-luna");
+  assert.equal(migrated.finalize.reasoningEffort, "low");
+  const separatelyChosen = normalizeAiRoutes({ draft: { model: "gpt-6-luna" }, finalize: { model: "gpt-6-sol" } });
+  assert.equal(separatelyChosen.finalize.model, "gpt-6-sol");
+});
+
 test("unknown models fail closed unless explicitly registered for a future rollout", () => {
   assert.equal(resolveAiRoute({ aiRoutes: { draft: { model: "unknown-model" } } }, "draft").model, "gpt-6-sol");
   assert.equal(resolveAiRoute({ aiRoutes: { draft: { model: "gpt-future" } } }, "draft", { extraModels: ["gpt-future"] }).model, "gpt-future");
