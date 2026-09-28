@@ -5,7 +5,7 @@ const { normalizeAiRoutes, resolveAiRoute, publicModelCatalog } = require("../li
 test("GPT-6 roles default to Luna and Sol by responsibility", () => {
   const routes = normalizeAiRoutes();
   assert.equal(routes.draft.model, "gpt-6-sol");
-  assert.equal(routes.finalize.model, "gpt-6-luna");
+  assert.equal(routes.finalize.model, "gpt-6-sol");
   assert.equal(routes.finalize.reasoningEffort, "low");
   assert.equal(routes.learning.model, "gpt-6-sol");
   assert.equal(routes.classify.model, "gpt-6-luna");
@@ -36,8 +36,9 @@ test("saved GPT-5.6 routes move to the approved GPT-6 defaults", () => {
   assert.equal(routes.critical.model, "gpt-6-sol");
 });
 
-test("booking keeps critical reasoning while style review has its own configurable role", () => {
+test("booking keeps critical reasoning while style review uses low effort by default", () => {
   assert.equal(resolveAiRoute({}, "booking").model, "gpt-6-sol");
-  assert.equal(resolveAiRoute({}, "finalize").model, "gpt-6-luna");
-  assert.equal(resolveAiRoute({ aiRoutes: { finalize: { model: "gpt-6-sol", reasoningEffort: "low" } } }, "finalize").model, "gpt-6-sol");
+  assert.equal(resolveAiRoute({}, "finalize").model, "gpt-6-sol");
+  assert.equal(resolveAiRoute({}, "finalize").reasoningEffort, "low");
+  assert.equal(resolveAiRoute({ aiRoutes: { finalize: { model: "gpt-6-luna", reasoningEffort: "low" } } }, "finalize").model, "gpt-6-luna");
 });
