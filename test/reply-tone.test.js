@@ -27,7 +27,7 @@ test("設定したトーンを参考情報ではなく返信全文の必須条�
 test("標準文体は患者様への礼儀を求め、馴れ馴れしい相づちを検出する", () => {
   assert.match(PATIENT_COURTESY, /礼儀正しく/);
   assert.match(PATIENT_COURTESY, /お問い合わせの内容を正確に受け止め/);
-  assert.match(PATIENT_COURTESY, /クリニック側から一歩控えた姿勢/);
+  assert.match(PATIENT_COURTESY, /受付側から一歩控えた姿勢/);
   assert.match(PATIENT_COURTESY, /負担へ配慮/);
   for (const text of [
     "保定装置がある中でのホワイトニングは、気になりますよね。",
@@ -99,6 +99,12 @@ test("軽量な文体校正が日時・料金・URLを変えた場合は採用�
   const changedMeaning = await qualityFunctions("明後日午後はご予約できます。", "患者様に丁寧に")
     .finalizeGeneratedDraft({}, "明日午前はご予約できません。", "line");
   assert.equal(changedMeaning.text, "明日午前はご予約できません。");
+  const swappedPrices = await qualityFunctions("Aコース5,000円、Bコース3,000円です。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "Aコース3,000円、Bコース5,000円です。", "line");
+  assert.equal(swappedPrices.text, "Aコース3,000円、Bコース5,000円です。");
+  const changedNegation = await qualityFunctions("ご予約は必要です。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "ご予約は不要です。", "line");
+  assert.equal(changedNegation.text, "ご予約は不要です。");
 });
 
 test("予約照会を並行実行しても本人未確認時の予約情報をAIへ渡さない", async () => {

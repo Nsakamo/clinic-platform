@@ -1739,7 +1739,7 @@ function draftQualityIssues(text){
 }
 function preservesReplyFacts(original, revised){
   // 文体校正は判断しない。書き換えると危険な表記が変われば元の文へ戻す。
-  const tokens = text => [...String(text||"").matchAll(/https?:\/\/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|[0-9０-９]+(?:[.,，．:/：~〜～-][0-9０-９]+)*(?:[%％円時分日月年本回件]|[A-Za-z]{1,4}|\b)|明後日|明日|午前|午後|当日|前日|翌日|[月火水木金土日]曜日|できません|できます|承れません|承れます|不可|可能/gu)].map(match => match[0]).sort();
+  const tokens = text => [...String(text||"").matchAll(/https?:\/\/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|[0-9０-９]+(?:[.,，．:/：~〜～-][0-9０-９]+)*(?:[%％円時分日月年本回件]|[A-Za-z]{1,4}|\b)|明後日|明日|午前|午後|当日|前日|翌日|[月火水木金土日]曜日|いただけません|ございません|ありません|承れません|できません|できない|いたしかねます|不要|不可/gu)].map(match => match[0]);
   const before = tokens(original), after = tokens(revised);
   return before.length === after.length && before.every((token, index) => token === after[index]);
 }
