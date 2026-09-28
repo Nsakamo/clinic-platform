@@ -1739,7 +1739,7 @@ function draftQualityIssues(text){
 }
 function preservesReplyFacts(original, revised){
   // 文体校正は判断しない。書き換えると危険な表記が変われば元の文へ戻す。
-  const tokens = text => [...String(text||"").matchAll(/https?:\/\/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|[0-9０-９]+(?:[.,，．:/：~〜～-][0-9０-９]+)*(?:[%％円時分日月年本回件]|[A-Za-z]{1,4}|\b)|[一二三四五六七八九十百千]+(?:円|日|時|分|本|回|件)|明後日|明日|本日|今日|来週|今週|来月|今月|午前|午後|当日|前日|翌日|[月火水木金土日]曜日|以上|以下|以内|かかりません|いたしません|承りません|受け付けません|いただけません|ございません|ありません|承れません|できません|できない|いたしかねます|不要|不可/gu)].map(match => match[0]);
+  const tokens = text => [...String(text||"").matchAll(/https?:\/\/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|[0-9０-９]+(?:[.,，．:/：~〜～-][0-9０-９]+)*(?:[%％円時分日月年本回件]|[A-Za-z]{1,4}|\b)|[一二三四五六七八九十百千]+(?:円|日|時|分|本|回|件)|明後日|明日|本日|今日|来週|今週|来月|今月|午前|午後|当日|前日|翌日|[月火水木金土日]曜日|以上|以下|以内|かかりません|受け付けません|いただけません|ございません|承れません|いたしません|していません|おりません|ありません|承りません|できません|できかねます|致しかねます|いたしかねます|しません|できない|不要|不可/gu)].map(match => match[0]);
   const before = tokens(original), after = tokens(revised);
   return before.length === after.length && before.every((token, index) => token === after[index]);
 }
@@ -1747,7 +1747,7 @@ async function finalizeGeneratedDraft(t, raw, channel){
   let text = cleanDraftText(raw), issues = draftQualityIssues(text);
   const tone = normalizeReplyTone(S(t).tone);
   if(!issues.length && !tone) return { text, issues:[] };
-  const sys = "患者へ送る日本語文の最終校正者。事実・日時・料金・URL・可否・固有名詞・謝罪の有無を変えず、不自然な敬語、過剰な格式、重複、馴れ馴れしい言い回しを直す。新しい情報を足さない。" + PATIENT_COURTESY
+  const sys = "患者へ送る日本語文の最終校正者。事実・日時・料金・URL・可否・固有名詞・謝罪の有無を変えず、不自然な敬語、過剰な格式、重複、馴れ馴れしい言い回しを直す。日付や可否の表現は原文の語を保ち、丁寧さはその周囲の言葉で調整する。新しい情報を足さない。" + PATIENT_COURTESY
     + (channel==="mail" ? "メールの署名は残す。" : "LINE本文として簡潔にする。")
     + toneRewriteInstruction(tone, channel)
     + "返信本文だけを出力する。";
@@ -1771,6 +1771,7 @@ async function validateDraftAgainstEvidence(t, input){
     input.precedents ? "【類似するスタッフ確定例】\n" + input.precedents : "",
   ].filter(Boolean).join("\n\n") || "（事実の根拠資料なし）";
   const sys = "あなたは患者返信の送信前監査兼、日本語編集者です。根拠の優先順位は、最新の店舗ルール > 本人確認済みシステムデータ > 類似するスタッフ確定例。同種の店舗ルールが複数あり食い違う場合は更新日が最も新しいものを採用する。新しい店舗ルールと古い確定例が食い違えば必ず店舗ルールを採用する。類似するスタッフ確定例は、同種問い合わせへの結論・案内手順・必要確認・通常の料金や規定の根拠として使えるが、個別患者の予約・体調・特例は引き継がない。根拠にない事実、数字、可否、完了報告、医療判断があればpass:false。回答漏れ、会話との矛盾、別患者情報の混入もpass:false。内容が正しく日本語だけが不自然・冗長な場合は、事実を一切変えず自然で簡潔な受付文へ直してrevised_draftに入れ、pass:trueにできる。一般的な挨拶、謝意、確認する旨、必要情報を尋ねる文は根拠なしでも可。" + PATIENT_COURTESY
+    + "監査で文章を修正する場合は、日付や可否の表現を原文の語のまま保ち、丁寧さはその周囲の言葉で調整する。"
     + (replyToneInstruction(S(t).tone) ? "\n\n" + replyToneInstruction(S(t).tone) + "\n監査で文章を修正する場合も、このトーンを弱めてはいけない。" : "")
     + "必ずJSONのみ: {\"pass\":true|false,\"answered\":true|false,\"natural\":true|false,\"revised_draft\":\"修正不要なら空文字\",\"unsupported_claims\":[\"\"],\"contradictions\":[\"\"],\"reason\":\"短い日本語\"}";
   const user = "【問い合わせ・直近文脈】\n" + String(input.query || "").slice(0, 2500)
