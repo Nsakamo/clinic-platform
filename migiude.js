@@ -1737,6 +1737,11 @@ function draftQualityIssues(text){
   if(/^【.*】/.test(text.trim()) || /```/.test(text)) issues.push("meta_text");
   return issues;
 }
+function preservesReplyFacts(original, revised){
+  const tokens = text => [...String(text||"").matchAll(/https?:\/\/[^\s<>"'）]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|[0-9０-９]+(?:[.,，．:/：~〜～-][0-9０-９]+)*(?:[%％円時分日月年本回件]|\b)/g)].map(match => match[0]).sort();
+  const before = tokens(original), after = tokens(revised);
+  return before.length === after.length && before.every((token, index) => token === after[index]);
+}
 async function finalizeGeneratedDraft(t, raw, channel){
   let text = cleanDraftText(raw), issues = draftQualityIssues(text);
   const tone = normalizeReplyTone(S(t).tone);
@@ -1748,7 +1753,7 @@ async function finalizeGeneratedDraft(t, raw, channel){
   const revised = await aiChat(t, sys, [{role:"user",content:text.slice(0,5000)}], 1800, "finalize");
   if(revised){
     const candidate = cleanDraftText(revised);
-    if(candidate && !draftQualityIssues(candidate).some(issue => issue === "empty" || issue === "conversational_tone")) {
+    if(candidate && preservesReplyFacts(text, candidate) && !draftQualityIssues(candidate).some(issue => issue === "empty" || issue === "conversational_tone")) {
       if(tone) issues.push("tone_reviewed");
       text = candidate;
       issues = issues.filter(issue => issue !== "conversational_tone");
@@ -1779,7 +1784,7 @@ async function validateDraftAgainstEvidence(t, input){
     const contradictions = Array.isArray(parsed.contradictions) ? parsed.contradictions.map(String).filter(Boolean).slice(0, 8) : [];
     const answered = parsed.answered === true;
     const candidateDraft = cleanDraftText(String(parsed.revised_draft || "")).slice(0, 5000);
-    const revisedDraft = candidateDraft && !hasConversationalTone(candidateDraft) ? candidateDraft : "";
+    const revisedDraft = candidateDraft && preservesReplyFacts(input.draft, candidateDraft) && !hasConversationalTone(candidateDraft) ? candidateDraft : "";
     const courteous = !hasConversationalTone(revisedDraft || input.draft);
     const pass = parsed.pass === true && answered && !unsupportedClaims.length && !contradictions.length && courteous;
     const reasons = [];
@@ -2213,13 +2218,19 @@ async function genDraft(t, c, opts) {
   while (msgsArr.length && msgsArr[0].role === "assistant") msgsArr.shift();
   if (!msgsArr.length || msgsArr[msgsArr.length - 1].role !== "user") return null;
   let bookingTxt = "";
-  if(!opts.skipExternal){ try { bookingTxt = await fetchBooking(t, c); } catch (e) { bookingTxt = ""; } }
   // 予約自動受付: 本人確認つきコンテキスト。未確認の相手には既存の照会テキストも渡さない（個人情報を出させない）。
   let baCtx = null, baTxt = "";
   // 予約の自動操作がOFFでも、スタッフLINEの毎回承認モードでは安全な読み取り照会を使う。
   // handleInbound側で書き込みactionは実行しないため、予約・顧客情報を返信案へ反映するだけになる。
-  if (!opts.skipExternal && (baEnabled(t) || staffLineReviewAll(t)) && PARTNER_KEY) {
-    try { baCtx = await baCall(t, c, "context", { email: (c.ba && c.ba.email) || undefined }); } catch (e) { baCtx = null; }
+  const needsBaContext = !opts.skipExternal && (baEnabled(t) || staffLineReviewAll(t)) && PARTNER_KEY;
+  if (!opts.skipExternal) {
+    // 独立した読み取り照会を同時に始め、双方の完了後に本人確認の境界を適用する。
+    [bookingTxt, baCtx] = await Promise.all([
+      fetchBooking(t, c).catch(() => ""),
+      needsBaContext ? baCall(t, c, "context", { email: (c.ba && c.ba.email) || undefined }).catch(() => null) : Promise.resolve(null),
+    ]);
+  }
+  if (needsBaContext) {
     baTxt = baPromptBlock(baCtx);
     // 本人確認が取れていない相手（照会失敗も含む）には既存の照会テキストも渡さない（個人情報を出させない）
     if (!(baCtx && baCtx.ok && baCtx.verified)) bookingTxt = "";
@@ -7201,7 +7212,7 @@ function renderRuleGauge(){
     else { warn.style.display="none"; }
   }
 }
-const AI_ROUTE_LABELS={draft:"下書き・自動返信",chat:"文章修正チャット",learning:"学習・ルール整理",audit:"送信前監査",classify:"軽い分類",critical:"予約・重要判断"};
+const AI_ROUTE_LABELS={draft:"下書き・自動返信",finalize:"文体の最終校正",chat:"文章修正チャット",learning:"学習・ルール整理",audit:"送信前監査",classify:"軽い分類",critical:"予約・重要判断"};
 function renderAiRouteFields(settings){const box=document.getElementById("aiRouteFields");if(!box)return;const routes=settings.aiRoutes||{},catalog=Array.isArray(settings.aiModelCatalog)?settings.aiModelCatalog:[];box.innerHTML=Object.keys(AI_ROUTE_LABELS).map(task=>{const current=routes[task]&&routes[task].model||"";return '<label style="font-size:10.5px;color:#475569;">'+AI_ROUTE_LABELS[task]+'<select data-ai-route="'+task+'" style="width:100%;padding:7px;border:1px solid #d1d5db;border-radius:7px;font-size:11px;margin-top:2px;">'+catalog.map(m=>'<option value="'+esc(m.id)+'"'+(m.id===current?' selected':'')+'>'+esc(m.label)+'</option>').join("")+'</select></label>';}).join("");}
 function collectAiRoutes(){const out={};document.querySelectorAll("[data-ai-route]").forEach(el=>{out[el.getAttribute("data-ai-route")]={model:el.value};});return out;}
 async function openSet(){try{const ar=await fetch("/api/account");const a=await ar.json();document.getElementById("accountLoginId").textContent="ログインID: "+(a.loginId||"");document.getElementById("setAccountEmail").value=a.accountEmail||"";document.getElementById("accountEmailStat").textContent=(a.accountEmail?"再設定メールアドレス登録済み":"再設定メールアドレス未登録")+(a.resetEmailReady?"・メール送信可能":"・送信メール設定が必要");}catch(e){}
