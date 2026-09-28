@@ -105,6 +105,12 @@ test("軽量な文体校正が日時・料金・URLを変えた場合は採用�
   const changedNegation = await qualityFunctions("ご予約は必要です。", "患者様に丁寧に")
     .finalizeGeneratedDraft({}, "ご予約は不要です。", "line");
   assert.equal(changedNegation.text, "ご予約は不要です。");
+  const changedFee = await qualityFunctions("キャンセル料がかかります。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "キャンセル料はかかりません。", "line");
+  assert.equal(changedFee.text, "キャンセル料はかかりません。");
+  const changedKanjiDate = await qualityFunctions("四日にご案内します。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "三日にご案内します。", "line");
+  assert.equal(changedKanjiDate.text, "三日にご案内します。");
 });
 
 test("予約照会を並行実行しても本人未確認時の予約情報をAIへ渡さない", async () => {

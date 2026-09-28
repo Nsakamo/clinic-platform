@@ -1739,7 +1739,7 @@ function draftQualityIssues(text){
 }
 function preservesReplyFacts(original, revised){
   // 文体校正は判断しない。書き換えると危険な表記が変われば元の文へ戻す。
-  const tokens = text => [...String(text||"").matchAll(/https?:\/\/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|[0-9０-９]+(?:[.,，．:/：~〜～-][0-9０-９]+)*(?:[%％円時分日月年本回件]|[A-Za-z]{1,4}|\b)|明後日|明日|午前|午後|当日|前日|翌日|[月火水木金土日]曜日|いただけません|ございません|ありません|承れません|できません|できない|いたしかねます|不要|不可/gu)].map(match => match[0]);
+  const tokens = text => [...String(text||"").matchAll(/https?:\/\/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|[0-9０-９]+(?:[.,，．:/：~〜～-][0-9０-９]+)*(?:[%％円時分日月年本回件]|[A-Za-z]{1,4}|\b)|[一二三四五六七八九十百千]+(?:円|日|時|分|本|回|件)|明後日|明日|本日|今日|来週|今週|来月|今月|午前|午後|当日|前日|翌日|[月火水木金土日]曜日|以上|以下|以内|かかりません|いたしません|承りません|受け付けません|いただけません|ございません|ありません|承れません|できません|できない|いたしかねます|不要|不可/gu)].map(match => match[0]);
   const before = tokens(original), after = tokens(revised);
   return before.length === after.length && before.every((token, index) => token === after[index]);
 }
