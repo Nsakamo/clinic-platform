@@ -27,6 +27,8 @@ test("設定したトーンを参考情報ではなく返信全文の必須条�
 test("標準文体は患者様への礼儀を求め、馴れ馴れしい相づちを検出する", () => {
   assert.match(PATIENT_COURTESY, /礼儀正しく/);
   assert.match(PATIENT_COURTESY, /お問い合わせの内容を正確に受け止め/);
+  assert.match(PATIENT_COURTESY, /受付側から一歩控えた姿勢/);
+  assert.match(PATIENT_COURTESY, /負担へ配慮/);
   for (const text of [
     "保定装置がある中でのホワイトニングは、気になりますよね。",
     "気になりますよね、状態を確認いたします。",
@@ -48,13 +50,13 @@ test("標準文体は患者様への礼儀を求め、馴れ馴れしい相づ�
   ]) assert.equal(hasConversationalTone(text), false, text);
 });
 
-function qualityFunctions(aiReply) {
+function qualityFunctions(aiReply, tone = "") {
   const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
   const start = source.indexOf("function cleanDraftText(raw){");
   const end = source.indexOf("// 出力が途中で切れる", start);
   assert.ok(start > 0 && end > start);
   return vm.runInNewContext(source.slice(start, end) + "\n({finalizeGeneratedDraft,validateDraftAgainstEvidence})", {
-    S: () => ({ tone: "" }), aiChat: async () => aiReply,
+    S: () => ({ tone }), aiChat: async () => aiReply,
     PATIENT_COURTESY, hasConversationalTone, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction,
   });
 }
@@ -76,6 +78,83 @@ test("初回下書きの口語表現は校正失敗・再発時に残してス�
   assert.equal(originalState.needs_human, true);
 });
 
+test("軽量な文体校正が日時・料金・URLを変えた場合は採用しない", async () => {
+  const original = "10月3日15:00のご予約は¥3,900です。https://example.test/booking をご確認ください。";
+  for (const changed of [
+    "10月4日15:00のご予約は¥3,900です。https://example.test/booking をご確認ください。",
+    "10月3日15:00のご予約は¥4,900です。https://example.test/booking をご確認ください。",
+    "10月3日15:00のご予約は¥3,900です。https://other.test/booking をご確認ください。",
+  ]) {
+    const result = await qualityFunctions(changed, "患者様に丁寧に").finalizeGeneratedDraft({}, original, "line");
+    assert.match(result.text, /10月3日15:00/);
+    assert.match(result.text, /3,900/);
+    assert.match(result.text, /example\.test/);
+  }
+  const accepted = await qualityFunctions("10月3日15:00のご予約は¥3,900です。お手数ですが、https://example.test/booking をご確認いただけますと幸いです。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, original, "line");
+  assert.match(accepted.text, /お手数ですが/);
+  const inlineUrl = await qualityFunctions("https://example.test/bookingをご確認いただけますと幸いです。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "https://example.test/bookingをご確認ください。", "line");
+  assert.match(inlineUrl.text, /いただけますと幸いです/);
+  const changedMeaning = await qualityFunctions("明後日午後はご予約できます。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "明日午前はご予約できません。", "line");
+  assert.equal(changedMeaning.text, "明日午前はご予約できません。");
+  const swappedPrices = await qualityFunctions("Aコース5,000円、Bコース3,000円です。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "Aコース3,000円、Bコース5,000円です。", "line");
+  assert.equal(swappedPrices.text, "Aコース3,000円、Bコース5,000円です。");
+  const changedNegation = await qualityFunctions("ご予約は必要です。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "ご予約は不要です。", "line");
+  assert.equal(changedNegation.text, "ご予約は不要です。");
+  const changedFee = await qualityFunctions("キャンセル料がかかります。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "キャンセル料はかかりません。", "line");
+  assert.equal(changedFee.text, "キャンセル料はかかりません。");
+  const changedKanjiDate = await qualityFunctions("四日にご案内します。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "三日にご案内します。", "line");
+  assert.equal(changedKanjiDate.text, "三日にご案内します。");
+  for (const [before, after] of [
+    ["追加料金は発生しません。", "追加料金が発生します。"],
+    ["本日の受付はしておりません。", "本日の受付はしております。"],
+    ["ご案内いたしかねます。", "ご案内いたします。"],
+  ]) {
+    const guarded = await qualityFunctions(after, "患者様に丁寧に").finalizeGeneratedDraft({}, before, "line");
+    assert.equal(guarded.text, before);
+  }
+});
+
+test("予約照会を並行実行しても本人未確認時の予約情報をAIへ渡さない", async () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
+  const start = source.indexOf("async function genDraft(t, c, opts) {");
+  const end = source.indexOf("// 毎回承認モード", start);
+  let releaseBooking, releaseContext, bookingStarted = false, contextStarted = false, prompt = "";
+  const booking = new Promise(resolve => { releaseBooking = resolve; });
+  let context = new Promise(resolve => { releaseContext = resolve; });
+  const { genDraft } = vm.runInNewContext(source.slice(start, end) + "\n({genDraft})", {
+    PATIENT_COURTESY, JP_QUALITY: PATIENT_COURTESY,
+    S: () => ({ tone: "", prefs: [] }), activeConversationMessages: c => c.msgs,
+    rulesRankedWithScores: () => [], rulesBlock: () => "", ruleBudget: () => 0,
+    examplesRanked: () => [], trustedLearningPrecedent: () => false,
+    prefsBlock: () => "", notesBlock: () => "", baEnabled: () => true,
+    staffLineReviewAll: () => false, PARTNER_KEY: "test-only",
+    fetchBooking: () => { bookingStarted = true; return booking; },
+    baCall: () => { contextStarted = true; return context; },
+    baPromptBlock: () => "", replyToneInstruction,
+    aiChat: async (_t, system) => { prompt = system; return null; },
+  });
+  const pending = genDraft({ name: "テスト医院" }, { channel: "line", msgs: [{ from: "them", text: "テスト：予約を確認したいです" }] });
+  assert.equal(bookingStarted, true);
+  assert.equal(contextStarted, true);
+  releaseBooking("機密の予約日時 10月3日15:00");
+  releaseContext(null);
+  await pending;
+  assert.doesNotMatch(prompt, /機密の予約日時/);
+  prompt = "";
+  context = new Promise(resolve => { releaseContext = resolve; });
+  const verified = genDraft({ name: "テスト医院" }, { channel: "line", msgs: [{ from: "them", text: "テスト：予約を確認したいです" }] });
+  releaseContext({ ok: true, verified: true });
+  await verified;
+  assert.match(prompt, /機密の予約日時/);
+});
+
 test("送信前監査は口語の修正案を捨て、元の文が口語なら送信を止める", async () => {
   const reply = (revised, unsupported = []) => JSON.stringify({ pass: true, answered: true, natural: true, revised_draft: revised, unsupported_claims: unsupported, contradictions: [], reason: "内容を確認しました" });
   const base = { query: "保定装置のままホワイトニングできますか", draft: "状態を確認したうえでご案内いたします。" };
@@ -89,6 +168,10 @@ test("送信前監査は口語の修正案を捨て、元の文が口語なら�
   assert.equal(unsupported.pass, false);
   assert.match(unsupported.reason, /根拠や内容に確認/);
   assert.match(unsupported.reason, /文体にスタッフ確認/);
+  const changedFacts = await qualityFunctions(reply("10月4日15:00のご予約を確認します。")).validateDraftAgainstEvidence({}, { ...base, draft: "10月3日15:00のご予約を確認します。" });
+  assert.equal(changedFacts.revisedDraft, "");
+  assert.equal(changedFacts.pass, false);
+  assert.match(changedFacts.reason, /事実が変わった/);
 });
 
 test("初回生成から自動送信判定まで口語のままなら送信候補にしない", async () => {
@@ -127,6 +210,8 @@ test("生成後の再確認でも事実を変えずにトーンを反映させ�
   assert.match(instruction, /事実・日時・料金・URL・可否・固有名詞/);
   assert.match(instruction, /メールの署名は残してください/);
   assert.match(instruction, /返信本文だけ/);
+  const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
+  assert.match(source, /日付や可否の表現は原文の語を保ち/);
 });
 
 test("トーン設定は上限を超えてプロンプトへ入れない", () => {

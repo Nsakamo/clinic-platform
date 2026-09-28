@@ -1737,18 +1737,24 @@ function draftQualityIssues(text){
   if(/^【.*】/.test(text.trim()) || /```/.test(text)) issues.push("meta_text");
   return issues;
 }
+function preservesReplyFacts(original, revised){
+  // 文体校正は判断しない。書き換えると危険な表記が変われば元の文へ戻す。
+  const tokens = text => [...String(text||"").matchAll(/https?:\/\/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|[0-9０-９]+(?:[.,，．:/：~〜～-][0-9０-９]+)*(?:[%％円時分日月年本回件]|[A-Za-z]{1,4}|\b)|[一二三四五六七八九十百千]+(?:円|日|時|分|本|回|件)|明後日|明日|本日|今日|来週|今週|来月|今月|午前|午後|当日|前日|翌日|[月火水木金土日]曜日|以上|以下|以内|かかりません|受け付けません|いただけません|ございません|承れません|いたしません|していません|おりません|ありません|承りません|できません|できかねます|致しかねます|いたしかねます|しません|できない|不要|不可/gu)].map(match => match[0]);
+  const before = tokens(original), after = tokens(revised);
+  return before.length === after.length && before.every((token, index) => token === after[index]);
+}
 async function finalizeGeneratedDraft(t, raw, channel){
   let text = cleanDraftText(raw), issues = draftQualityIssues(text);
   const tone = normalizeReplyTone(S(t).tone);
   if(!issues.length && !tone) return { text, issues:[] };
-  const sys = "患者へ送る日本語文の最終校正者。事実・日時・料金・URL・可否・固有名詞・謝罪の有無を変えず、不自然な敬語、過剰な格式、重複、馴れ馴れしい言い回しを直す。新しい情報を足さない。" + PATIENT_COURTESY
+  const sys = "患者へ送る日本語文の最終校正者。事実・日時・料金・URL・可否・固有名詞・謝罪の有無を変えず、不自然な敬語、過剰な格式、重複、馴れ馴れしい言い回しを直す。日付や可否の表現は原文の語を保ち、丁寧さはその周囲の言葉で調整する。新しい情報を足さない。" + PATIENT_COURTESY
     + (channel==="mail" ? "メールの署名は残す。" : "LINE本文として簡潔にする。")
     + toneRewriteInstruction(tone, channel)
     + "返信本文だけを出力する。";
   const revised = await aiChat(t, sys, [{role:"user",content:text.slice(0,5000)}], 1800, "finalize");
   if(revised){
     const candidate = cleanDraftText(revised);
-    if(candidate && !draftQualityIssues(candidate).some(issue => issue === "empty" || issue === "conversational_tone")) {
+    if(candidate && preservesReplyFacts(text, candidate) && !draftQualityIssues(candidate).some(issue => issue === "empty" || issue === "conversational_tone")) {
       if(tone) issues.push("tone_reviewed");
       text = candidate;
       issues = issues.filter(issue => issue !== "conversational_tone");
@@ -1765,6 +1771,7 @@ async function validateDraftAgainstEvidence(t, input){
     input.precedents ? "【類似するスタッフ確定例】\n" + input.precedents : "",
   ].filter(Boolean).join("\n\n") || "（事実の根拠資料なし）";
   const sys = "あなたは患者返信の送信前監査兼、日本語編集者です。根拠の優先順位は、最新の店舗ルール > 本人確認済みシステムデータ > 類似するスタッフ確定例。同種の店舗ルールが複数あり食い違う場合は更新日が最も新しいものを採用する。新しい店舗ルールと古い確定例が食い違えば必ず店舗ルールを採用する。類似するスタッフ確定例は、同種問い合わせへの結論・案内手順・必要確認・通常の料金や規定の根拠として使えるが、個別患者の予約・体調・特例は引き継がない。根拠にない事実、数字、可否、完了報告、医療判断があればpass:false。回答漏れ、会話との矛盾、別患者情報の混入もpass:false。内容が正しく日本語だけが不自然・冗長な場合は、事実を一切変えず自然で簡潔な受付文へ直してrevised_draftに入れ、pass:trueにできる。一般的な挨拶、謝意、確認する旨、必要情報を尋ねる文は根拠なしでも可。" + PATIENT_COURTESY
+    + "監査で文章を修正する場合は、日付や可否の表現を原文の語のまま保ち、丁寧さはその周囲の言葉で調整する。"
     + (replyToneInstruction(S(t).tone) ? "\n\n" + replyToneInstruction(S(t).tone) + "\n監査で文章を修正する場合も、このトーンを弱めてはいけない。" : "")
     + "必ずJSONのみ: {\"pass\":true|false,\"answered\":true|false,\"natural\":true|false,\"revised_draft\":\"修正不要なら空文字\",\"unsupported_claims\":[\"\"],\"contradictions\":[\"\"],\"reason\":\"短い日本語\"}";
   const user = "【問い合わせ・直近文脈】\n" + String(input.query || "").slice(0, 2500)
@@ -1779,14 +1786,16 @@ async function validateDraftAgainstEvidence(t, input){
     const contradictions = Array.isArray(parsed.contradictions) ? parsed.contradictions.map(String).filter(Boolean).slice(0, 8) : [];
     const answered = parsed.answered === true;
     const candidateDraft = cleanDraftText(String(parsed.revised_draft || "")).slice(0, 5000);
-    const revisedDraft = candidateDraft && !hasConversationalTone(candidateDraft) ? candidateDraft : "";
+    const factChanged = !!candidateDraft && !preservesReplyFacts(input.draft, candidateDraft);
+    const revisedDraft = candidateDraft && !factChanged && !hasConversationalTone(candidateDraft) ? candidateDraft : "";
     const courteous = !hasConversationalTone(revisedDraft || input.draft);
-    const pass = parsed.pass === true && answered && !unsupportedClaims.length && !contradictions.length && courteous;
+    const pass = parsed.pass === true && answered && !unsupportedClaims.length && !contradictions.length && courteous && !factChanged;
     const reasons = [];
     if (unsupportedClaims.length || contradictions.length) reasons.push("根拠や内容に確認が必要です");
     if (parsed.reason) reasons.push(String(parsed.reason));
     if (!reasons.length) reasons.push(pass ? "根拠監査済み" : "送信前確認が必要です");
     if (!courteous) reasons.push("文体にスタッフ確認が必要です");
+    if (factChanged) reasons.push("監査の修正文で日時・金額などの事実が変わったためスタッフ確認が必要です");
     return { pass, answered, natural: parsed.natural === true, revisedDraft: pass ? revisedDraft : "", unsupportedClaims, contradictions, reason: reasons.join("／").slice(0, 300) };
   } catch (e) {
     return { pass: false, answered: false, unsupportedClaims: [], contradictions: [], reason: "送信前監査の結果を確認できませんでした" };
@@ -2213,13 +2222,19 @@ async function genDraft(t, c, opts) {
   while (msgsArr.length && msgsArr[0].role === "assistant") msgsArr.shift();
   if (!msgsArr.length || msgsArr[msgsArr.length - 1].role !== "user") return null;
   let bookingTxt = "";
-  if(!opts.skipExternal){ try { bookingTxt = await fetchBooking(t, c); } catch (e) { bookingTxt = ""; } }
   // 予約自動受付: 本人確認つきコンテキスト。未確認の相手には既存の照会テキストも渡さない（個人情報を出させない）。
   let baCtx = null, baTxt = "";
   // 予約の自動操作がOFFでも、スタッフLINEの毎回承認モードでは安全な読み取り照会を使う。
   // handleInbound側で書き込みactionは実行しないため、予約・顧客情報を返信案へ反映するだけになる。
-  if (!opts.skipExternal && (baEnabled(t) || staffLineReviewAll(t)) && PARTNER_KEY) {
-    try { baCtx = await baCall(t, c, "context", { email: (c.ba && c.ba.email) || undefined }); } catch (e) { baCtx = null; }
+  const needsBaContext = !opts.skipExternal && (baEnabled(t) || staffLineReviewAll(t)) && PARTNER_KEY;
+  if (!opts.skipExternal) {
+    // 独立した読み取り照会を同時に始め、双方の完了後に本人確認の境界を適用する。
+    [bookingTxt, baCtx] = await Promise.all([
+      fetchBooking(t, c).catch(() => ""),
+      needsBaContext ? baCall(t, c, "context", { email: (c.ba && c.ba.email) || undefined }).catch(() => null) : Promise.resolve(null),
+    ]);
+  }
+  if (needsBaContext) {
     baTxt = baPromptBlock(baCtx);
     // 本人確認が取れていない相手（照会失敗も含む）には既存の照会テキストも渡さない（個人情報を出させない）
     if (!(baCtx && baCtx.ok && baCtx.verified)) bookingTxt = "";
@@ -7201,7 +7216,7 @@ function renderRuleGauge(){
     else { warn.style.display="none"; }
   }
 }
-const AI_ROUTE_LABELS={draft:"下書き・自動返信",chat:"文章修正チャット",learning:"学習・ルール整理",audit:"送信前監査",classify:"軽い分類",critical:"予約・重要判断"};
+const AI_ROUTE_LABELS={draft:"下書き・自動返信",finalize:"文体の最終校正",chat:"文章修正チャット",learning:"学習・ルール整理",audit:"送信前監査",classify:"軽い分類",critical:"予約・重要判断"};
 function renderAiRouteFields(settings){const box=document.getElementById("aiRouteFields");if(!box)return;const routes=settings.aiRoutes||{},catalog=Array.isArray(settings.aiModelCatalog)?settings.aiModelCatalog:[];box.innerHTML=Object.keys(AI_ROUTE_LABELS).map(task=>{const current=routes[task]&&routes[task].model||"";return '<label style="font-size:10.5px;color:#475569;">'+AI_ROUTE_LABELS[task]+'<select data-ai-route="'+task+'" style="width:100%;padding:7px;border:1px solid #d1d5db;border-radius:7px;font-size:11px;margin-top:2px;">'+catalog.map(m=>'<option value="'+esc(m.id)+'"'+(m.id===current?' selected':'')+'>'+esc(m.label)+'</option>').join("")+'</select></label>';}).join("");}
 function collectAiRoutes(){const out={};document.querySelectorAll("[data-ai-route]").forEach(el=>{out[el.getAttribute("data-ai-route")]={model:el.value};});return out;}
 async function openSet(){try{const ar=await fetch("/api/account");const a=await ar.json();document.getElementById("accountLoginId").textContent="ログインID: "+(a.loginId||"");document.getElementById("setAccountEmail").value=a.accountEmail||"";document.getElementById("accountEmailStat").textContent=(a.accountEmail?"再設定メールアドレス登録済み":"再設定メールアドレス未登録")+(a.resetEmailReady?"・メール送信可能":"・送信メール設定が必要");}catch(e){}
