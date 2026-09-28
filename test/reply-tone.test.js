@@ -111,6 +111,14 @@ test("軽量な文体校正が日時・料金・URLを変えた場合は採用�
   const changedKanjiDate = await qualityFunctions("四日にご案内します。", "患者様に丁寧に")
     .finalizeGeneratedDraft({}, "三日にご案内します。", "line");
   assert.equal(changedKanjiDate.text, "三日にご案内します。");
+  for (const [before, after] of [
+    ["追加料金は発生しません。", "追加料金が発生します。"],
+    ["本日の受付はしておりません。", "本日の受付はしております。"],
+    ["ご案内いたしかねます。", "ご案内いたします。"],
+  ]) {
+    const guarded = await qualityFunctions(after, "患者様に丁寧に").finalizeGeneratedDraft({}, before, "line");
+    assert.equal(guarded.text, before);
+  }
 });
 
 test("予約照会を並行実行しても本人未確認時の予約情報をAIへ渡さない", async () => {
@@ -202,6 +210,8 @@ test("生成後の再確認でも事実を変えずにトーンを反映させ�
   assert.match(instruction, /事実・日時・料金・URL・可否・固有名詞/);
   assert.match(instruction, /メールの署名は残してください/);
   assert.match(instruction, /返信本文だけ/);
+  const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
+  assert.match(source, /日付や可否の表現は原文の語を保ち/);
 });
 
 test("トーン設定は上限を超えてプロンプトへ入れない", () => {
