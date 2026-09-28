@@ -93,6 +93,12 @@ test("軽量な文体校正が日時・料金・URLを変えた場合は採用�
   const accepted = await qualityFunctions("10月3日15:00のご予約は¥3,900です。お手数ですが、https://example.test/booking をご確認いただけますと幸いです。", "患者様に丁寧に")
     .finalizeGeneratedDraft({}, original, "line");
   assert.match(accepted.text, /お手数ですが/);
+  const inlineUrl = await qualityFunctions("https://example.test/bookingをご確認いただけますと幸いです。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "https://example.test/bookingをご確認ください。", "line");
+  assert.match(inlineUrl.text, /いただけますと幸いです/);
+  const changedMeaning = await qualityFunctions("明後日午後はご予約できます。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "明日午前はご予約できません。", "line");
+  assert.equal(changedMeaning.text, "明日午前はご予約できません。");
 });
 
 test("予約照会を並行実行しても本人未確認時の予約情報をAIへ渡さない", async () => {
@@ -144,6 +150,8 @@ test("送信前監査は口語の修正案を捨て、元の文が口語なら�
   assert.match(unsupported.reason, /文体にスタッフ確認/);
   const changedFacts = await qualityFunctions(reply("10月4日15:00のご予約を確認します。")).validateDraftAgainstEvidence({}, { ...base, draft: "10月3日15:00のご予約を確認します。" });
   assert.equal(changedFacts.revisedDraft, "");
+  assert.equal(changedFacts.pass, false);
+  assert.match(changedFacts.reason, /事実が変わった/);
 });
 
 test("初回生成から自動送信判定まで口語のままなら送信候補にしない", async () => {

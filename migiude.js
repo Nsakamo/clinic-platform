@@ -1738,7 +1738,8 @@ function draftQualityIssues(text){
   return issues;
 }
 function preservesReplyFacts(original, revised){
-  const tokens = text => [...String(text||"").matchAll(/https?:\/\/[^\s<>"'）]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|[0-9０-９]+(?:[.,，．:/：~〜～-][0-9０-９]+)*(?:[%％円時分日月年本回件]|\b)/g)].map(match => match[0]).sort();
+  // 文体校正は判断しない。書き換えると危険な表記が変われば元の文へ戻す。
+  const tokens = text => [...String(text||"").matchAll(/https?:\/\/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|[0-9０-９]+(?:[.,，．:/：~〜～-][0-9０-９]+)*(?:[%％円時分日月年本回件]|[A-Za-z]{1,4}|\b)|明後日|明日|午前|午後|当日|前日|翌日|[月火水木金土日]曜日|できません|できます|承れません|承れます|不可|可能/gu)].map(match => match[0]).sort();
   const before = tokens(original), after = tokens(revised);
   return before.length === after.length && before.every((token, index) => token === after[index]);
 }
@@ -1784,14 +1785,16 @@ async function validateDraftAgainstEvidence(t, input){
     const contradictions = Array.isArray(parsed.contradictions) ? parsed.contradictions.map(String).filter(Boolean).slice(0, 8) : [];
     const answered = parsed.answered === true;
     const candidateDraft = cleanDraftText(String(parsed.revised_draft || "")).slice(0, 5000);
-    const revisedDraft = candidateDraft && preservesReplyFacts(input.draft, candidateDraft) && !hasConversationalTone(candidateDraft) ? candidateDraft : "";
+    const factChanged = !!candidateDraft && !preservesReplyFacts(input.draft, candidateDraft);
+    const revisedDraft = candidateDraft && !factChanged && !hasConversationalTone(candidateDraft) ? candidateDraft : "";
     const courteous = !hasConversationalTone(revisedDraft || input.draft);
-    const pass = parsed.pass === true && answered && !unsupportedClaims.length && !contradictions.length && courteous;
+    const pass = parsed.pass === true && answered && !unsupportedClaims.length && !contradictions.length && courteous && !factChanged;
     const reasons = [];
     if (unsupportedClaims.length || contradictions.length) reasons.push("根拠や内容に確認が必要です");
     if (parsed.reason) reasons.push(String(parsed.reason));
     if (!reasons.length) reasons.push(pass ? "根拠監査済み" : "送信前確認が必要です");
     if (!courteous) reasons.push("文体にスタッフ確認が必要です");
+    if (factChanged) reasons.push("監査の修正文で日時・金額などの事実が変わったためスタッフ確認が必要です");
     return { pass, answered, natural: parsed.natural === true, revisedDraft: pass ? revisedDraft : "", unsupportedClaims, contradictions, reason: reasons.join("／").slice(0, 300) };
   } catch (e) {
     return { pass: false, answered: false, unsupportedClaims: [], contradictions: [], reason: "送信前監査の結果を確認できませんでした" };
