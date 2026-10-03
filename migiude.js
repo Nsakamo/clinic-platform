@@ -4093,6 +4093,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
     + (selected.length ? "\n【今回スタッフが選択した返信対象】\n" + selected.join("、") + "\n選ばれていない項目は補わない。" : "");
   const auditSystem = "あなたは受付スタッフの編集指示と患者向け下書きの照合担当です。最新のスタッフ指示を文面へ正確に反映し、前の下書きにあるスタッフの確定判断は最新指示が明示的に変更しない限り維持されたか判定する。スタッフが今回の扱いを決めた場合、可否を改めて確認する案内へ戻してはいけない。スタッフが可否の確認を指示した場合は、適用を確約してはいけない。未実施のシステム操作を実施済みとは書かない。指示と無関係な確認や個人情報の要求を新しく足さない。元の下書きにある文でも、最新指示に矛盾する前提やそれに付随する要求は残さない。患者様には丁寧な敬語を使う。店舗ルール・医学的安全性に明らかな矛盾があれば理由で示す。必ずJSONのみで {\"pass\":true|false,\"reason\":\"短い理由\"} と答える。";
   async function audit(candidate) {
+    if (!String(candidate || "").trim()) return { pass: false, reason: "返信本文が空です" };
     const mismatch = explicitEditMismatch(instruction, candidate, p.previousDraft);
     const prompt = "【患者様の直近の内容】\n" + String(p.lastQ || "").slice(0, 1200)
       + "\n【編集前の下書き】\n" + String(p.previousDraft || "").slice(0, 4000)
@@ -4149,6 +4150,7 @@ app.post("/api/draft-chat", guard, oneMutationAtATime("draft-chat", req => req.b
     const reviewed = await reviewDraftChatCandidate(t, p, out.draft);
     if (reviewed.error) return res.json({ ok: false, error: reviewed.error });
     out.draft = reviewed.text;
+    if (out.draft) out.reply = "返信案を作成しました。下の最終案をご確認ください。この操作では患者様への送信は行っていません。";
     // 文章作成中は学習候補の抽出だけ行う。恒久保存は患者への送信後にスタッフが適用範囲を選んで確定する。
     const savedMem = String(out.memory || "").trim().slice(0, 200);
     let savedRule = null;
@@ -4169,7 +4171,8 @@ async function finalizeDraftChatEnvelope(t, full, p) {
   if (!match || !String(match[2] || "").trim()) return source;
   const finalized = await reviewDraftChatCandidate(t, p, match[2]);
   if (finalized.error) throw new Error(finalized.error);
-  return source.slice(0, match.index) + match[1] + finalized.text + source.slice(match.index + match[0].length);
+  const prefix = source.slice(0, match.index).replace(/(@@REPLY@@[ \t]*\r?\n)[\s\S]*$/, "$1返信案を作成しました。下の最終案をご確認ください。この操作では患者様への送信は行っていません。\n");
+  return prefix + match[1] + finalized.text + source.slice(match.index + match[0].length);
 }
 
 // 互換API。編集指示と患者向け文体を確認した完成文だけをマーカー形式で返す。

@@ -148,6 +148,14 @@ test("二回修復しても照合できない案は採用せず、修復回数�
   assert.equal(h.calls.length, 5);
 });
 
+test("整形で空になった修復案をAIが合格と返しても採用しない", async () => {
+  const h = reviewHarness(['{"pass":false}', "   ", "   ", '{"pass":true}']);
+  const out = await h.review({}, { c: { channel: "line" }, lastQ: query, latestInstruction: "規定を案内", evidence: rules }, "誤った案");
+  assert.equal(out.text, "");
+  assert.ok(out.error);
+  assert.equal(h.calls.filter(call => call.task === "audit").length, 1);
+});
+
 test("料金と提出期限の起点は推測で補わず、相対表現と金額確認を維持する", () => {
   assert.match(decision.REPLY_DECISION, /患者の送信時刻から具体的な締切時刻を計算しない/);
   assert.match(decision.REPLY_DECISION, /金額は確認のうえ案内する/);
