@@ -42,6 +42,13 @@ test("丁寧な欠席表現・発熱も証明書発行だけと誤判定せず�
     "テスト：発熱があり明日伺えません。診断書は必要でしょうか",
     "テスト：インフルで明日来院することができません。",
     "テスト：インフルエンザで来られません。",
+    "テスト：インフルエンザで出勤停止になり、明日伺えません。証明書は必要ですか",
+    "テスト：コロナで会社も休んでいます。明日の分はキャンセルでお願いします。診断書は要りますか",
+    "テスト：インフルエンザなので別の日に変更したいです。診断書は必要ですか",
+    "テスト：インフルで明日の予約を取り消したいです。証明書いりますか",
+    "テスト：発熱で明日は受診できません",
+    "テスト：インフルで明日は休ませてください",
+    "テスト：インフルで予定を変更し、振り替えたいです",
   ]) {
     assert.equal(decision.isCancellationInquiry(text), true, text);
     assert.equal(decision.needsCancellationPolicyReview(text, rules), true, text);
@@ -50,6 +57,9 @@ test("丁寧な欠席表現・発熱も証明書発行だけと誤判定せず�
   const school = "テスト：インフルエンザで学校をお休みするので治癒証明書をお願いします";
   assert.equal(decision.isCancellationInquiry(school), false);
   assert.equal(decision.needsCancellationPolicyReview(school, rules), false);
+  assert.equal(decision.isCertificateIssuanceInquiry("テスト：インフルで明日は都合が悪いです。証明書は必要ですか"), false);
+  assert.equal(decision.isCertificateIssuanceInquiry("テスト：受診証明書を発行してもらえますか"), true);
+  assert.equal(decision.isCancellationInquiry("テスト：発熱していますが伺えますか"), false);
 });
 
 test("旧返信に送信日時がなくても話題だけを区切り、仮の活動日時を返信資料へ漏らさない", () => {
@@ -202,7 +212,8 @@ test("証明書発行だけの問い合わせへ免除案内を強制せず、�
       reviewDraftChatCandidate: async (_t, p) => {
         reviewed = true;
         assert.equal(p.forbidCancellationGuidance, !infection);
-        assert.match(p.latestInstruction, infection ? /免除条件と必要な提出物/ : /依頼だけに回答/);
+        assert.match(p.latestInstruction, /今回の依頼だけに回答/);
+        assert.match(p.latestInstruction, /言い方が定型でなくても/);
         return { text: "証明書の内容はスタッフが確認します。", error: "" };
       },
       evaluateResponseGrounding, applyLearningReadinessGate: () => ({}),
@@ -234,6 +245,26 @@ test("自動返信とスタッフLINE承認も実送信日時を持ち、翌日�
   for (const line of source.split("\n").filter(line => /msgs\.push\(.*from: "us"/.test(line))) {
     assert.match(line, /sentAt/, line);
   }
+});
+
+test("非定型の感染症連絡は発行だけと断定せず、関連するキャンセル案内を機械的に禁止しない", async () => {
+  const start = source.indexOf("async function genDraft(t, c, opts) {"), end = source.indexOf("// 毎回承認モード", start);
+  let inspected = false;
+  const context = {
+    ...decision, activeConversationMessages: c => c.msgs, S: () => ({ tone: "", prefs: [] }),
+    rulesRankedWithScores: () => [{ r: { content: rules }, n: 3, score: 0.5 }], rulesBlock: () => rules, ruleBudget: () => 16000,
+    examplesRanked: () => [], trustedLearningPrecedent: () => false, prefsBlock: () => "", notesBlock: () => "", replyToneInstruction: () => "",
+    JP_QUALITY: "", PATIENT_COURTESY: "", baEnabled: () => false, staffLineReviewAll: () => false, PARTNER_KEY: "",
+    aiChat: async () => JSON.stringify({ draft: "証明書と予約変更について確認します。", confidence: "high", needs_human: true }),
+    finalizeGeneratedDraft: async (_t, text) => ({ text, issues: [] }), applyCourtesyGate: () => {},
+    reviewDraftChatCandidate: async (_t, p) => { inspected = true; assert.equal(p.forbidCancellationGuidance, false); assert.match(p.latestInstruction, /言い方が定型でなくても/); return { text: "免除条件と必要な証明書を案内します。", error: "" }; },
+    evaluateResponseGrounding, applyLearningReadinessGate: () => ({}),
+  };
+  vm.runInNewContext(source.slice(start, end), context);
+  const out = await context.genDraft({}, { channel: "line", msgs: [{ from: "them", text: "テスト：インフルで明日の都合が悪くなりました。証明書は必要ですか" }] }, { skipExternal: true });
+  assert.equal(inspected, true);
+  assert.match(out.draft, /免除条件/);
+  assert.equal(out.grounding.autoSendAllowed, false);
 });
 
 test("感染症のスタッフ確認ゲートを予約の自動提案も迂回できず、通常提案は維持", async () => {
