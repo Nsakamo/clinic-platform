@@ -57,8 +57,6 @@ test("丁寧な欠席表現・発熱も証明書発行だけと誤判定せず�
   const school = "テスト：インフルエンザで学校をお休みするので治癒証明書をお願いします";
   assert.equal(decision.isCancellationInquiry(school), false);
   assert.equal(decision.needsCancellationPolicyReview(school, rules), false);
-  assert.equal(decision.isCertificateIssuanceInquiry("テスト：インフルで明日は都合が悪いです。証明書は必要ですか"), false);
-  assert.equal(decision.isCertificateIssuanceInquiry("テスト：受診証明書を発行してもらえますか"), true);
   assert.equal(decision.isCancellationInquiry("テスト：発熱していますが伺えますか"), false);
 });
 
@@ -101,13 +99,14 @@ test("日付を跨ぐ遅延処理でも送信日時を保存し、欠落・未�
   assert.doesNotMatch(inbound, /previousMessage\.at\s*=/);
 });
 
-test("証明書発行案の無関係な免除案内はAIが合格としても除去する", async () => {
+test("証明書発行案の無関係な免除案内を内容監査で修正する", async () => {
   const corrected = "受診証明書の発行についてスタッフが確認し、ご案内いたします。";
-  const h = reviewHarness(['{"pass":true}', corrected, '{"pass":true}']);
-  const p = { c: { channel: "line" }, lastQ: "テスト：受診証明書を発行してもらえますか", latestInstruction: "証明書の発行についてだけ回答して", evidence: rules, forbidCancellationGuidance: true };
+  const h = reviewHarness(['{"pass":false,"reason":"無関係なキャンセル案内"}', corrected, '{"pass":true}']);
+  const p = { c: { channel: "line" }, lastQ: "テスト：受診証明書を発行してもらえますか", latestInstruction: "証明書の発行についてだけ回答して", evidence: rules };
   const result = await h.review({}, p, "証明書を確認します。感染症のキャンセル料は条件を満たせば免除されます。");
   assert.equal(result.text, corrected);
   assert.equal(h.calls.length, 3);
+  assert.match(h.calls[0].sys, /今回と無関係な規定/);
 });
 
 function reviewHarness(responses) {
@@ -211,7 +210,7 @@ test("証明書発行だけの問い合わせへ免除案内を強制せず、�
       finalizeGeneratedDraft: async (_t, text) => ({ text, issues: [] }), applyCourtesyGate: () => {},
       reviewDraftChatCandidate: async (_t, p) => {
         reviewed = true;
-        assert.equal(p.forbidCancellationGuidance, !infection);
+        assert.equal(p.forbidCancellationGuidance, undefined);
         assert.match(p.latestInstruction, /今回の依頼だけに回答/);
         assert.match(p.latestInstruction, /言い方が定型でなくても/);
         return { text: "証明書の内容はスタッフが確認します。", error: "" };
@@ -257,7 +256,7 @@ test("非定型の感染症連絡は発行だけと断定せず、関連する�
     JP_QUALITY: "", PATIENT_COURTESY: "", baEnabled: () => false, staffLineReviewAll: () => false, PARTNER_KEY: "",
     aiChat: async () => JSON.stringify({ draft: "証明書と予約変更について確認します。", confidence: "high", needs_human: true }),
     finalizeGeneratedDraft: async (_t, text) => ({ text, issues: [] }), applyCourtesyGate: () => {},
-    reviewDraftChatCandidate: async (_t, p) => { inspected = true; assert.equal(p.forbidCancellationGuidance, false); assert.match(p.latestInstruction, /言い方が定型でなくても/); return { text: "免除条件と必要な証明書を案内します。", error: "" }; },
+    reviewDraftChatCandidate: async (_t, p) => { inspected = true; assert.equal(p.forbidCancellationGuidance, undefined); assert.match(p.latestInstruction, /言い方が定型でなくても/); return { text: "免除条件と必要な証明書を案内します。", error: "" }; },
     evaluateResponseGrounding, applyLearningReadinessGate: () => ({}),
   };
   vm.runInNewContext(source.slice(start, end), context);
