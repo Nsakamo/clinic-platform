@@ -89,13 +89,21 @@ async function main() {
   assert.equal(after.grounding.autoSendAllowed, false);
   console.log(JSON.stringify({ case: "proof-received-not-reviewed", model: resolveAiRoute(t.config.settings, "draft").model, draft: after.draft }));
 
-  for (const inquiry of ["テスト：受診証明書を発行してもらえますか。", "テスト：インフルエンザの治癒証明書をお願いします。"]) {
+  for (const inquiry of ["テスト：受診証明書を発行してもらえますか。", "テスト：インフルエンザの治癒証明書をお願いします。", "テスト：インフルエンザで学校をお休みするので治癒証明書をお願いします。"]) {
     const ordinary = { id: "テスト証明書発行", channel: "line", msgs: [{ from: "them", text: inquiry, at: current.getTime(), sentAt: current.getTime() }] };
     const certificate = await context.genDraft(t, ordinary, { skipExternal: true });
     assert.ok(certificate && certificate.draft);
     assert.doesNotMatch(certificate.draft, /キャンセル|免除|3[,，]?300|12時間/);
     assert.equal(certificate.grounding.autoSendAllowed, false);
     console.log(JSON.stringify({ case: "certificate-issuance-only", inquiry, model: resolveAiRoute(t.config.settings, "draft").model, draft: certificate.draft }));
+  }
+  for (const inquiry of ["テスト：インフルエンザで明日伺うことができません。証明書は必要ですか。", "テスト：インフルになり明日はお休みさせてください。診断書いりますか。", "テスト：発熱があり明日伺えません。診断書は必要でしょうか。"]) {
+    const polite = { id: "テスト欠席表現", channel: "line", msgs: [{ from: "them", text: inquiry, at: current.getTime(), sentAt: current.getTime() }] };
+    const cancellation = await context.genDraft(t, polite, { skipExternal: true });
+    assert.ok(cancellation && cancellation.draft);
+    assert.match(cancellation.draft, /証明書|診断書/);
+    assert.equal(cancellation.grounding.autoSendAllowed, false);
+    console.log(JSON.stringify({ case: "polite-cancellation", inquiry, model: resolveAiRoute(t.config.settings, "draft").model, draft: cancellation.draft }));
   }
 }
 

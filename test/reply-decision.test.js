@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
 const decision = require("../lib/reply-decision");
-const { selectConversationContext } = require("../lib/conversation-context");
+const { selectConversationContext, preserveTopicBoundary } = require("../lib/conversation-context");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("../lib/draft-edit");
 const { evaluateResponseGrounding } = require("../lib/response-grounding");
 const source = fs.readFileSync(require.resolve("../migiude.js"), "utf8");
@@ -33,6 +33,38 @@ test("患者連絡の実際の日付をJSTで渡し、時刻だけの旧履歴�
   assert.match(decision.replyMessageText({ text: query, at: Date.parse("2026-10-02T23:54:00Z") }), /受信記録日時（送信日時は不明）/);
   assert.match(decision.REPLY_DECISION, /別の月の次回予約/);
   assert.match(decision.REPLY_DECISION, /連絡を送った日時を基準/);
+});
+
+test("丁寧な欠席表現・発熱も証明書発行だけと誤判定せず、学校の発行依頼は分ける", () => {
+  for (const text of [
+    "テスト：インフルエンザで明日伺うことができません。証明書は必要ですか",
+    "テスト：インフルになり明日はお休みさせてください。診断書いりますか",
+    "テスト：発熱があり明日伺えません。診断書は必要でしょうか",
+    "テスト：インフルで明日来院することができません。",
+    "テスト：インフルエンザで来られません。",
+  ]) {
+    assert.equal(decision.isCancellationInquiry(text), true, text);
+    assert.equal(decision.needsCancellationPolicyReview(text, rules), true, text);
+    assert.match(decision.replyRuleQuery(text), /受診証明/, text);
+  }
+  const school = "テスト：インフルエンザで学校をお休みするので治癒証明書をお願いします";
+  assert.equal(decision.isCancellationInquiry(school), false);
+  assert.equal(decision.needsCancellationPolicyReview(school, rules), false);
+});
+
+test("旧返信に送信日時がなくても話題だけを区切り、仮の活動日時を返信資料へ漏らさない", () => {
+  const before = Date.parse("2026-10-01T00:00:00Z");
+  const old = { from: "us", text: "テスト：前の返信です", time: "09:00" };
+  const c = { ts: before, msgs: [{ from: "them", text: query }, old] };
+  preserveTopicBoundary(c);
+  assert.equal(old.topicActivityAt, before);
+  assert.equal(old.at, undefined);
+  assert.equal(old.sentAt, undefined);
+  assert.equal(decision.replyMessageText(old), old.text);
+  c.msgs.push({ from: "them", text: "テスト：営業時間について", sentAt: before + 86400000 });
+  c.ts = before + 86400000;
+  assert.deepEqual(selectConversationContext(c).current.map(m => m.text), ["テスト：営業時間について"]);
+  assert.match(source, /preserveTopicBoundary\(c\);\s*c\.msgs\.push/);
 });
 
 test("日付を跨ぐ遅延処理でも送信日時を保存し、欠落・未来日時や旧履歴の日時を捏造しない", async () => {
@@ -210,6 +242,7 @@ test("感染症のスタッフ確認ゲートを予約の自動提案も迂回�
     let proposed = 0, delivered = 0;
     const context = {
       ...decision, cancelAutoReply: () => {}, colorFor: () => "", nowt: () => "テスト", statBump: () => {}, lastText: () => "テスト", dbSave: () => {},
+      preserveTopicBoundary,
       baEnabled: () => true, PARTNER_KEY: "テスト", baHandlePending: async () => false, staffLineReviewAll: () => false,
       genDraft: async () => ({ draft: "テスト：証明書はスタッフが確認します。", confidence: "high", needs_human: blocked, replyRequiresStaff: blocked,
         grounding: { autoSendAllowed: false, reasons: [] }, validation: { pass: false }, action: { type: "cancel", appointmentId: "テスト将来予約" } }),
