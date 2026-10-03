@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const { PATIENT_COURTESY, applyCourtesyGate, hasConversationalTone, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction } = require("../lib/reply-tone");
+const { REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview } = require("../lib/reply-decision");
 
 test("空欄なら標準トーンのままにする", () => {
   assert.equal(replyToneInstruction("   "), "");
@@ -129,6 +130,7 @@ test("予約照会を並行実行しても本人未確認時の予約情報をAI
   const booking = new Promise(resolve => { releaseBooking = resolve; });
   let context = new Promise(resolve => { releaseContext = resolve; });
   const { genDraft } = vm.runInNewContext(source.slice(start, end) + "\n({genDraft})", {
+    REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview,
     PATIENT_COURTESY, JP_QUALITY: PATIENT_COURTESY,
     S: () => ({ tone: "", prefs: [] }), activeConversationMessages: c => c.msgs,
     rulesRankedWithScores: () => [], rulesBlock: () => "", ruleBudget: () => 0,
@@ -183,6 +185,7 @@ test("初回生成から自動送信判定まで口語のままなら送信候�
   assert.ok(qualityStart > 0 && qualityEnd > qualityStart && draftStart > qualityEnd && draftEnd > draftStart);
   let calls = 0;
   const functions = vm.runInNewContext(source.slice(qualityStart, qualityEnd) + source.slice(draftStart, draftEnd) + "\n({genDraft})", {
+    REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview,
     PATIENT_COURTESY, JP_QUALITY: PATIENT_COURTESY,
     hasConversationalTone, applyCourtesyGate, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction,
     S: () => ({ tone: "", prefs: [] }), activeConversationMessages: c => c.msgs,
@@ -234,8 +237,8 @@ test("スタッフLINEの返信修正にも共通トーン指示と生成後の�
   const start = source.indexOf("async function staffLineReviseDraft");
   const end = source.indexOf("const staffLineInFlight", start);
   const body = source.slice(start, end);
-  assert.match(body, /replyToneInstruction\(S\(t\)\.tone\)/);
-  assert.match(body, /finalizeGeneratedDraft\(t, out, c\.channel\)/);
+  assert.match(body, /draftChatPrep\(t,/);
+  assert.match(body, /reviewDraftChatCandidate\(t, p, out\)/);
 });
 
 test("品質テストは最終トーン確認が成功した場合だけ確認済みと返す", () => {

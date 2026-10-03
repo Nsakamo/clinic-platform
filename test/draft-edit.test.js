@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("../lib/draft-edit");
+const { REPLY_DECISION } = require("../lib/reply-decision");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
 const start = source.indexOf("async function reviewDraftChatCandidate(");
@@ -20,6 +21,7 @@ function reviewer(replies) {
     explicitEditMismatch,
     hasConversationalTone: () => false,
     PATIENT_COURTESY: "患者様に礼儀正しく返信する。",
+    REPLY_DECISION,
   };
   vm.runInNewContext(source.slice(start, end), context);
   return { review: context.reviewDraftChatCandidate, calls };
@@ -255,6 +257,36 @@ test("相談のJSON回答にAIが旧下書きを含めても、患者向け案�
   assert.equal(result.ok, true);
   assert.equal(result.draft, "");
   assert.match(result.reply, /確認が必要です/);
+});
+
+test("照合後の完成案と矛盾するスタッフ向け説明をJSONと互換形式に残さない", async () => {
+  const routeStart = source.indexOf('app.post("/api/draft-chat"');
+  const routeEnd = source.indexOf("function staffAppointmentById", routeStart);
+  const handlers = new Map();
+  const correct = "証明書をお送りください。条件を満たさない場合は3,300円です。";
+  const context = {
+    app: { post: (route, ...args) => handlers.set(route, args.at(-1)) },
+    guard() {}, oneMutationAtATime: () => (_req, _res, next) => next(),
+    ANTHROPIC_KEY: "test", process: { env: {} },
+    draftChatPrep: async () => ({ c: { channel: "line" }, consultation: false, base: "", edits: [], engLabel: "テスト", topicTs: 1 }),
+    aiChat: async () => JSON.stringify({ reply: "11月の案内を残しました", draft: "11月の空きを確認します", action: { type: "none" } }),
+    reviewDraftChatCandidate: async () => ({ text: correct, error: "" }),
+    saveDraftChatSession: async () => true, normalizeStaffBookingAction: () => null,
+    DRAFTCHAT_MEMORY_RULE: "", DRAFTCHAT_RULE_RULE: "",
+  };
+  vm.runInNewContext(source.slice(routeStart, routeEnd), context);
+  let result;
+  await handlers.get("/api/draft-chat")({ tenant: {}, body: { id: "テスト会話" } }, { json(value) { result = value; } });
+  assert.equal(result.draft, correct);
+  assert.doesNotMatch(result.reply, /11月/);
+  assert.match(result.reply, /最終案/);
+  assert.match(result.reply, /送信は行っていません/);
+  const envelope = await context.finalizeDraftChatEnvelope({}, '@@REPLY@@\n11月の案内を残しました\n@@DRAFT@@\n11月の空きを確認します\n@@MEMORY@@\n方針\n@@ACTION@@\n{"type":"none"}', { c: { channel: "line" }, consultation: false });
+  assert.doesNotMatch(envelope, /11月/);
+  assert.match(envelope, /最終案/);
+  assert.ok(envelope.includes(correct));
+  assert.match(envelope, /@@MEMORY@@\n方針/);
+  assert.match(envelope, /@@ACTION@@\n\{"type":"none"\}/);
 });
 
 test("編集履歴は会話単位で保存され、一覧に一括で含めない", () => {
