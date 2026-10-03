@@ -19,7 +19,7 @@ test("感染症の変更理由から免除・証明書ルールも取得し、�
   assert.equal(decision.needsCancellationPolicyReview(query, rules), true);
   assert.equal(decision.needsCancellationPolicyReview("テスト：ご来院ありがとうございます", rules), false);
   assert.equal(decision.needsCancellationPolicyReview(query, "免除規定なし"), false);
-  for (const unrelated of ["テスト：受診証明書を発行してもらえますか", "テスト：診断書の発行方法を教えてください", "テスト：インフルエンザの予防について教えてください"]) {
+  for (const unrelated of ["テスト：受診証明書を発行してもらえますか", "テスト：診断書の発行方法を教えてください", "テスト：インフルエンザの予防について教えてください", "テスト：インフルエンザの治癒証明書をお願いします"]) {
     assert.equal(decision.needsCancellationPolicyReview(unrelated, rules), false, unrelated);
   }
   assert.equal(decision.needsCancellationPolicyReview(query + " 証明書の写真を提出しました", rules), true);
@@ -51,9 +51,21 @@ test("日付を跨ぐ遅延処理でも送信日時を保存し、欠落・未�
   await context.processQueuedLinePayload({}, { token: "テスト", botId: "テスト" }, { source: { userId: "テスト" }, timestamp: sentAt, message: { type: "text", text: "テスト：本日の予約を変更したいです" } });
   assert.equal(received.sentAt, sentAt);
   assert.match(source, /sentAt: parsed\.date \? mdate : undefined/);
+  const mail = decision.inboundMessageTimes(sentAt, receivedAt, "mail_header");
+  assert.equal(mail.at, receivedAt);
+  assert.match(decision.replyMessageText({ ...mail, text: query }), /メール記載日時.*料金適用日は要確認/);
   const inbound = source.slice(source.indexOf("async function handleInboundCore("), source.indexOf("// ===== 予約自動受付: 確認待ち"));
-  assert.match(inbound, /inboundMessageTimes\(opts\.sentAt, recvAt\)/);
+  assert.match(inbound, /inboundMessageTimes\(opts\.sentAt, recvAt, opts\.sentAtSource\)/);
   assert.doesNotMatch(inbound, /previousMessage\.at\s*=/);
+});
+
+test("証明書発行案の無関係な免除案内はAIが合格としても除去する", async () => {
+  const corrected = "受診証明書の発行についてスタッフが確認し、ご案内いたします。";
+  const h = reviewHarness(['{"pass":true}', corrected, '{"pass":true}']);
+  const p = { c: { channel: "line" }, lastQ: "テスト：受診証明書を発行してもらえますか", latestInstruction: "証明書の発行についてだけ回答して", evidence: rules, forbidCancellationGuidance: true };
+  const result = await h.review({}, p, "証明書を確認します。感染症のキャンセル料は条件を満たせば免除されます。");
+  assert.equal(result.text, corrected);
+  assert.equal(h.calls.length, 3);
 });
 
 function reviewHarness(responses) {
@@ -155,18 +167,61 @@ test("証明書発行だけの問い合わせへ免除案内を強制せず、�
       JP_QUALITY: "", PATIENT_COURTESY: "", baEnabled: () => false, staffLineReviewAll: () => false, PARTNER_KEY: "",
       aiChat: async () => JSON.stringify({ draft: "証明書について確認します。", confidence: "high", needs_human: !infection }),
       finalizeGeneratedDraft: async (_t, text) => ({ text, issues: [] }), applyCourtesyGate: () => {},
-      reviewDraftChatCandidate: async () => { reviewed = true; return { text: "証明書の内容はスタッフが確認します。", error: "" }; },
+      reviewDraftChatCandidate: async (_t, p) => {
+        reviewed = true;
+        assert.equal(p.forbidCancellationGuidance, !infection);
+        assert.match(p.latestInstruction, infection ? /免除条件と必要な提出物/ : /依頼だけに回答/);
+        return { text: "証明書の内容はスタッフが確認します。", error: "" };
+      },
       evaluateResponseGrounding, applyLearningReadinessGate: () => ({}),
     };
     vm.runInNewContext(source.slice(start, end), context);
     const msgs = (infection ? [query, "テスト：ありがとうございます", "テスト：分かりました", "テスト：写真を用意します", "テスト：証明書の写真を提出しました"] : ["テスト：受診証明書を発行してもらえますか"])
       .map(text => ({ from: "them", text }));
     const out = await context.genDraft({}, { channel: "line", msgs }, { skipExternal: true });
-    assert.equal(reviewed, infection);
+    assert.equal(reviewed, true);
     if (infection) {
       assert.equal(out.needs_human, true);
       assert.equal(out.grounding.autoSendAllowed, false);
       assert.match(out.grounding.reasons.join(" "), /免除条件・証明書/);
     } else { assert.doesNotMatch(out.draft, /免除|3,300円/); }
+  }
+});
+
+test("自動返信とスタッフLINE承認も実送信日時を持ち、翌日の別話題を分離する", async () => {
+  const start = source.indexOf("async function baDeliver(t, c, text) {"), end = source.indexOf("async function ", start + 20);
+  const context = { deliverText: async () => ({ sent: true }), finishLearningUsageTrace: async () => {}, statBump: () => {}, nowt: () => "テスト", lastText: () => "テスト", dbSave: () => {}, notifyAll: () => {} };
+  vm.runInNewContext(source.slice(start, end), context);
+  const c = { id: "テスト", msgs: [{ from: "them", text: query, at: Date.now() - 1000 }] };
+  await context.baDeliver({}, c, "テスト：ご案内します");
+  const outgoing = c.msgs.at(-1);
+  assert.ok(outgoing.sentAt > 0);
+  assert.match(decision.replyMessageText(outgoing), /送信日時/);
+  c.msgs.push({ from: "them", text: "テスト：営業時間を教えてください", sentAt: outgoing.sentAt + 86400000 });
+  assert.deepEqual(selectConversationContext(c).current.map(m => m.text), ["テスト：営業時間を教えてください"]);
+  for (const line of source.split("\n").filter(line => /msgs\.push\(.*from: "us"/.test(line))) {
+    assert.match(line, /sentAt/, line);
+  }
+});
+
+test("感染症のスタッフ確認ゲートを予約の自動提案も迂回できず、通常提案は維持", async () => {
+  const start = source.indexOf("async function handleInboundCore("), end = source.indexOf("// ===== 複数アカウント対応", start);
+  for (const blocked of [true, false]) {
+    let proposed = 0, delivered = 0;
+    const context = {
+      ...decision, cancelAutoReply: () => {}, colorFor: () => "", nowt: () => "テスト", statBump: () => {}, lastText: () => "テスト", dbSave: () => {},
+      baEnabled: () => true, PARTNER_KEY: "テスト", baHandlePending: async () => false, staffLineReviewAll: () => false,
+      genDraft: async () => ({ draft: "テスト：証明書はスタッフが確認します。", confidence: "high", needs_human: blocked, replyRequiresStaff: blocked,
+        grounding: { autoSendAllowed: false, reasons: [] }, validation: { pass: false }, action: { type: "cancel", appointmentId: "テスト将来予約" } }),
+      startLearningUsageTrace: async () => {}, baAction: async () => { proposed++; return true; }, S: () => ({ autoReply: false }),
+      deliverText: async () => { delivered++; return { sent: true }; }, notifyAll: () => {}, staffLineEscalate: async () => {},
+      aiUsageContext: { getStore: () => ({ entries: [] }) }, forwardToPartner: async () => {},
+    };
+    vm.runInNewContext(source.slice(start, end), context);
+    const t = { slug: "テスト", store: {} };
+    await context.handleInboundCore(t, { channel: "line", uid: "テスト", text: query });
+    assert.equal(proposed, blocked ? 0 : 1);
+    assert.equal(delivered, 0);
+    if (blocked) assert.match(t.store["line:テスト"].draft, /証明書/);
   }
 });
