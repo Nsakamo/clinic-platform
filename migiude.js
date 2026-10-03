@@ -448,7 +448,7 @@ function staffLineApprovalMessage(t, c, approval, summary, reason) {
     staffLinePostback("対応する", "migiude=claim&id=" + id, "primary"),
     { type: "box", layout: "horizontal", spacing: "sm", contents: [staffLinePostback("会話履歴", "migiude=history&id=" + id + "&page=0"), staffLinePostback("患者・予約情報", "migiude=info&id=" + id)] },
     staffLinePostback("返信を修正", "migiude=edit&id=" + id),
-    { type: "box", layout: "horizontal", spacing: "sm", contents: [staffLinePostback("この内容で送信", "migiude=send&id=" + id, "primary"), staffLinePostback("送信しない", "migiude=cancel&id=" + id)] }
+    { type: "box", layout: "horizontal", spacing: "sm", contents: [staffLinePostback("この内容で送信", "migiude=send&id=" + id + "&h=" + approval.draftHash, "primary"), staffLinePostback("送信しない", "migiude=cancel&id=" + id)] }
   ] } } };
 }
 function staffLineHistoryPageMessage(c, approvalId, page) {
@@ -500,6 +500,25 @@ async function staffLineRequestApproval(t, c, reason, opts) {
   if (!r.ok) return false;
   c.staffLineApproval = approval; c.status = "todo"; c.flag = true; dbSave(t, c);
   return true;
+}
+function staffLineCardMatches(c, approval, cardHash) {
+  return !!(approval && typeof cardHash === "string" && cardHash === approval.draftHash
+    && sha(String(c.draft || "").trim()) === approval.draftHash);
+}
+async function staffLineReplyOrPush(t, replyToken, groupId, messages) {
+  const result = await staffLineReply(t, replyToken, messages);
+  return result && result.ok ? result : staffLinePush(t, groupId, messages);
+}
+async function staffLineApplyRevision(t, c, approval, instruction, userId, replyToken) {
+  const beforeHash = approval.draftHash;
+  const revised = await staffLineReviseDraft(t, c, instruction);
+  if (!revised || c.staffLineApproval !== approval || approval.status !== "pending" || approval.expiresAt < Date.now()
+      || approval.assignedUserId !== userId || !staffLineCardMatches(c, approval, beforeHash)) return false;
+  c.draft = revised; approval.draft = revised; approval.draftHash = sha(revised);
+  approval.editInstruction = instruction; approval.reason = "スタッフの修正指示：「" + instruction.slice(0, 180) + "」";
+  approval.expiresAt = Date.now() + 24 * 60 * 60 * 1000; dbSave(t, c);
+  const delivered = await staffLineReplyOrPush(t, replyToken, approval.groupId, [staffLineApprovalMessage(t, c, approval, approval.summary, approval.reason)]);
+  return !!(delivered && delivered.ok);
 }
 async function staffLineReviseDraft(t, c, instruction) {
   const p = await draftChatPrep(t, { id: c.id, messages: [
@@ -2774,12 +2793,10 @@ app.post("/webhook/staff-line", async (req, res) => {
         const found = staffLineApprovalById(t, edit.approvalId);
         if (!found || found.approval.status !== "pending" || found.approval.assignedUserId !== userId) { staffLineEditSessions.delete(key); continue; }
         try {
-          const revised = await staffLineReviseDraft(t, found.c, text.slice(0, 1200));
-          if (!revised) throw new Error("no_draft");
-          found.c.draft = revised; found.approval.draft = revised; found.approval.draftHash = sha(revised); found.approval.editInstruction = text.slice(0, 1200); found.approval.reason = "スタッフの修正指示：「" + text.slice(0, 180) + "」"; found.approval.expiresAt = Date.now() + 24 * 60 * 60 * 1000; dbSave(t, found.c);
+          const delivered = await staffLineApplyRevision(t, found.c, found.approval, text.slice(0, 1200), userId, ev.replyToken);
+          if (!delivered) throw new Error("revision_not_delivered");
           staffLineEditSessions.delete(key);
-          await staffLineReply(t, ev.replyToken, [staffLineApprovalMessage(t, found.c, found.approval, found.approval.summary, found.approval.reason)]);
-        } catch (e) { staffLineEditSessions.delete(key); await staffLineReply(t, ev.replyToken, [staffLineText("返信案を修正できませんでした。右腕くんの画面で確認してください。")]); }
+        } catch (e) { staffLineEditSessions.delete(key); await staffLineReplyOrPush(t, ev.replyToken, groupId, [staffLineText("修正案の確認カードをお届けできませんでした。古いカードからは送信できません。右腕くんの画面で最新の案を確認してください。")]); }
         continue;
       }
 
@@ -2821,7 +2838,7 @@ app.post("/webhook/staff-line", async (req, res) => {
         found.c.time = nowt(); found.c.ts = Date.now(); found.c.last = lastText(found.c); dbSave(t, found.c);
         await staffLineReply(t, ev.replyToken, [staffLineText("⛔ 今回は患者様へ送信せず、この案件を対応済みとして終了しました。次の新着は新しい問い合わせとして判定します。")]); continue;
       }
-      if (action !== "send" || sha(String(found.c.draft || "").trim()) !== found.approval.draftHash) { await staffLineReply(t, ev.replyToken, [staffLineText("返信案が更新されています。最新の承認依頼を確認してください。")]); continue; }
+      if (action !== "send" || !staffLineCardMatches(found.c, found.approval, q.get("h"))) { await staffLineReply(t, ev.replyToken, [staffLineText("返信案が更新されています。最新の承認依頼を確認してください。")]); continue; }
       const lockKey = t.slug + "::" + found.c.id;
       if (sendLocks.has(lockKey)) { await staffLineReply(t, ev.replyToken, [staffLineText("送信処理中です。しばらくお待ちください。")]); continue; }
       sendLocks.add(lockKey); found.approval.status = "sending"; dbSave(t, found.c);
