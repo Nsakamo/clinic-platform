@@ -18,9 +18,9 @@ const { MAX_ATTACHMENTS, normalizeFileIds, normalizeScheduledMessageInput, prune
 const { lineWebhookEventId, lineWebhookRetryDelay, isProcessableLineEvent } = require("./lib/line-webhook-queue");
 const { normalizeAiRoutes, resolveAiRoute, publicModelCatalog } = require("./lib/ai-model-router");
 const { contextualLearningFallback, formatLearningProposal } = require("./lib/learning-context");
-const { selectConversationContext } = require("./lib/conversation-context");
+const { selectConversationContext, preserveTopicBoundary } = require("./lib/conversation-context");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("./lib/draft-edit");
-const { REPLY_DECISION, replyRuleQuery, replyMessageText, needsCancellationPolicyReview, inboundMessageTimes } = require("./lib/reply-decision");
+const { REPLY_DECISION, isCancellationInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview, inboundMessageTimes } = require("./lib/reply-decision");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
 const { AiUsageSpool, resolveAiUsageSpoolPath } = require("./lib/ai-usage-spool");
@@ -2201,7 +2201,7 @@ async function genDraft(t, c, opts) {
   const rel = rankedRules.map(x => x.r);
   const rulesTxt = rulesBlock(rel, ruleBudget(t));
   const policyReviewNeeded = needsCancellationPolicyReview(activeMsgs.filter(m => m.from === "them").slice(-16).map(m => m.text || "").join(" "), rulesTxt);
-  const certificateOnly = !policyReviewNeeded && /診断書|証明書|受診証明/.test(lastQ) && !/キャンセル|取消|変更|行けな|行けません|来院でき|来られな|来れな|欠席|休みます/.test(lastQ);
+  const certificateOnly = !policyReviewNeeded && /診断書|証明書|受診証明/.test(lastQ) && !isCancellationInquiry(lastQ);
   const replyRequiresStaff = policyReviewNeeded || certificateOnly;
   const exRel = examplesRanked(t, latestQ.slice(0, 800), 4, lastQ.slice(0, 1500));
   const trustedPrecedents = exRel.filter(trustedLearningPrecedent);
@@ -2286,7 +2286,7 @@ async function genDraft(t, c, opts) {
       if (replyRequiresStaff) {
         const reviewed = await reviewDraftChatCandidate(t, {
           c, latestInstruction: policyReviewNeeded
-            ? "今回の患者連絡に対して、該当する店舗ルールの免除条件と必要な提出物、条件を満たさない場合の料金を案内してください。既に提出・説明されたことは繰り返さず、未確認の免除や予約変更は確定しないでください。"
+            ? "最新の患者連絡が感染症による予約変更・キャンセルやその証明書提出の話なら、該当する店舗ルールの免除条件と必要な提出物、条件を満たさない場合の料金を案内してください。過去に感染症の話があっても、最新の連絡が別の依頼なら無関係な免除や料金を持ち込まず今回の依頼だけに回答してください。発熱などの症状だけで感染症と診断せず、免除規定が該当する場合の条件として説明してください。既に提出・説明されたことは繰り返さず、未確認の免除や予約変更は確定しないでください。"
             : "今回は証明書についての依頼だけに回答してください。患者が相談していないキャンセル免除や変更料を案内しないでください。証明書の発行可否や方法が未確認なら、スタッフが確認する旨を案内してください。",
           forbidCancellationGuidance: certificateOnly,
           previousDraft: "", lastQ, evidence: "【今回の会話】\n" + msgsArr.map(m => m.role + ": " + m.content).join("\n") + "\n【店舗ルール】\n" + rulesBlock(rel.slice(0, 20), 16000) + "\n【照会結果（今回の対象とは限らない）】\n" + bookingTxt,
@@ -2310,7 +2310,7 @@ async function genDraft(t, c, opts) {
         verifiedSlots: !!opts.baSlotsTxt,
         learningExampleCount: exRel.length,
       });
-      out.replyRequiresStaff = replyRequiresStaff;
+      out.replyRequiresStaff = replyRequiresStaff || (Array.isArray(out.grounding.domains) && out.grounding.domains.includes("medical"));
       if (replyRequiresStaff) {
         out.needs_human = true;
         out.grounding.autoSendAllowed = false;
@@ -2427,6 +2427,7 @@ async function handleInboundCore(t, opts) {
   if (opts.pic) c.pic = opts.pic;
   if (opts.acct) c.acct = opts.acct; // どの連携アカウント（LINEチャネル/メールアドレス）経由か
   const med = ["image", "video", "file", "audio"].includes(opts.media) ? opts.media : null;
+  preserveTopicBoundary(c);
   c.msgs.push({ from: "them", text: opts.text || "", media: med, mediaId: med ? (opts.mediaId || null) : null, fileName: med === "file" ? (opts.fileName || "ファイル") : undefined, time: nowt(), ...inboundMessageTimes(opts.sentAt, recvAt, opts.sentAtSource) });
   statBump(t, "in");
   if (opts.subject) c.subject = String(opts.subject).slice(0, 300);
