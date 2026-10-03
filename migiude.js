@@ -20,7 +20,7 @@ const { normalizeAiRoutes, resolveAiRoute, publicModelCatalog } = require("./lib
 const { contextualLearningFallback, formatLearningProposal } = require("./lib/learning-context");
 const { selectConversationContext } = require("./lib/conversation-context");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("./lib/draft-edit");
-const { REPLY_DECISION, replyRuleQuery, replyMessageText, needsCancellationPolicyReview } = require("./lib/reply-decision");
+const { REPLY_DECISION, replyRuleQuery, replyMessageText, needsCancellationPolicyReview, inboundMessageTimes } = require("./lib/reply-decision");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
 const { AiUsageSpool, resolveAiUsageSpoolPath } = require("./lib/ai-usage-spool");
@@ -2200,6 +2200,7 @@ async function genDraft(t, c, opts) {
   const rankedRules = rulesRankedWithScores(t, replyRuleQuery(lastQ.slice(0, 1500)));
   const rel = rankedRules.map(x => x.r);
   const rulesTxt = rulesBlock(rel, ruleBudget(t));
+  const policyReviewNeeded = needsCancellationPolicyReview(activeMsgs.filter(m => m.from === "them").slice(-16).map(m => m.text || "").join(" "), rulesTxt);
   const exRel = examplesRanked(t, latestQ.slice(0, 800), 4, lastQ.slice(0, 1500));
   const trustedPrecedents = exRel.filter(trustedLearningPrecedent);
   const examplesTxt = exRel.length ? exRel.map(e => {
@@ -2280,7 +2281,7 @@ async function genDraft(t, c, opts) {
       out.draft = finalized.text; out.qualityIssues = finalized.issues;
       // Human-only illness cases still need a complete policy reply; the normal
       // auto-send gate below must not bypass this content review.
-      if (needsCancellationPolicyReview(lastQ, rulesTxt)) {
+      if (policyReviewNeeded) {
         const reviewed = await reviewDraftChatCandidate(t, {
           c, latestInstruction: "今回の患者連絡に対して、該当する店舗ルールの免除条件と必要な提出物、条件を満たさない場合の料金を案内してください。既に提出・説明されたことは繰り返さず、未確認の免除や予約変更は確定しないでください。",
           previousDraft: "", lastQ, evidence: "【今回の会話】\n" + msgsArr.map(m => m.role + ": " + m.content).join("\n") + "\n【店舗ルール】\n" + rulesBlock(rel.slice(0, 20), 16000) + "\n【照会結果（今回の対象とは限らない）】\n" + bookingTxt,
@@ -2304,6 +2305,11 @@ async function genDraft(t, c, opts) {
         verifiedSlots: !!opts.baSlotsTxt,
         learningExampleCount: exRel.length,
       });
+      if (policyReviewNeeded) {
+        out.needs_human = true;
+        out.grounding.autoSendAllowed = false;
+        out.grounding.reasons.push("感染症の免除条件・証明書はスタッフ確認が必要です");
+      }
       if (finalized.issues.includes("conversational_tone")) {
         out.grounding.autoSendAllowed = false;
         out.grounding.reasons.push("返信の文体にスタッフ確認が必要です");
@@ -2415,9 +2421,7 @@ async function handleInboundCore(t, opts) {
   if (opts.pic) c.pic = opts.pic;
   if (opts.acct) c.acct = opts.acct; // どの連携アカウント（LINEチャネル/メールアドレス）経由か
   const med = ["image", "video", "file", "audio"].includes(opts.media) ? opts.media : null;
-  const previousMessage = c.msgs[c.msgs.length - 1];
-  if (previousMessage && !previousMessage.at && Number(c.ts || 0) > 0) previousMessage.at = Number(c.ts);
-  c.msgs.push({ from: "them", text: opts.text || "", media: med, mediaId: med ? (opts.mediaId || null) : null, fileName: med === "file" ? (opts.fileName || "ファイル") : undefined, time: nowt(), at: recvAt });
+  c.msgs.push({ from: "them", text: opts.text || "", media: med, mediaId: med ? (opts.mediaId || null) : null, fileName: med === "file" ? (opts.fileName || "ファイル") : undefined, time: nowt(), ...inboundMessageTimes(opts.sentAt, recvAt) });
   statBump(t, "in");
   if (opts.subject) c.subject = String(opts.subject).slice(0, 300);
   c.status = "todo"; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
@@ -2606,7 +2610,7 @@ async function processQueuedLinePayload(t, acct, ev) {
   if (mt === "text") text = ev.message.text || "";
   else if (mt === "image" || mt === "video" || mt === "audio") { media = mt; mediaId = ev.message.id; }
   else if (mt === "file") { media = "file"; mediaId = ev.message.id; fileName = ev.message.fileName || "ファイル"; }
-  await handleInbound(t, { channel: "line", uid, name: prof.name, pic: prof.pic, text, media, mediaId, fileName, acct: { type: "line", key: acct.botId || "main", name: acct.name } });
+  await handleInbound(t, { channel: "line", uid, name: prof.name, pic: prof.pic, text, media, mediaId, fileName, sentAt: ev.timestamp, acct: { type: "line", key: acct.botId || "main", name: acct.name } });
 }
 let lineWebhookQueueRunning = false;
 async function processLineWebhookQueue() {
@@ -2880,7 +2884,7 @@ async function pollAll() {
               if (!email || ownAddrs.includes(email)) continue;
               if (/no-?reply|mailer-daemon|postmaster/i.test(email)) continue;
               const text = String(parsed.text || parsed.subject || "").replace(/\r/g, "").slice(0, 8000);
-              await handleInbound(t, { channel: "mail", uid: email, name: fromV.name || email, text, subject: parsed.subject || "", acct: { type: "mail", key: acc.smtpUser, name: acc.name } });
+              await handleInbound(t, { channel: "mail", uid: email, name: fromV.name || email, text, subject: parsed.subject || "", sentAt: parsed.date ? mdate : undefined, acct: { type: "mail", key: acc.smtpUser, name: acc.name } });
             } catch (e) { console.error("mail parse:", e.message); }
           }
           // フェッチ完了後にまとめて既読化（ループ中は効かないため）
@@ -3323,9 +3327,9 @@ app.post("/api/quality-preview", guard, async (req,res)=>{
   const t=req.tenant, inquiry=String(req.body.inquiry||"").trim().slice(0,1200), channel=req.body.channel==="mail"?"mail":"line";
   if(!inquiry) return res.status(400).json({ok:false,error:"empty"});
   if(!activeAiEngine(t)) return res.status(503).json({ok:false,error:"no_ai_key"});
-  const c={id:"quality-preview",userId:"quality-preview",name:"テスト患者",channel,msgs:[{from:"them",text:inquiry,time:nowt()}],draft:""};
+  const c={id:"quality-preview",userId:"quality-preview",name:"テスト患者",channel,msgs:[{from:"them",text:inquiry,time:nowt(),sentAt:Date.now()}],draft:""};
   const out=await genDraft(t,c,{skipExternal:true});
-  if(!out||!String(out.draft||"").trim()) return res.status(502).json({ok:false,error:"ai_failed"});
+  if(!out||!String(out.draft||"").trim()) return res.status(502).json({ok:false,error:out && Array.isArray(out.qualityIssues) && out.qualityIssues.includes("policy_review_failed") ? "policy_review_failed" : "ai_failed"});
   res.json({ok:true,draft:String(out.draft).slice(0,5000),confidence:String(out.confidence||""),qualityIssues:Array.isArray(out.qualityIssues)?out.qualityIssues:[],toneApplied:Array.isArray(out.qualityIssues)&&out.qualityIssues.includes("tone_reviewed"),learningRefs:Array.isArray(out.learningRefs)?out.learningRefs:[],learningUsage:out.learningUsage||null,grounding:out.grounding||null,validation:out.validation||null,learningReadiness:out.learningReadiness||null,engine:activeAiEngine(t)});
 });
 // 新モデルを本番回答へ使わず、同じ問い合わせで比較する並行テスト。
@@ -4060,7 +4064,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
       + "\n【最新のスタッフ指示】\n" + instruction
       + evidence
       + "\n【編集後の下書き】\n" + candidate;
-    const rawAudit = await aiChat(t, auditSystem + REPLY_DECISION + "登録ルールに基づく具体的な条件・必要な提出物・条件不成立時の案内が欠ける、今回と無関係な予約を対象とする、申告だけで免除を確定する、または証明書を未確認なのに確認済みとする場合はpass:false。", [{ role: "user", content: prompt }], 900, "audit");
+    const rawAudit = await aiChat(t, auditSystem + REPLY_DECISION + "今回の依頼に該当する登録ルールの具体的な条件・必要な提出物・条件不成立時の案内が欠ける、今回と無関係な規定や予約を持ち出す、申告だけで免除を確定する、または証明書を未確認なのに確認済みとする場合はpass:false。証明書の発行依頼だけなら感染症キャンセル規定を強制しない。", [{ role: "user", content: prompt }], 900, "audit");
     if (!rawAudit) return { pass: false, reason: "編集指示の照合ができませんでした" };
     try {
       const match = rawAudit.match(/\{[\s\S]*\}/);
@@ -5989,7 +5993,7 @@ const PAGE = `<!DOCTYPE html>
       <option value="gemini">Gemini（gemini-3-flash）</option>
       <option value="claude">Claude（保険・安定）</option>
     </select>
-    <div id="engineNote" style="font-size:11px;color:#6b7280;margin-top:2px;">通常の下書き・学習・予約など重要判断はSol、分類はLunaを使います。1つのOpenAI APIキーで切り替わります。</div>
+    <div id="engineNote" style="font-size:11px;color:#6b7280;margin-top:2px;">返信作成・相談・文体校正はLuna、監査・学習・予約など重要判断はSolが既定です。保存済みの役割別設定を優先します。</div>
     <details id="aiRouteDetails" style="margin-top:8px;"><summary style="font-size:12px;cursor:pointer;color:#047857;">モデルの役割別設定</summary><div id="aiRouteFields" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:7px;"></div><div style="font-size:10.5px;color:#6b7280;line-height:1.5;margin-top:5px;">将来のモデルは運営側の登録後、この一覧から役割ごとに切り替えられます。設定変更前は「並行テスト」で患者へ送らず比較できます。</div></details>
     <div id="modelAlert" style="display:none;font-size:11px;background:#fef3c7;border:1px solid #fcd34d;color:#92400e;border-radius:8px;padding:8px;margin-top:6px;line-height:1.5;"></div>
   </div>
@@ -7300,7 +7304,7 @@ async function testStaffLine(){const btn=document.getElementById("staffLineTestB
 async function disconnectStaffLine(){if(!await uiConfirm("右腕くんとスタッフLINEの連携を解除しますか？\\n通知・承認は停止し、登録スタッフも解除されます。"))return;const btn=document.getElementById("staffLineDisconnectBtn");await withBusy("staff-line-disconnect",btn,"解除中…",async()=>{try{const r=await api("/api/staff-line/disconnect",{}),j=await r.json();if(!r.ok||!j.ok)throw new Error("disconnect");document.getElementById("setStaffLineEnabled").checked=false;uiAlert("スタッフLINE連携を解除しました");await loadStaffLine();}catch(e){uiAlert("連携解除に失敗しました");}});}
 async function changeStaffLineRole(id,role,select){await withBusy("staff-line-role-"+id,select,"変更中…",async()=>{try{const r=await api("/api/staff-line/staff-role",{id,role}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");renderStaffLineStaff(j.staff||[]);}catch(e){uiAlert(e.message==="last_admin"?"最後の管理者は変更できません。先に別の管理者を指定してください":"権限を変更できませんでした");await loadStaffLine();}});}
 async function deleteStaffLineStaff(id,btn){if(!await uiConfirm("このスタッフのLINE操作権限を解除しますか？"))return;await withBusy("staff-line-delete-"+id,btn,"解除中…",async()=>{try{const r=await api("/api/staff-line/staff-delete",{id}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"delete");renderStaffLineStaff(j.staff||[]);}catch(e){uiAlert(e.message==="last_admin"?"最後の管理者は解除できません":"登録を解除できませんでした");await loadStaffLine();}});}
-async function runQualityPreview(){const input=document.getElementById("qualityPreviewInput"),out=document.getElementById("qualityPreviewResult"),btn=document.getElementById("qualityPreviewBtn"),inquiry=input.value.trim();if(!inquiry){uiAlert("テストする問い合わせ文を入力してください");return;}btn.disabled=true;btn.textContent="生成中…";out.style.display="block";out.textContent="返信案を生成しています…";try{const r=await api("/api/quality-preview",{inquiry,channel:document.getElementById("qualityPreviewChannel").value}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"failed");const label=({gpt:"GPT",gemini:"Gemini",claude:"Claude"})[j.engine]||j.engine;const refs=Array.isArray(j.learningRefs)?j.learningRefs:[];const g=j.grounding||{},v=j.validation||{};const audit=g.autoSendAllowed&&v.pass?" / 根拠監査OK":" / スタッフ確認: "+((g.reasons&&g.reasons[0])||v.reason||"根拠不足");out.textContent=j.draft+"\\n\\n―― "+label+" / 確信率 "+(j.confidence||"不明")+(j.toneApplied?" / 設定トーン確認済み":j.qualityIssues&&j.qualityIssues.length?" / 自動校正済み":"")+(refs.length?" / 過去対応 "+refs.length+"件参照":" / 過去対応の該当なし")+audit;}catch(e){out.textContent=e.message==="no_ai_key"?"AIキーが未設定のため生成できません。運営にAI接続設定を依頼してください。":e.message==="ai_failed"?"登録済みのAIキーを確認できませんでした。キーの失効・利用上限・モデル権限を運営側で確認してください。患者やLINEには送信されていません。":"生成できませんでした。時間をおいて再度お試しください。";}finally{btn.disabled=false;btn.textContent="返信案をテスト生成";}}
+async function runQualityPreview(){const input=document.getElementById("qualityPreviewInput"),out=document.getElementById("qualityPreviewResult"),btn=document.getElementById("qualityPreviewBtn"),inquiry=input.value.trim();if(!inquiry){uiAlert("テストする問い合わせ文を入力してください");return;}btn.disabled=true;btn.textContent="生成中…";out.style.display="block";out.textContent="返信案を生成しています…";try{const r=await api("/api/quality-preview",{inquiry,channel:document.getElementById("qualityPreviewChannel").value}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"failed");const label=({gpt:"GPT",gemini:"Gemini",claude:"Claude"})[j.engine]||j.engine;const refs=Array.isArray(j.learningRefs)?j.learningRefs:[];const g=j.grounding||{},v=j.validation||{};const audit=g.autoSendAllowed&&v.pass?" / 根拠監査OK":" / スタッフ確認: "+((g.reasons&&g.reasons[0])||v.reason||"根拠不足");out.textContent=j.draft+"\\n\\n―― "+label+" / 確信率 "+(j.confidence||"不明")+(j.toneApplied?" / 設定トーン確認済み":j.qualityIssues&&j.qualityIssues.length?" / 自動校正済み":"")+(refs.length?" / 過去対応 "+refs.length+"件参照":" / 過去対応の該当なし")+audit;}catch(e){out.textContent=e.message==="no_ai_key"?"AIキーが未設定のため生成できません。運営にAI接続設定を依頼してください。":e.message==="policy_review_failed"?"登録ルールに沿った返信か確認できなかったため、案を採用しませんでした。患者やLINEには送信されていません。":e.message==="ai_failed"?"登録済みのAIキーを確認できませんでした。キーの失効・利用上限・モデル権限を運営側で確認してください。患者やLINEには送信されていません。":"生成できませんでした。時間をおいて再度お試しください。";}finally{btn.disabled=false;btn.textContent="返信案をテスト生成";}}
 async function runShadowPreview(){const inquiry=document.getElementById("qualityPreviewInput").value.trim(),out=document.getElementById("qualityPreviewResult"),btn=document.getElementById("shadowPreviewBtn"),routes=collectAiRoutes();if(!inquiry){uiAlert("テストする問い合わせ文を入力してください");return;}btn.disabled=true;btn.textContent="2つのモデルを比較中…";out.style.display="block";out.textContent="本番回答には使わず、並行テストしています…";try{const r=await api("/api/model-shadow-preview",{inquiry,channel:document.getElementById("qualityPreviewChannel").value,candidate:routes.draft}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"failed");out.textContent="【現在のモデル "+j.active.route.model+"】\\n"+j.active.draft+"\\n\\n【候補モデル "+j.candidate.route.model+"】\\n"+j.candidate.draft+"\\n\\n※患者への送信・会話保存・学習は行っていません。";}catch(e){out.textContent=e.message==="no_openai_key"?"OpenAI APIが未接続です。":"並行テストを実行できませんでした。";}finally{btn.disabled=false;btn.textContent="候補モデルを並行テスト（回答には使用しない）";}}
 let settingsSaveBusy=false;
 async function saveSet(){if(settingsSaveBusy)return;const btn=document.getElementById("saveSettingsBtn");settingsSaveBusy=true;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>保存中…';}const autoReply=document.getElementById("setAuto").checked;const bookingActions=document.getElementById("setBookingActions").checked;const inboxOrder=document.getElementById("setInboxOrder").value;const staffLineEnabled=document.getElementById("setStaffLineEnabled").checked;const staffLineReplyMode=document.getElementById("setStaffLineReplyMode").value;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;const aiRoutes=collectAiRoutes();const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{const r=await api("/api/settings",{autoReply,bookingActions,inboxOrder,staffLineEnabled,staffLineReplyMode,level,tone,engine,aiRoutes,autoDelayMin});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");await load();uiAlert("設定を保存しました");closeSet();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"先に法人専用スタッフLINEと通知グループを接続してください":e.message==="no_ai_key"?"AIキーが未設定のため自動返信を有効にできません。運営へ接続設定を依頼してください":"保存に失敗しました");}finally{settingsSaveBusy=false;if(btn){btn.disabled=false;btn.removeAttribute("aria-busy");btn.textContent="設定を保存";}}}

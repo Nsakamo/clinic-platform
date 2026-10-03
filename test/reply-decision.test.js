@@ -19,15 +19,41 @@ test("感染症の変更理由から免除・証明書ルールも取得し、�
   assert.equal(decision.needsCancellationPolicyReview(query, rules), true);
   assert.equal(decision.needsCancellationPolicyReview("テスト：ご来院ありがとうございます", rules), false);
   assert.equal(decision.needsCancellationPolicyReview(query, "免除規定なし"), false);
+  for (const unrelated of ["テスト：受診証明書を発行してもらえますか", "テスト：診断書の発行方法を教えてください", "テスト：インフルエンザの予防について教えてください"]) {
+    assert.equal(decision.needsCancellationPolicyReview(unrelated, rules), false, unrelated);
+  }
+  assert.equal(decision.needsCancellationPolicyReview(query + " 証明書の写真を提出しました", rules), true);
 });
 
 test("患者連絡の実際の日付をJSTで渡し、時刻だけの旧履歴には日付を補わない", () => {
-  const text = decision.replyMessageText({ from: "them", text: query, at: Date.parse("2026-10-02T23:54:00Z") });
+  const text = decision.replyMessageText({ from: "them", text: query, sentAt: Date.parse("2026-10-02T23:54:00Z"), at: Date.parse("2026-10-02T23:54:00Z") });
   assert.match(text, /2026\/10\/3.*8:54:00/);
   assert.match(text, /本日11時/);
   assert.equal(decision.replyMessageText({ text: query, time: "09:54" }), query);
+  assert.match(decision.replyMessageText({ text: query, at: Date.parse("2026-10-02T23:54:00Z") }), /受信記録日時（送信日時は不明）/);
   assert.match(decision.REPLY_DECISION, /別の月の次回予約/);
   assert.match(decision.REPLY_DECISION, /連絡を送った日時を基準/);
+});
+
+test("日付を跨ぐ遅延処理でも送信日時を保存し、欠落・未来日時や旧履歴の日時を捏造しない", async () => {
+  const sentAt = Date.parse("2026-10-02T14:59:00Z"), receivedAt = Date.parse("2026-10-02T15:05:00Z");
+  const times = decision.inboundMessageTimes(sentAt, receivedAt);
+  assert.deepEqual(times, { at: sentAt, sentAt, receivedAt });
+  assert.match(decision.replyMessageText({ ...times, text: "テスト：本日の予約を変更したいです" }), /送信日時.*2026\/10\/2.*23:59/);
+  for (const invalid of [undefined, "不正", -1, receivedAt + 86400000]) {
+    assert.deepEqual(decision.inboundMessageTimes(invalid, receivedAt), { at: receivedAt, receivedAt });
+  }
+  const start = source.indexOf("async function processQueuedLinePayload(");
+  const end = source.indexOf("let lineWebhookQueueRunning", start);
+  let received;
+  const context = { isProcessableLineEvent: () => true, lineProfile: async () => ({ name: "テスト患者" }), handleInbound: async (_t, opts) => { received = opts; } };
+  vm.runInNewContext(source.slice(start, end), context);
+  await context.processQueuedLinePayload({}, { token: "テスト", botId: "テスト" }, { source: { userId: "テスト" }, timestamp: sentAt, message: { type: "text", text: "テスト：本日の予約を変更したいです" } });
+  assert.equal(received.sentAt, sentAt);
+  assert.match(source, /sentAt: parsed\.date \? mdate : undefined/);
+  const inbound = source.slice(source.indexOf("async function handleInboundCore("), source.indexOf("// ===== 予約自動受付: 確認待ち"));
+  assert.match(inbound, /inboundMessageTimes\(opts\.sentAt, recvAt\)/);
+  assert.doesNotMatch(inbound, /previousMessage\.at\s*=/);
 });
 
 function reviewHarness(responses) {
@@ -81,7 +107,7 @@ test("編集準備は関連証明書ルールと会話日時を照合資料へ�
     baEnabled: () => false, PARTNER_KEY: "", staffBookingPrompt: () => "", ANTHROPIC_KEY: "", process: { env: {} }, JP_QUALITY: "",
   };
   vm.runInNewContext(source.slice(start, end), context);
-  const c = { id: "テスト患者", channel: "line", ts: 1, msgs: [{ from: "them", text: query, at: Date.parse("2026-10-03T00:54:00Z") }] };
+  const c = { id: "テスト患者", channel: "line", ts: 1, msgs: [{ from: "them", text: query, sentAt: Date.parse("2026-10-03T00:54:00Z"), at: Date.parse("2026-10-03T00:54:00Z") }] };
   const result = await context.draftChatPrep({ store: { [c.id]: c } }, { id: c.id, messages: [{ role: "user", content: "診断書のやつ使って伝えて" }] });
   assert.match(queries[0], /受診証明/);
   assert.match(result.evidence, /12時間以内/);
@@ -116,4 +142,31 @@ test("感染症免除は根拠があっても患者申告だけで自動確定�
   const result = evaluateResponseGrounding({ query, draft: "証明書をご提出ください。", ruleMatches: [{ overlap: 4, score: 0.5 }], verifiedBooking: true });
   assert.equal(result.autoSendAllowed, false);
   assert.match(result.reasons.join(" "), /スタッフ確認/);
+});
+
+test("証明書発行だけの問い合わせへ免除案内を強制せず、提出後は古い感染症文脈でもスタッフ確認を維持", async () => {
+  const start = source.indexOf("async function genDraft(t, c, opts) {"), end = source.indexOf("// 毎回承認モード", start);
+  for (const infection of [false, true]) {
+    let reviewed = false;
+    const context = {
+      ...decision, activeConversationMessages: c => c.msgs, S: () => ({ tone: "", prefs: [] }),
+      rulesRankedWithScores: () => [{ r: { content: rules }, n: 3, score: 0.5 }], rulesBlock: () => rules, ruleBudget: () => 16000,
+      examplesRanked: () => [], trustedLearningPrecedent: () => false, prefsBlock: () => "", notesBlock: () => "", replyToneInstruction: () => "",
+      JP_QUALITY: "", PATIENT_COURTESY: "", baEnabled: () => false, staffLineReviewAll: () => false, PARTNER_KEY: "",
+      aiChat: async () => JSON.stringify({ draft: "証明書について確認します。", confidence: "high", needs_human: !infection }),
+      finalizeGeneratedDraft: async (_t, text) => ({ text, issues: [] }), applyCourtesyGate: () => {},
+      reviewDraftChatCandidate: async () => { reviewed = true; return { text: "証明書の内容はスタッフが確認します。", error: "" }; },
+      evaluateResponseGrounding, applyLearningReadinessGate: () => ({}),
+    };
+    vm.runInNewContext(source.slice(start, end), context);
+    const msgs = (infection ? [query, "テスト：ありがとうございます", "テスト：分かりました", "テスト：写真を用意します", "テスト：証明書の写真を提出しました"] : ["テスト：受診証明書を発行してもらえますか"])
+      .map(text => ({ from: "them", text }));
+    const out = await context.genDraft({}, { channel: "line", msgs }, { skipExternal: true });
+    assert.equal(reviewed, infection);
+    if (infection) {
+      assert.equal(out.needs_human, true);
+      assert.equal(out.grounding.autoSendAllowed, false);
+      assert.match(out.grounding.reasons.join(" "), /免除条件・証明書/);
+    } else { assert.doesNotMatch(out.draft, /免除|3,300円/); }
+  }
 });
