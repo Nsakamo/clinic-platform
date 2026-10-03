@@ -18,7 +18,8 @@ test("Web画面は送信成功後に対象返信だけを安全な学習キュ�
 });
 
 test("スタッフLINEの既存学習経路は維持し、修正指示を引き渡す", () => {
-  assert.match(source, /found\.approval\.editInstruction = text\.slice/);
+  assert.match(source, /approval\.editInstruction = instruction/);
+  assert.match(source, /staffLineApplyRevision\(t, found\.c, found\.approval, text\.slice\(0, 1200\)/);
   assert.match(source, /queueStaffLearning\(t, found\.c,[\s\S]{0,300}instr: editInstruction, source: "staff_line"/);
 });
 
