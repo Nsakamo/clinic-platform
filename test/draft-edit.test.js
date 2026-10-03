@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("../lib/draft-edit");
+const { REPLY_DECISION } = require("../lib/reply-decision");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
 const start = source.indexOf("async function reviewDraftChatCandidate(");
@@ -20,6 +21,7 @@ function reviewer(replies) {
     explicitEditMismatch,
     hasConversationalTone: () => false,
     PATIENT_COURTESY: "患者様に礼儀正しく返信する。",
+    REPLY_DECISION,
   };
   vm.runInNewContext(source.slice(start, end), context);
   return { review: context.reviewDraftChatCandidate, calls };
