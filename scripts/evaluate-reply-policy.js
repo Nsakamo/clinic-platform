@@ -47,6 +47,7 @@ async function main() {
   vm.runInContext(section("const JP_QUALITY = ", "// 出力が途中で切れる"), context);
   vm.runInContext(section("async function reviewDraftChatCandidate(", 'app.post("/api/draft-chat"'), context);
   vm.runInContext(section("async function draftChatPrep(", 'app.get("/api/draft-chat-history"'), context);
+  vm.runInContext(section("async function staffLineReviseDraft(", "const staffLineInFlight"), context);
   vm.runInContext(section("async function genDraft(t, c, opts) {", "// 毎回承認モード"), context);
   const t = { name: "テストクリニック", config: { settings: { engine: "gpt", tone: "患者様に配慮し丁寧に", prefs: [] } }, store: {} };
   const question = "テスト：インフルエンザになり、本日11時の予約に行けません。別の日に変更したいです。";
@@ -72,6 +73,12 @@ async function main() {
   assert.match(revised.text, /3[,，]?300/);
   assert.doesNotMatch(revised.text, /11月/);
   console.log(JSON.stringify({ case: "staff-edit", model: resolveAiRoute(t.config.settings, "chat").model, draft: revised.text }));
+  c.draft = "11月の予約の空き状況を確認し、ご連絡します。";
+  const staffLine = await context.staffLineReviseDraft(t, c, "診断書のルールを使って今回の変更について伝えて。11月の予約の話はしないで。");
+  assert.match(staffLine, /証明書/);
+  assert.match(staffLine, /3[,，]?300/);
+  assert.doesNotMatch(staffLine, /11月/);
+  console.log(JSON.stringify({ case: "staff-line-edit-no-send", model: resolveAiRoute(t.config.settings, "chat").model, draft: staffLine }));
 
   c.msgs.push({ from: "us", text: revised.text, at: current.getTime() + 1000, sentAt: current.getTime() + 1000 },
     { from: "them", text: "テスト：証明書の写真を提出しました。確認をお願いします。", at: current.getTime() + 2000, sentAt: current.getTime() + 2000 },
@@ -82,11 +89,14 @@ async function main() {
   assert.equal(after.grounding.autoSendAllowed, false);
   console.log(JSON.stringify({ case: "proof-received-not-reviewed", model: resolveAiRoute(t.config.settings, "draft").model, draft: after.draft }));
 
-  const ordinary = { id: "テスト証明書発行", channel: "line", msgs: [{ from: "them", text: "テスト：受診証明書を発行してもらえますか。", at: current.getTime(), sentAt: current.getTime() }] };
-  const certificate = await context.genDraft(t, ordinary, { skipExternal: true });
-  assert.ok(certificate && certificate.draft);
-  assert.doesNotMatch(certificate.draft, /キャンセル|免除|3[,，]?300|12時間/);
-  console.log(JSON.stringify({ case: "certificate-issuance-only", model: resolveAiRoute(t.config.settings, "draft").model, draft: certificate.draft }));
+  for (const inquiry of ["テスト：受診証明書を発行してもらえますか。", "テスト：インフルエンザの治癒証明書をお願いします。"]) {
+    const ordinary = { id: "テスト証明書発行", channel: "line", msgs: [{ from: "them", text: inquiry, at: current.getTime(), sentAt: current.getTime() }] };
+    const certificate = await context.genDraft(t, ordinary, { skipExternal: true });
+    assert.ok(certificate && certificate.draft);
+    assert.doesNotMatch(certificate.draft, /キャンセル|免除|3[,，]?300|12時間/);
+    assert.equal(certificate.grounding.autoSendAllowed, false);
+    console.log(JSON.stringify({ case: "certificate-issuance-only", inquiry, model: resolveAiRoute(t.config.settings, "draft").model, draft: certificate.draft }));
+  }
 }
 
 main().catch(error => { console.error("Synthetic evaluation failed:", String(error.message || error).slice(0, 300)); process.exitCode = 1; });
