@@ -111,17 +111,48 @@ test("証明書発行案の無関係な免除案内を内容監査で修正す�
 
 function reviewHarness(responses) {
   const calls = [];
+  const finalizations = [];
   const start = source.indexOf("async function reviewDraftChatCandidate(");
   const end = source.indexOf('app.post("/api/draft-chat"', start);
   const context = {
     ...decision, explicitEditMismatch,
-    finalizeGeneratedDraft: async (_t, text) => ({ text, issues: [] }),
+    finalizeGeneratedDraft: async (_t, text) => { finalizations.push(text); return { text, issues: [] }; },
     hasConversationalTone: () => false, PATIENT_COURTESY: "丁寧に",
     aiChat: async (_t, sys, messages, _limit, task) => { calls.push({ sys, messages, task }); return responses.shift(); },
   };
   vm.runInNewContext(source.slice(start, end), context);
-  return { review: context.reviewDraftChatCandidate, calls };
+  return { review: context.reviewDraftChatCandidate, calls, finalizations };
 }
+
+test("既に整形した初回案を二重整形せず、修正で落ちた注意書きは二回目で回復できる", async () => {
+  const correct = "証明書はこの案内から12時間以内に提出してください。前日キャンセルの金額は確認のうえ案内します。";
+  const h = reviewHarness([
+    '{"pass":false,"reason":"患者送信時刻から締切を計算している"}',
+    "証明書はこの案内から12時間以内に提出してください。",
+    '{"pass":false,"reason":"金額の確認待ちが落ちた"}',
+    correct, '{"pass":true}',
+  ]);
+  const out = await h.review({}, { c: { channel: "line" }, lastQ: query, latestInstruction: "規定を案内", alreadyFinalized: true, evidence: rules }, "証明書は23時までです。金額は確認します。");
+  assert.equal(out.text, correct);
+  assert.equal(h.calls.length, 5);
+  assert.equal(h.finalizations.length, 2);
+  assert.match(h.calls[3].messages[0].content, /金額の確認待ちが落ちた/);
+  assert.match(h.calls[3].sys, /指摘されていない正しい条件・未確定事項の説明を落とさない/);
+});
+
+test("二回修復しても照合できない案は採用せず、修復回数は上限を守る", async () => {
+  const h = reviewHarness(['{"pass":false}', "誤案1", '{"pass":false}', "誤案2", '{"pass":false}']);
+  const out = await h.review({}, { c: { channel: "line" }, lastQ: query, latestInstruction: "規定を案内", evidence: rules }, "誤案0");
+  assert.equal(out.text, "");
+  assert.ok(out.error);
+  assert.equal(h.calls.length, 5);
+});
+
+test("料金と提出期限の起点は推測で補わず、相対表現と金額確認を維持する", () => {
+  assert.match(decision.REPLY_DECISION, /患者の送信時刻から具体的な締切時刻を計算しない/);
+  assert.match(decision.REPLY_DECISION, /金額は確認のうえ案内する/);
+  assert.match(decision.REPLY_DECISION, /単にスタッフが証明書を確認すると書くだけでは料金確認の説明にならない/);
+});
 
 test("証明書提出後は案内済みの条件の再掲を必須にせず、選択対象とスタッフ指示を照合する", async () => {
   const text = "証明書をご提出いただきありがとうございます。スタッフが内容を確認し、ご案内いたします。";

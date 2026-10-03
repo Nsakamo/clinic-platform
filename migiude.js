@@ -2308,7 +2308,7 @@ async function genDraft(t, c, opts) {
       if (replyRequiresStaff) {
         const reviewed = await reviewDraftChatCandidate(t, {
           c, latestInstruction: "最新の患者連絡の目的を読み、今回の依頼だけに回答してください。感染症による予約変更・キャンセルやその証明書提出の話なら、該当する店舗ルールの免除条件と必要な提出物、条件を満たさない場合の料金を案内してください。証明書の発行だけを依頼している場合や、最新の連絡が別件の場合には、無関係なキャンセル免除や料金を持ち込まないでください。病名や証明書の語だけでキャンセルとは決めず、言い方が定型でなくても実際の予約変更・キャンセルの依頼を見落とさないでください。発行可否や方法が未確認ならスタッフが確認する旨を伝えてください。発熱だけで感染症と診断せず、免除規定が該当する場合の条件として説明してください。提出・説明済みの内容を繰り返さず、未確認の免除や予約変更を確定しないでください。",
-          previousDraft: "", lastQ, selectedTopics: opts.only || [],
+          previousDraft: "", lastQ, alreadyFinalized: true, selectedTopics: opts.only || [],
           evidence: "【今回の会話】\n" + msgsArr.map(m => m.role + ": " + m.content).join("\n")
             + "\n【店舗ルール】\n" + rulesBlock(rel.slice(0, 20), 16000)
             + "\n【スタッフの共通指示】\n" + prefsBlock(t) + "\n【この患者への対応メモ】\n" + notesBlock(c)
@@ -2796,7 +2796,7 @@ app.post("/webhook/staff-line", async (req, res) => {
           const delivered = await staffLineApplyRevision(t, found.c, found.approval, text.slice(0, 1200), userId, ev.replyToken);
           if (!delivered) throw new Error("revision_not_delivered");
           staffLineEditSessions.delete(key);
-        } catch (e) { staffLineEditSessions.delete(key); await staffLineReplyOrPush(t, ev.replyToken, groupId, [staffLineText("修正案の確認カードをお届けできませんでした。古いカードからは送信できません。右腕くんの画面で最新の案を確認してください。")]); }
+        } catch (e) { staffLineEditSessions.delete(key); await staffLineReplyOrPush(t, ev.replyToken, groupId, [staffLineText("修正案の作成または確認カードのお届けができませんでした。この修正操作では患者様へ送信していません。右腕くんの画面で最新の案を確認してください。")]); }
         continue;
       }
 
@@ -4085,7 +4085,7 @@ function draftChatNote(t, c, edits) {
 async function reviewDraftChatCandidate(t, p, raw) {
   if (p.consultation) return { text: "", error: "" };
   if (!String(raw || "").trim()) return { text: "", error: "" };
-  let text = (await finalizeGeneratedDraft(t, raw, p.c.channel)).text;
+  let text = p.alreadyFinalized ? String(raw) : (await finalizeGeneratedDraft(t, raw, p.c.channel)).text;
   const instruction = String(p.latestInstruction || "").slice(0, 1500);
   if (!instruction) return { text, error: "" };
   const selected = Array.isArray(p.selectedTopics) ? p.selectedTopics.map(String).slice(0, 20) : [];
@@ -4111,17 +4111,20 @@ async function reviewDraftChatCandidate(t, p, raw) {
   let checked = await audit(text);
   if (checked.pass) return { text, error: "" };
   const repairSystem = "患者様向け返信文の編集者です。最新のスタッフ指示をそのまま反映して、返信本文の完成形だけを出力する。前の下書きにあるスタッフの確定判断は、最新指示が明示的に変更しない限り維持する。スタッフが『充てる』と確定した場合は可否確認に戻さず、適用可否を確認するよう明示した場合は充当を確約しない。未実施の操作を実施済みと書かない。指示と矛盾する確認待ち表現や不要な追加質問は削る。新しい事実・条件・個人情報の依頼は加えない。医療判断や店舗ルールへの明らかな違反はしない。礼儀正しく簡潔な敬語にする。" + PATIENT_COURTESY;
-  const repairPrompt = "【患者様の直近の内容】\n" + String(p.lastQ || "").slice(0, 1200)
-    + "\n【編集前の下書き】\n" + String(p.previousDraft || "").slice(0, 4000)
-    + "\n【最新のスタッフ指示】\n" + instruction
-    + evidence
-    + "\n【修正が必要な案】\n" + text
-    + "\n【照合で見つかった問題】\n" + checked.reason;
-  const repaired = await aiChat(t, repairSystem + REPLY_DECISION + "新しい推測は加えない。関連ルールの条件・提出物・料金は、今回の依頼や選択対象でまだ案内が必要なものだけ補う。既に条件を伝え証明書を提出済みなら、お礼とスタッフ確認待ちだけでよく、条件・期限・料金や同じ提出依頼を繰り返さない。提示されたスタッフ共通指示と対応メモを保つ。", [{ role: "user", content: repairPrompt }], 1800, "chat");
-  if (repaired) {
-    const candidate = (await finalizeGeneratedDraft(t, repaired, p.c.channel)).text;
-    checked = await audit(candidate);
-    if (checked.pass) return { text: candidate, error: "" };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const repairPrompt = "【患者様の直近の内容】\n" + String(p.lastQ || "").slice(0, 1200)
+      + "\n【編集前の下書き】\n" + String(p.previousDraft || "").slice(0, 4000)
+      + "\n【最新のスタッフ指示】\n" + instruction
+      + evidence
+      + "\n【修正が必要な案】\n" + text
+      + "\n【照合で見つかった問題】\n" + checked.reason;
+    const repaired = await aiChat(t, repairSystem + REPLY_DECISION + "新しい推測は加えない。指摘箇所を直す際、指摘されていない正しい条件・未確定事項の説明を落とさない。関連ルールの条件・提出物・料金は、今回の依頼や選択対象でまだ案内が必要なものだけ補う。既に条件を伝え証明書を提出済みなら、お礼とスタッフ確認待ちだけでよく、条件・期限・料金や同じ提出依頼を繰り返さない。提示されたスタッフ共通指示と対応メモを保つ。", [{ role: "user", content: repairPrompt }], 1800, "chat");
+    if (repaired) {
+      const candidate = (await finalizeGeneratedDraft(t, repaired, p.c.channel)).text;
+      checked = await audit(candidate);
+      if (checked.pass) return { text: candidate, error: "" };
+      text = candidate;
+    }
   }
   return { text: "", error: "編集指示を正確に反映できませんでした。内容を短く言い換えて、もう一度お試しください。" };
 }
