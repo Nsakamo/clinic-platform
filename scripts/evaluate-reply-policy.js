@@ -45,6 +45,7 @@ async function main() {
     return result.text;
   };
   vm.runInContext(section("const JP_QUALITY = ", "// 出力が途中で切れる"), context);
+  vm.runInContext(section("function salvageDraft(", "// ===== 受付くん連携: 受信イベント転送"), context);
   vm.runInContext(section("async function reviewDraftChatCandidate(", 'app.post("/api/draft-chat"'), context);
   vm.runInContext(section("async function draftChatPrep(", 'app.get("/api/draft-chat-history"'), context);
   vm.runInContext(section("async function staffLineReviseDraft(", "const staffLineInFlight"), context);
@@ -97,7 +98,19 @@ async function main() {
     assert.equal(certificate.grounding.autoSendAllowed, false);
     console.log(JSON.stringify({ case: "certificate-issuance-only", inquiry, model: resolveAiRoute(t.config.settings, "draft").model, draft: certificate.draft }));
   }
-  for (const inquiry of ["テスト：インフルエンザで明日伺うことができません。証明書は必要ですか。", "テスト：インフルになり明日はお休みさせてください。診断書いりますか。", "テスト：発熱があり明日伺えません。診断書は必要でしょうか。"]) {
+  for (const inquiry of [
+    "テスト：インフルエンザで明日伺うことができません。証明書は必要ですか。",
+    "テスト：インフルになり明日はお休みさせてください。診断書いりますか。",
+    "テスト：発熱があり明日伺えません。診断書は必要でしょうか。",
+    "テスト：インフルエンザで出勤停止になり、明日伺えません。証明書は必要ですか。",
+    "テスト：コロナで会社も休んでいます。明日の分はキャンセルでお願いします。診断書は要りますか。",
+    "テスト：インフルエンザなので別の日に変更したいです。診断書は必要ですか。",
+    "テスト：インフルで明日の予約を取り消したいです。証明書いりますか。",
+    "テスト：発熱で明日は受診できません。証明書は必要ですか。",
+    "テスト：インフルで明日は休ませてください。診断書は必要ですか。",
+    "テスト：インフルで予定を変更し、振り替えたいです。証明書は必要ですか。",
+    "テスト：インフルで明日の都合が悪くなりました。証明書は必要ですか。",
+  ]) {
     const polite = { id: "テスト欠席表現", channel: "line", msgs: [{ from: "them", text: inquiry, at: current.getTime(), sentAt: current.getTime() }] };
     const cancellation = await context.genDraft(t, polite, { skipExternal: true });
     assert.ok(cancellation && cancellation.draft);

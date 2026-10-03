@@ -20,7 +20,7 @@ const { normalizeAiRoutes, resolveAiRoute, publicModelCatalog } = require("./lib
 const { contextualLearningFallback, formatLearningProposal } = require("./lib/learning-context");
 const { selectConversationContext, preserveTopicBoundary } = require("./lib/conversation-context");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("./lib/draft-edit");
-const { REPLY_DECISION, isCancellationInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview, inboundMessageTimes } = require("./lib/reply-decision");
+const { REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, isCertificateIssuanceInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview, inboundMessageTimes } = require("./lib/reply-decision");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
 const { AiUsageSpool, resolveAiUsageSpoolPath } = require("./lib/ai-usage-spool");
@@ -2200,9 +2200,13 @@ async function genDraft(t, c, opts) {
   const rankedRules = rulesRankedWithScores(t, replyRuleQuery(lastQ.slice(0, 1500)));
   const rel = rankedRules.map(x => x.r);
   const rulesTxt = rulesBlock(rel, ruleBudget(t));
-  const policyReviewNeeded = needsCancellationPolicyReview(activeMsgs.filter(m => m.from === "them").slice(-16).map(m => m.text || "").join(" "), rulesTxt);
-  const certificateOnly = !policyReviewNeeded && /診断書|証明書|受診証明/.test(lastQ) && !isCancellationInquiry(lastQ);
-  const replyRequiresStaff = policyReviewNeeded || certificateOnly;
+  const policyContext = activeMsgs.filter(m => m.from === "them").slice(-16).map(m => m.text || "").join(" ");
+  const policyReviewNeeded = needsCancellationPolicyReview(policyContext, rulesTxt);
+  // Unknown wording is not proof of a certificate-only intent. In illness
+  // cases let the conditional content audit interpret the actual request.
+  const certificateOnly = !policyReviewNeeded && !isIllnessInquiry(policyContext) && isCertificateIssuanceInquiry(lastQ);
+  const certificateInquiry = /診断書|証明書|受診証明/.test(lastQ);
+  const replyRequiresStaff = policyReviewNeeded || certificateInquiry || (isIllnessInquiry(lastQ) && /免除|免責/.test(rulesTxt));
   const exRel = examplesRanked(t, latestQ.slice(0, 800), 4, lastQ.slice(0, 1500));
   const trustedPrecedents = exRel.filter(trustedLearningPrecedent);
   const examplesTxt = exRel.length ? exRel.map(e => {
@@ -2285,9 +2289,7 @@ async function genDraft(t, c, opts) {
       // auto-send gate below must not bypass this content review.
       if (replyRequiresStaff) {
         const reviewed = await reviewDraftChatCandidate(t, {
-          c, latestInstruction: policyReviewNeeded
-            ? "最新の患者連絡が感染症による予約変更・キャンセルやその証明書提出の話なら、該当する店舗ルールの免除条件と必要な提出物、条件を満たさない場合の料金を案内してください。過去に感染症の話があっても、最新の連絡が別の依頼なら無関係な免除や料金を持ち込まず今回の依頼だけに回答してください。発熱などの症状だけで感染症と診断せず、免除規定が該当する場合の条件として説明してください。既に提出・説明されたことは繰り返さず、未確認の免除や予約変更は確定しないでください。"
-            : "今回は証明書についての依頼だけに回答してください。患者が相談していないキャンセル免除や変更料を案内しないでください。証明書の発行可否や方法が未確認なら、スタッフが確認する旨を案内してください。",
+          c, latestInstruction: "最新の患者連絡の目的を読み、今回の依頼だけに回答してください。感染症による予約変更・キャンセルやその証明書提出の話なら、該当する店舗ルールの免除条件と必要な提出物、条件を満たさない場合の料金を案内してください。証明書の発行だけを依頼している場合や、最新の連絡が別件の場合には、無関係なキャンセル免除や料金を持ち込まないでください。病名や証明書の語だけでキャンセルとは決めず、言い方が定型でなくても実際の予約変更・キャンセルの依頼を見落とさないでください。発行可否や方法が未確認ならスタッフが確認する旨を伝えてください。発熱だけで感染症と診断せず、免除規定が該当する場合の条件として説明してください。提出・説明済みの内容を繰り返さず、未確認の免除や予約変更を確定しないでください。",
           forbidCancellationGuidance: certificateOnly,
           previousDraft: "", lastQ, evidence: "【今回の会話】\n" + msgsArr.map(m => m.role + ": " + m.content).join("\n") + "\n【店舗ルール】\n" + rulesBlock(rel.slice(0, 20), 16000) + "\n【照会結果（今回の対象とは限らない）】\n" + bookingTxt,
         }, out.draft);
@@ -2314,7 +2316,7 @@ async function genDraft(t, c, opts) {
       if (replyRequiresStaff) {
         out.needs_human = true;
         out.grounding.autoSendAllowed = false;
-        out.grounding.reasons.push(policyReviewNeeded ? "感染症の免除条件・証明書はスタッフ確認が必要です" : "証明書の発行・確認はスタッフ確認が必要です");
+        out.grounding.reasons.push(policyReviewNeeded ? "感染症の免除条件・証明書はスタッフ確認が必要です" : "返信内容・証明書の扱いはスタッフ確認が必要です");
       }
       if (finalized.issues.includes("conversational_tone")) {
         out.grounding.autoSendAllowed = false;
