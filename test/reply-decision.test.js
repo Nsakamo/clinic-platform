@@ -106,7 +106,7 @@ test("証明書発行案の無関係な免除案内を内容監査で修正す�
   const result = await h.review({}, p, "証明書を確認します。感染症のキャンセル料は条件を満たせば免除されます。");
   assert.equal(result.text, corrected);
   assert.equal(h.calls.length, 3);
-  assert.match(h.calls[0].sys, /今回と無関係な規定/);
+  assert.match(h.calls[0].sys, /無関係な規定や予約を持ち出す/);
 });
 
 function reviewHarness(responses) {
@@ -122,6 +122,37 @@ function reviewHarness(responses) {
   vm.runInNewContext(source.slice(start, end), context);
   return { review: context.reviewDraftChatCandidate, calls };
 }
+
+test("証明書提出後は案内済みの条件の再掲を必須にせず、選択対象とスタッフ指示を照合する", async () => {
+  const text = "証明書をご提出いただきありがとうございます。スタッフが内容を確認し、ご案内いたします。";
+  const h = reviewHarness(['{"pass":true}']);
+  const result = await h.review({}, {
+    c: { channel: "line" }, lastQ: "証明書の写真を提出しました", latestInstruction: "受領と確認待ちを伝えて",
+    selectedTopics: ["証明書の受領"], evidence: rules + "\nスタッフ共通指示：簡潔に\n対応メモ：メール連絡希望\n確認済み空き枠：10月6日11時\n店舗返信：条件と3,300円を案内済み",
+  }, text);
+  assert.equal(result.text, text);
+  assert.match(h.calls[0].sys, /患者へ既に伝えた条件・料金の再掲は合格条件ではない/);
+  assert.match(h.calls[0].messages[0].content, /選ばれていない項目は補わない/);
+  for (const value of ["簡潔に", "メール連絡希望", "10月6日11時", "証明書の受領"]) assert.ok(h.calls[0].messages[0].content.includes(value));
+});
+
+test("通常の治療予約の変更を感染症・証明書専用ゲートで止めない", async () => {
+  const start = source.indexOf("async function genDraft(t, c, opts) {"), end = source.indexOf("// 毎回承認モード", start);
+  const context = {
+    ...decision, activeConversationMessages: c => c.msgs, S: () => ({ tone: "", prefs: [] }),
+    rulesRankedWithScores: () => [{ r: { content: rules }, n: 3, score: 0.5 }], rulesBlock: () => rules, ruleBudget: () => 16000,
+    examplesRanked: () => [], trustedLearningPrecedent: () => false, prefsBlock: () => "", notesBlock: () => "", replyToneInstruction: () => "",
+    JP_QUALITY: "", PATIENT_COURTESY: "", baEnabled: () => false, staffLineReviewAll: () => false, PARTNER_KEY: "",
+    aiChat: async () => JSON.stringify({ draft: "ご希望の日時をお知らせください。", confidence: "high", needs_human: false, action: { type: "reschedule" } }),
+    finalizeGeneratedDraft: async (_t, text) => ({ text, issues: [] }), applyCourtesyGate: () => {},
+    reviewDraftChatCandidate: async () => { throw new Error("感染症専用の追加照合は不要"); },
+    evaluateResponseGrounding, applyLearningReadinessGate: () => ({}),
+  };
+  vm.runInNewContext(source.slice(start, end), context);
+  const out = await context.genDraft({}, { channel: "line", msgs: [{ from: "them", text: "次回の治療の予約を来週に変更したいです" }] }, { skipExternal: true });
+  assert.equal(out.replyRequiresStaff, false);
+  assert.equal(out.action.type, "reschedule");
+});
 
 test("編集後の照合・修復・再照合に正式ルールを渡し、証明書案内の抜けを修復する", async () => {
   const corrected = "ご連絡ありがとうございます。証明書を12時間以内にご提出いただき、予約前日の受診日・予約者名・病院名が確認できれば免除対象となります。条件を満たさない当日変更は3,300円です。";
