@@ -8,6 +8,7 @@ const assert = require("node:assert/strict");
 const tone = require("../lib/reply-tone");
 const decision = require("../lib/reply-decision");
 const edit = require("../lib/draft-edit");
+const consultation = require("../lib/draft-consultation");
 const { selectConversationContext } = require("../lib/conversation-context");
 const { evaluateResponseGrounding } = require("../lib/response-grounding");
 const { resolveAiRoute } = require("../lib/ai-model-router");
@@ -26,7 +27,7 @@ async function main() {
   ];
   const current = new Date();
   const context = {
-    ...tone, ...decision, ...edit, selectConversationContext, evaluateResponseGrounding,
+    ...tone, ...decision, ...edit, ...consultation, selectConversationContext, evaluateResponseGrounding,
     process, fetch, console, PATIENT_COURTESY: tone.PATIENT_COURTESY,
     S: t => t.config.settings, activeConversationMessages: c => c.msgs,
     rulesRankedWithScores: () => rules.map(r => ({ r, n: 4, score: 0.5 })),

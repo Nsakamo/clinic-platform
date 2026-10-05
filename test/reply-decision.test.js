@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 const decision = require("../lib/reply-decision");
 const { selectConversationContext, preserveTopicBoundary } = require("../lib/conversation-context");
+const consultation = require("../lib/draft-consultation");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("../lib/draft-edit");
 const { evaluateResponseGrounding } = require("../lib/response-grounding");
 const source = fs.readFileSync(require.resolve("../migiude.js"), "utf8");
@@ -115,7 +116,7 @@ function reviewHarness(responses) {
   const start = source.indexOf("async function reviewDraftChatCandidate(");
   const end = source.indexOf('app.post("/api/draft-chat"', start);
   const context = {
-    ...decision, explicitEditMismatch,
+    ...decision, ...consultation, explicitEditMismatch,
     finalizeGeneratedDraft: async (_t, text) => { finalizations.push(text); return { text, issues: [] }; },
     hasConversationalTone: () => false, PATIENT_COURTESY: "丁寧に",
     aiChat: async (_t, sys, messages, _limit, task) => { calls.push({ sys, messages, task }); return responses.shift(); },
@@ -223,7 +224,7 @@ test("編集準備は関連証明書ルールと会話日時を照合資料へ�
   const end = source.indexOf('app.get("/api/draft-chat-history"', start);
   const queries = [];
   const context = {
-    ...decision, selectConversationContext, normalizeDraftEditHistory, isDraftChatConsultation,
+    ...decision, ...consultation, selectConversationContext, normalizeDraftEditHistory, isDraftChatConsultation,
     rulesRankedWithScores: (_t, q) => { queries.push(q); return [{ n: 2, r: { content: rules } }]; },
     rulesBlock: rel => rel.map(r => r.content).join("\n"),
     S: () => ({ engine: "gpt", tone: "" }), notesBlock: () => "", prefsBlock: () => "", replyToneInstruction: () => "",
