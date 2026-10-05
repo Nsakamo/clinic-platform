@@ -66,6 +66,15 @@ test("下書き参照と具体的な過去参照が同じ指示にあっても�
   assert.match(context.olderRelevant[1].text, /追跡番号/);
 });
 
+test("案内・文書・文言・文面への過去参照を下書きの案・文と取り違えない", () => {
+  const at = Date.now();
+  const c = { handledThroughIndex: 2, msgs: [msg("them", "テスト：配送が届きません", at), msg("us", "ヤマトの追跡番号で確認できます", at + 1), msg("them", "ありがとうございます", at + TOPIC_GAP_MS + 2)] };
+  for (const referenceText of ["先ほどの案内の追跡番号も載せて", "前回の文書の追跡番号も載せて", "前回の文言の追跡番号も載せて", "前回の文面の追跡番号も載せて"]) {
+    const context = selectConversationContext(c, { referenceText, includeHandledReference: true });
+    assert.equal(context.olderRelevant.length, 2, referenceText);
+  }
+});
+
 test("お願いで始まる新しい質問・時間の空いたお礼は古い話題の継続にしない", () => {
   const at = Date.now();
   const c = { handledThroughIndex: 2, msgs: [msg("them", "チケットを使えますか", at), msg("us", "チケット消化か3,300円です", at + 1), msg("them", "お願いします。マウスピースの受け取りはいつですか", at + 2)] };
