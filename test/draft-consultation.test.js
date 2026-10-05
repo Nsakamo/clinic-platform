@@ -46,6 +46,24 @@ test("患者の最新一言で消えた前提もスタッフが参照すれば�
   assert.equal(context.olderRelevant.length, 2);
 });
 
+test("返信・回答・上記という通常の編集語で別件の対応済み履歴を参照しない", async () => {
+  const at = Date.now();
+  const c = { id: "テスト別件", handledThroughIndex: 2, msgs: [msg("them", "チケットを使えますか", at), msg("us", "チケット消化か3,300円のお支払いを選べます", at + 1), msg("them", "マウスピースの受け取りはいつですか", at + TOPIC_GAP_MS + 2)] };
+  for (const content of ["返信を丁寧に作って", "上記の回答を短くして", "丁寧な返信にして。".repeat(160)]) {
+    assert.equal(selectConversationContext(c, { includeHandledReference: true, referenceText: content }).olderRelevant.length, 0);
+    const p = await harness().draftChatPrep(tenant(c), { id: c.id, messages: [{ role: "user", content }] });
+    assert.doesNotMatch(p.evidence, /チケット消化/);
+  }
+});
+
+test("お願いで始まる新しい質問・時間の空いたお礼は古い話題の継続にしない", () => {
+  const at = Date.now();
+  const c = { handledThroughIndex: 2, msgs: [msg("them", "チケットを使えますか", at), msg("us", "チケット消化か3,300円です", at + 1), msg("them", "お願いします。マウスピースの受け取りはいつですか", at + 2)] };
+  assert.equal(selectConversationContext(c, { includeHandledReference: true }).olderRelevant.length, 0);
+  c.msgs[2] = msg("them", "ありがとうございます", at + TOPIC_GAP_MS + 2);
+  assert.equal(selectConversationContext(c, { includeHandledReference: true }).olderRelevant.length, 0);
+});
+
 test("対応済み会話を明示的に相談したときだけ最後の患者の質問を引き継ぐ", () => {
   const c = { handledThroughIndex: 2, msgs: [msg("them", "テスト：送料はいくらですか", 1), msg("us", "660円です", 2)] };
   assert.equal(selectConversationContext(c).current.length, 0);

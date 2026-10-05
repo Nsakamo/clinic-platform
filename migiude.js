@@ -3961,18 +3961,19 @@ async function draftChatPrep(t, body) {
   const edits = normalizeDraftEditHistory(requestedEdits);
   if (!edits.length || edits[edits.length - 1].role !== "user") return { error: "empty" };
   const staffHistory = staffConsultationTranscript(requestedEdits);
-  const referenceText = requestedEdits.filter(m => m.role === "user").map(m => m.content).join(" ").slice(-8000);
+  const referenceText = latestInstruction;
   const context = selectConversationContext(c, { maxCurrent: 40, maxOlder: 20, referenceText, includeHandledReference: true });
   const line = m => (m.from === "them" ? "お客様" : "クリニック") + ": " + replyMessageText(m);
   const conv = formatDraftContext(context.current, line, 24000);
   const olderConv = formatDraftContext(context.olderRelevant, line, 12000);
   const lastQ = context.current.filter(m => m.from === "them").slice(-1).map(m => m.text || "").join("");
-  const editTxt = latestInstruction + " " + referenceText + " " + previousDraft;
+  const priorInstructions = requestedEdits.filter(m => m.role === "user").slice(0, -1).map(m => m.content).join(" ");
   const latestStaffInput = requestedEdits.slice().reverse().find(e => e.role === "user");
   const voiceInputNote = latestStaffInput && latestStaffInput.inputMode === "voice"
     ? "\n\n【音声入力されたスタッフ指示】最新のスタッフ指示は音声認識から変換された文章です。誤字、同音異義語、助詞抜け、途中の言い直しがあっても、お客様との会話、現在の下書き、店舗ルール、院内用語から意図を復元し、明らかな変換ミスをスタッフに直させず反映する。意味不明な語をそのまま患者向け下書きへ転記しない。ただし患者名、医院、予約日時、金額、回数、予約の変更・取消など重要情報に複数の解釈が残る場合は推測せず、replyで短く確認し、actionはnone、下書きは変更しない。"
     : "";
-  const rel = rulesRankedWithScores(t, replyRuleQuery((latestInstruction + " " + lastQ + " " + editTxt + " " + conv).slice(0, 6500)))
+  const ruleQuery = [latestInstruction.slice(0, 2000), lastQ.slice(0, 2000), priorInstructions.slice(0, 1500), previousDraft.slice(0, 1000)].join(" ");
+  const rel = rulesRankedWithScores(t, replyRuleQuery(ruleQuery))
     .filter(x => x.n > 0).slice(0, 20).map(x => x.r);
   const rulesTxt = rel.length ? rulesBlock(rel, 16000) : "";
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
@@ -3984,7 +3985,7 @@ async function draftChatPrep(t, body) {
   const base = "あなたは「" + (t.name || "クリニック") + "」の受付スタッフの返信作成アシスタントです。"
     + "スタッフと会話しながら、お客様への返信下書きを一緒に磨き上げます。あなたと会話しているのはスタッフで、下書きを送る相手はお客様です。"
     + "\n\n【現在の話題（この最新メッセージへの返信に使う主な会話）】\n" + conv
-    + (olderConv ? "\n\n【過去の関連説明（最新メッセージが参照している場合だけ補助的に使う）】\n" + olderConv + "\n過去側で完了した質問には改めて回答せず、現在の話題に必要な事実だけ引き継ぐ。" : "")
+    + (olderConv ? "\n\n【患者またはスタッフが参照した過去の関連説明】\n" + olderConv + "\n過去側で完了した質問には改めて回答せず、現在の話題に必要な事実だけ引き継ぐ。" : "")
     + "\n\n返信を作成する現在日は" + today + "です。患者の連絡日時とは区別する。" + REPLY_DECISION
     + "医療判断・診断はしない。断定的表現や絵文字は使わない。" + sig
     + (rulesTxt ? "\n\n【通常の店舗ルール（スタッフが今回の例外を明示した項目以外の基準。推測で補わない）】\n" + rulesTxt : "")
@@ -4118,7 +4119,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
   }
   let checked = await audit(text);
   if (checked.pass) return { text, error: "" };
-  const repairSystem = "患者様向け返信文の編集者です。患者の前後のやり取りとスタッフ相談履歴に基づき、最新指示を反映した完成文だけを出力する。以前の未撤回の訂正・決定と指摘されていない正しい内容は保ち、最新指示で撤回された内容は戻さない。未実施の操作を実施済みと書かない。指示と矛盾する確認待ち表現や不要な追加質問は削る。新しい事実・条件・個人情報の依頼は加えない。医療判断はしない。礼儀正しく簡潔な敬語にする。" + PATIENT_COURTESY;
+  const repairSystem = "患者様向け返信文の編集者です。患者の前後のやり取りとスタッフ相談履歴に基づき、最新指示を反映した完成文だけを出力する。以前の未撤回の訂正・決定と指摘されていない正しい内容は保ち、最新指示で撤回された内容は戻さない。最新指示と矛盾しないスタッフ共通指示・患者対応メモを保つ。未実施の操作を実施済みと書かない。指示と矛盾する確認待ち表現や不要な追加質問は削る。新しい事実・条件・個人情報の依頼は加えない。医療判断はしない。礼儀正しく簡潔な敬語にする。" + PATIENT_COURTESY;
   for (let attempt = 0; attempt < 2; attempt++) {
     const repairPrompt = "【患者様の直近の内容】\n" + String(p.lastQ || "").slice(0, 1200)
       + "\n【編集前の下書き】\n" + String(p.previousDraft || "").slice(0, 4000)
