@@ -20,7 +20,9 @@ global.fetch = (url, options) => {
   return originalFetch(url, options);
 };
 const filename = require.resolve("../migiude.js");
-const source = fs.readFileSync(filename, "utf8").replace("app.listen(PORT,", 'app.listen(PORT, "127.0.0.1",');
+const originalSource = fs.readFileSync(filename, "utf8");
+if (originalSource.split("app.listen(PORT,").length !== 2) throw new Error("test_listen_binding_not_found");
+const source = originalSource.replace("app.listen(PORT,", 'app.listen(PORT, "127.0.0.1",');
 const fixture = `
 const testTenant = TEN["consultation-test"] = newTenant("consultation-test", "テスト相談クリニック", {
   loginId: "consultation-test", passHash: hashPassword("local-test-only"), conn: {},
