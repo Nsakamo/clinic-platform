@@ -7,6 +7,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("../lib/draft-edit");
 const { REPLY_DECISION } = require("../lib/reply-decision");
+const consultation = require("../lib/draft-consultation");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
 const start = source.indexOf("async function reviewDraftChatCandidate(");
@@ -16,6 +17,7 @@ assert.ok(start > 0 && end > start);
 function reviewer(replies) {
   const calls = [];
   const context = {
+    ...consultation,
     finalizeGeneratedDraft: async (_t, text) => ({ text }),
     aiChat: async (_t, sys, messages, _limit, task) => { calls.push({ sys, messages, task }); return replies.shift(); },
     explicitEditMismatch,
