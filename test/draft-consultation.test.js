@@ -49,11 +49,21 @@ test("患者の最新一言で消えた前提もスタッフが参照すれば�
 test("返信・回答・上記という通常の編集語で別件の対応済み履歴を参照しない", async () => {
   const at = Date.now();
   const c = { id: "テスト別件", handledThroughIndex: 2, msgs: [msg("them", "チケットを使えますか", at), msg("us", "チケット消化か3,300円のお支払いを選べます", at + 1), msg("them", "マウスピースの受け取りはいつですか", at + TOPIC_GAP_MS + 2)] };
-  for (const content of ["返信を丁寧に作って", "上記の回答を短くして", "丁寧な返信にして。".repeat(160)]) {
+  for (const content of ["返信を丁寧に作って", "上記の回答を短くして", "丁寧な返信にして。".repeat(160),
+    "さっきの案をもっと短くして", "先ほどの返信を丁寧に", "前回の文に戻して", "以前の下書きに戻して", "この前の文章を短くして",
+    "さっきの返答を柔らかくして", "その件の続きも書いて", "前回の説明も添えて"]) {
     assert.equal(selectConversationContext(c, { includeHandledReference: true, referenceText: content }).olderRelevant.length, 0);
     const p = await harness().draftChatPrep(tenant(c), { id: c.id, messages: [{ role: "user", content }] });
     assert.doesNotMatch(p.evidence, /チケット消化/);
   }
+});
+
+test("下書き参照と具体的な過去参照が同じ指示にあっても関連履歴だけ取り出す", () => {
+  const at = Date.now();
+  const c = { handledThroughIndex: 2, msgs: [msg("them", "テスト：配送が届きません", at), msg("us", "ヤマトの追跡番号で確認できます", at + 1), msg("them", "ありがとうございます", at + TOPIC_GAP_MS + 2)] };
+  const context = selectConversationContext(c, { referenceText: "さっきの案を短くして。先ほどの追跡番号も載せて", includeHandledReference: true });
+  assert.equal(context.olderRelevant.length, 2);
+  assert.match(context.olderRelevant[1].text, /追跡番号/);
 });
 
 test("お願いで始まる新しい質問・時間の空いたお礼は古い話題の継続にしない", () => {
