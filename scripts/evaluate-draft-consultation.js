@@ -41,7 +41,7 @@ function createHarness() {
     const route = resolveAiRoute(t.config.settings, task);
     const out = await ctx.aiChatOne("gpt", sys, messages, limit, route);
     if (!out.text) throw new Error("empty model output");
-    calls.push({ task, model: route.model }); return out.text;
+    calls.push({ task, model: route.model, output: out.text }); return out.text;
   };
   vm.runInContext(section("const JP_QUALITY = ", "// 出力が途中で切れる"), ctx);
   vm.runInContext(section("function salvageDraft(", "// ===== 受付くん連携: 受信イベント転送"), ctx);
@@ -56,10 +56,13 @@ function createHarness() {
       if (stream) {
         const meta = full.match(/@@META@@(.*)$/s);
         assert.ok(meta, "stream must include meta");
-        const result = JSON.parse(meta[1]); assert.equal(result.ok, true, result.error);
+        const result = JSON.parse(meta[1]);
+        if (!result.ok) console.error(JSON.stringify({ syntheticAudit: calls.filter(c => c.task === "audit").slice(-3).map(c => c.output) }));
+        assert.equal(result.ok, true, result.error);
         const match = full.match(/@@DRAFT@@\s*([\s\S]*?)(?=\n@@(?:MEMORY|RULE|ACTION|META)@@|$)/);
         return { draft: match ? match[1].trim() : "", raw: full };
       }
+      if (!json.ok) console.error(JSON.stringify({ syntheticAudit: calls.filter(c => c.task === "audit").slice(-3).map(c => c.output) }));
       assert.equal(json.ok, true, json.error); return json;
     },
   };

@@ -205,7 +205,7 @@ test("編集チャットは関連ルールだけを選び、両APIが同じ監�
   assert.match(prep, /normalizeDraftEditHistory\(requestedEdits\)/);
   const routes = source.slice(source.indexOf('app.post("/api/draft-chat"'), source.indexOf("function staffAppointmentById", source.indexOf('app.post("/api/draft-chat"')));
   assert.match(routes, /reviewDraftChatCandidate\(t, p, out\.draft\)/);
-  assert.match(routes, /reviewDraftChatCandidate\(t, p, match\[2\]\)/);
+  assert.match(routes, /reviewDraftChatCandidate\(t, p, section \? section\.text : ""\)/);
   assert.doesNotMatch(routes, /aiChatStream\(/);
 });
 
@@ -215,6 +215,7 @@ test("相談への返事は患者向け下書きを作らず、返信だけの�
   const handlers = new Map();
   const saved = [];
   const context = {
+    ...consultation,
     app: { post: (route, ...handlersForRoute) => handlers.set(route, handlersForRoute.at(-1)) },
     guard() {}, oneMutationAtATime: () => (_req, _res, next) => next(),
     ANTHROPIC_KEY: "test", process: { env: {} },
@@ -267,6 +268,7 @@ test("照合後の完成案と矛盾するスタッフ向け説明をJSONと互�
   const handlers = new Map();
   const correct = "証明書をお送りください。条件を満たさない場合は3,300円です。";
   const context = {
+    ...consultation,
     app: { post: (route, ...args) => handlers.set(route, args.at(-1)) },
     guard() {}, oneMutationAtATime: () => (_req, _res, next) => next(),
     ANTHROPIC_KEY: "test", process: { env: {} },
