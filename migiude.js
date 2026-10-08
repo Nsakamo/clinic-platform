@@ -4187,11 +4187,14 @@ async function finalizeDraftChatEnvelope(t, full, p) {
   if ((!section || !section.text) && !p.acknowledgementOnly && !isAcknowledgementOnlyRequest(p.latestInstruction)) return source;
   const finalized = await reviewDraftChatCandidate(t, p, section ? section.text : "");
   if (finalized.error) throw new Error(finalized.error);
+  if (/@@(?:REPLY|DRAFT|MEMORY|RULE|ACTION|META)@@/.test(finalized.text)) throw new Error("invalid_edit_response");
   const tail = /^@@(?:MEMORY|RULE|ACTION|META)@@[ \t]*(?:\r?\n|$)/m.exec(source);
   const start = section ? section.start : tail ? tail.index : source.length;
   const end = section ? section.end : start;
   const prefix = source.slice(0, start).replace(/(@@REPLY@@[ \t]*\r?\n)[\s\S]*$/, "$1返信案を作成しました。下の最終案をご確認ください。この操作では患者様への送信は行っていません。\n");
-  return prefix + "\n@@DRAFT@@\n" + finalized.text + "\n" + source.slice(end);
+  const result = prefix + "\n@@DRAFT@@\n" + finalized.text + "\n" + source.slice(end);
+  if (!isValidDraftChatEnvelope(result)) throw new Error("invalid_edit_response");
+  return result;
 }
 
 // 互換API。編集指示と患者向け文体を確認した完成文だけをマーカー形式で返す。
