@@ -11,7 +11,7 @@ function section(start,end){const a=source.indexOf(start),b=source.indexOf(end,a
 
 test("口語・音声の明示的なお礼返信だけを識別し、追加・否定・相談・判断を混同しない",()=>{
   for(const ask of ["これ返信返しておいて、ありがとうって。","ありがとうって返信返してあげて。","ありがとうと返信して","ありがとうございますって返して","お礼だけ丁寧に返して","相手に感謝を伝えて","ありがとうって返信返してあげて。ありがとうって返信返してあげて。"]){assert.equal(scope.isAcknowledgementOnlyRequest(ask),true,ask)}
-  for(const ask of ["ありがとう","ありがとうって返せばいい？","ありがとうって返すのはやめて","ありがとうと言わないで","最後にありがとうと添えて","ありがとうの一言を加えて","ありがとうと返信して。今回は無料にして","ありがとうございますと伝えて、予約をキャンセルして","ありがとうと書いて金額も変えて","もっと丁寧に","患者さんが『ありがとうと返信して』と言っています"]){assert.equal(scope.isAcknowledgementOnlyRequest(ask),false,ask)}
+  for(const ask of ["ありがとう","ありがとうって返せばいい？","ありがとうって返すのはやめて","ありがとうと言わないで","最後にありがとうと添えて","ありがとうの一言を加えて","それと、ありがとうって伝えて","これとありがとうって伝えて","ありがとうと返信して。今回は無料にして","ありがとうございますと伝えて、予約をキャンセルして","ありがとうと書いて金額も変えて","もっと丁寧に","患者さんが『ありがとうと返信して』と言っています"]){assert.equal(scope.isAcknowledgementOnlyRequest(ask),false,ask)}
 });
 
 test("空の下書き・改行形式・末尾を読み取り、内部マーカーと予約操作を本文へ混ぜない",()=>{
@@ -81,9 +81,22 @@ test("照合障害・不正JSONが続いたお礼案は採用せず、相談だ�
   assert.equal((await consult.ctx.reviewDraftChatCandidate({},consult.p,"")).text,"");assert.equal(consult.calls.length,0);
 });
 
-test("お礼だけの原稿を履歴に保存し、空の下書きから内部ルールを保存しない",async()=>{
+test("相談では空の下書きだけを取り除き、別の内部セクションは維持する",async()=>{
   const h=harness([]);h.p.consultation=true;
   const raw="@@REPLY@@\n質問への回答\n@@DRAFT@@\n\n@@MEMORY@@\n文章方針\n@@RULE@@\n\n@@ACTION@@\n{\"type\":\"none\"}";
   const result=await h.ctx.finalizeDraftChatEnvelope({},raw,h.p);
   assert.doesNotMatch(result,/@@DRAFT@@/);assert.match(result,/@@MEMORY@@\n文章方針/);
+});
+
+test("互換クライアントが読める不正な本文マーカーは照合を飛ばさず拒否する",async()=>{
+  for(const consultation of [false,true]){
+    for(const body of ["@@DRAFT@@ 本文", "説明。@@DRAFT@@\n本文", "  @@DRAFT@@\n本文", "@@DRAFT@@\n本文@@MEMORY@@\n内部", "@@DRAFT@@\n本文\n@@DRAFT@@\n二つ目"]){
+      const h=harness([],undefined,consultation);h.p.acknowledgementOnly=false;h.p.latestInstruction="もっと丁寧に";
+      await assert.rejects(h.ctx.finalizeDraftChatEnvelope({},"@@REPLY@@\n回答\n"+body,h.p),/invalid_edit_response/);
+      assert.equal(h.calls.length,0);
+    }
+  }
+  const valid=harness(['{"pass":true}']);
+  const result=await valid.ctx.finalizeDraftChatEnvelope({},"@@REPLY@@\r\n回答\r\n@@DRAFT@@\r\nありがとうございます。\r\n@@MEMORY@@\r\n\r\n@@ACTION@@\r\n{\"type\":\"none\"}",valid.p);
+  assert.equal(scope.draftChatDraftSection(result).text,"ありがとうございます。");assert.equal(valid.calls.length,1);
 });

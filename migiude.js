@@ -4180,6 +4180,11 @@ app.post("/api/draft-chat", guard, oneMutationAtATime("draft-chat", req => req.b
 async function finalizeDraftChatEnvelope(t, full, p) {
   const source = String(full || "");
   const section = draftChatDraftSection(source);
+  // The compatibility client recognizes markers even in malformed layouts.
+  // Reject anything it could render as a draft that this parser cannot audit.
+  const marker = source.indexOf("@@DRAFT@@");
+  if (marker !== -1 && (!section || marker !== section.start || source.indexOf("@@DRAFT@@", marker + 9) !== -1
+      || /@@(?:REPLY|MEMORY|RULE|ACTION|META)@@/.test(section.text))) throw new Error("invalid_edit_response");
   if (p.consultation) return section ? source.slice(0, section.start) + source.slice(section.end) : source;
   if ((!section || !section.text) && !p.acknowledgementOnly && !isAcknowledgementOnlyRequest(p.latestInstruction)) return source;
   const finalized = await reviewDraftChatCandidate(t, p, section ? section.text : "");
