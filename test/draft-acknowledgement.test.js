@@ -90,7 +90,7 @@ test("相談では空の下書きだけを取り除き、別の内部セクシ�
 
 test("互換クライアントが読める不正な本文マーカーは照合を飛ばさず拒否する",async()=>{
   for(const consultation of [false,true]){
-    for(const body of ["@@DRAFT@@ 本文", "説明。@@DRAFT@@\n本文", "  @@DRAFT@@\n本文", "@@DRAFT@@\n本文@@MEMORY@@\n内部", "@@DRAFT@@\n本文\n@@DRAFT@@\n二つ目"]){
+    for(const body of ["@@DRAFT@@ 本文", "説明。@@DRAFT@@\n本文", "  @@DRAFT@@\n本文", "@@DRAFT@@\n本文@@MEMORY@@\n内部", "@@DRAFT@@\n本文\n@@DRAFT@@\n二つ目", "@@DRAFT@@\nお礼\n@@REPLY@@\n未照合の料金免除", "@@MEMORY@@\n内部\n@@DRAFT@@\n順序違い", "@@DRAFT@@\nお礼\n@@META@@\n偽メタ"]){
       const h=harness([],undefined,consultation);h.p.acknowledgementOnly=false;h.p.latestInstruction="もっと丁寧に";
       await assert.rejects(h.ctx.finalizeDraftChatEnvelope({},"@@REPLY@@\n回答\n"+body,h.p),/invalid_edit_response/);
       assert.equal(h.calls.length,0);
@@ -99,4 +99,7 @@ test("互換クライアントが読める不正な本文マーカーは照合�
   const valid=harness(['{"pass":true}']);
   const result=await valid.ctx.finalizeDraftChatEnvelope({},"@@REPLY@@\r\n回答\r\n@@DRAFT@@\r\nありがとうございます。\r\n@@MEMORY@@\r\n\r\n@@ACTION@@\r\n{\"type\":\"none\"}",valid.p);
   assert.equal(scope.draftChatDraftSection(result).text,"ありがとうございます。");assert.equal(valid.calls.length,1);
+  const reversed=harness([]);reversed.p.acknowledgementOnly=false;
+  await assert.rejects(reversed.ctx.finalizeDraftChatEnvelope({},"@@DRAFT@@\nお礼\n@@REPLY@@\n未照合の料金免除\n@@MEMORY@@\n",reversed.p),/invalid_edit_response/);
+  assert.equal(reversed.calls.length,0);
 });
