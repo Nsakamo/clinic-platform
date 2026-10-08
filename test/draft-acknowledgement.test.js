@@ -32,6 +32,11 @@ test("お礼の返信範囲は文体だけの後続編集に引き継ぎ、別�
   assert.equal(scope.acknowledgementDraftScope([{role:"user",content:"予約日時を案内して"},{role:"user",content:"もっと丁寧に"}]),false);
 });
 
+test("この文へお礼を書く追加指示を、相手へのお礼返信と区別する",()=>{
+  for(const ask of ["これにお礼を書いて","これにありがとうって書いて","それにありがとうって伝えて"]){assert.equal(scope.isAcknowledgementOnlyRequest(ask),false,ask)}
+  assert.equal(scope.isAcknowledgementOnlyRequest("これにありがとうと返信して"),true);
+});
+
 function harness(outputs,rawResponse,consultation=false){
   const routes=new Map(),calls=[],saved=[];
   const p={c:{channel:"line"},latestInstruction:"これ返信返しておいて、ありがとうって。",previousDraft:"通常は3,300円です。",lastQ:"テスト：証明書を送ります。免除できますか？",staffHistory:"スタッフの指示：お礼だけに作り直して",acknowledgementOnly:true,consultation,base:"",edits:[],engLabel:"テスト",topicTs:1,baCtx:{ok:true,verified:true,appointments:[{id:"test-appointment",changeable:true}]}};
