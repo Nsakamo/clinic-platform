@@ -19,7 +19,7 @@ const { lineWebhookEventId, lineWebhookRetryDelay, isProcessableLineEvent } = re
 const { normalizeAiRoutes, resolveAiRoute, publicModelCatalog } = require("./lib/ai-model-router");
 const { contextualLearningFallback, formatLearningProposal } = require("./lib/learning-context");
 const { selectConversationContext, preserveTopicBoundary } = require("./lib/conversation-context");
-const { STAFF_DRAFT_POLICY, formatDraftContext, staffConsultationTranscript, isAcknowledgementOnlyRequest, acknowledgementDraftScope, ACKNOWLEDGEMENT_DRAFT_POLICY, draftChatDraftSection } = require("./lib/draft-consultation");
+const { STAFF_DRAFT_POLICY, formatDraftContext, staffConsultationTranscript, isAcknowledgementOnlyRequest, acknowledgementDraftScope, ACKNOWLEDGEMENT_DRAFT_POLICY, draftChatDraftSection, isValidDraftChatEnvelope } = require("./lib/draft-consultation");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("./lib/draft-edit");
 const { REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview, inboundMessageTimes } = require("./lib/reply-decision");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
@@ -4179,12 +4179,10 @@ app.post("/api/draft-chat", guard, oneMutationAtATime("draft-chat", req => req.b
 
 async function finalizeDraftChatEnvelope(t, full, p) {
   const source = String(full || "");
-  const section = draftChatDraftSection(source);
   // The compatibility client recognizes markers even in malformed layouts.
-  // Reject anything it could render as a draft that this parser cannot audit.
-  const marker = source.indexOf("@@DRAFT@@");
-  if (marker !== -1 && (!section || marker !== section.start || source.indexOf("@@DRAFT@@", marker + 9) !== -1
-      || /@@(?:REPLY|MEMORY|RULE|ACTION|META)@@/.test(section.text))) throw new Error("invalid_edit_response");
+  // Reject duplicate, inline or reordered controls before either side parses.
+  if (!isValidDraftChatEnvelope(source)) throw new Error("invalid_edit_response");
+  const section = draftChatDraftSection(source);
   if (p.consultation) return section ? source.slice(0, section.start) + source.slice(section.end) : source;
   if ((!section || !section.text) && !p.acknowledgementOnly && !isAcknowledgementOnlyRequest(p.latestInstruction)) return source;
   const finalized = await reviewDraftChatCandidate(t, p, section ? section.text : "");
