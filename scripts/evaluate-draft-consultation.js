@@ -59,8 +59,8 @@ function createHarness() {
         const result = JSON.parse(meta[1]);
         if (!result.ok) console.error(JSON.stringify({ syntheticAudit: calls.filter(c => c.task === "audit").slice(-3).map(c => c.output) }));
         assert.equal(result.ok, true, result.error);
-        const match = full.match(/@@DRAFT@@\s*([\s\S]*?)(?=\n@@(?:MEMORY|RULE|ACTION|META)@@|$)/);
-        return { draft: match ? match[1].trim() : "", raw: full };
+        const draft = consultation.draftChatDraftSection(full);
+        return { draft: draft ? draft.text : "", raw: full };
       }
       if (!json.ok) console.error(JSON.stringify({ syntheticAudit: calls.filter(c => c.task === "audit").slice(-3).map(c => c.output) }));
       assert.equal(json.ok, true, json.error); return json;

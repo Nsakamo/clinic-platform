@@ -103,3 +103,11 @@ test("互換クライアントが読める不正な本文マーカーは照合�
   await assert.rejects(reversed.ctx.finalizeDraftChatEnvelope({},"@@DRAFT@@\nお礼\n@@REPLY@@\n未照合の料金免除\n@@MEMORY@@\n",reversed.p),/invalid_edit_response/);
   assert.equal(reversed.calls.length,0);
 });
+
+test("修復AIが返した本文の内部マーカーも表示と履歴保存の前に拒否する",async()=>{
+  for(const marker of ["REPLY","DRAFT","MEMORY","RULE","ACTION","META"]){
+    const h=harness(["ありがとうございます。\n@@"+marker+"@@\n内部情報",'{"pass":true}']);
+    await assert.rejects(h.ctx.finalizeDraftChatEnvelope({},"@@REPLY@@\n作成します\n@@DRAFT@@\n\n",h.p),/invalid_edit_response/);
+    assert.equal(h.calls.length,2);assert.equal(h.saved.length,0);
+  }
+});
