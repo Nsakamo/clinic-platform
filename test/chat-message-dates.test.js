@@ -25,6 +25,7 @@ function browser(now = "2026-10-11T00:00:00+09:00", element = null) {
 }
 
 test("テスト：当日は日本時間の時刻のみ、前日・同年・前年は年月日と時刻", () => {
+  if (process.env.CHAT_DATES_CHILD === "1") assert.equal(Intl.DateTimeFormat().resolvedOptions().timeZone, "America/Los_Angeles");
   const { context: c } = browser();
   assert.equal(c.messageTimeLabel({ sentAt: Date.parse("2026-10-10T15:00:00Z"), time: "15:00" }), "00:00");
   assert.equal(c.messageTimeLabel({ sentAt: Date.parse("2026-10-10T14:59:00Z") }), "2026年10月10日 23:59");
@@ -102,8 +103,13 @@ test("テスト：会話を開く際に日本時間の日付を記録する", ()
 });
 
 test("テスト：海外タイムゾーンで同じ日本時間の判定と表示になる", { skip: process.env.CHAT_DATES_CHILD === "1" }, () => {
-  const result = spawnSync(process.execPath, ["--test", __filename], { env: { ...process.env, TZ: "America/Los_Angeles", CHAT_DATES_CHILD: "1" }, encoding: "utf8" });
+  const env = { ...process.env, TZ: "America/Los_Angeles", CHAT_DATES_CHILD: "1" };
+  // node:test's parent marker otherwise makes the nested runner silently execute zero tests.
+  delete env.NODE_TEST_CONTEXT;
+  const result = spawnSync(process.execPath, ["--test", __filename], { env, encoding: "utf8" });
   assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /\btests 8\b/);
+  assert.match(result.stdout, /\bpass 7\b/);
 });
 
 test("テスト：受信と送信の保存経路はメッセージにmillisecond日時を記録する", () => {
