@@ -6345,16 +6345,17 @@ function mediaHtml(m){ var cls='b '+(m.from==="them"?"them":"us"); var raw=m.med
 const messageDateFormatter=new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Tokyo",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hourCycle:"h23"});
 function messageDateParts(timestamp){const parts={};messageDateFormatter.formatToParts(new Date(timestamp)).forEach(p=>{parts[p.type]=p.value;});return parts;}
 function messageDayKey(timestamp){const p=messageDateParts(timestamp===undefined?Date.now():timestamp);return p.year+"-"+p.month+"-"+p.day;}
-function messageTimeLabel(message,now){
+function messageTimeLabel(message,now,today){
   for(const field of ["sentAt","at","receivedAt","createdAt","ts"]){
     const raw=message[field];if((typeof raw!=="number"&&typeof raw!=="string")||(typeof raw==="string"&&!raw.trim()))continue;
-    const timestamp=Number(raw);if(!Number.isFinite(timestamp)||timestamp<=0||!Number.isFinite(new Date(timestamp).getTime()))continue;
+    // 保存日時はepoch milliseconds。秒単位の誤った値を1970年として表示しない。
+    const timestamp=Number(raw);if(!Number.isFinite(timestamp)||timestamp<946684800000||!Number.isFinite(new Date(timestamp).getTime()))continue;
     const p=messageDateParts(timestamp),time=p.hour+":"+p.minute;
-    return messageDayKey(timestamp)===messageDayKey(now)?time:p.year+"年"+Number(p.month)+"月"+Number(p.day)+"日 "+time;
+    return p.year+"-"+p.month+"-"+p.day===(today===undefined?messageDayKey(now):today)?time:p.year+"年"+Number(p.month)+"月"+Number(p.day)+"日 "+time;
   }
   return message.time?String(message.time)+"（日付不明）":"日時不明";
 }
-function bubblesHtml(r){const now=Date.now();return r.msgs.map(m=>{const body=m.media?mediaHtml(m):('<div class="b '+(m.from==="them"?"them":"us")+'">'+esc(m.text)+'</div>');const tl=esc(messageTimeLabel(m,now))+(m.auto?' <span style="color:#7c3aed;">🤖 自動返信</span>':"")+(m.scheduled?' <span style="color:#1d4ed8;">🕒 予約送信</span>':"");return body+'<div class="btime" style="align-self:'+(m.from==="them"?"flex-start":"flex-end")+'">'+tl+'</div>';}).join("");}
+function bubblesHtml(r){const now=Date.now(),today=messageDayKey(now);return r.msgs.map(m=>{const body=m.media?mediaHtml(m):('<div class="b '+(m.from==="them"?"them":"us")+'">'+esc(m.text)+'</div>');const tl=esc(messageTimeLabel(m,now,today))+(m.auto?' <span style="color:#7c3aed;">🤖 自動返信</span>':"")+(m.scheduled?' <span style="color:#1d4ed8;">🕒 予約送信</span>':"");return body+'<div class="btime" style="align-self:'+(m.from==="them"?"flex-start":"flex-end")+'">'+tl+'</div>';}).join("");}
 function groundingText(r){if(!(r&&r.grounding))return "";const g=r.grounding,v=r.validation||{};if(g.autoSendAllowed&&v.pass)return "✓ 送信前の根拠監査済み"+(g.sources&&g.sources.length?"（"+g.sources.join("・")+"）":"");const reasons=Array.isArray(g.reasons)?g.reasons:[];return "⚠ スタッフ確認が必要"+(reasons.length?"："+reasons.join("／"):(v.reason?"："+v.reason:""));}
 function renderGrounding(r){const el=document.getElementById("groundingUsed");if(!el)return;const text=groundingText(r);el.textContent=text;el.style.display=text?"block":"none";el.style.color=(r&&r.grounding&&r.grounding.autoSendAllowed&&r.validation&&r.validation.pass)?"#047857":"#b45309";}
 let draftEditTimer=null;
