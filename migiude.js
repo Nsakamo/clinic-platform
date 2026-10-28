@@ -12,7 +12,7 @@ const crypto = require("crypto");
 const { AsyncLocalStorage } = require("async_hooks");
 const { intentTokens, rankLearningExamples, sameLearningExample } = require("./lib/learning-retrieval");
 const { evaluateResponseGrounding } = require("./lib/response-grounding");
-const { PATIENT_COURTESY, applyCourtesyGate, hasConversationalTone, normalizeReplyTone, replyToneInstruction, staffRequestsConversationalTone, toneRewriteInstruction } = require("./lib/reply-tone");
+const { PATIENT_COURTESY, applyCourtesyGate, hasConversationalTone, normalizeReplyTone, replyToneInstruction, staffAllowsConversationalTone, staffRequestsConversationalTone, toneRewriteInstruction } = require("./lib/reply-tone");
 const { STYLE_LESSON_SYSTEM, acceptableStyleLesson, mergeStyleLessons, parseStyleLessonResponse, styleEditWorthLearning, styleLessonActive, styleLessonList, styleLessonUserPrompt, styleLessonsPromptBlock } = require("./lib/style-learning");
 const { compareConversations, compareConversationsRecent } = require("./lib/conversation-order");
 const { MAX_ATTACHMENTS, normalizeFileIds, normalizeScheduledMessageInput, pruneScheduledMessages } = require("./lib/scheduled-message");
@@ -1313,13 +1313,19 @@ async function proposeConflictResolution(t, item, instruction) {
 }
 // AI下書きとスタッフが実際に送った文の差から、書き方の直し方だけを学ぶ。
 // 失敗しても判断メモリの学習結果には影響させない（文体は学ばないだけ）。
-async function learnStyleFromStaffEdit(t, input) {
-  const empty = { added: [], reinforced: [] };
-  if (!input || !styleEditWorthLearning(input.draft0, input.final)) return empty;
-  const raw = await aiChat(t, STYLE_LESSON_SYSTEM, [{ role: "user", content: styleLessonUserPrompt(input) }], 500, "learning");
-  const sources = [input.q, input.final, input.draft0, input.instr];
-  const lessons = parseStyleLessonResponse(raw).map(text => acceptableStyleLesson(text, sources)).filter(Boolean);
-  if (!lessons.length) return empty;
+// 抽出だけを行い、保存（merge）はジョブの状態を確かめた最後に呼び出し側で行う。
+// スタッフが口調を指定して作った文や、口語のまま送った文は、自動送信の礼儀ゲートを学習経由で迂回させないため対象外。
+async function extractStyleLessonsFromStaffEdit(t, input) {
+  if (!input || !styleEditWorthLearning(input.draft0, input.final)) return [];
+  const staffTurns = [input.instr].concat(sanitizeLearningChat(input.learningChat).filter(m => m.role === "user").map(m => m.content));
+  if (staffTurns.some(staffRequestsConversationalTone) || hasConversationalTone(input.final)) return [];
+  const existing = styleLessonList(t.config);
+  const raw = await aiChat(t, STYLE_LESSON_SYSTEM, [{ role: "user", content: styleLessonUserPrompt(input, existing) }], 500, "learning");
+  const sources = [input.q, input.final, input.draft0, input.instr].concat(Array.isArray(input.names) ? input.names : []);
+  return parseStyleLessonResponse(raw).map(text => acceptableStyleLesson(text, sources)).filter(Boolean);
+}
+function saveStyleLessons(t, lessons) {
+  if (!Array.isArray(lessons) || !lessons.length) return { added: [], reinforced: [] };
   return mergeStyleLessons(t.config, lessons, Date.now(), () => "sl-" + Date.now().toString(36) + "-" + crypto.randomBytes(3).toString("hex"));
 }
 const runningLearningJobs = new Set();
@@ -1334,15 +1340,12 @@ async function processLearningJob(t, jobId) {
     if (!ex) throw new Error("example_not_found");
     const proposed = await proposeContextualLearning(t, p), proposal = proposed.text;
     if (job.status !== "processing") return;
-    let styleResult = { added: [], reinforced: [] };
+    let styleLessons = [];
     if (p.changed) {
-      try { styleResult = await learnStyleFromStaffEdit(t, { q: p.q, draft0: p.draft0, final: p.final, instr: p.instr, channel: p.channel }); }
+      try { styleLessons = await extractStyleLessonsFromStaffEdit(t, { q: p.q, draft0: p.draft0, final: p.final, instr: p.instr, learningChat: p.learningChat, channel: p.channel, names: p.names }); }
       catch (e) { console.error("style learning:", String(e && e.message || e).slice(0, 80)); }
       if (job.status !== "processing") return;
     }
-    const styleNote = styleResult.reinforced.some(styleLessonActive)
-      ? "書き方の直しも、同じ直しが重なったため次の下書きから反映します"
-      : (styleResult.added.length || styleResult.reinforced.length ? "書き方の直しは候補として記録しました（同じ直しがもう一度あれば反映します）" : "");
     const review = Object.assign({}, job.learningReview || {}, { text: proposal });
     const exampleConflict = p.changed ? await checkConflict(t, p.q, p.final, ex.id) : null;
     if (job.status !== "processing") return;
@@ -1352,6 +1355,13 @@ async function processLearningJob(t, jobId) {
     }) : null;
     if (!conflict) conflict = await checkFormalRuleConflict(t, p.q, proposal, ex.id, p.source);
     try { await recordLearningPerformance(t, p.q, !!p.changed, !!conflict); } catch (e) { console.error("learning performance:", e && e.message); }
+    // 以降は同期処理だけ。ここでまだ処理中（スタッフが「学習しない」を選んでいない）場合に限り文体の学びを保存する。
+    if (job.status !== "processing") return;
+    let styleResult = { added: [], reinforced: [] };
+    try { styleResult = saveStyleLessons(t, styleLessons); } catch (e) { console.error("style learning save:", String(e && e.message || e).slice(0, 80)); }
+    const styleNote = styleResult.reinforced.some(styleLessonActive)
+      ? "書き方の直しも、同じ直しが重なったため次の下書きから反映します"
+      : (styleResult.added.length || styleResult.reinforced.length ? "書き方の直しは候補として記録しました（同じ直しがもう一度あれば反映します）" : "");
     if (conflict) {
       job.status = "ready"; job.resultType = "conflict"; job.learningReview = null;
       job.conflict = publicLearningConflict(conflict); job.outcome = null;
@@ -1399,7 +1409,7 @@ async function queueStaffLearning(t, c, opts) {
   const now = Date.now(), job = {
     id: "lj-" + now.toString(36) + "-" + crypto.randomBytes(3).toString("hex"), conversationId: String(c && c.id || ""),
     exampleId: ex.id, reused: !!ex.reused, status: "processing", resultType: "", createdAt: now, updatedAt: now, learningReview: review, conflict: null, outcome: null,
-    payload: { q, final, draft0, instr, learningChat, reviewText: opts.reviewText, source: opts.source || "web", channel: c && c.channel === "mail" ? "mail" : "line", changed: final !== draft0 || !!instr },
+    payload: { q, final, draft0, instr, learningChat, reviewText: opts.reviewText, source: opts.source || "web", channel: c && c.channel === "mail" ? "mail" : "line", names: [c && c.name, c && c.verifiedPatientName].filter(Boolean).map(name => String(name).slice(0, 60)), changed: final !== draft0 || !!instr },
   };
   learningJobs(t).push(job);
   while (t.config.learningJobs.length > 80) {
@@ -1434,7 +1444,7 @@ async function prepareStaffLearningConsent(t, c, opts) {
     id: "lc-" + now.toString(36) + "-" + crypto.randomBytes(3).toString("hex"), conversationId: String(c && c.id || ""),
     exampleId: 0, reused: false, status: "awaiting_consent", resultType: "", createdAt: now, updatedAt: now,
     expiresAt: now + LEARNING_CONSENT_TTL_MS, promptMs: LEARNING_PROMPT_MS, learningReview: review, conflict: null, outcome: null,
-    payload: { q, final, draft0, instr, learningChat, reviewText: opts.reviewText, source: opts.source || "web", channel: c && c.channel === "mail" ? "mail" : "line", changed: final !== draft0 || !!instr },
+    payload: { q, final, draft0, instr, learningChat, reviewText: opts.reviewText, source: opts.source || "web", channel: c && c.channel === "mail" ? "mail" : "line", names: [c && c.name, c && c.verifiedPatientName].filter(Boolean).map(name => String(name).slice(0, 60)), changed: final !== draft0 || !!instr },
   };
   jobs.push(job);
   await saveTenantConfig(t);
@@ -4034,7 +4044,7 @@ async function draftChatPrep(t, body) {
   const lastQ = context.current.filter(m => m.from === "them").slice(-1).map(m => m.text || "").join("");
   const priorInstructions = requestedEdits.filter(m => m.role === "user").slice(0, -1).map(m => m.content).join(" ");
   // スタッフが今回の相談で口調・言い回しを明示した場合は、患者向け文体の既定よりスタッフの指示を優先する。
-  const allowConversational = requestedEdits.filter(m => m.role === "user").some(m => staffRequestsConversationalTone(m.content));
+  const allowConversational = staffAllowsConversationalTone(requestedEdits.filter(m => m.role === "user").map(m => m.content));
   const latestStaffInput = requestedEdits.slice().reverse().find(e => e.role === "user");
   const voiceInputNote = latestStaffInput && latestStaffInput.inputMode === "voice"
     ? "\n\n【音声入力されたスタッフ指示】最新のスタッフ指示は音声認識から変換された文章です。誤字、同音異義語、助詞抜け、途中の言い直しがあっても、お客様との会話、現在の下書き、店舗ルール、院内用語から意図を復元し、明らかな変換ミスをスタッフに直させず反映する。意味不明な語をそのまま患者向け下書きへ転記しない。ただし患者名、医院、予約日時、金額、回数、予約の変更・取消など重要情報に複数の解釈が残る場合は推測せず、replyで短く確認し、actionはnone、下書きは変更しない。"
@@ -4062,7 +4072,9 @@ async function draftChatPrep(t, body) {
     + (notesBlock(c) ? "\n\n【このお客様への対応でスタッフが以前出した指示メモ（引き続き守る）】\n" + notesBlock(c) : "")
     + staffBookingPrompt(baCtx)
     + "\n\n" + JP_QUALITY
-    + "\n\n【スタッフ指示の優先】スタッフがこの相談で明示した文体・口調・言い回しの指示は、上の患者向け文体の既定、店舗トーン、学んだ文体より優先して反映する。ただし事実・料金・可否・医療判断・本人確認・個人情報の制約は変えない。"
+    + "\n\n【スタッフ指示の優先】スタッフがこの相談で明示した文体・言い回しの指示は、店舗トーンと学んだ文体より優先して反映する。"
+    + (allowConversational ? "スタッフが親しみのある口調を明示しているため、その口調は患者向け文体の既定より優先する。" : "患者様への礼儀（馴れ馴れしい相づちを使わない等）は保つ。")
+    + "事実・料金・可否・医療判断・本人確認・個人情報の制約は変えない。"
     + "\n\nスタッフの指示がどんなに短くても（「あってる」「もっと短く」「優しく」等）、お客様との会話の文脈に当てはめて意味を解釈すること。"
     + voiceInputNote
     + "\n\n【会話の仕方】ChatGPTのような自然な会話相手として振る舞う。スタッフが指示ではなく質問・相談をしてきた場合（例:「キャンセル料っていくらだっけ？」「どっちの言い方がいいと思う？」）は、店舗ルールと会話文脈を踏まえて返事で普通に答え、下書きは変えなくてよい。指示が曖昧なら、解釈した上で作りつつ、返事で一言確認する。"
@@ -5525,6 +5537,12 @@ app.get("/signup", (req, res) => res.redirect("/")); // 申込みは営業契約
 app.get("/board", (req, res) => { res.set("Content-Type", "text/html; charset=utf-8"); res.set("Cache-Control", "no-store"); res.send(pageWithEnvironmentBanner(req, tenantFromReq(req) ? BOARD_PAGE : emailLoginPage(LOGIN_PAGE, requestPublicBase(req)))); });
 if (process.env.NODE_ENV === "test") {
   app.get("/__test/async-error", async () => { throw new Error("private-test-stack-marker"); });
+  // テスト専用（NODE_ENV=test のときだけ存在）: ログイン中の法人に文体の学びを入れて、法人分離を実HTTPで確かめる。
+  app.post("/__test/style-lessons", guard, async (req, res) => {
+    const result = saveStyleLessons(req.tenant, Array.isArray(req.body.lessons) ? req.body.lessons : []);
+    await saveTenantConfig(req.tenant);
+    res.json({ ok: true, ids: result.added.concat(result.reinforced).map(item => item.id) });
+  });
 }
 app.use((err, req, res, next) => {
   console.error("request failed:", req.method, req.path, err && err.message ? err.message : "unknown");

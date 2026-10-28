@@ -61,6 +61,33 @@ test("文体の学習の取得・更新・削除はログイン中の法人の�
     assert.equal(missing.response.status, 404);
     const missingDelete = await json("/api/style-lesson-delete", { method: "POST", headers, body: JSON.stringify({ id: "sl-none" }) });
     assert.equal(missingDelete.response.status, 404);
+    // 2つ目の法人を作り、A の学びを B から変更・削除できないことを確かめる。
+    const createdB = await json("/api/partner/tenants", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-partner-key": PARTNER_KEY },
+      body: JSON.stringify({ slug: "style-test-b", name: "テスト院B", accountEmail: "style-test-b@example.test", password: "password-T-123" }),
+    });
+    assert.equal(createdB.response.status, 201);
+    const loggedInB = await json("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ loginId: "style-test-b", password: "password-T-123" }) });
+    const headersB = Object.assign({}, headers, { Cookie: String(loggedInB.response.headers.get("set-cookie") || "").split(";")[0] });
+    const seeded = await json("/__test/style-lessons", { method: "POST", headers, body: JSON.stringify({ lessons: ["箇条書きを使わない"] }) });
+    assert.equal(seeded.response.status, 200);
+    const lessonId = seeded.body.ids[0];
+    assert.ok(lessonId);
+    assert.equal((await json("/api/style-lesson-update", { method: "POST", headers: headersB, body: JSON.stringify({ id: lessonId, disabled: true }) })).response.status, 404);
+    assert.equal((await json("/api/style-lesson-delete", { method: "POST", headers: headersB, body: JSON.stringify({ id: lessonId }) })).response.status, 404);
+    assert.deepEqual((await json("/api/learning-data", { headers: { Cookie: headersB.Cookie } })).body.styles, []);
+    const stillA = (await json("/api/learning-data", { headers: { Cookie: cookie } })).body.styles;
+    assert.equal(stillA.length, 1);
+    assert.equal(stillA[0].disabled, false);
+    // 画面での文言修正にも同じ安全フィルタがかかる。
+    const rejected = await json("/api/style-lesson-update", { method: "POST", headers, body: JSON.stringify({ id: lessonId, text: "冒頭は「山田様」と書く" }) });
+    assert.equal(rejected.response.status, 400);
+    assert.equal(rejected.body.error, "style_text_rejected");
+    const confirmed = await json("/api/style-lesson-update", { method: "POST", headers, body: JSON.stringify({ id: lessonId, confirm: true }) });
+    assert.equal(confirmed.body.style.active, true);
+    assert.equal((await json("/api/style-lesson-delete", { method: "POST", headers, body: JSON.stringify({ id: lessonId }) })).response.status, 200);
+    assert.deepEqual((await json("/api/learning-data", { headers: { Cookie: cookie } })).body.styles, []);
     const foreignOrigin = await json("/api/style-lesson-delete", { method: "POST", headers: Object.assign({}, headers, { Origin: "https://evil.example" }), body: JSON.stringify({ id: "sl-none" }) });
     assert.equal(foreignOrigin.response.status, 403);
   } finally {

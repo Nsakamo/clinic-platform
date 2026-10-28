@@ -370,7 +370,9 @@ test("スタッフが口調を明示した編集は、患者向け文体の既�
 
 test("編集準備はスタッフ自身の指示に口調の明示がある時だけ優先フラグを立てる", () => {
   const prep = source.slice(source.indexOf("async function draftChatPrep(t, body)"), source.indexOf('app.get("/api/draft-chat-history"'));
-  assert.match(prep, /const allowConversational = requestedEdits\.filter\(m => m\.role === "user"\)\.some\(m => staffRequestsConversationalTone\(m\.content\)\)/);
+  assert.match(prep, /const allowConversational = staffAllowsConversationalTone\(requestedEdits\.filter\(m => m\.role === "user"\)\.map\(m => m\.content\)\)/);
   assert.match(prep, /【スタッフ指示の優先】/);
+  assert.match(prep, /allowConversational \? "スタッフが親しみのある口調を明示しているため/);
+  assert.match(prep, /患者様への礼儀（馴れ馴れしい相づちを使わない等）は保つ/);
   assert.match(prep, /allowConversational, consultation:/);
 });
