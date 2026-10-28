@@ -58,7 +58,7 @@ function qualityFunctions(aiReply, tone = "") {
   assert.ok(start > 0 && end > start);
   return vm.runInNewContext(source.slice(start, end) + "\n({finalizeGeneratedDraft,validateDraftAgainstEvidence})", {
     S: () => ({ tone }), aiChat: async () => aiReply,
-    PATIENT_COURTESY, hasConversationalTone, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction,
+    PATIENT_COURTESY, hasConversationalTone, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction, styleLessonsBlock: () => "",
   });
 }
 
@@ -135,7 +135,7 @@ test("予約照会を並行実行しても本人未確認時の予約情報をAI
     S: () => ({ tone: "", prefs: [] }), activeConversationMessages: c => c.msgs,
     rulesRankedWithScores: () => [], rulesBlock: () => "", ruleBudget: () => 0,
     examplesRanked: () => [], trustedLearningPrecedent: () => false,
-    prefsBlock: () => "", notesBlock: () => "", baEnabled: () => true,
+    prefsBlock: () => "", notesBlock: () => "", styleLessonsBlock: () => "", baEnabled: () => true,
     staffLineReviewAll: () => false, PARTNER_KEY: "test-only",
     fetchBooking: () => { bookingStarted = true; return booking; },
     baCall: () => { contextStarted = true; return context; },
@@ -187,7 +187,7 @@ test("初回生成から自動送信判定まで口語のままなら送信候�
   const functions = vm.runInNewContext(source.slice(qualityStart, qualityEnd) + source.slice(draftStart, draftEnd) + "\n({genDraft})", {
     REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview,
     PATIENT_COURTESY, JP_QUALITY: PATIENT_COURTESY,
-    hasConversationalTone, applyCourtesyGate, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction,
+    hasConversationalTone, applyCourtesyGate, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction, styleLessonsBlock: () => "",
     S: () => ({ tone: "", prefs: [] }), activeConversationMessages: c => c.msgs,
     rulesRankedWithScores: () => [], rulesBlock: () => "", ruleBudget: () => 0,
     examplesRanked: () => [], trustedLearningPrecedent: () => false,
@@ -224,7 +224,7 @@ test("トーン設定は上限を超えてプロンプトへ入れない", () =>
 test("下書き・作り直し・送信前監査が共通のトーン指示と最終確認を使う", () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
   assert.ok((source.match(/replyToneInstruction\(S\(t\)\.tone/g) || []).length >= 7);
-  assert.match(source, /toneRewriteInstruction\(tone, channel\)/);
+  assert.match(source, /toneRewriteInstruction\(tone, channel(?:, \{ includeCourtesy: false \})?\)/);
   assert.match(source, /finalizeDraftChatEnvelope/);
   assert.match(source, /const JP_QUALITY = .*PATIENT_COURTESY/);
   assert.match(source, /applyCourtesyGate\(out, finalized\.issues\)/);

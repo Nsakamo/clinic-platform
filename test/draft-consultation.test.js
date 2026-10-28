@@ -16,7 +16,7 @@ function harness(responses = []) {
     S: t => t.config.settings,
     rulesRankedWithScores: (_t, query) => { queries.push(query); return [{ n: 1, r: { content: "通常の当日キャンセル料は3,300円です。" } }]; },
     rulesBlock: rel => rel.map(r => r.content).join("\n"),
-    notesBlock: () => "", prefsBlock: () => "", replyToneInstruction: () => "",
+    notesBlock: () => "", prefsBlock: () => "", replyToneInstruction: () => "", styleLessonsBlock: () => "", staffRequestsConversationalTone: () => false,
     baEnabled: () => false, PARTNER_KEY: "", staffBookingPrompt: () => "", ANTHROPIC_KEY: "", process: { env: {} }, JP_QUALITY: "", PATIENT_COURTESY: "丁寧に",
     hasConversationalTone: () => false, finalizeGeneratedDraft: async (_t, text) => ({ text }),
     aiChat: async (_t, sys, messages, limit, task) => { calls.push({ sys, messages, limit, task }); return responses.shift(); },

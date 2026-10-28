@@ -337,3 +337,40 @@ test("編集履歴は患者の新着後に旧話題へ上書きせず、同じ�
   assert.equal(await context.saveDraftChatSession(t, { c, topicTs: 100 }, body, "古い案", "draft"), false);
   assert.equal(saves, 1);
 });
+
+test("スタッフが口調を明示した編集は、患者向け文体の既定より指示を優先して採用する", async () => {
+  const { hasConversationalTone } = require("../lib/reply-tone");
+  const casual = "ホワイトニング、気になりますよね。当日の状態を拝見してご案内いたします。";
+  function casualReviewer(replies) {
+    const calls = [], finalizeOptions = [];
+    const context = {
+      ...consultation,
+      finalizeGeneratedDraft: async (_t, text, _channel, options) => { finalizeOptions.push(options || {}); return { text }; },
+      aiChat: async (_t, sys, messages, _limit, task) => { calls.push({ sys, messages, task }); return replies.shift(); },
+      explicitEditMismatch, hasConversationalTone,
+      PATIENT_COURTESY: "患者様に礼儀正しく返信する。", REPLY_DECISION,
+    };
+    vm.runInNewContext(source.slice(start, end), context);
+    return { review: context.reviewDraftChatCandidate, calls, finalizeOptions };
+  }
+  const base = { c: { channel: "line" }, latestInstruction: "「気になりますよね」って入れて", previousDraft: "当日の状態を拝見してご案内いたします。", lastQ: "ホワイトニングできますか" };
+  const allowed = casualReviewer(['{"pass":true,"reason":"指示を反映"}']);
+  const ok = await allowed.review({}, Object.assign({}, base, { allowConversational: true }), casual);
+  assert.equal(ok.text, casual);
+  assert.equal(ok.error, "");
+  assert.equal(allowed.finalizeOptions[0].allowConversational, true);
+  assert.match(allowed.calls[0].sys, /その口調や言い回し自体は不合格の理由にしない/);
+  // 明示がない編集では、従来どおり口語の下書きを採用しない。
+  const blocked = casualReviewer(['{"pass":true,"reason":"問題なし"}', casual, '{"pass":true}', casual, '{"pass":true}']);
+  const ng = await blocked.review({}, Object.assign({}, base, { latestInstruction: "短くして" }), casual);
+  assert.equal(ng.text, "");
+  assert.match(ng.error, /編集指示を正確に反映できませんでした/);
+  assert.equal(blocked.finalizeOptions[0].allowConversational, false);
+});
+
+test("編集準備はスタッフ自身の指示に口調の明示がある時だけ優先フラグを立てる", () => {
+  const prep = source.slice(source.indexOf("async function draftChatPrep(t, body)"), source.indexOf('app.get("/api/draft-chat-history"'));
+  assert.match(prep, /const allowConversational = requestedEdits\.filter\(m => m\.role === "user"\)\.some\(m => staffRequestsConversationalTone\(m\.content\)\)/);
+  assert.match(prep, /【スタッフ指示の優先】/);
+  assert.match(prep, /allowConversational, consultation:/);
+});
