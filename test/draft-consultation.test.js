@@ -9,18 +9,19 @@ const edit = require("../lib/draft-edit");
 const { selectConversationContext, TOPIC_GAP_MS } = require("../lib/conversation-context");
 const source = fs.readFileSync(require.resolve("../migiude.js"), "utf8");
 function section(start, end) { return source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start))); }
-function harness(responses = []) {
+function harness(responses = [], overrides = {}) {
   const calls = [], queries = [];
   const ctx = {
     ...consultation, ...decision, ...edit, selectConversationContext,
     S: t => t.config.settings,
     rulesRankedWithScores: (_t, query) => { queries.push(query); return [{ n: 1, r: { content: "通常の当日キャンセル料は3,300円です。" } }]; },
     rulesBlock: rel => rel.map(r => r.content).join("\n"),
-    notesBlock: () => "", prefsBlock: () => "", replyToneInstruction: () => "",
+    notesBlock: () => "", prefsBlock: () => "", replyToneInstruction: () => "", styleLessonsBlock: () => "", staffRequestsConversationalTone: () => false, staffAllowsConversationalTone: () => false,
     baEnabled: () => false, PARTNER_KEY: "", staffBookingPrompt: () => "", ANTHROPIC_KEY: "", process: { env: {} }, JP_QUALITY: "", PATIENT_COURTESY: "丁寧に",
     hasConversationalTone: () => false, finalizeGeneratedDraft: async (_t, text) => ({ text }),
     aiChat: async (_t, sys, messages, limit, task) => { calls.push({ sys, messages, limit, task }); return responses.shift(); },
   };
+  Object.assign(ctx, overrides);
   vm.createContext(ctx);
   vm.runInContext(section("async function draftChatPrep(", 'app.get("/api/draft-chat-history"'), ctx);
   vm.runInContext(section("async function reviewDraftChatCandidate(", 'app.post("/api/draft-chat"'), ctx);
@@ -152,4 +153,23 @@ test("実際のスタッフ相談がない初回案の照合には特例上書�
     assert.match(call.sys, /実際のスタッフ相談履歴はありません/);
     assert.doesNotMatch(call.sys, /通常ルールと異なる形に決定できる/);
   }
+});
+
+test("編集準備の口調許可は、最新の未撤回のスタッフ指示だけで決まる", async () => {
+  const tone = require("../lib/reply-tone");
+  const at = Date.now();
+  const c = { id: "c-tone", channel: "line", ts: at, msgs: [msg("them", "テスト：ホワイトニングできますか", at)] };
+  async function prep(instructions) {
+    const h = harness([], { staffAllowsConversationalTone: tone.staffAllowsConversationalTone });
+    const messages = [{ role: "assistant", content: "当日の状態を拝見してご案内いたします。", kind: "draft" }];
+    instructions.forEach((content, i) => { if (i) messages.push({ role: "assistant", content: "当日の状態を拝見してご案内いたします。", kind: "draft" }); messages.push({ role: "user", content }); });
+    return h.draftChatPrep(tenant(c), { id: c.id, messages });
+  }
+  assert.equal((await prep(["もっとフランクに"])).allowConversational, true);
+  assert.equal((await prep(["もっとフランクに", "短くして"])).allowConversational, true);
+  assert.equal((await prep(["もっとフランクに", "やっぱり丁寧に戻して"])).allowConversational, false);
+  assert.equal((await prep(["「痛いんだよね」って患者さん言ってるけど、短くして"])).allowConversational, false);
+  const strict = await prep(["短くして"]);
+  assert.equal(strict.allowConversational, false);
+  assert.match(strict.base, /患者様への礼儀（馴れ馴れしい相づちを使わない等）は保つ/);
 });

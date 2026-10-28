@@ -18,7 +18,7 @@ function createContext(overrides = {}) {
     recentCustomerQuestion: () => "予約を変更できますか",
     sanitizeLearningChat: value => Array.isArray(value) ? value : [],
     exampleAdd: async () => ({ id: 41 }),
-    learningReviewPayload: ex => ({ exampleId: ex.id, text: "予約変更の条件を確認する" }),
+    learningReviewPayload: ex => ({ exampleId: ex.id, text: "予約変更の条件を確認する" }), learningPayloadContext: () => ({}),
     crypto: { randomBytes: () => Buffer.from("abcdef", "hex") },
     learningJobs: tenant => tenant.config.learningJobs,
     saveTenantConfig: async tenant => { tenant.saved = true; },
