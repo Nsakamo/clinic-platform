@@ -109,7 +109,7 @@ test("上限を超えたら、反映中のものは残して古い候補から�
   const active = { id: "keep", text: "冒頭の定型あいさつを省く", count: 5, firstSeen: 1, lastSeen: 1, disabled: false, edited: false };
   config.styleLessons.push(active);
   let n = 0, i = 0;
-  const nouns = ["冒頭", "書き出し", "締め", "結び", "あいさつ", "結論", "前置き", "箇条書き", "改行", "空行", "段落", "句読点", "敬語", "二重敬語", "定型句", "繰り返し", "お礼の言葉", "言い回し", "語尾", "署名"];
+  const nouns = ["冒頭", "書き出し", "締め", "結び", "あいさつ", "結論", "前置き", "箇条書き", "改行", "空行", "段落", "句読点", "クッション言葉", "二重敬語", "定型句", "繰り返し", "お礼の言葉", "言い回し", "語尾", "署名"];
   const verbs = ["は簡潔にまとめる", "は過剰に重ねない", "は同じ表現を使わない", "は最後にまとめる"];
   for (const noun of nouns) for (const verb of verbs) {
     const text = noun + verb;
@@ -336,4 +336,15 @@ test("テスト用の学び投入ルートは本番相当の実行環境では�
   assert.match(source, /if \(!isManagedRuntime\(\)\) app\.post\("\/__test\/style-lessons", guard, oneMutationAtATime\("learning"\)/);
   const at = source.indexOf('app.post("/__test/style-lessons"');
   assert.ok(source.lastIndexOf('if (process.env.NODE_ENV === "test") {', at) > source.lastIndexOf("\n}\n", at));
+});
+
+test("監査3周目: 丁寧さを外す・返信の中身を削る・参照や経路を変える学びを保存しない", () => {
+  for (const ng of [
+    "敬語は使わない", "丁寧語は使わない", "返信は敬語を使わず書く", "「です」は使わない", "「ます」は使わない", "語尾に「です」を付けない", "語尾は「ます」にしない", "「ください」は使わない",
+    "返信はしない", "次は返信しない", "返信は「承知いたしました」だけにする", "結論は「承りました」にする", "返信には結論を入れない", "本文は入れない", "本文は書かず署名だけ書く",
+    "署名だけ書く", "前の返信と同じにする", "前の返信の文章を入れる", "返信は控える", "結論は避ける",
+    "LINEではなくメールで返信する", "メールではなくLINEで返信する", "以上の表現より次の表現を使う", "次の言葉を使う", "以下の表現は使わない",
+  ]) assert.equal(style.acceptableStyleLesson(ng), "", ng);
+  for (const ok of ["二重敬語は使わない", "過剰な敬語は控える", "「させていただきます」は使わない", "語尾は「です・ます」でそろえる", "結論を最初の一文に書く"]) assert.ok(style.acceptableStyleLesson(ok), ok);
+  for (const casual of ["了解", "よろしく", "OK"]) assert.equal(style.casualSentenceEnding(casual), true, casual);
 });
