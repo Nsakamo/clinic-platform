@@ -13,7 +13,7 @@ const { AsyncLocalStorage } = require("async_hooks");
 const { intentTokens, rankLearningExamples, sameLearningExample } = require("./lib/learning-retrieval");
 const { evaluateResponseGrounding } = require("./lib/response-grounding");
 const { PATIENT_COURTESY, applyCourtesyGate, hasConversationalTone, normalizeReplyTone, replyToneInstruction, staffAllowsConversationalTone, staffRequestsConversationalTone, toneRewriteInstruction } = require("./lib/reply-tone");
-const { STYLE_LESSON_SYSTEM, acceptableStyleLesson, mergeStyleLessons, parseStyleLessonResponse, styleEditWorthLearning, styleLessonActive, styleLessonList, styleLessonUserPrompt, styleLessonsPromptBlock } = require("./lib/style-learning");
+const { STYLE_LESSON_SYSTEM, acceptableStyleLesson, casualSentenceEnding, mergeStyleLessons, parseStyleLessonResponse, styleEditWorthLearning, styleLessonActive, styleLessonList, styleLessonUserPrompt, styleLessonsPromptBlock } = require("./lib/style-learning");
 const { compareConversations, compareConversationsRecent } = require("./lib/conversation-order");
 const { MAX_ATTACHMENTS, normalizeFileIds, normalizeScheduledMessageInput, pruneScheduledMessages } = require("./lib/scheduled-message");
 const { lineWebhookEventId, lineWebhookRetryDelay, isProcessableLineEvent } = require("./lib/line-webhook-queue");
@@ -1311,6 +1311,14 @@ async function proposeConflictResolution(t, item, instruction) {
   const match = String(raw || "").match(/\{[\s\S]*\}/), parsed = match ? JSON.parse(match[0]) : {};
   return String(parsed.proposal || "").trim().slice(0, 2400);
 }
+// 文体学習の照合に使う、会話の送信経路と患者の表示名（保存はジョブ完了まで。完了時に payload ごと消える）。
+function learningPayloadContext(t, conversationId, conversation) {
+  const c = conversation || (t && t.store ? t.store[String(conversationId || "")] : null);
+  return {
+    channel: c && c.channel === "mail" ? "mail" : "line",
+    names: [c && c.name, c && c.verifiedPatientName].filter(Boolean).map(name => String(name).slice(0, 60)),
+  };
+}
 // AI下書きとスタッフが実際に送った文の差から、書き方の直し方だけを学ぶ。
 // 失敗しても判断メモリの学習結果には影響させない（文体は学ばないだけ）。
 // 抽出だけを行い、保存（merge）はジョブの状態を確かめた最後に呼び出し側で行う。
@@ -1318,7 +1326,7 @@ async function proposeConflictResolution(t, item, instruction) {
 async function extractStyleLessonsFromStaffEdit(t, input) {
   if (!input || !styleEditWorthLearning(input.draft0, input.final)) return [];
   const staffTurns = [input.instr].concat(sanitizeLearningChat(input.learningChat).filter(m => m.role === "user").map(m => m.content));
-  if (staffTurns.some(staffRequestsConversationalTone) || hasConversationalTone(input.final)) return [];
+  if (staffTurns.some(staffRequestsConversationalTone) || hasConversationalTone(input.final) || casualSentenceEnding(input.final)) return [];
   const existing = styleLessonList(t.config);
   const raw = await aiChat(t, STYLE_LESSON_SYSTEM, [{ role: "user", content: styleLessonUserPrompt(input, existing) }], 500, "learning");
   const sources = [input.q, input.final, input.draft0, input.instr].concat(Array.isArray(input.names) ? input.names : []);
@@ -1355,20 +1363,27 @@ async function processLearningJob(t, jobId) {
     }) : null;
     if (!conflict) conflict = await checkFormalRuleConflict(t, p.q, proposal, ex.id, p.source);
     try { await recordLearningPerformance(t, p.q, !!p.changed, !!conflict); } catch (e) { console.error("learning performance:", e && e.message); }
-    // 以降は同期処理だけ。ここでまだ処理中（スタッフが「学習しない」を選んでいない）場合に限り文体の学びを保存する。
     if (job.status !== "processing") return;
-    let styleResult = { added: [], reinforced: [] };
-    try { styleResult = saveStyleLessons(t, styleLessons); } catch (e) { console.error("style learning save:", String(e && e.message || e).slice(0, 80)); }
-    const styleNote = styleResult.reinforced.some(styleLessonActive)
-      ? "書き方の直しも、同じ直しが重なったため次の下書きから反映します"
-      : (styleResult.added.length || styleResult.reinforced.length ? "書き方の直しは候補として記録しました（同じ直しがもう一度あれば反映します）" : "");
+    // 文体の学びは、判断の保存まで成功し、まだ処理中（スタッフが「学習しない」を選んでいない）場合に限り、同期的に保存する。
+    // 内容の矛盾（conflict）判定になった送信でも、書き方の直しは内容と独立しているため保存する。
+    const commitStyle = () => {
+      if (job.status !== "processing") return "";
+      let styleResult = { added: [], reinforced: [] };
+      try { styleResult = saveStyleLessons(t, styleLessons); } catch (e) { console.error("style learning save:", String(e && e.message || e).slice(0, 80)); }
+      return styleResult.reinforced.some(styleLessonActive)
+        ? "書き方の直しも、同じ直しが重なったため次の下書きから反映します"
+        : (styleResult.added.length || styleResult.reinforced.length ? "書き方の直しは候補として記録しました（同じ直しがもう一度あれば反映します）" : "");
+    };
     if (conflict) {
+      commitStyle();
       job.status = "ready"; job.resultType = "conflict"; job.learningReview = null;
       job.conflict = publicLearningConflict(conflict); job.outcome = null;
     } else {
       // 自動学習は一般化済み判断メモリまで。最優先の店舗ルールは明示確認なしに追加・更新しない。
       const learningMeta = proposed.meta;
       await exampleLearningMetaUpdate(t, ex.id, learningMeta);
+      if (job.status !== "processing") return;
+      const styleNote = commitStyle();
       const reusable = learningMeta.scope === "reusable";
       const type = !reusable ? "ignored" : (job.reused ? "duplicate" : "new");
       job.status = "completed"; job.resultType = type; job.learningReview = review; job.conflict = null;
@@ -1409,7 +1424,7 @@ async function queueStaffLearning(t, c, opts) {
   const now = Date.now(), job = {
     id: "lj-" + now.toString(36) + "-" + crypto.randomBytes(3).toString("hex"), conversationId: String(c && c.id || ""),
     exampleId: ex.id, reused: !!ex.reused, status: "processing", resultType: "", createdAt: now, updatedAt: now, learningReview: review, conflict: null, outcome: null,
-    payload: { q, final, draft0, instr, learningChat, reviewText: opts.reviewText, source: opts.source || "web", channel: c && c.channel === "mail" ? "mail" : "line", names: [c && c.name, c && c.verifiedPatientName].filter(Boolean).map(name => String(name).slice(0, 60)), changed: final !== draft0 || !!instr },
+    payload: { q, final, draft0, instr, learningChat, reviewText: opts.reviewText, source: opts.source || "web", ...learningPayloadContext(t, c && c.id, c), changed: final !== draft0 || !!instr },
   };
   learningJobs(t).push(job);
   while (t.config.learningJobs.length > 80) {
@@ -1444,7 +1459,7 @@ async function prepareStaffLearningConsent(t, c, opts) {
     id: "lc-" + now.toString(36) + "-" + crypto.randomBytes(3).toString("hex"), conversationId: String(c && c.id || ""),
     exampleId: 0, reused: false, status: "awaiting_consent", resultType: "", createdAt: now, updatedAt: now,
     expiresAt: now + LEARNING_CONSENT_TTL_MS, promptMs: LEARNING_PROMPT_MS, learningReview: review, conflict: null, outcome: null,
-    payload: { q, final, draft0, instr, learningChat, reviewText: opts.reviewText, source: opts.source || "web", channel: c && c.channel === "mail" ? "mail" : "line", names: [c && c.name, c && c.verifiedPatientName].filter(Boolean).map(name => String(name).slice(0, 60)), changed: final !== draft0 || !!instr },
+    payload: { q, final, draft0, instr, learningChat, reviewText: opts.reviewText, source: opts.source || "web", ...learningPayloadContext(t, c && c.id, c), changed: final !== draft0 || !!instr },
   };
   jobs.push(job);
   await saveTenantConfig(t);
@@ -3707,7 +3722,7 @@ app.post("/api/learning-scope", guard, oneMutationAtATime("learning", learningMu
         // 旧バージョンでAI整理済み・判断待ちになっていた案件も、新しい安全確認フローへ移行する。
         job.status = "processing"; job.resultType = ""; job.reused = !!ex.reused;
         job.learningReview = Object.assign({}, job.learningReview || {}, { exampleId: ex.id, text });
-        job.payload = { q: ex.q, final: ex.final, draft0: ex.draft0, instr: ex.instr, learningChat: ex.learningChat, reviewText: text, source: ex.source || "web", changed: ex.final !== ex.draft0 || !!ex.instr };
+        job.payload = Object.assign(learningPayloadContext(t, job.conversationId), { q: ex.q, final: ex.final, draft0: ex.draft0, instr: ex.instr, learningChat: ex.learningChat, reviewText: text, source: ex.source || "web", changed: ex.final !== ex.draft0 || !!ex.instr });
         job.updatedAt = Date.now();
       }
       if (!ex) return res.status(404).json({ ok: false, error: "example_not_found" });
@@ -3717,7 +3732,7 @@ app.post("/api/learning-scope", guard, oneMutationAtATime("learning", learningMu
           id: "lj-" + now.toString(36) + "-" + crypto.randomBytes(3).toString("hex"), conversationId: String(req.body.conversationId || ""),
           exampleId: ex.id, reused: !!ex.reused, status: "processing", resultType: "", createdAt: now, updatedAt: now,
           learningReview: learningReviewPayload(ex, { q: ex.q, final: ex.final, draft0: ex.draft0, instr: ex.instr, reviewText: text, conversationId: req.body.conversationId }), conflict: null, outcome: null,
-          payload: { q: ex.q, final: ex.final, draft0: ex.draft0, instr: ex.instr, learningChat: ex.learningChat, reviewText: text, source: ex.source || "web-recovered", changed: ex.final !== ex.draft0 || !!ex.instr },
+          payload: Object.assign(learningPayloadContext(t, req.body.conversationId), { q: ex.q, final: ex.final, draft0: ex.draft0, instr: ex.instr, learningChat: ex.learningChat, reviewText: text, source: ex.source || "web-recovered", changed: ex.final !== ex.draft0 || !!ex.instr }),
         };
         learningJobs(t).push(job);
       }
@@ -5538,7 +5553,7 @@ app.get("/board", (req, res) => { res.set("Content-Type", "text/html; charset=ut
 if (process.env.NODE_ENV === "test") {
   app.get("/__test/async-error", async () => { throw new Error("private-test-stack-marker"); });
   // テスト専用（NODE_ENV=test のときだけ存在）: ログイン中の法人に文体の学びを入れて、法人分離を実HTTPで確かめる。
-  app.post("/__test/style-lessons", guard, async (req, res) => {
+  if (!isManagedRuntime()) app.post("/__test/style-lessons", guard, oneMutationAtATime("learning"), async (req, res) => {
     const result = saveStyleLessons(req.tenant, Array.isArray(req.body.lessons) ? req.body.lessons : []);
     await saveTenantConfig(req.tenant);
     res.json({ ok: true, ids: result.added.concat(result.reinforced).map(item => item.id) });
