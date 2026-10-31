@@ -1,4 +1,5 @@
 "use strict";
+const promptStubs = require("./helpers/prompt-stubs");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -14,7 +15,7 @@ function harness(responses = []) {
   const ctx = {
     ...consultation, ...decision, ...edit, selectConversationContext,
     S: t => t.config.settings,
-    rulesRankedWithScores: (_t, query) => { queries.push(query); return [{ n: 1, r: { content: "通常の当日キャンセル料は3,300円です。" } }]; },
+    ...promptStubs(), rulesRankedWithScores: (_t, query) => { queries.push(query); return [{ n: 1, r: { content: "通常の当日キャンセル料は3,300円です。" } }]; },
     rulesBlock: rel => rel.map(r => r.content).join("\n"),
     notesBlock: () => "", prefsBlock: () => "", replyToneInstruction: () => "",
     baEnabled: () => false, PARTNER_KEY: "", staffBookingPrompt: () => "", ANTHROPIC_KEY: "", process: { env: {} }, JP_QUALITY: "", PATIENT_COURTESY: "丁寧に",
