@@ -42,7 +42,7 @@ function harness(outputs,rawResponse,consultation=false){
   const routes=new Map(),calls=[],saved=[];
   const p={c:{channel:"line"},latestInstruction:"これ返信返しておいて、ありがとうって。",previousDraft:"通常は3,300円です。",lastQ:"テスト：証明書を送ります。免除できますか？",staffHistory:"スタッフの指示：お礼だけに作り直して",acknowledgementOnly:true,consultation,base:"",edits:[],engLabel:"テスト",topicTs:1,baCtx:{ok:true,verified:true,appointments:[{id:"test-appointment",changeable:true}]}};
   const ctx={...scope,...edit,...output, safeDraftChatText: output.safeText,REPLY_DECISION,PATIENT_COURTESY:"丁寧に",hasConversationalTone:()=>false,
-    cleanDraftText:x=>String(x||"").trim(),draftQualityIssues:()=>[],preservesReplyFacts:()=>true,baEnabled:()=>false,PARTNER_KEY:"",baContextCached:async()=>null,
+    cleanDraftText:x=>String(x||"").trim(),sha:v=>require("node:crypto").createHash("sha256").update(v).digest("hex"),draftQualityIssues:()=>[],preservesReplyFacts:()=>true,baEnabled:()=>false,PARTNER_KEY:"",baContextCached:async()=>null,
     ANTHROPIC_KEY:"test",process:{env:{}},guard(){},oneMutationAtATime:()=>()=>{},
     app:{post:(route,...args)=>routes.set(route,args.at(-1))},draftChatPrep:async()=>p,
     aiChat:async(_t,sys,messages,_limit,task)=>{calls.push({sys,task});return rawResponse!==undefined&&calls.length===1?rawResponse:outputs.shift()},
@@ -132,14 +132,15 @@ test("相談チャットでは照合で懸念が残っても止めず、確認�
   assert.equal(h.saved[0].warning,"料金の記載を確認してください","確認ポイントも履歴に残す");
 });
 
+function verifyBase(h){h.p.c.draftChatSession={topicTs:h.p.topicTs,verifiedDraftHash:h.ctx.sha(h.p.previousDraft.trim())};}
 test("文体だけの指示で事実が変わらなければ照合AIを呼ばずに返す",async()=>{
   const h=harness([],JSON.stringify({reply:"丁寧にしました",draft:"お写真をお送りいただき、誠にありがとうございます。通常は3,300円です。"}));
-  h.p.acknowledgementOnly=false;h.p.latestInstruction="もっと丁寧で温かい言い方にして";
+  h.p.acknowledgementOnly=false;h.p.latestInstruction="もっと丁寧で温かい言い方にして";verifyBase(h);
   const r=await runStream(h);
   assert.equal(r.meta.ok,true);assert.equal(r.meta.warning,"");assert.equal(h.calls.length,1);
   // 事実が変わったら（ここでは preservesReplyFacts=false）通常の照合へ回す
   const changed=harness(['{"pass":true}'],JSON.stringify({reply:"丁寧にしました",draft:"通常は5,500円です。"}));
-  changed.ctx.preservesReplyFacts=()=>false;changed.p.acknowledgementOnly=false;changed.p.latestInstruction="もっと丁寧に";
+  changed.ctx.preservesReplyFacts=()=>false;changed.p.acknowledgementOnly=false;changed.p.latestInstruction="もっと丁寧に";verifyBase(changed);
   await runStream(changed);assert.equal(changed.calls.length,2);assert.equal(changed.calls[1].task,"audit");
 });
 
@@ -155,9 +156,33 @@ test("学習候補や確認ポイントに区切り記号を仕込まれても�
   assert.match(src,/const mi=acc\.indexOf\(MK_T\);/);
 });
 
-test("短くする編集で文が減った時は、判断語が残っていても照合を省かない",async()=>{
+test("文体の編集で文が減った時は、判断語が残っていても照合を省かない",async()=>{
   const h=harness(['{"pass":true}'],JSON.stringify({reply:"短くしました",draft:"テスト：ご連絡ありがとうございます。"}));
-  h.p.acknowledgementOnly=false;h.p.latestInstruction="もっと短く";h.p.previousDraft="テスト：ご連絡ありがとうございます。ご来院の際は保険証をお持ちください。";
+  h.p.acknowledgementOnly=false;h.p.latestInstruction="もっと丁寧に";h.p.previousDraft="テスト：ご連絡ありがとうございます。ご来院の際は保険証をお持ちください。";verifyBase(h);
   await runStream(h);
   assert.equal(h.calls.length,2);assert.equal(h.calls[1].task,"audit");
+});
+
+test("確認ポイント付きの案や照合していない下書きを基準にした文体修正は、照合を省かない",async()=>{
+  const draft="お写真をお送りいただき、誠にありがとうございます。通常は3,300円です。";
+  for(const setup of [h=>{},h=>{h.p.c.draftChatSession={topicTs:h.p.topicTs,verifiedDraftHash:""}},h=>{h.p.c.draftChatSession={topicTs:h.p.topicTs+1,verifiedDraftHash:h.ctx.sha(h.p.previousDraft.trim())}}]){
+    const h=harness(['{"pass":true}'],JSON.stringify({reply:"丁寧にしました",draft}));
+    h.p.acknowledgementOnly=false;h.p.latestInstruction="もっと丁寧に";setup(h);
+    await runStream(h);assert.equal(h.calls.length,2);assert.equal(h.calls[1].task,"audit");
+  }
+});
+
+test("書き方の見本の文をそのまま借りた文体修正は照合へ回す",async()=>{
+  const h=harness(['{"pass":true}'],JSON.stringify({reply:"寄り添いました",draft:"お身体のつらい中ご連絡いただき、誠にありがとうございます。通常は3,300円です。"}));
+  h.p.acknowledgementOnly=false;h.p.latestInstruction="もっと寄り添って";verifyBase(h);
+  h.p.styleSampleTexts=["テスト：お身体のつらい中ご連絡いただき恐縮です。"];h.p.knownText="テスト：料金を教えてください";
+  await runStream(h);assert.equal(h.calls.length,2);assert.equal(h.calls[1].task,"audit");
+});
+
+test("編集の依頼に形式なしの文だけが返ったら、返事にせず下書き候補として照合する",async()=>{
+  const h=harness(['{"pass":true}'],"テスト：お写真ありがとうございます。通常は3,300円です。");
+  h.p.acknowledgementOnly=false;h.p.latestInstruction="料金も入れて";
+  const r=await runStream(h);
+  assert.equal(scope.draftChatDraftSection(r.body).text,"テスト：お写真ありがとうございます。通常は3,300円です。");
+  assert.equal(h.calls[1].task,"audit");
 });

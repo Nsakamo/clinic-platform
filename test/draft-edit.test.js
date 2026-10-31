@@ -205,7 +205,8 @@ test("編集チャットは関連ルールだけを選び、両APIが同じ監�
   assert.match(prep, /promptRulesText\(t, ranked\.map\(x => x\.r\), ruleBudget\(t\)\)/);
   assert.match(prep, /filter\(x => x\.n > 0\)\.slice\(0, 20\)\.map\(x => x\.r\), 16000\)/);
   assert.match(prep, /examplesRanked\(t,/);
-  assert.match(prep, /styleSamplesBlock\(styleSamples\(t,/);
+  assert.match(prep, /const samples = styleSamples\(t,/);
+  assert.match(prep, /styleSamplesBlock\(samples\)/);
   assert.match(prep, /normalizeDraftEditHistory\(requestedEdits\)/);
   const routes = source.slice(source.indexOf('app.post("/api/draft-chat"'), source.indexOf("function staffAppointmentById", source.indexOf('app.post("/api/draft-chat"')));
   assert.match(routes, /reviewDraftChatCandidate\(t, p, out\.draft == null \? "" : out\.draft\)/);
@@ -323,6 +324,7 @@ test("編集履歴は患者の新着後に旧話題へ上書きせず、同じ�
     app: { get: (route, _guard, handler) => handlers.set(route, handler) },
     guard() {},
     dbSave: async () => { saves += 1; return true; },
+    sha: v => require("node:crypto").createHash("sha256").update(v).digest("hex"),
   };
   vm.runInNewContext(source.slice(sessionStart, sessionEnd), context);
   const c = { id: "テスト会話", ts: 100 };
@@ -353,4 +355,12 @@ test("編集履歴は患者の新着後に旧話題へ上書きせず、同じ�
   assert.equal(stored[1].warning, undefined);
   assert.equal(stored[2].warning, undefined);
   assert.equal(stored.at(-1).warning, "日時を確認");
+  // 照合済みの案のハッシュ: 合格した案で設定、確認ポイント付きで消える、返事だけの回は引き継ぐ
+  assert.equal(c.draftChatSession.verifiedDraftHash, "");
+  await context.saveDraftChatSession(t, { c, topicTs: 100 }, withWarning, "合格した案", "draft", "", true);
+  assert.equal(c.draftChatSession.verifiedDraftHash, context.sha("合格した案"));
+  await context.saveDraftChatSession(t, { c, topicTs: 100 }, withWarning, "質問への返事", "reply", "", false);
+  assert.equal(c.draftChatSession.verifiedDraftHash, context.sha("合格した案"));
+  await context.saveDraftChatSession(t, { c, topicTs: 100 }, withWarning, "懸念の残る案", "draft", "料金を確認", false);
+  assert.equal(c.draftChatSession.verifiedDraftHash, "");
 });

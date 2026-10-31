@@ -21,7 +21,7 @@ const { contextualLearningFallback, formatLearningProposal } = require("./lib/le
 const { selectConversationContext, preserveTopicBoundary } = require("./lib/conversation-context");
 const { STAFF_DRAFT_POLICY, formatDraftContext, staffConsultationTranscript, isAcknowledgementOnlyRequest, acknowledgementDraftScope, ACKNOWLEDGEMENT_DRAFT_POLICY } = require("./lib/draft-consultation");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("./lib/draft-edit");
-const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, sentenceCount, safeText: safeDraftChatText, maskStyleSample } = require("./lib/draft-chat-output");
+const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, sentenceCount, borrowsFromSamples, safeText: safeDraftChatText, maskStyleSample } = require("./lib/draft-chat-output");
 const { REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview, inboundMessageTimes } = require("./lib/reply-decision");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
@@ -1637,7 +1637,10 @@ async function aiChatOne(eng, system, messages, maxTokens, route, options){
       headers: { "Content-Type":"application/json", "Authorization":"Bearer "+process.env.OPENAI_KEY },
       body: JSON.stringify(body) });
     let r = await send(payload);
-    if(!r.ok && r.status === 400 && payload.response_format){ delete payload.response_format; r = await send(payload); }
+    if(!r.ok && r.status === 400 && payload.response_format){
+      const detail = await r.text().catch(()=>"");
+      if(/response_format|json/i.test(detail)){ delete payload.response_format; r = await send(payload); }
+    }
     if(!r.ok) throw new Error("openai_"+r.status);
     const d = await r.json(); return { text: d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content, usage: { input_tokens: Number(d.usage && d.usage.prompt_tokens || 0), output_tokens: Number(d.usage && d.usage.completion_tokens || 0), provider: "openai", model: route.model } };
   }
@@ -1958,15 +1961,19 @@ function baCacheClear(t, c) { const prefix = t.slug + "::" + c.id + "::"; for (c
 function baContextCached(t, c, timeoutMs) {
   const key = baCacheKey(t, c), hit = baContextCache.get(key), now = Date.now();
   if (hit && now - hit.at < BA_CONTEXT_CACHE_MS) return hit.promise;
+  baContextCacheSweep(now);
   const promise = baCall(t, c, "context", {}, timeoutMs || 12000).then(value => {
     // 照会に失敗した結果は覚えない（次回もう一度照会する）
     if (!value || value.ok === false) { const cur = baContextCache.get(key); if (cur && cur.promise === promise) baContextCache.delete(key); }
     return value;
   }, () => { baContextCache.delete(key); return null; });
   baContextCache.set(key, { at: now, promise });
-  if (baContextCache.size > 500) { for (const [k, v] of baContextCache) { if (now - v.at >= BA_CONTEXT_CACHE_MS) baContextCache.delete(k); } }
   return promise;
 }
+// 期限切れの照会結果（予約・氏名を含む）をメモリに残さない
+function baContextCacheSweep(now) { for (const [k, v] of baContextCache) { if ((now || Date.now()) - v.at >= BA_CONTEXT_CACHE_MS) baContextCache.delete(k); } }
+const baContextCacheTimer = setInterval(() => baContextCacheSweep(), 60 * 1000);
+if (baContextCacheTimer.unref) baContextCacheTimer.unref();
 async function baCall(t, c, action, extra, timeoutMs) {
   // 予約を変更し得る操作の前後では、相談用の照会キャッシュを捨てて最新を読み直す（完了後は finally で再度捨てる）
   // result（実行結果の照会）も、実行が終わった直後の可能性があるため破棄の対象にする
@@ -4053,7 +4060,8 @@ async function draftChatPrep(t, body) {
   // 送信後に学習した判断手順（安全確認済み）と、この院のスタッフが実際に送った返信の見本
   const exRel = examplesRanked(t, (lastQ || latestInstruction).slice(0, 800), LEARNED_EXAMPLES_K, ruleQuery.slice(0, 1500));
   const examplesTxt = exRel.length ? formatLearnedExamples(exRel) : "";
-  const samplesTxt = styleSamplesBlock(styleSamples(t, (lastQ || latestInstruction).slice(0, 800), ruleQuery.slice(0, 1500)));
+  const samples = styleSamples(t, (lastQ || latestInstruction).slice(0, 800), ruleQuery.slice(0, 1500));
+  const samplesTxt = styleSamplesBlock(samples);
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = c.channel === "mail" ? "メールなので下書きの最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
   let baCtx = null;
@@ -4090,7 +4098,8 @@ async function draftChatPrep(t, body) {
   const evidence = "【今回の会話】\n" + conv + (olderConv ? "\n【参照された過去説明】\n" + olderConv : "")
     + "\n【関連店舗ルール】\n" + relevantRulesTxt + "\n【スタッフの共通指示】\n" + prefsBlock(t)
     + "\n【この患者への対応メモ】\n" + notesBlock(c) + staffBookingPrompt(baCtx);
-  return { c, topicTs, edits: edits.map(e => ({ role: e.role, content: e.content })), base, engLabel, baCtx, latestInstruction, previousDraft, lastQ, evidence, staffHistory, acknowledgementOnly, consultation: isDraftChatConsultation(latestInstruction) };
+  return { c, topicTs, edits: edits.map(e => ({ role: e.role, content: e.content })), base, engLabel, baCtx, latestInstruction, previousDraft, lastQ, evidence, staffHistory, acknowledgementOnly, consultation: isDraftChatConsultation(latestInstruction),
+    styleSampleTexts: samples.map(x => x.text), knownText: conv + "\n" + olderConv };
 }
 
 app.get("/api/draft-chat-history", guard, (req, res) => {
@@ -4102,7 +4111,7 @@ app.get("/api/draft-chat-history", guard, (req, res) => {
   res.json({ ok: true, messages, draftAtSave: messages.length ? String(session.draftAtSave || "") : "" });
 });
 
-async function saveDraftChatSession(t, p, body, assistantContent, kind, warning) {
+async function saveDraftChatSession(t, p, body, assistantContent, kind, warning, verified) {
   if (Number(p.c.ts || 0) !== p.topicTs) return false;
   // 案に付けた「⚠確認ポイント」も履歴に残し、画面を開き直しても通常の案と見分けられるようにする
   const warn = (m, value) => { const w = m.role === "assistant" && m.kind !== "reply" && typeof value === "string" ? value.trim().slice(0, 200) : ""; if (w) m.warning = w; return m; };
@@ -4110,7 +4119,10 @@ async function saveDraftChatSession(t, p, body, assistantContent, kind, warning)
     .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
     .map(m => warn({ role: m.role, content: m.content.slice(0, 4000), inputMode: m.inputMode === "voice" ? "voice" : "text", kind: m.kind === "reply" ? "reply" : "draft" }, m.warning));
   messages.push(warn({ role: "assistant", content: String(assistantContent || "").slice(0, 4000), kind: kind === "reply" ? "reply" : "draft" }, warning));
-  p.c.draftChatSession = { topicTs: p.topicTs, messages: messages.slice(-20), draftAtSave: String(p.c.draft || "").slice(0, 4000), updatedAt: Date.now() };
+  const prevSession = p.c.draftChatSession && Number(p.c.draftChatSession.topicTs || 0) === Number(p.topicTs || 0) ? p.c.draftChatSession : null;
+  // 照合に合格した（または合格した案から文体だけ直した）最新の案のハッシュ。返事だけの回は案が変わらないので引き継ぐ。
+  const verifiedDraftHash = kind === "reply" ? (prevSession && prevSession.verifiedDraftHash) || "" : verified ? sha(String(assistantContent || "").slice(0, 4000).trim()) : "";
+  p.c.draftChatSession = { topicTs: p.topicTs, messages: messages.slice(-20), draftAtSave: String(p.c.draft || "").slice(0, 4000), verifiedDraftHash, updatedAt: Date.now() };
   return dbSave(t, p.c);
 }
 
@@ -4192,6 +4204,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
       && text.length >= String(p.previousDraft).trim().length * 0.4
       && !hasConversationalTone(text) && !explicitEditMismatch(instruction, text, p.previousDraft)
       && !/@@\s*(?:REPLY|DRAFT|MEMORY|RULE|ACTION|META)\s*@@/.test(text)
+      && !borrowsFromSamples(text, p.styleSampleTexts, String(p.previousDraft || "") + "\n" + String(p.knownText || "")) // 見本の他患者の文を借りていたら照合
       && !draftQualityIssues(text).some(issue => issue === "empty" || issue === "meta_text")) {
     return { text, error: "", fastPath: true };
   }
@@ -4294,15 +4307,23 @@ function draftChatOutputFormat() {
     + "\n" + DRAFTCHAT_MEMORY_RULE
     + "\n" + DRAFTCHAT_RULE_RULE;
 }
+function draftChatVerifiedBase(p) {
+  const s = p && p.c && p.c.draftChatSession, prev = String(p && p.previousDraft || "").trim();
+  return !!(s && prev && s.verifiedDraftHash && Number(s.topicTs || 0) === Number(p.topicTs || 0) && s.verifiedDraftHash === sha(prev));
+}
 async function runDraftChat(t, body) {
   const p = await draftChatPrep(t, body);
   if (p.error) return { ok: false, error: p.error, status: 400 };
   // 相談チャットの案は、スタッフが「この下書きを使う」を押すまで患者へ送られない。
   // そのため照合で懸念が残っても止めずに確認ポイントを添えて返し、文体だけの修正は事実が変わっていなければ照合AIを省く。
-  p.allowWarning = true; p.skipStylePass = true; p.styleFastPath = true;
+  // 照合を省けるのは、編集前の案が「この相談で照合に合格した（または合格した案から文体だけ直した）案」と同じ時だけ。
+  // 確認ポイント付きの案や、照合していない下書きを基準にした時は、文体だけの指示でも照合AIを通す。
+  p.allowWarning = true; p.skipStylePass = true; p.styleFastPath = draftChatVerifiedBase(p);
   const raw = await aiChat(t, p.base + draftChatOutputFormat(), p.edits, 4000, "chat", null, { json: true });
   if (!raw) return { ok: false, error: "ai_failed" };
   const out = parseDraftChatOutput(raw) || { reply: "", draft: null };
+  // 編集の依頼にAIが形式なしで患者向けの文だけを返した場合は、返事として出さず下書き候補として照合する
+  if (out.format === "plain" && !p.consultation && out.reply) { out.draft = out.reply; out.reply = ""; }
   const reviewed = p.consultation ? { text: "", error: "" } : await reviewDraftChatCandidate(t, p, out.draft == null ? "" : out.draft);
   if (reviewed.error) return { ok: false, error: reviewed.error };
   const draft = String(reviewed.text || "").trim().slice(0, 4000);
@@ -4317,7 +4338,7 @@ async function runDraftChat(t, body) {
     if (title && content) rule = { title, content };
   }
   const action = normalizeStaffBookingAction(p, out.action);
-  const historySaved = await saveDraftChatSession(t, p, body, draft || reply, draft ? "draft" : "reply", draft ? reviewed.warning : "");
+  const historySaved = await saveDraftChatSession(t, p, body, draft || reply, draft ? "draft" : "reply", draft ? reviewed.warning : "", draft && !reviewed.warning);
   return { ok: true, reply: reply.slice(0, 600), draft, memory, rule, action, warning: safeDraftChatText(reviewed.warning), fastPath: !!reviewed.fastPath, engLabel: p.engLabel, historySaved };
 }
 

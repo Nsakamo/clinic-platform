@@ -51,10 +51,10 @@ test("画面向けの封筒はどんな値からでも正しい順序・単独�
 });
 
 test("文体だけの指示を識別し、事実・判断を含む指示は通常の照合へ回す", () => {
-  for (const ask of ["もっと丁寧で温かい言い方にして", "丁寧に", "短く", "柔らかく", "優しく", "もう少し温かみのある感じで", "敬語を自然にして", "もっとカジュアルすぎないように", "丁寧すぎない感じに"]) {
+  for (const ask of ["もっと丁寧で温かい言い方にして", "丁寧に", "柔らかく", "優しく", "もう少し温かみのある感じで", "敬語を自然にして", "もっとカジュアルすぎないように", "丁寧すぎない感じに"]) {
     assert.equal(out.isStyleOnlyInstruction(ask), true, ask);
   }
-  for (const ask of ["", "もっと詳しく", "長くして", "もっと短く、謝罪は残して", "3300円にして丁寧に", "キャンセル料なしで丁寧に", "丁寧にして予約日も書いて", "お礼を丁寧に", "確認は不要と丁寧に伝えて", "短くしないで", "医院名を入れて柔らかく", "テスト".repeat(30) + "丁寧に"]) {
+  for (const ask of ["", "短く", "もっと簡潔に", "端的に", "もっと詳しく", "長くして", "もっと短く、謝罪は残して", "3300円にして丁寧に", "キャンセル料なしで丁寧に", "丁寧にして予約日も書いて", "お礼を丁寧に", "確認は不要と丁寧に伝えて", "短くしないで", "医院名を入れて柔らかく", "テスト".repeat(30) + "丁寧に"]) {
     assert.equal(out.isStyleOnlyInstruction(ask), false, ask);
   }
 });
@@ -122,7 +122,7 @@ test("書き方の見本は再利用可と確認済みの学習だけを使い�
 });
 
 test("相談用の予約照会キャッシュは失敗を覚えず、予約を変え得る操作で捨てる", async () => {
-  const ctx = { PARTNER_KEY: "", next: null, calls: 0, sha: v => require("node:crypto").createHash("sha256").update(v).digest("hex") };
+  const ctx = { PARTNER_KEY: "", next: null, calls: 0, setInterval: () => ({}), sha: v => require("node:crypto").createHash("sha256").update(v).digest("hex") };
   vm.createContext(ctx);
   // 本物の baCall 冒頭（キャッシュ破棄）を残し、通信部分だけを置き換える
   const realHead = section("async function baCall(", "  try {\n    if (!PARTNER_KEY) return null;");
