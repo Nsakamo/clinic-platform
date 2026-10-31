@@ -135,7 +135,7 @@ test("相談チャットでは照合で懸念が残っても止めず、確認�
 function verifyBase(h){h.p.c.draftChatSession={topicTs:h.p.topicTs,verifiedDraftHash:h.ctx.sha(h.p.previousDraft.trim())};}
 test("文体だけの指示で事実が変わらなければ照合AIを呼ばずに返す",async()=>{
   const h=harness([],JSON.stringify({reply:"丁寧にしました",draft:"お写真をお送りいただき、誠にありがとうございます。通常は3,300円です。"}));
-  h.p.acknowledgementOnly=false;h.p.latestInstruction="もっと丁寧で温かい言い方にして";verifyBase(h);
+  h.p.acknowledgementOnly=false;h.p.latestInstruction="もっと丁寧で温かい言い方にして";h.p.previousDraft="お写真ありがとうございます。通常は3,300円です。";verifyBase(h);
   const r=await runStream(h);
   assert.equal(r.meta.ok,true);assert.equal(r.meta.warning,"");assert.equal(h.calls.length,1);
   // 事実が変わったら（ここでは preservesReplyFacts=false）通常の照合へ回す
