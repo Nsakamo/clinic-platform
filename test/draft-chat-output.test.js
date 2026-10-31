@@ -224,3 +224,10 @@ test("途中で切れた出力から救出した案は、文体だけの指示�
   const run = section("async function runDraftChat(", "function staffAppointmentById(");
   assert.match(run, /if \(out\.format === "salvaged" \|\| out\.format === "plain"\) p\.styleFastPath = false;/);
 });
+
+test("書き方の見本と定型のあいさつだけが重なる場合は借用とみなさず、内容の重なりだけを借用とする", () => {
+  const sample = ["テスト：お写真をお送りいただき、誠にありがとうございます。妊娠中とのことですので施術は控えます。何かご不明な点がございましたら、お気軽にお問い合わせください。"];
+  const known = "お写真ありがとうございます。担当医が確認いたします。";
+  assert.equal(out.borrowsFromSamples("お写真をお送りいただき、誠にありがとうございます。担当医が確認いたします。何かご不明な点がございましたら、お気軽にお問い合わせください。", sample, known), false);
+  assert.equal(out.borrowsFromSamples("お写真ありがとうございます。妊娠中とのことですので施術は控えます。", sample, known), true);
+});
