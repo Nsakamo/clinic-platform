@@ -11,6 +11,8 @@ module.exports = function promptStubs() {
     styleSamplesBlock: () => "",
     STAFF_TONE_PRIORITY: "【スタッフの口調指示の優先】",
     ruleBudget: () => 16000,
+    rulesCharTotal: () => Number.MAX_SAFE_INTEGER, // 既定は「全文は照合へ渡さない」側で動かす
+    rulesList: () => [],
     examplesRanked: () => [],
     baContextCached: () => Promise.resolve(null),
   };

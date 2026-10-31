@@ -74,6 +74,7 @@ test("文体だけの編集で照合を省けるのは、判断に関わる語�
   assert.equal(out.decisionTermsPreserved("証明書をご提出いただければ3,300円は免除となる場合があります。", "3,300円は免除となります。"), false, "条件の節を落とした");
   assert.equal(out.decisionTermsPreserved("テスト：白い部分は成形時のものです。", "テスト：白い部分は成形時のもので、痛みもなく大丈夫です。"), false, "根拠のない安心・医療の主張を足した");
   assert.equal(out.decisionTermsPreserved("キャンセルは可能です。", "キャンセルはできかねます。"), false);
+  assert.equal(out.decisionTermsPreserved("お写真ありがとうございます。担当医が確認のうえ、改めてご連絡いたします。", "お写真ありがとうございます。施術後によく見られるものですので、どうぞご安心ください。担当医が確認のうえ、改めてご連絡いたします。"), false, "根拠のない安心づけを足した");
 });
 
 test("書き方の見本は氏名・連絡先・日時・数字を伏せ、一般名詞の敬称は残す", () => {
@@ -106,6 +107,7 @@ test("書き方の見本は再利用可と確認済みの学習だけを使い�
     LEARNING_INTENT_LABELS: { price: "料金", other: "その他" },
     learningIntentKey: () => "price",
     maskStyleSample: out.maskStyleSample,
+    STYLE_SAMPLE_PERSONAL: /痛|腫れ|症状|妊娠/,
     reusableLearningSummary: e => (e.learningMeta && e.learningMeta.scope === "reusable" ? "判断手順" : ""),
     STYLE_SAMPLES_K: 3,
   };
@@ -113,7 +115,8 @@ test("書き方の見本は再利用可と確認済みの学習だけを使い�
   vm.runInContext(section("function styleSamples(", "// ---------- helpers ----------"), ctx);
   const final = "テスト田中様、お問い合わせありがとうございます。料金は3,300円でございます。ご不明点はお気軽にお知らせください。";
   const reusable = { scope: "reusable" }, oneOff = { scope: "one_off" };
-  const t = { examples: { 1: { id: 1, q: "テスト料金は？", final, learningMeta: reusable }, 2: { id: 2, q: "テスト特例", final, learningMeta: oneOff }, 7: { id: 7, q: "テスト未学習", final }, 3: { id: 3, q: "テスト", final, learningMeta: reusable }, 4: { id: 4, q: "テスト", final, learningMeta: reusable }, 5: { id: 5, q: "テスト", final, learningMeta: reusable }, 6: { id: 6, q: "テスト", final: "短い", learningMeta: reusable } } };
+  const personal = "テスト：妊娠中とのことですので、施術は控えさせていただきます。ご理解のほどお願いいたします。";
+  const t = { examples: { 1: { id: 1, q: "テスト料金は？", final, learningMeta: reusable }, 2: { id: 2, q: "テスト特例", final, learningMeta: oneOff }, 7: { id: 7, q: "テスト未学習", final }, 3: { id: 3, q: "テスト", final, learningMeta: reusable }, 4: { id: 4, q: "テスト", final, learningMeta: reusable }, 5: { id: 5, q: "テスト", final, learningMeta: reusable }, 6: { id: 6, q: "テスト", final: "短い", learningMeta: reusable }, 8: { id: 8, q: "テスト", final: personal, learningMeta: reusable } } };
   const samples = ctx.styleSamples(t, "テスト料金", "テスト料金");
   assert.equal(JSON.stringify(samples.map(s => s.id)), "[1]");
   assert.doesNotMatch(samples[0].text, /田中|3,300/);
@@ -158,4 +161,15 @@ test("初回下書きの自動送信の根拠に数える学習例は、プロ�
   assert.equal((draft.match(/learningExampleCount: exGate\.length/g) || []).length, 2);
   assert.doesNotMatch(draft, /learningExampleCount: exRel\.length/);
   assert.match(source, /const LEARNED_EXAMPLES_GATE_K = 4;/);
+});
+
+test("相談の生成指示は根拠のない安心づけを足してよいと書かない", () => {
+  const m = source.match(/const STAFF_TONE_PRIORITY = "([^"]*)";/);
+  assert.ok(m);
+  assert.doesNotMatch(m[1], /安心していただける一言/);
+  assert.match(m[1], /根拠のない安心づけ/);
+});
+
+test("空の指示は相談の生成に進まない", () => {
+  assert.match(source, /edits\[edits\.length - 1\]\.role !== "user" \|\| !String\(latestInstruction \|\| ""\)\.trim\(\)\) return \{ error: "empty" \}/);
 });

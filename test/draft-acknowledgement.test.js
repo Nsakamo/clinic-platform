@@ -186,3 +186,12 @@ test("編集の依頼に形式なしの文だけが返ったら、返事にせ�
   assert.equal(scope.draftChatDraftSection(r.body).text,"テスト：お写真ありがとうございます。通常は3,300円です。");
   assert.equal(h.calls[1].task,"audit");
 });
+
+test("文体以外の指示でも、書き方の見本の文をそのまま含む案には確認ポイントを付け、照合済みにしない",async()=>{
+  const h=harness(['{"pass":true}'],JSON.stringify({reply:"入れました",draft:"妊娠中とのことですので施術は控えさせていただきます。料金は3,300円です。"}));
+  h.p.acknowledgementOnly=false;h.p.latestInstruction="料金も入れて";
+  h.p.styleSampleTexts=["テスト：妊娠中とのことですので施術は控えさせていただきます。"];h.p.knownText="テスト：料金を教えてください";
+  const r=await runStream(h);
+  assert.equal(r.meta.ok,true);assert.match(r.meta.warning,/書き方の見本/);
+  assert.equal(h.saved[0].warning.includes("書き方の見本"),true);
+});

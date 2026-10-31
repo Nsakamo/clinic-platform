@@ -1518,6 +1518,7 @@ function formatLearnedExamples(exRel) {
 const LEARNED_EXAMPLES_K = 8;
 const LEARNED_EXAMPLES_GATE_K = 4; // 自動送信の根拠に数える件数（変更前と同じ）
 const STYLE_SAMPLES_K = 3;
+const STYLE_SAMPLE_PERSONAL = /痛|腫れ|出血|症状|体調|具合|妊娠|授乳|病|熱|薬|治療|抜歯|術後|副作用|アレルギ|しみ|かゆ|不幸|ご家族|事故|入院|通院|経過|お子/;
 // スタッフが実際に患者へ送った返信を「書き方の見本」にする（同じ法人のものだけ。スタッフが確認する相談チャット専用）。
 // 対象は安全確認で「他の患者にも再利用できる」と判定された学習例だけ（今回限り・個人情報監査不合格・学習失敗の例は使わない）。
 // 氏名・連絡先・日時・数字は伏字にし、見本の事実は使わせない。学習の確認待ち・矛盾確認中の例も使わない。
@@ -1525,7 +1526,8 @@ function styleSamples(t, query, context, k) {
   const pendingIds = new Set(learningConflicts(t, true).flatMap(item => item.kind === "rule" ? [Number(item.newId)] : [Number(item.oldId), Number(item.newId)]));
   learningJobs(t).filter(job => job.status === "processing" && Number(job.exampleId)).forEach(job => pendingIds.add(Number(job.exampleId)));
   const list = Object.values(t.examples || {})
-    .filter(e => e && !pendingIds.has(Number(e.id)) && reusableLearningSummary(e) && String(e.q || "").trim() && String(e.final || "").trim().length >= 30);
+    .filter(e => e && !pendingIds.has(Number(e.id)) && reusableLearningSummary(e) && String(e.q || "").trim() && String(e.final || "").trim().length >= 30
+      && !STYLE_SAMPLE_PERSONAL.test(String(e.q || "") + String(e.final || ""))); // 体調・症状・家庭の事情を含む返信は見本にしない
   if (!list.length || !String(query || context || "").trim()) return [];
   return rankLearningExamples(list, { latest: query, context: context || query }, k || STYLE_SAMPLES_K)
     .map(e => ({ id: e.id, intent: LEARNING_INTENT_LABELS[learningIntentKey(e.q)] || "その他", text: maskStyleSample(String(e.final).slice(0, 700)) }))
@@ -3887,11 +3889,12 @@ app.post("/api/customer-appt-cancel", guard, oneMutationAtATime("appointment-can
   const t = req.tenant; const c = t.store[req.body.id];
   if (!c) return res.json({ ok: false, error: "no" });
   if (req.body.confirmed !== true) return res.status(400).json({ ok: false, error: "confirmation_required" });
+  baCacheClear(t, c); // 相談用の予約照会キャッシュを取消の前後で捨てる
   const r = await partnerPost("/appointment-cancel", {
     slug: t.slug, appointmentId: req.body.appointmentId, reason: req.body.reason,
     channel: c.channel === "mail" ? "mail" : "line", userId: c.userId,
     phone: c.ba && c.ba.phone ? c.ba.phone : undefined, confirmed: true,
-  });
+  }).finally(() => baCacheClear(t, c));
   if (!r.json) return res.json({ ok: false });
   res.json(r.json);
 });
@@ -4025,7 +4028,7 @@ function staffBookingPrompt(ctx) {
     + "\n対象予約が複数あり特定できない、日付・時刻が不足、操作不可、または患者名を別人として指定している場合はactionをnoneにし、必要な確認をスタッフへ質問する。推測でIDや日時を補わない。";
 }
 // スタッフが明示した口調・言い回しの指示は、既定の文体ルール（トーン設定・簡潔さの目安・礼儀ガード）より優先する（運用方針）。
-const STAFF_TONE_PRIORITY = "【スタッフの口調指示の優先】スタッフが口調・言い回し・温度感・長さ（例:「もっと丁寧で温かく」「もっと柔らかく」「短く」）を明示したら、その指示を既定の文体ルール（トーン設定、簡潔さや敬語の量の目安、文数の目安）より優先し、読んで違いがはっきり分かるように返信全文を書き直す。丁寧・温かくの指示では、お問い合わせへのお礼、相手の状況や気持ちへの配慮、安心していただける一言、締めのあいさつなどを自然に加えてよい。ただし事実・日時・金額・可否・結論・案内先は変えず、医療判断や新しい約束は加えない。";
+const STAFF_TONE_PRIORITY = "【スタッフの口調指示の優先】スタッフが口調・言い回し・温度感・長さ（例:「もっと丁寧で温かく」「もっと柔らかく」「短く」）を明示したら、その指示を既定の文体ルール（トーン設定、簡潔さや敬語の量の目安、文数の目安）より優先し、読んで違いがはっきり分かるように返信全文を書き直す。丁寧・温かくの指示では、お問い合わせへのお礼、ご連絡への感謝、お手数への気づかい、締めのあいさつなどを自然に加えてよい。ただし事実・日時・金額・可否・結論・案内先は変えず、『ご安心ください』『よくあることです』のような根拠のない安心づけ、症状や経過への言及、医療判断、新しい約束は加えない。";
 // 共通部（会話文脈＋ルール＋方針）。出力形式はJSONで受け取り、画面向けの形はサーバーで組み立てる。
 async function draftChatPrep(t, body) {
   const c = t.store[body.id] || null;
@@ -4038,7 +4041,7 @@ async function draftChatPrep(t, body) {
   const acknowledgementOnly = acknowledgementDraftScope(requestedEdits);
   const previousDraft = (requestedEdits.slice().reverse().find(m => m.role === "assistant" && m.kind !== "reply") || {}).content || String(c.draft || "").slice(0, 4000);
   const edits = normalizeDraftEditHistory(requestedEdits);
-  if (!edits.length || edits[edits.length - 1].role !== "user") return { error: "empty" };
+  if (!edits.length || edits[edits.length - 1].role !== "user" || !String(latestInstruction || "").trim()) return { error: "empty" };
   const staffHistory = staffConsultationTranscript(requestedEdits);
   const referenceText = latestInstruction;
   const context = selectConversationContext(c, { maxCurrent: 40, maxOlder: 20, referenceText, includeHandledReference: true });
@@ -4056,7 +4059,8 @@ async function draftChatPrep(t, body) {
   // 相談でもルールブックは全文を読む（以前は文字の一致で選んだ上位20件だけで、言い回しが違うルールが漏れていた）。
   const rulesTxt = promptRulesText(t, ranked.map(x => x.r), ruleBudget(t));
   // 照合AIへ渡す根拠は、速さのため関連の高いルールに絞る。
-  const relevantRulesTxt = rulesBlock(ranked.filter(x => x.n > 0).slice(0, 20).map(x => x.r), 16000);
+  // ルールブックが4万字以内なら照合AIにも全文を渡す（言い回しの違うルールを根拠にした案を誤って不合格にしない）
+  const relevantRulesTxt = rulesCharTotal(t) <= 40000 ? rulesBlock(rulesList(t), 40000) : rulesBlock(ranked.filter(x => x.n > 0).slice(0, 20).map(x => x.r), 16000);
   // 送信後に学習した判断手順（安全確認済み）と、この院のスタッフが実際に送った返信の見本
   const exRel = examplesRanked(t, (lastQ || latestInstruction).slice(0, 800), LEARNED_EXAMPLES_K, ruleQuery.slice(0, 1500));
   const examplesTxt = exRel.length ? formatLearnedExamples(exRel) : "";
@@ -4327,6 +4331,10 @@ async function runDraftChat(t, body) {
   const reviewed = p.consultation ? { text: "", error: "" } : await reviewDraftChatCandidate(t, p, out.draft == null ? "" : out.draft);
   if (reviewed.error) return { ok: false, error: reviewed.error };
   const draft = String(reviewed.text || "").trim().slice(0, 4000);
+  // 照合の結果にかかわらず、書き方の見本（他の患者への返信）の文をそのまま含む案には必ず確認ポイントを付け、照合済みにしない
+  if (draft && borrowsFromSamples(draft, p.styleSampleTexts, String(p.previousDraft || "") + "\n" + String(p.knownText || ""))) {
+    reviewed.warning = [reviewed.warning, "書き方の見本（他の患者への返信）と同じ文が含まれています。今回の患者に当てはまるか確認してください"].filter(Boolean).join("／");
+  }
   let reply = String(out.reply || "").trim();
   if (draft) reply = "返信案を作成しました。下の最終案をご確認ください。この操作では患者様への送信は行っていません。";
   if (!draft && !reply) return { ok: false, error: "invalid_edit_response" };
