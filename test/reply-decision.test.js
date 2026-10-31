@@ -1,5 +1,6 @@
 "use strict";
 
+const promptStubs = require("./helpers/prompt-stubs");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -180,7 +181,7 @@ test("通常の治療予約の変更を感染症・証明書専用ゲートで�
   const start = source.indexOf("async function genDraft(t, c, opts) {"), end = source.indexOf("// 毎回承認モード", start);
   const context = {
     ...decision, activeConversationMessages: c => c.msgs, S: () => ({ tone: "", prefs: [] }),
-    rulesRankedWithScores: () => [{ r: { content: rules }, n: 3, score: 0.5 }], rulesBlock: () => rules, ruleBudget: () => 16000,
+    ...promptStubs(), rulesRankedWithScores: () => [{ r: { content: rules }, n: 3, score: 0.5 }], rulesBlock: () => rules, ruleBudget: () => 16000,
     examplesRanked: () => [], trustedLearningPrecedent: () => false, prefsBlock: () => "", notesBlock: () => "", replyToneInstruction: () => "",
     JP_QUALITY: "", PATIENT_COURTESY: "", baEnabled: () => false, staffLineReviewAll: () => false, PARTNER_KEY: "",
     aiChat: async () => JSON.stringify({ draft: "ご希望の日時をお知らせください。", confidence: "high", needs_human: false, action: { type: "reschedule" } }),
@@ -225,7 +226,7 @@ test("編集準備は関連証明書ルールと会話日時を照合資料へ�
   const queries = [];
   const context = {
     ...decision, ...consultation, selectConversationContext, normalizeDraftEditHistory, isDraftChatConsultation,
-    rulesRankedWithScores: (_t, q) => { queries.push(q); return [{ n: 2, r: { content: rules } }]; },
+    ...promptStubs(), rulesRankedWithScores: (_t, q) => { queries.push(q); return [{ n: 2, r: { content: rules } }]; },
     rulesBlock: rel => rel.map(r => r.content).join("\n"),
     S: () => ({ engine: "gpt", tone: "" }), notesBlock: () => "", prefsBlock: () => "", replyToneInstruction: () => "",
     baEnabled: () => false, PARTNER_KEY: "", staffBookingPrompt: () => "", ANTHROPIC_KEY: "", process: { env: {} }, JP_QUALITY: "",
@@ -247,7 +248,7 @@ test("初回生成は人の確認が必要でも免除案内の漏れを照合�
   const context = {
     ...decision, activeConversationMessages: c => c.msgs,
     S: () => ({ tone: "", prefs: [] }),
-    rulesRankedWithScores: () => [{ r: { content: rules }, n: 3, score: 0.5 }], rulesBlock: () => rules, ruleBudget: () => 16000,
+    ...promptStubs(), rulesRankedWithScores: () => [{ r: { content: rules }, n: 3, score: 0.5 }], rulesBlock: () => rules, ruleBudget: () => 16000,
     examplesRanked: () => [], trustedLearningPrecedent: () => false, prefsBlock: () => "", notesBlock: () => "", replyToneInstruction: () => "",
     JP_QUALITY: "", PATIENT_COURTESY: "", baEnabled: () => false, staffLineReviewAll: () => false, PARTNER_KEY: "",
     aiChat: async (_t, sys) => { prompt = sys; return JSON.stringify({ draft: "空き状況を確認します。", confidence: "high", needs_human: true }); },
@@ -274,7 +275,7 @@ test("証明書発行だけの問い合わせへ免除案内を強制せず、�
     let reviewed = false;
     const context = {
       ...decision, activeConversationMessages: c => c.msgs, S: () => ({ tone: "", prefs: [] }),
-      rulesRankedWithScores: () => [{ r: { content: rules }, n: 3, score: 0.5 }], rulesBlock: () => rules, ruleBudget: () => 16000,
+      ...promptStubs(), rulesRankedWithScores: () => [{ r: { content: rules }, n: 3, score: 0.5 }], rulesBlock: () => rules, ruleBudget: () => 16000,
       examplesRanked: () => [], trustedLearningPrecedent: () => false, prefsBlock: () => "", notesBlock: () => "", replyToneInstruction: () => "",
       JP_QUALITY: "", PATIENT_COURTESY: "", baEnabled: () => false, staffLineReviewAll: () => false, PARTNER_KEY: "",
       aiChat: async () => JSON.stringify({ draft: "証明書について確認します。", confidence: "high", needs_human: !infection }),
@@ -322,7 +323,7 @@ test("非定型の感染症連絡は発行だけと断定せず、関連する�
   let inspected = false;
   const context = {
     ...decision, activeConversationMessages: c => c.msgs, S: () => ({ tone: "", prefs: [] }),
-    rulesRankedWithScores: () => [{ r: { content: rules }, n: 3, score: 0.5 }], rulesBlock: () => rules, ruleBudget: () => 16000,
+    ...promptStubs(), rulesRankedWithScores: () => [{ r: { content: rules }, n: 3, score: 0.5 }], rulesBlock: () => rules, ruleBudget: () => 16000,
     examplesRanked: () => [], trustedLearningPrecedent: () => false, prefsBlock: () => "", notesBlock: () => "", replyToneInstruction: () => "",
     JP_QUALITY: "", PATIENT_COURTESY: "", baEnabled: () => false, staffLineReviewAll: () => false, PARTNER_KEY: "",
     aiChat: async () => JSON.stringify({ draft: "証明書と予約変更について確認します。", confidence: "high", needs_human: true }),

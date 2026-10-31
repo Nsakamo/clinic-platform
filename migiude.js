@@ -19,8 +19,9 @@ const { lineWebhookEventId, lineWebhookRetryDelay, isProcessableLineEvent } = re
 const { normalizeAiRoutes, resolveAiRoute, publicModelCatalog } = require("./lib/ai-model-router");
 const { contextualLearningFallback, formatLearningProposal } = require("./lib/learning-context");
 const { selectConversationContext, preserveTopicBoundary } = require("./lib/conversation-context");
-const { STAFF_DRAFT_POLICY, formatDraftContext, staffConsultationTranscript, isAcknowledgementOnlyRequest, acknowledgementDraftScope, ACKNOWLEDGEMENT_DRAFT_POLICY, draftChatDraftSection, isValidDraftChatEnvelope } = require("./lib/draft-consultation");
+const { STAFF_DRAFT_POLICY, formatDraftContext, staffConsultationTranscript, isAcknowledgementOnlyRequest, acknowledgementDraftScope, ACKNOWLEDGEMENT_DRAFT_POLICY } = require("./lib/draft-consultation");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("./lib/draft-edit");
+const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, maskStyleSample } = require("./lib/draft-chat-output");
 const { REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview, inboundMessageTimes } = require("./lib/reply-decision");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
@@ -527,6 +528,7 @@ async function staffLineReviseDraft(t, c, instruction) {
     { role: "user", content: String(instruction || "").slice(0, 1200) },
   ] });
   if (p.error || p.consultation) return "";
+  p.styleFastPath = true; // 文体だけの修正で事実が変わっていなければ照合AIを省く（承認はスタッフLINEで行う）
   const out = await aiChat(t, p.base + "\n患者へ送る返信本文の完成形だけを出力する。", p.edits, 1800, "chat");
   if (!String(out || "").trim()) return "";
   return (await reviewDraftChatCandidate(t, p, out)).text;
@@ -1497,6 +1499,43 @@ function rulesBlock(list, budget) {
   }
   return out.join("\n");
 }
+// AIへ渡すルールブック本文。全文が枠に収まるなら登録順（毎回同じ並び）で全件渡し、
+// OpenAIのプロンプトキャッシュ（同じ先頭部分の再利用）が効くようにする。収まらない時だけ関連度順で枠まで渡す。
+function promptRulesText(t, ranked, budget) {
+  budget = budget || ruleBudget(t);
+  if (rulesCharTotal(t) <= budget) return rulesBlock(rulesList(t), budget);
+  return rulesBlock(Array.isArray(ranked) ? ranked : rulesList(t), budget);
+}
+// 安全確認済みの学習（一般化した判断手順）をプロンプト用に整形する
+function formatLearnedExamples(exRel) {
+  return (Array.isArray(exRel) ? exRel : []).map(e => {
+    const score = Math.round(Number(e.matchScore || 0) * 100);
+    const confirmed = Math.max(1, Number(e.confirmedCount || 1));
+    const date = Number(e.ts || 0) ? new Date(Number(e.ts)).toLocaleDateString("ja-JP") : "日時不明";
+    const role = trustedLearningPrecedent(e) ? "再利用できる確定例" : "参考例";
+    return "・[対応例#" + e.id + " / " + role + " / " + date + " / 類似" + score + "% / スタッフ確認" + confirmed + "回] " + reusableLearningSummary(e);
+  }).join("\n");
+}
+const LEARNED_EXAMPLES_K = 8;
+const STYLE_SAMPLES_K = 3;
+// スタッフが実際に患者へ送った返信を「書き方の見本」にする（同じ法人のものだけ）。
+// 氏名・連絡先・日時・数字は伏字にし、見本の事実は使わせない。学習の確認待ち・矛盾確認中の例は使わない。
+function styleSamples(t, query, context, k) {
+  const pendingIds = new Set(learningConflicts(t, true).flatMap(item => item.kind === "rule" ? [Number(item.newId)] : [Number(item.oldId), Number(item.newId)]));
+  learningJobs(t).filter(job => job.status === "processing" && Number(job.exampleId)).forEach(job => pendingIds.add(Number(job.exampleId)));
+  const list = Object.values(t.examples || {})
+    .filter(e => e && !pendingIds.has(Number(e.id)) && String(e.q || "").trim() && String(e.final || "").trim().length >= 30);
+  if (!list.length || !String(query || context || "").trim()) return [];
+  return rankLearningExamples(list, { latest: query, context: context || query }, k || STYLE_SAMPLES_K)
+    .map(e => ({ id: e.id, intent: LEARNING_INTENT_LABELS[learningIntentKey(e.q)] || "その他", text: maskStyleSample(String(e.final).slice(0, 700)) }))
+    .filter(x => x.text.length >= 20);
+}
+function styleSamplesBlock(samples) {
+  if (!Array.isArray(samples) || !samples.length) return "";
+  return "【書き方の見本（この院のスタッフが実際に送った返信。氏名・日時・数字は伏字）】\n"
+    + "言葉づかい・温度感・構成・長さ・締め方をこの見本に寄せる。見本の内容（料金・日時・可否・案内先など）は今回の根拠にしない。事実は店舗ルールと会話・照会結果だけから書く。\n"
+    + samples.map((s, i) => "見本" + (i + 1) + "（" + s.intent + "）:\n" + s.text).join("\n---\n");
+}
 
 // ---------- helpers ----------
 function lastText(c) { const m = c.msgs[c.msgs.length - 1]; if (!m) return ""; if (m.media === "image") return "［画像］写真"; if (m.media === "video") return "［動画］動画"; if (m.media === "file") return "［ファイル］" + (m.fileName || ""); if (m.media === "audio") return "［音声］"; return m.text || ""; }
@@ -1587,12 +1626,17 @@ async function flushPendingAiUsage(){
 }
 const aiUsageRetryTimer = setInterval(() => { flushPendingAiUsage().catch(() => {}); }, 30000);
 if(aiUsageRetryTimer.unref) aiUsageRetryTimer.unref();
-async function aiChatOne(eng, system, messages, maxTokens, route){
+async function aiChatOne(eng, system, messages, maxTokens, route, options){
   if(eng === "gpt"){
     route = route || { model: process.env.OPENAI_MODEL || "gpt-6-sol", reasoningEffort: "medium" };
-    const r = await fetch("https://api.openai.com/v1/chat/completions", { method:"POST",
+    const payload = { model:route.model, max_completion_tokens:maxTokens, reasoning_effort:route.reasoningEffort, messages:[{role:"system",content:system}].concat(messages) };
+    // JSONで答えさせる指定（形式崩れを防ぐ）。モデルが未対応で400になった場合は指定なしで1回だけ送り直す。
+    if(options && options.json) payload.response_format = { type:"json_object" };
+    const send = body => fetch("https://api.openai.com/v1/chat/completions", { method:"POST",
       headers: { "Content-Type":"application/json", "Authorization":"Bearer "+process.env.OPENAI_KEY },
-      body: JSON.stringify({ model:route.model, max_completion_tokens:maxTokens, reasoning_effort:route.reasoningEffort, messages:[{role:"system",content:system}].concat(messages) }) });
+      body: JSON.stringify(body) });
+    let r = await send(payload);
+    if(!r.ok && r.status === 400 && payload.response_format){ delete payload.response_format; r = await send(payload); }
     if(!r.ok) throw new Error("openai_"+r.status);
     const d = await r.json(); return { text: d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content, usage: { input_tokens: Number(d.usage && d.usage.prompt_tokens || 0), output_tokens: Number(d.usage && d.usage.completion_tokens || 0), provider: "openai", model: route.model } };
   }
@@ -1619,11 +1663,11 @@ async function aiChatOne(eng, system, messages, maxTokens, route){
   if(!r.ok) throw new Error("anthropic_"+r.status);
   const d = await r.json(); return { text: (d.content && d.content[0] && d.content[0].text) || null, usage: { input_tokens: Number(d.usage && d.usage.input_tokens || 0), output_tokens: Number(d.usage && d.usage.output_tokens || 0), provider: "anthropic", model: "claude-sonnet-4-6" } };
 }
-async function aiChat(t, system, messages, maxTokens, task, routeOverride){
-  const route = openAiRoute(t, task || "draft", routeOverride);
+async function aiChat(t, system, messages, maxTokens, task, routeOverride, options){
+  const route = openAiRoute(t, task || "draft", routeOverride || undefined);
   for(const eng of aiEngineOrder(t)){
     try{
-      const result = await aiChatOne(eng, system, messages, maxTokens, eng === "gpt" ? route : null);
+      const result = await aiChatOne(eng, system, messages, maxTokens, eng === "gpt" ? route : null, options);
       if(result && result.text){
         await recordAiUsage(t, result.usage, task || "draft");
         const store = aiUsageContext.getStore();
@@ -1903,7 +1947,26 @@ async function fetchBooking(t, c) {
 // 曖昧な返信では絶対に実行しない。確認文・結果文はうけつけるん生成の定型文をそのまま送る（AIが改変しない）。
 const BA_URL = PARTNER_BASE + "/appointment-actions";
 function baEnabled(t) { return !!S(t).bookingActions; }
+// 「右腕くんに相談」用の予約照会の短期キャッシュ（スタッフが確認してから使う下書き専用。自動送信の経路では使わない）。
+// 相談パネルを開いた時点で先に照会しておき、指示を送った時の待ち時間（うけつけるんの起動待ち等）を減らす。
+const BA_CONTEXT_CACHE_MS = 90 * 1000;
+const baContextCache = new Map();
+function baCacheKey(t, c) { return t.slug + "::" + c.id; }
+function baContextCached(t, c, timeoutMs) {
+  const key = baCacheKey(t, c), hit = baContextCache.get(key), now = Date.now();
+  if (hit && now - hit.at < BA_CONTEXT_CACHE_MS) return hit.promise;
+  const promise = baCall(t, c, "context", {}, timeoutMs || 12000).then(value => {
+    // 照会に失敗した結果は覚えない（次回もう一度照会する）
+    if (!value || value.ok === false) { const cur = baContextCache.get(key); if (cur && cur.promise === promise) baContextCache.delete(key); }
+    return value;
+  }, () => { baContextCache.delete(key); return null; });
+  baContextCache.set(key, { at: now, promise });
+  if (baContextCache.size > 500) { for (const [k, v] of baContextCache) { if (now - v.at >= BA_CONTEXT_CACHE_MS) baContextCache.delete(k); } }
+  return promise;
+}
 async function baCall(t, c, action, extra, timeoutMs) {
+  // 予約を変更し得る操作の前後では、相談用の照会キャッシュを捨てて最新を読み直す
+  if (action !== "context" && action !== "slots" && action !== "result" && t && c) baContextCache.delete(baCacheKey(t, c));
   try {
     if (!PARTNER_KEY) return null;
     const body = Object.assign({ action, slug: t.slug, channel: c.channel === "mail" ? "mail" : "line", userId: c.userId }, extra || {});
@@ -2219,22 +2282,17 @@ async function genDraft(t, c, opts) {
   const lastQ = recentQuestions.join(" ");
   const rankedRules = rulesRankedWithScores(t, replyRuleQuery(lastQ.slice(0, 1500)));
   const rel = rankedRules.map(x => x.r);
-  const rulesTxt = rulesBlock(rel, ruleBudget(t));
+  const rulesTxt = promptRulesText(t, rel, ruleBudget(t));
   const policyContext = activeMsgs.filter(m => m.from === "them").slice(-16).map(m => m.text || "").join(" ");
   const policyReviewNeeded = needsCancellationPolicyReview(policyContext, rulesTxt);
   // Unknown wording is not proof of a certificate-only intent. In illness
   // cases let the conditional content audit interpret the actual request.
   const certificateInquiry = /診断書|証明書|受診証明/.test(lastQ);
   const replyRequiresStaff = policyReviewNeeded || certificateInquiry || (isIllnessInquiry(lastQ) && /免除|免責/.test(rulesTxt));
-  const exRel = examplesRanked(t, latestQ.slice(0, 800), 4, lastQ.slice(0, 1500));
+  const exRel = examplesRanked(t, latestQ.slice(0, 800), LEARNED_EXAMPLES_K, lastQ.slice(0, 1500));
   const trustedPrecedents = exRel.filter(trustedLearningPrecedent);
-  const examplesTxt = exRel.length ? exRel.map(e => {
-    const score = Math.round(Number(e.matchScore || 0) * 100);
-    const confirmed = Math.max(1, Number(e.confirmedCount || 1));
-    const date = Number(e.ts || 0) ? new Date(Number(e.ts)).toLocaleDateString("ja-JP") : "日時不明";
-    const role = trustedLearningPrecedent(e) ? "再利用できる確定例" : "参考例";
-    return "・[対応例#" + e.id + " / " + role + " / " + date + " / 類似" + score + "% / スタッフ確認" + confirmed + "回] " + reusableLearningSummary(e);
-  }).join("\n") : "";
+  const examplesTxt = exRel.length ? formatLearnedExamples(exRel) : "";
+  const samplesTxt = styleSamplesBlock(styleSamples(t, latestQ.slice(0, 800), lastQ.slice(0, 1500)));
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = channel === "mail" ? "メールなので返信本文の最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
   const msgsArr = []; let cur = null;
@@ -2273,19 +2331,11 @@ async function genDraft(t, c, opts) {
         + (opts.bookingReviewPreview ? "\nこれはスタッフ承認前の返信案である。予約変更が完了したとは絶対に書かず、確認できた空き状況を伝えたうえで『この日時へ変更をご希望ですか』と患者の意思を確認する。actionはtype:noneにする。" : "");
     }
   }
+  // 先頭は毎回同じ内容（役割・安全ルール・出力形式・トーン・共通指示・ルールブック）、後ろに今回の会話ごとに変わる内容を置く。
+  // 同じ先頭部分はOpenAI側で再利用（プロンプトキャッシュ）され、返信作成が速くなる。
   const sys = "あなたはクリニック・店舗「" + (t.name || "クリニック") + "」の受付スタッフです。お客様とこの会話をしてきた本人として、最新のメッセージへ、自然で温かく、簡潔な敬語で返信します。"
-    + "返信を作成する現在日は" + today + "です。患者の連絡日時とは区別する。" + REPLY_DECISION
-    + (opts.only && opts.only.length
-        ? "お客様は複数の連絡をしているが、今回はスタッフが選んだ次の項目だけに答えること。選ばれていない項目には一切触れない: 「" + opts.only.map(s => String(s)).join("」「") + "」。会話で既に伝えた内容は繰り返さない。"
-        : "お客様が複数の質問・依頼をしている場合は、その全てにもれなく答えること。1つも取りこぼさない。会話で既に伝えた内容は繰り返さない。")
+    + REPLY_DECISION
     + "医療判断・診断はしない。「絶対」「完治」など断定的表現は使わない。絵文字は使わない。" + sig
-    + (rulesTxt ? "\n\n【店舗ルール（最優先で従う。料金・規定・対応可否はここに従い、推測で答えない。同じ内容が食い違う場合は更新日が新しいルールを使う）】\n" + rulesTxt : "")
-    + (examplesTxt ? "\n\n【今回の問い合わせに近い、スタッフ確認済みの過去対応】\n『再利用できる確定例』は、同じ状況ならスタッフが確定した結論・案内順序・必要な確認事項・通常の料金や規定を次の回答にも引き継ぐ。これが右腕くんの対応学習である。ただし優先順位は、最新の店舗ルール > 本人確認済みシステムデータ > 再利用できる確定例 > 参考例。新しいルールと古い例が矛盾したら必ず新しいルールを使う。個別患者の予約日時・体調・例外対応は他の患者へ引き継がない。『参考例』は文章と手順だけ参考にする。\n" + examplesTxt : "")
-    + (replyToneInstruction(S(t).tone) ? "\n\n" + replyToneInstruction(S(t).tone) : "")
-    + (prefsBlock(t) ? "\n\n【スタッフが記憶させた指示（全返信で必ず守る。トーン指示と同格で最優先）】\n" + prefsBlock(t) : "")
-    + (notesBlock(c) ? "\n\n【このお客様への対応でスタッフが出した指示メモ（編集チャットでの指示。今回の返信でも引き続き従う。ただし明らかに“その時限り”の内容は無視してよい）】\n" + notesBlock(c) : "")
-    + (bookingTxt ? "\n\n【この方の情報（うけつけるん＝予約システムからの照会結果。氏名・会員ランク・ポイント・予約・回数券・最終来院などの参考。日付判断・キャンセル可否・来院案内に使う。ここに無い内容は推測しない。カルテ・診療内容は含まれない）】\n" + bookingTxt : "")
-    + baTxt
     + "\n\n【事実の安全ルール】料金・金額・割引・期限・規定・営業日・対応可否は店舗ルールに明記された内容だけを答える。予約日時・空き枠・患者固有情報・手続き完了は、本人確認済みのシステム照会結果だけを答える。痛み・症状・薬・安全性は診断や『大丈夫』という断定をせず、スタッフ確認へ回す。根拠が無い場合は推測せず『確認してご案内します』と伝え、needs_human:true、confidence:lowにする。"
     + "\n\n" + JP_QUALITY
     + "\n\n出力は必ず次のJSONのみ（前後に説明や```やかぎ括弧を付けない）: {\"draft\":\"お客様への返信文\",\"confidence\":\"high|medium|low\",\"is_urgent\":true|false,\"needs_human\":true|false,\"site_alert\":\"遅刻|当日キャンセル|緊急来院|none\",\"site_summary\":\"現場向け一行要約。site_alertがnoneなら空文字\",\"topics\":[{\"q\":\"短い質問ラベル\",\"need\":true}]"
@@ -2293,10 +2343,23 @@ async function genDraft(t, c, opts) {
     + "}"
     + "\nconfidence: ルールと会話から自信を持って答えられればhigh、判断に迷う/情報不足ならlow。"
     + (baTxt
-        ? "\nneeds_human: クレーム・支払いトラブル・偽物疑惑・キャンセル料の例外判断などスタッフの人間判断が必要ならtrue。予約の確認・キャンセル・日時変更は上の【予約自動受付】のactionで処理できるため、それだけならfalseでよい。"
+        ? "\nneeds_human: クレーム・支払いトラブル・偽物疑惑・キャンセル料の例外判断などスタッフの人間判断が必要ならtrue。予約の確認・キャンセル・日時変更は下の【予約自動受付】のactionで処理できるため、それだけならfalseでよい。"
         : "\nneeds_human: 予約状況の確認・キャンセル例外判断・クレーム・支払いトラブル・偽物疑惑などスタッフ確認が必要ならtrue。")
     + "\nis_urgent: 痛み・出血・腫れ・強い不調など緊急性があればtrue。"
-    + "\ntopics: お客様の直近メッセージにある「返信すべき質問・依頼」を、それぞれ短い日本語ラベル(q)で列挙する（最大5件）。状況連絡・挨拶・お礼や、時間が経って既に解決済みと思われるもの（例: かなり前に届いた『遅れます』）は need:false。それ以外は need:true。質問が1つだけなら1件でよい。";
+    + "\ntopics: お客様の直近メッセージにある「返信すべき質問・依頼」を、それぞれ短い日本語ラベル(q)で列挙する（最大5件）。状況連絡・挨拶・お礼や、時間が経って既に解決済みと思われるもの（例: かなり前に届いた『遅れます』）は need:false。それ以外は need:true。質問が1つだけなら1件でよい。"
+    + (replyToneInstruction(S(t).tone) ? "\n\n" + replyToneInstruction(S(t).tone) : "")
+    + (prefsBlock(t) ? "\n\n【スタッフが記憶させた指示（全返信で必ず守る。トーン指示と同格で最優先）】\n" + prefsBlock(t) : "")
+    + (rulesTxt ? "\n\n【店舗ルール（最優先で従う。料金・規定・対応可否はここに従い、推測で答えない。同じ内容が食い違う場合は更新日が新しいルールを使う）】\n" + rulesTxt : "")
+    // ---- ここから下は問い合わせごとに変わる ----
+    + (examplesTxt ? "\n\n【今回の問い合わせに近い、スタッフ確認済みの過去対応】\n『再利用できる確定例』は、同じ状況ならスタッフが確定した結論・案内順序・必要な確認事項・通常の料金や規定を次の回答にも引き継ぐ。これが右腕くんの対応学習である。ただし優先順位は、最新の店舗ルール > 本人確認済みシステムデータ > 再利用できる確定例 > 参考例。新しいルールと古い例が矛盾したら必ず新しいルールを使う。個別患者の予約日時・体調・例外対応は他の患者へ引き継がない。『参考例』は文章と手順だけ参考にする。\n" + examplesTxt : "")
+    + (samplesTxt ? "\n\n" + samplesTxt : "")
+    + "\n\n返信を作成する現在日は" + today + "です。患者の連絡日時とは区別する。"
+    + (opts.only && opts.only.length
+        ? "お客様は複数の連絡をしているが、今回はスタッフが選んだ次の項目だけに答えること。選ばれていない項目には一切触れない: 「" + opts.only.map(s => String(s)).join("」「") + "」。会話で既に伝えた内容は繰り返さない。"
+        : "お客様が複数の質問・依頼をしている場合は、その全てにもれなく答えること。1つも取りこぼさない。会話で既に伝えた内容は繰り返さない。")
+    + (notesBlock(c) ? "\n\n【このお客様への対応でスタッフが出した指示メモ（編集チャットでの指示。今回の返信でも引き続き従う。ただし明らかに“その時限り”の内容は無視してよい）】\n" + notesBlock(c) : "")
+    + (bookingTxt ? "\n\n【この方の情報（うけつけるん＝予約システムからの照会結果。氏名・会員ランク・ポイント・予約・回数券・最終来院などの参考。日付判断・キャンセル可否・来院案内に使う。ここに無い内容は推測しない。カルテ・診療内容は含まれない）】\n" + bookingTxt : "")
+    + baTxt;
   try {
     const raw = await aiChat(t, sys, msgsArr, 4000, "draft", opts && opts.aiRouteOverride);
     if (!raw) return null;
@@ -3948,7 +4011,9 @@ function staffBookingPrompt(ctx) {
     + "\n書き込み操作はactionを出しても即実行されず、画面に対象患者・予約・内容の確認カードが出る。スタッフがそのカードで実行を承認した時だけ処理される。"
     + "\n対象予約が複数あり特定できない、日付・時刻が不足、操作不可、または患者名を別人として指定している場合はactionをnoneにし、必要な確認をスタッフへ質問する。推測でIDや日時を補わない。";
 }
-// 共通部（会話文脈＋ルール＋方針）。出力形式だけ通常版(JSON)とストリーミング版(マーカー)で変える。
+// スタッフが明示した口調・言い回しの指示は、既定の文体ルール（トーン設定・簡潔さの目安・礼儀ガード）より優先する（運用方針）。
+const STAFF_TONE_PRIORITY = "【スタッフの口調指示の優先】スタッフが口調・言い回し・温度感・長さ（例:「もっと丁寧で温かく」「もっと柔らかく」「短く」）を明示したら、その指示を既定の文体ルール（トーン設定、簡潔さや敬語の量の目安、文数の目安）より優先し、読んで違いがはっきり分かるように返信全文を書き直す。丁寧・温かくの指示では、お問い合わせへのお礼、相手の状況や気持ちへの配慮、安心していただける一言、締めのあいさつなどを自然に加えてよい。ただし事実・日時・金額・可否・結論・案内先は変えず、医療判断や新しい約束は加えない。";
+// 共通部（会話文脈＋ルール＋方針）。出力形式はJSONで受け取り、画面向けの形はサーバーで組み立てる。
 async function draftChatPrep(t, body) {
   const c = t.store[body.id] || null;
   if (!c) return { error: "no_conv" };
@@ -3974,38 +4039,50 @@ async function draftChatPrep(t, body) {
     ? "\n\n【音声入力されたスタッフ指示】最新のスタッフ指示は音声認識から変換された文章です。誤字、同音異義語、助詞抜け、途中の言い直しがあっても、お客様との会話、現在の下書き、店舗ルール、院内用語から意図を復元し、明らかな変換ミスをスタッフに直させず反映する。意味不明な語をそのまま患者向け下書きへ転記しない。ただし患者名、医院、予約日時、金額、回数、予約の変更・取消など重要情報に複数の解釈が残る場合は推測せず、replyで短く確認し、actionはnone、下書きは変更しない。"
     : "";
   const ruleQuery = [latestInstruction.slice(0, 2000), lastQ.slice(0, 2000), priorInstructions.slice(0, 1500), previousDraft.slice(0, 1000)].join(" ");
-  const rel = rulesRankedWithScores(t, replyRuleQuery(ruleQuery))
-    .filter(x => x.n > 0).slice(0, 20).map(x => x.r);
-  const rulesTxt = rel.length ? rulesBlock(rel, 16000) : "";
+  const ranked = rulesRankedWithScores(t, replyRuleQuery(ruleQuery));
+  // 相談でもルールブックは全文を読む（以前は文字の一致で選んだ上位20件だけで、言い回しが違うルールが漏れていた）。
+  const rulesTxt = promptRulesText(t, ranked.map(x => x.r), ruleBudget(t));
+  // 照合AIへ渡す根拠は、速さのため関連の高いルールに絞る。
+  const relevantRulesTxt = rulesBlock(ranked.filter(x => x.n > 0).slice(0, 20).map(x => x.r), 16000);
+  // 送信後に学習した判断手順（安全確認済み）と、この院のスタッフが実際に送った返信の見本
+  const exRel = examplesRanked(t, (lastQ || latestInstruction).slice(0, 800), LEARNED_EXAMPLES_K, ruleQuery.slice(0, 1500));
+  const examplesTxt = exRel.length ? formatLearnedExamples(exRel) : "";
+  const samplesTxt = styleSamplesBlock(styleSamples(t, (lastQ || latestInstruction).slice(0, 800), ruleQuery.slice(0, 1500)));
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = c.channel === "mail" ? "メールなので下書きの最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
   let baCtx = null;
   if (baEnabled(t) && PARTNER_KEY) {
-    try { baCtx = await baCall(t, c, "context", {}, 12000); } catch (e) { baCtx = null; }
+    try { baCtx = await baContextCached(t, c, 12000); } catch (e) { baCtx = null; }
   }
+  // 先頭は毎回同じ内容（役割・方針・トーン・共通指示・ルールブック）、後ろに会話ごとに変わる内容を置く（プロンプトキャッシュで速くするため）。
   const base = "あなたは「" + (t.name || "クリニック") + "」の受付スタッフの返信作成アシスタントです。"
     + "スタッフと会話しながら、お客様への返信下書きを一緒に磨き上げます。あなたと会話しているのはスタッフで、下書きを送る相手はお客様です。"
-    + "\n\n【現在の話題（この最新メッセージへの返信に使う主な会話）】\n" + conv
-    + (olderConv ? "\n\n【患者またはスタッフが参照した過去の関連説明】\n" + olderConv + "\n過去側で完了した質問には改めて回答せず、現在の話題に必要な事実だけ引き継ぐ。" : "")
-    + "\n\n返信を作成する現在日は" + today + "です。患者の連絡日時とは区別する。" + REPLY_DECISION
+    + REPLY_DECISION
     + "医療判断・診断はしない。断定的表現や絵文字は使わない。" + sig
-    + (rulesTxt ? "\n\n【通常の店舗ルール（スタッフが今回の例外を明示した項目以外の基準。推測で補わない）】\n" + rulesTxt : "")
-    + (replyToneInstruction(S(t).tone, 1000) ? "\n\n" + replyToneInstruction(S(t).tone, 1000) : "")
-    + (prefsBlock(t) ? "\n\n【スタッフが記憶させた指示（全返信で必ず守る）】\n" + prefsBlock(t) : "")
-    + (notesBlock(c) ? "\n\n【このお客様への対応でスタッフが以前出した指示メモ（引き続き守る）】\n" + notesBlock(c) : "")
-    + staffBookingPrompt(baCtx)
     + "\n\n" + JP_QUALITY
     + "\n\nスタッフの指示がどんなに短くても（「あってる」「もっと短く」「優しく」等）、お客様との会話の文脈に当てはめて意味を解釈すること。"
-    + voiceInputNote
+    + "\n\n" + STAFF_TONE_PRIORITY
     + "\n\n【会話の仕方】ChatGPTのような自然な会話相手として振る舞う。スタッフが指示ではなく質問・相談をしてきた場合（例:「キャンセル料っていくらだっけ？」「どっちの言い方がいいと思う？」）は、店舗ルールと会話文脈を踏まえて返事で普通に答え、下書きは変えなくてよい。指示が曖昧なら、解釈した上で作りつつ、返事で一言確認する。"
     + "\n\n" + STAFF_DRAFT_POLICY
+    + (replyToneInstruction(S(t).tone, 1000) ? "\n\n" + replyToneInstruction(S(t).tone, 1000) : "")
+    + (prefsBlock(t) ? "\n\n【スタッフが記憶させた指示（全返信で必ず守る）】\n" + prefsBlock(t) : "")
+    + (rulesTxt ? "\n\n【通常の店舗ルール（ルールブック全文。スタッフが今回の例外を明示した項目以外の基準。推測で補わない。同じ内容が食い違う場合は更新日が新しいルールを使う）】\n" + rulesTxt : "")
+    // ---- ここから下は会話・指示ごとに変わる ----
+    + (examplesTxt ? "\n\n【今回に近い、スタッフ確認済みの過去対応（右腕くんの学習）】\n同じ状況ならスタッフが確定した結論・案内順序・必要な確認事項を引き継ぐ。優先順位は、今回のスタッフ指示 > 最新の店舗ルール > 本人確認済みシステムデータ > 再利用できる確定例 > 参考例。個別患者の予約日時・体調・例外対応は引き継がない。\n" + examplesTxt : "")
+    + (samplesTxt ? "\n\n" + samplesTxt : "")
+    + "\n\n【現在の話題（この最新メッセージへの返信に使う主な会話）】\n" + conv
+    + (olderConv ? "\n\n【患者またはスタッフが参照した過去の関連説明】\n" + olderConv + "\n過去側で完了した質問には改めて回答せず、現在の話題に必要な事実だけ引き継ぐ。" : "")
+    + "\n\n返信を作成する現在日は" + today + "です。患者の連絡日時とは区別する。"
+    + (notesBlock(c) ? "\n\n【このお客様への対応でスタッフが以前出した指示メモ（引き続き守る）】\n" + notesBlock(c) : "")
+    + staffBookingPrompt(baCtx)
+    + voiceInputNote
     + "\n\n【これまでの相談（後の訂正を優先し、未撤回の決定を引き継ぐ）】\n" + staffHistory
     + "\n\n【編集前の案（誤りは最新指示で直す）】\n" + previousDraft
     + "\n\n【今回の最新スタッフ指示（編集の最優先対象）】\n" + latestInstruction
     + (acknowledgementOnly ? "\n\n" + ACKNOWLEDGEMENT_DRAFT_POLICY : "");
   const engLabel = (S(t).engine === "gpt" && process.env.OPENAI_KEY) ? "GPT" : (S(t).engine === "gemini" && process.env.GEMINI_KEY) ? "Gemini" : (ANTHROPIC_KEY ? "Claude(保険)" : "AI");
   const evidence = "【今回の会話】\n" + conv + (olderConv ? "\n【参照された過去説明】\n" + olderConv : "")
-    + "\n【関連店舗ルール】\n" + rulesTxt + "\n【スタッフの共通指示】\n" + prefsBlock(t)
+    + "\n【関連店舗ルール】\n" + relevantRulesTxt + "\n【スタッフの共通指示】\n" + prefsBlock(t)
     + "\n【この患者への対応メモ】\n" + notesBlock(c) + staffBookingPrompt(baCtx);
   return { c, topicTs, edits: edits.map(e => ({ role: e.role, content: e.content })), base, engLabel, baCtx, latestInstruction, previousDraft, lastQ, evidence, staffHistory, acknowledgementOnly, consultation: isDraftChatConsultation(latestInstruction) };
 }
@@ -4096,8 +4173,19 @@ async function reviewDraftChatCandidate(t, p, raw) {
   const instruction = String(p.latestInstruction || "").slice(0, 4000);
   const acknowledgementOnly = p.acknowledgementOnly === true || isAcknowledgementOnlyRequest(instruction);
   if (!String(raw || "").trim() && !acknowledgementOnly) return { text: "", error: "" };
-  let text = !String(raw || "").trim() ? "" : p.alreadyFinalized ? String(raw) : (await finalizeGeneratedDraft(t, raw, p.c.channel)).text;
+  // 相談チャットでは文体の指示を生成時に渡しているため、別の文体校正AIは通さない（スタッフの口調指示を打ち消さず、速くするため）。
+  const finalizeText = async value => p.skipStylePass ? cleanDraftText(value) : (await finalizeGeneratedDraft(t, value, p.c.channel)).text;
+  let text = !String(raw || "").trim() ? "" : p.alreadyFinalized ? String(raw) : await finalizeText(raw);
   if (!instruction) return { text, error: "" };
+  // 「丁寧に」「短く」など文体だけの指示: 日時・金額・URL・否定・可否などの事実が編集前と同じなら、照合AIを省いてすぐ返す。
+  if (p.styleFastPath && text && !acknowledgementOnly && isStyleOnlyInstruction(instruction)
+      && String(p.previousDraft || "").trim() && preservesReplyFacts(p.previousDraft, text)
+      && text.length >= String(p.previousDraft).trim().length * 0.4
+      && !hasConversationalTone(text) && !explicitEditMismatch(instruction, text, p.previousDraft)
+      && !/@@\s*(?:REPLY|DRAFT|MEMORY|RULE|ACTION|META)\s*@@/.test(text)
+      && !draftQualityIssues(text).some(issue => issue === "empty" || issue === "meta_text")) {
+    return { text, error: "", fastPath: true };
+  }
   const replyScope = acknowledgementOnly ? "\n" + ACKNOWLEDGEMENT_DRAFT_POLICY : "";
   const staffPolicy = p.staffHistory ? STAFF_DRAFT_POLICY : "\n【初回生成の照合】実際のスタッフ相談履歴はありません。通常の店舗ルールを最優先にし、患者の希望や引用、過去の個別例を今回のスタッフ特例と扱わない。";
   const selected = Array.isArray(p.selectedTopics) ? p.selectedTopics.map(String).slice(0, 20) : [];
@@ -4107,6 +4195,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
   const auditSystem = "あなたは受付スタッフの編集指示と患者向け下書きの照合担当です。患者の前後のやり取りと相談履歴を読んで、最新の指示、以前の未撤回の訂正、今回の質問への回答が正確か判定する。日時・医院・金額・否定・条件・対応の結論の取り違え、質問への回答漏れ、指示と無関係な追加質問、撤回済みの情報や古いAI案への逆戻りはpass:false。未実施のシステム操作を実施済みとは書かない。患者様には丁寧な敬語を使う。医学的安全性・本人確認の制約は守る。必ずJSONのみで {\"pass\":true|false,\"reason\":\"短い理由\"} と答える。";
   async function audit(candidate) {
     if (!String(candidate || "").trim()) return { pass: false, reason: "返信本文が空です" };
+    if (/@@\s*(?:REPLY|DRAFT|MEMORY|RULE|ACTION|META)\s*@@/.test(String(candidate))) return { pass: false, reason: "本文に内部の区切り記号が混ざっています" };
     const mismatch = explicitEditMismatch(instruction, candidate, p.previousDraft);
     const prompt = "【患者様の直近の内容】\n" + String(p.lastQ || "").slice(0, 1200)
       + "\n【編集前の下書き】\n" + String(p.previousDraft || "").slice(0, 4000)
@@ -4125,7 +4214,9 @@ async function reviewDraftChatCandidate(t, p, raw) {
   let checked = await audit(text);
   if (checked.pass) return { text, error: "" };
   const repairSystem = "患者様向け返信文の編集者です。患者の前後のやり取りとスタッフ相談履歴に基づき、最新指示を反映した完成文だけを出力する。以前の未撤回の訂正・決定と指摘されていない正しい内容は保ち、最新指示で撤回された内容は戻さない。最新指示と矛盾しないスタッフ共通指示・患者対応メモを保つ。未実施の操作を実施済みと書かない。指示と矛盾する確認待ち表現や不要な追加質問は削る。新しい事実・条件・個人情報の依頼は加えない。医療判断はしない。礼儀正しく簡潔な敬語にする。" + PATIENT_COURTESY;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  // 相談チャット（スタッフが確認してから使う案）は修復1回まで。残った懸念は確認ポイントとして案に添える。
+  const attempts = p.allowWarning ? 1 : 2;
+  for (let attempt = 0; attempt < attempts; attempt++) {
     const repairPrompt = "【患者様の直近の内容】\n" + String(p.lastQ || "").slice(0, 1200)
       + "\n【編集前の下書き】\n" + String(p.previousDraft || "").slice(0, 4000)
       + "\n【最新のスタッフ指示】\n" + instruction
@@ -4134,11 +4225,15 @@ async function reviewDraftChatCandidate(t, p, raw) {
       + "\n【照合で見つかった問題】\n" + checked.reason;
     const repaired = await aiChat(t, (acknowledgementOnly ? "患者様向けのお礼の返信文を編集する。直前のお礼案とスタッフの文体指示を踏まえ、自然で丁寧な完成文だけを出力する。医学的安全性・本人確認・個人情報保護を守り、未実施の操作を実施済みとは書かない。" + PATIENT_COURTESY + replyScope : repairSystem + REPLY_DECISION + "新しい推測は加えない。指摘箇所を直す際、指摘されていない正しい条件・未確定事項の説明を落とさない。関連ルールの条件・提出物・料金は、今回の依頼や選択対象でまだ案内が必要なものだけ補う。既に条件を伝え証明書を提出済みなら、お礼とスタッフ確認待ちだけでよく、条件・期限・料金や同じ提出依頼を繰り返さない。" + staffPolicy), [{ role: "user", content: repairPrompt }], 4000, "chat");
     if (repaired) {
-      const candidate = (await finalizeGeneratedDraft(t, repaired, p.c.channel)).text;
+      const candidate = await finalizeText(repaired);
       checked = await audit(candidate);
       if (checked.pass) return { text: candidate, error: "" };
-      text = candidate;
+      if (String(candidate || "").trim()) text = candidate;
     }
+  }
+  // 患者へは「この下書きを使う」を押すまで送られない相談チャットでは、止めずに案と確認ポイントを返す。
+  if (p.allowWarning && String(text || "").trim() && !/@@\s*(?:REPLY|DRAFT|MEMORY|RULE|ACTION|META)\s*@@/.test(text)) {
+    return { text, error: "", warning: String(checked.reason || "内容をご確認ください").slice(0, 200) };
   }
   return { text: "", error: "編集指示を正確に反映できませんでした。内容を短く言い換えて、もう一度お試しください。" };
 }
@@ -4146,114 +4241,75 @@ async function reviewDraftChatCandidate(t, p, raw) {
 app.post("/api/draft-chat", guard, oneMutationAtATime("draft-chat", req => req.body.id), async (req, res) => {
   const t = req.tenant;
   if (!ANTHROPIC_KEY && !process.env.OPENAI_KEY && !process.env.GEMINI_KEY) return res.json({ ok: false, error: "no_ai_key" });
-  const p = await draftChatPrep(t, req.body);
-  if (p.error) return res.json({ ok: false, error: p.error });
-  const sys = p.base
-    + "\n編集を依頼された時は返信下書きの完成形の全文をdraftに入れる。質問・相談への回答だけで下書きを変えない時はdraftを空文字にする。replyにはスタッフへの返事（何をどう変えたか、または質問への答え。1〜3文。敬語でなくてよい）。"
-    + "出力は必ず次のJSONのみ: {\"reply\":\"スタッフへの返事\",\"draft\":\"お客様への返信下書き全文\",\"memory\":\"\",\"rule\":null,\"action\":{\"type\":\"none|context|slots|cancel|reschedule\",\"appointmentId\":\"\",\"date\":\"YYYY-MM-DD\",\"newDateTime\":\"YYYY-MM-DDTHH:MM\"}}"
-    + " actionは上のスタッフ用うけつけるん連携に該当する明確な依頼だけに使い、それ以外は必ずtype:none。"
-    + "\n" + DRAFTCHAT_MEMORY_RULE
-    + "\n" + DRAFTCHAT_RULE_RULE;
   try {
-    const raw = await aiChat(t, sys, p.edits, 4000, "chat");
-    if (!raw) return res.json({ ok: false, error: "ai_failed" });
-    let out = { reply: "", draft: "" };
-    try { const m = raw.match(/\{[\s\S]*\}/); out = JSON.parse(m ? m[0] : raw); } catch (e) { out = { reply: "", draft: salvageDraft(raw) }; }
-    if (p.consultation) out.draft = "";
-    const reviewed = await reviewDraftChatCandidate(t, p, out.draft);
-    if (reviewed.error) return res.json({ ok: false, error: reviewed.error });
-    out.draft = reviewed.text;
-    if (out.draft) out.reply = "返信案を作成しました。下の最終案をご確認ください。この操作では患者様への送信は行っていません。";
-    // 文章作成中は学習候補の抽出だけ行う。恒久保存は患者への送信後にスタッフが適用範囲を選んで確定する。
-    const savedMem = String(out.memory || "").trim().slice(0, 200);
-    let savedRule = null;
-    if (out.rule && typeof out.rule === "object") {
-      const title = String(out.rule.title || "").trim().slice(0, 100), content = String(out.rule.content || "").trim().slice(0, 1000);
-      if (title && content) savedRule = { title, content };
-    }
-    const staffAction = normalizeStaffBookingAction(p, out.action);
-    const historySaved = await saveDraftChatSession(t, p, req.body, out.draft || out.reply, out.draft ? "draft" : "reply");
-    res.json({ ok: true, reply: String(out.reply || "").slice(0, 600) + " 〔" + p.engLabel + "で作成〕", draft: String(out.draft || "").slice(0, 4000), memory: savedMem, rule: savedRule, action: staffAction, historySaved });
+    const r = await runDraftChat(t, req.body);
+    if (!r.ok) return res.json({ ok: false, error: r.error });
+    res.json({ ok: true, reply: r.reply + " 〔" + r.engLabel + "で作成〕", draft: r.draft, memory: r.memory, rule: r.rule, action: r.action, warning: r.warning, historySaved: r.historySaved });
   } catch (e) { res.json({ ok: false, error: String(e.message || e).slice(0, 80) }); }
 });
 
-async function finalizeDraftChatEnvelope(t, full, p) {
-  const source = String(full || "");
-  // The compatibility client recognizes markers even in malformed layouts.
-  // Reject duplicate, inline or reordered controls before either side parses.
-  if (!isValidDraftChatEnvelope(source)) throw new Error("invalid_edit_response");
-  const section = draftChatDraftSection(source);
-  if (p.consultation) return section ? source.slice(0, section.start) + source.slice(section.end) : source;
-  if ((!section || !section.text) && !p.acknowledgementOnly && !isAcknowledgementOnlyRequest(p.latestInstruction)) return source;
-  const finalized = await reviewDraftChatCandidate(t, p, section ? section.text : "");
-  if (finalized.error) throw new Error(finalized.error);
-  if (/@@(?:REPLY|DRAFT|MEMORY|RULE|ACTION|META)@@/.test(finalized.text)) throw new Error("invalid_edit_response");
-  const tail = /^@@(?:MEMORY|RULE|ACTION|META)@@[ \t]*(?:\r?\n|$)/m.exec(source);
-  const start = section ? section.start : tail ? tail.index : source.length;
-  const end = section ? section.end : start;
-  const prefix = source.slice(0, start).replace(/(@@REPLY@@[ \t]*\r?\n)[\s\S]*$/, "$1返信案を作成しました。下の最終案をご確認ください。この操作では患者様への送信は行っていません。\n");
-  const result = prefix + "\n@@DRAFT@@\n" + finalized.text + "\n" + source.slice(end);
-  if (!isValidDraftChatEnvelope(result)) throw new Error("invalid_edit_response");
-  return result;
-}
-
-// 互換API。編集指示と患者向け文体を確認した完成文だけをマーカー形式で返す。
-// 未確認の途中稿をブラウザへ送らないため、生成と校正が終わってから送信する。
+// 互換API（画面はこちらを使う）。照合が終わった完成文だけを、正しい形の封筒に組み立て直して返す。
 app.post("/api/draft-chat-stream", guard, oneMutationAtATime("draft-chat", req => req.body.id), async (req, res) => {
   const t = req.tenant;
   if (!ANTHROPIC_KEY && !process.env.OPENAI_KEY && !process.env.GEMINI_KEY) { res.status(400).end("no_ai_key"); return; }
-  const p = await draftChatPrep(t, req.body);
-  if (p.error) { res.status(400).end(p.error); return; }
-  const sys = p.base
-    + "\n\n【出力形式（厳守）】JSONではなく、次の4セクションをこの順で出力する。各マーカーは必ず行頭に単独で書く。"
-    + "\n@@REPLY@@\n（スタッフへの返事。何をどう変えたか、または質問への答え。1〜3文。敬語でなくてよい）"
-    + "\n@@DRAFT@@\n（お客様への返信下書きの完成形全文。下書きを変えない時は前と同じ全文。スタッフの質問に答えただけで下書き不要な時はこのセクションごと省略してよい）"
-    + "\n@@MEMORY@@\n（" + DRAFTCHAT_MEMORY_RULE + "無ければこの行のあとに何も書かない）"
-    + "\n@@RULE@@\n（" + DRAFTCHAT_RULE_RULE + " ある場合のみ {\"title\":\"…\",\"content\":\"…\"} のJSON1行。無ければこの行のあとに何も書かない）"
-    + "\n@@ACTION@@\n（スタッフが上のうけつけるん操作を明確に依頼した場合のみ {\"type\":\"context|slots|cancel|reschedule\",\"appointmentId\":\"…\",\"date\":\"YYYY-MM-DD\",\"newDateTime\":\"YYYY-MM-DDTHH:MM\"} のJSON1行。それ以外は {\"type\":\"none\"}）";
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("X-Accel-Buffering", "no");
   try {
-    let full = await aiChat(t, sys, p.edits, 4000, "chat");
-    if (full) {
-      const replySection = full.match(/@@REPLY@@[ \t]*\r?\n([\s\S]*?)(?=\r?\n@@(?:DRAFT|MEMORY|RULE|ACTION)@@|$)/);
-      if (!replySection || !String(replySection[1] || "").trim()) throw new Error("invalid_edit_response");
-      full = await finalizeDraftChatEnvelope(t, full, p);
-      res.write(full);
-    }
-    let savedMem = "", savedRule = null, staffAction = null;
-    if (full) {
-      const mm = full.match(/@@MEMORY@@\s*([\s\S]*)$/);
-      savedMem = String(mm ? mm[1].split(/@@/)[0] : "").trim().slice(0, 200);
-      const rm = full.match(/@@RULE@@\s*([\s\S]*)$/);
-      if (rm) {
-        const rtxt = rm[1].split(/@@/)[0].trim();
-        const jm = rtxt.match(/\{[\s\S]*?\}/);
-        if (jm) {
-          try {
-            const obj = JSON.parse(jm[0]), title = String(obj.title || "").trim().slice(0, 100), content = String(obj.content || "").trim().slice(0, 1000);
-            if (title && content) savedRule = { title, content };
-          } catch (e) {}
-        }
-      }
-      const am = full.match(/@@ACTION@@\s*([\s\S]*)$/);
-      if (am) {
-        const atxt = am[1].split(/@@/)[0].trim();
-        const aj = atxt.match(/\{[\s\S]*?\}/);
-        if (aj) { try { staffAction = normalizeStaffBookingAction(p, JSON.parse(aj[0])); } catch (e) {} }
-      }
-    }
-    const dm = draftChatDraftSection(full);
-    const rm = full && full.match(/@@REPLY@@\s*([\s\S]*?)(?=\n@@(?:DRAFT|MEMORY|RULE|ACTION)@@|$)/);
-    const hasDraft = !!(dm && dm.text);
-    const historySaved = full ? await saveDraftChatSession(t, p, req.body, String(hasDraft ? dm.text : rm ? rm[1] : "").trim(), hasDraft ? "draft" : "reply") : false;
-    res.write("\n@@META@@" + JSON.stringify({ ok: !!full, memory: savedMem, rule: savedRule, engine: p.engLabel, action: staffAction, historySaved }));
+    const r = await runDraftChat(t, req.body);
+    if (r.status === 400) { res.status(400).end(r.error); return; }
+    if (!r.ok) { res.write("\n@@META@@" + JSON.stringify({ ok: false, error: r.error })); res.end(); return; }
+    res.write(buildDraftChatEnvelope({ reply: r.reply, draft: r.draft, memory: r.memory, rule: r.rule, action: r.action }));
+    res.write("\n@@META@@" + JSON.stringify({ ok: true, memory: r.memory, rule: r.rule, engine: r.engLabel, action: r.action, warning: r.warning, historySaved: r.historySaved }));
   } catch (e) {
     try { res.write("\n@@META@@" + JSON.stringify({ ok: false, error: String(e.message || e).slice(0, 80) })); } catch (e2) {}
   }
   res.end();
 });
+
+// 相談パネルを開いた時に予約照会を先に済ませておく（指示を送った時の待ち時間を減らす）。結果は返さない。
+app.post("/api/draft-chat-warm", guard, (req, res) => {
+  const t = req.tenant, c = t.store[String(req.body && req.body.id || "")];
+  if (c && baEnabled(t) && PARTNER_KEY) baContextCached(t, c, 12000).catch(() => null);
+  res.json({ ok: true });
+});
+
+// 「右腕くんに相談」: AIにはJSONで答えさせ、照合済みの値から画面向けの形をサーバーで組み立てる。
+// 以前はAIにマーカー付き文章（@@REPLY@@ など）を書かせ、形が少しでも崩れると「回答を読み取れませんでした」で止まっていた。
+function draftChatOutputFormat() {
+  return "\n\n【出力形式（厳守）】必ず次のJSONオブジェクト1つだけを出力する（前後に説明や```を付けない）。"
+    + "{\"reply\":\"スタッフへの返事（何をどう変えたか、または質問への答え。1〜3文。敬語でなくてよい）\",\"draft\":\"お客様への返信下書きの完成形全文\",\"memory\":\"\",\"rule\":null,\"action\":{\"type\":\"none|context|slots|cancel|reschedule\",\"appointmentId\":\"\",\"date\":\"YYYY-MM-DD\",\"newDateTime\":\"YYYY-MM-DDTHH:MM\"}}"
+    + "\n編集を依頼された時は、返信下書きの完成形の全文をdraftに入れる。質問・相談への回答だけで下書きを変えない時はdraftを空文字にする。"
+    + " actionは上のスタッフ用うけつけるん連携に該当する明確な依頼だけに使い、それ以外は必ずtype:none。"
+    + "\n" + DRAFTCHAT_MEMORY_RULE
+    + "\n" + DRAFTCHAT_RULE_RULE;
+}
+async function runDraftChat(t, body) {
+  const p = await draftChatPrep(t, body);
+  if (p.error) return { ok: false, error: p.error, status: 400 };
+  // 相談チャットの案は、スタッフが「この下書きを使う」を押すまで患者へ送られない。
+  // そのため照合で懸念が残っても止めずに確認ポイントを添えて返し、文体だけの修正は事実が変わっていなければ照合AIを省く。
+  p.allowWarning = true; p.skipStylePass = true; p.styleFastPath = true;
+  const raw = await aiChat(t, p.base + draftChatOutputFormat(), p.edits, 4000, "chat", null, { json: true });
+  if (!raw) return { ok: false, error: "ai_failed" };
+  const out = parseDraftChatOutput(raw) || { reply: "", draft: null };
+  const reviewed = p.consultation ? { text: "", error: "" } : await reviewDraftChatCandidate(t, p, out.draft == null ? "" : out.draft);
+  if (reviewed.error) return { ok: false, error: reviewed.error };
+  const draft = String(reviewed.text || "").trim().slice(0, 4000);
+  let reply = String(out.reply || "").trim();
+  if (draft) reply = "返信案を作成しました。下の最終案をご確認ください。この操作では患者様への送信は行っていません。";
+  if (!draft && !reply) return { ok: false, error: "invalid_edit_response" };
+  // 文章作成中は学習候補の抽出だけ行う。恒久保存は患者への送信後にスタッフが適用範囲を選んで確定する。
+  const memory = String(out.memory || "").trim().slice(0, 200);
+  let rule = null;
+  if (out.rule && typeof out.rule === "object") {
+    const title = String(out.rule.title || "").trim().slice(0, 100), content = String(out.rule.content || "").trim().slice(0, 1000);
+    if (title && content) rule = { title, content };
+  }
+  const action = normalizeStaffBookingAction(p, out.action);
+  const historySaved = await saveDraftChatSession(t, p, body, draft || reply, draft ? "draft" : "reply");
+  return { ok: true, reply: reply.slice(0, 600), draft, memory, rule, action, warning: String(reviewed.warning || ""), fastPath: !!reviewed.fastPath, engLabel: p.engLabel, historySaved };
+}
 
 function staffAppointmentById(ctx, id) {
   return ctx && Array.isArray(ctx.appointments) ? ctx.appointments.find(a => String(a.id) === String(id || "")) : null;
@@ -7043,6 +7099,7 @@ function openDraftChat(){if(!current)return;const openId=current;const c=DATA.fi
   document.getElementById("dpanel").style.display="block";
   const app=document.getElementById("app");if(app)app.classList.add("dopen"); // 会話エリアをドロワー分だけ詰める（横並び表示）
   fetch("/api/staff-booking-pending?id="+encodeURIComponent(openId)).then(r=>r.json()).then(j=>{if(current===openId&&j&&j.pending)dBookingCard(j.pending);}).catch(()=>{});
+  api("/api/draft-chat-warm",{id:openId}).catch(()=>{});
   setTimeout(()=>{const t=document.getElementById("dText");if(t)t.focus();},50);}
 function slideClose(pid,cid){const p=document.getElementById(pid),c=document.getElementById(cid);if(!p||!c)return;
   const mob=window.matchMedia("(max-width:760px)").matches;
@@ -7087,6 +7144,7 @@ async function dSend(){if(window.__dBusy||window.__voiceBusy||dHistoryLoadingId=
     if(!fin.reply&&!fin.draft)throw new Error("stream_empty");
     if(fin.reply&&meta.engine){aiEl.textContent=fin.reply+" 〔"+meta.engine+"で作成〕";logEntry.text=aiEl.textContent;}
     dHist.push({role:"assistant",content:(fin.draft||fin.reply||"").slice(0,4000),kind:fin.draft?"draft":"reply"});
+    if(meta.warning&&fin.draft)dAdd("sysn","⚠ 確認ポイント："+meta.warning+"（内容を確かめてから使ってください）");
     if(meta.memory){if(dSessions[current])dSessions[current].memory=meta.memory;dAdd("sysn","🧠 学習候補：「"+meta.memory+"」（患者への送信後に安全確認し、再利用できる判断手順だけを学習します）");}
     if(meta.rule){if(dSessions[current])dSessions[current].rule=meta.rule;dAdd("sysn","📚 店舗ルール候補：「"+meta.rule.title+"」（患者への送信後に内容を確認して反映できます）");}
     if(meta.action)await dHandleBookingAction(meta.action);
@@ -7101,6 +7159,7 @@ async function dSend(){if(window.__dBusy||window.__voiceBusy||dHistoryLoadingId=
         aiEl.textContent=j.reply||"できました";logEntry.text=aiEl.textContent;
         if(j.draft){if(!cardEntry)dNewCard(j.draft);else{cardEntry.draft=j.draft;const cEl=cardEntry._el?cardEntry._el.querySelector(".c"):null;if(cEl)cEl.textContent=j.draft;}}
         dHist.push({role:"assistant",content:j.draft||j.reply,kind:j.draft?"draft":"reply"});
+        if(j.warning&&j.draft)dAdd("sysn","⚠ 確認ポイント："+j.warning+"（内容を確かめてから使ってください）");
         if(j.memory){if(dSessions[current])dSessions[current].memory=j.memory;dAdd("sysn","🧠 学習候補：「"+j.memory+"」（患者への送信後に安全確認し、再利用できる判断手順だけを学習します）");}
         if(j.rule){if(dSessions[current])dSessions[current].rule=j.rule;dAdd("sysn","📚 店舗ルール候補：「"+j.rule.title+"」（患者への送信後に内容を確認して反映できます）");}
         if(j.action)await dHandleBookingAction(j.action);

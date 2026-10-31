@@ -8,6 +8,7 @@ const vm = require("node:vm");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("../lib/draft-edit");
 const { REPLY_DECISION } = require("../lib/reply-decision");
 const consultation = require("../lib/draft-consultation");
+const draftOutput = require("../lib/draft-chat-output");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
 const start = source.indexOf("async function reviewDraftChatCandidate(");
@@ -200,12 +201,15 @@ test("修正しても指示に従わない場合は下書きカードへ渡さ�
 
 test("編集チャットは関連ルールだけを選び、両APIが同じ監査を通る", () => {
   const prep = source.slice(source.indexOf("async function draftChatPrep("), source.indexOf("function normalizeStaffBookingAction", source.indexOf("async function draftChatPrep(")));
-  assert.match(prep, /filter\(x => x\.n > 0\)\.slice\(0, 20\)/);
-  assert.match(prep, /rulesBlock\(rel, 16000\)/);
+  // 下書きの生成にはルールブック全文、照合AIの根拠には関連の高いルールだけを渡す
+  assert.match(prep, /promptRulesText\(t, ranked\.map\(x => x\.r\), ruleBudget\(t\)\)/);
+  assert.match(prep, /filter\(x => x\.n > 0\)\.slice\(0, 20\)\.map\(x => x\.r\), 16000\)/);
+  assert.match(prep, /examplesRanked\(t,/);
+  assert.match(prep, /styleSamplesBlock\(styleSamples\(t,/);
   assert.match(prep, /normalizeDraftEditHistory\(requestedEdits\)/);
   const routes = source.slice(source.indexOf('app.post("/api/draft-chat"'), source.indexOf("function staffAppointmentById", source.indexOf('app.post("/api/draft-chat"')));
-  assert.match(routes, /reviewDraftChatCandidate\(t, p, out\.draft\)/);
-  assert.match(routes, /reviewDraftChatCandidate\(t, p, section \? section\.text : ""\)/);
+  assert.match(routes, /reviewDraftChatCandidate\(t, p, out\.draft == null \? "" : out\.draft\)/);
+  assert.equal((routes.match(/await runDraftChat\(t, req\.body\)/g) || []).length, 2);
   assert.doesNotMatch(routes, /aiChatStream\(/);
 });
 
@@ -215,7 +219,7 @@ test("相談への返事は患者向け下書きを作らず、返信だけの�
   const handlers = new Map();
   const saved = [];
   const context = {
-    ...consultation,
+    ...consultation, ...draftOutput,
     app: { post: (route, ...handlersForRoute) => handlers.set(route, handlersForRoute.at(-1)) },
     guard() {}, oneMutationAtATime: () => (_req, _res, next) => next(),
     ANTHROPIC_KEY: "test", process: { env: {} },
@@ -234,10 +238,11 @@ test("相談への返事は患者向け下書きを作らず、返信だけの�
   assert.match(output, /"ok":true/);
   assert.doesNotMatch(output, /invalid_edit_response/);
   assert.deepEqual(saved, [{ text: "キャンセル料は店舗ルールを確認してください。", kind: "reply" }]);
-  const unwantedDraft = "@@REPLY@@\n確認が必要です。\n@@DRAFT@@\n今回のキャンセルに充当いたします。\n@@ACTION@@\n{\"type\":\"none\"}";
-  const stripped = await context.finalizeDraftChatEnvelope({}, unwantedDraft, { consultation: true });
-  assert.match(stripped, /確認が必要です/);
-  assert.doesNotMatch(stripped, /充当いたします/);
+  context.aiChat = async () => "@@REPLY@@\n確認が必要です。\n@@DRAFT@@\n今回のキャンセルに充当いたします。\n@@ACTION@@\n{\"type\":\"none\"}";
+  output = "";
+  await handlers.get("/api/draft-chat-stream")({ tenant: {}, body: { id: "テスト会話", messages: [] } }, response);
+  assert.match(output, /確認が必要です/);
+  assert.doesNotMatch(output, /充当いたします/);
 });
 
 test("相談のJSON回答にAIが旧下書きを含めても、患者向け案として採用しない", async () => {
@@ -245,6 +250,7 @@ test("相談のJSON回答にAIが旧下書きを含めても、患者向け案�
   const routeEnd = source.indexOf("function staffAppointmentById", routeStart);
   const handlers = new Map();
   const context = {
+    ...draftOutput,
     app: { post: (route, ...handlersForRoute) => handlers.set(route, handlersForRoute.at(-1)) },
     guard() {}, oneMutationAtATime: () => (_req, _res, next) => next(),
     ANTHROPIC_KEY: "test", process: { env: {} },
@@ -268,7 +274,7 @@ test("照合後の完成案と矛盾するスタッフ向け説明をJSONと互�
   const handlers = new Map();
   const correct = "証明書をお送りください。条件を満たさない場合は3,300円です。";
   const context = {
-    ...consultation,
+    ...consultation, ...draftOutput,
     app: { post: (route, ...args) => handlers.set(route, args.at(-1)) },
     guard() {}, oneMutationAtATime: () => (_req, _res, next) => next(),
     ANTHROPIC_KEY: "test", process: { env: {} },
@@ -285,7 +291,9 @@ test("照合後の完成案と矛盾するスタッフ向け説明をJSONと互�
   assert.doesNotMatch(result.reply, /11月/);
   assert.match(result.reply, /最終案/);
   assert.match(result.reply, /送信は行っていません/);
-  const envelope = await context.finalizeDraftChatEnvelope({}, '@@REPLY@@\n11月の案内を残しました\n@@DRAFT@@\n11月の空きを確認します\n@@MEMORY@@\n方針\n@@ACTION@@\n{"type":"none"}', { c: { channel: "line" }, consultation: false });
+  context.aiChat = async () => '@@REPLY@@\n11月の案内を残しました\n@@DRAFT@@\n11月の空きを確認します\n@@MEMORY@@\n方針\n@@ACTION@@\n{"type":"none"}';
+  let envelope = "";
+  await handlers.get("/api/draft-chat-stream")({ tenant: {}, body: { id: "テスト会話" } }, { setHeader() {}, write(text) { envelope += text; }, end() {}, status() { return this; } });
   assert.doesNotMatch(envelope, /11月/);
   assert.match(envelope, /最終案/);
   assert.ok(envelope.includes(correct));
