@@ -4261,7 +4261,8 @@ async function reviewDraftChatCandidate(t, p, raw) {
     }
   }
   // 患者へは「この下書きを使う」を押すまで送られない相談チャットでは、止めずに案と確認ポイントを返す。
-  if (p.allowWarning && String(text || "").trim() && !/@@\s*(?:REPLY|DRAFT|MEMORY|RULE|ACTION|META)\s*@@/.test(text)) {
+  if (p.allowWarning && String(text || "").trim() && !/@@\s*(?:REPLY|DRAFT|MEMORY|RULE|ACTION|META)\s*@@/.test(text)
+      && !draftQualityIssues(text).some(issue => issue === "empty" || issue === "meta_text")) {
     return { text, error: "", warning: String(checked.reason || "内容をご確認ください").slice(0, 200) };
   }
   return { text: "", error: "編集指示を正確に反映できませんでした。内容を短く言い換えて、もう一度お試しください。" };
