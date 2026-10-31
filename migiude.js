@@ -1519,7 +1519,7 @@ const LEARNED_EXAMPLES_K = 8;
 const LEARNED_EXAMPLES_GATE_K = 4; // 自動送信の根拠に数える件数（変更前と同じ）
 const STYLE_SAMPLES_K = 3;
 const STYLE_SAMPLE_SETTLE_MS = 15 * 60 * 1000;
-const STYLE_SAMPLE_PERSONAL = /痛|腫れ|出血|症状|体調|具合|妊娠|授乳|病|熱|薬|治療|抜歯|術後|副作用|アレルギ|しみ|かゆ|不幸|ご家族|事故|入院|通院|経過|お子/;
+const STYLE_SAMPLE_PERSONAL = /痛|腫れ|出血|症状|体調|具合|妊娠|授乳|病|熱|薬|治療|抜歯|術後|副作用|アレルギ|しみ|かゆ|不幸|ご家族|家族|事故|入院|通院|経過|お子|仕事|勤務|出張|転勤|転居|引っ越|引越|ご主人|旦那|奥様|夫|妻|学校|受験|介護|葬|結婚|離婚/;
 // スタッフが実際に患者へ送った返信を「書き方の見本」にする（同じ法人のものだけ。スタッフが確認する相談チャット専用）。
 // 対象は安全確認で「他の患者にも再利用できる」と判定された学習例だけ（今回限り・個人情報監査不合格・学習失敗の例は使わない）。
 // 氏名・連絡先・日時・数字は伏字にし、見本の事実は使わせない。学習の確認待ち・矛盾確認中の例も使わない。
@@ -4066,7 +4066,8 @@ async function draftChatPrep(t, body) {
   // 送信後に学習した判断手順（安全確認済み）と、この院のスタッフが実際に送った返信の見本
   const exRel = examplesRanked(t, (lastQ || latestInstruction).slice(0, 800), LEARNED_EXAMPLES_K, ruleQuery.slice(0, 1500));
   const examplesTxt = exRel.length ? formatLearnedExamples(exRel) : "";
-  const samples = styleSamples(t, (lastQ || latestInstruction).slice(0, 800), ruleQuery.slice(0, 1500));
+  // 書き方の見本は「右腕くんに相談」専用（スタッフLINEの修正など他の経路では使わない）
+  const samples = body.styleSamples === true ? styleSamples(t, (lastQ || latestInstruction).slice(0, 800), ruleQuery.slice(0, 1500)) : [];
   const samplesTxt = styleSamplesBlock(samples);
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = c.channel === "mail" ? "メールなので下書きの最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
@@ -4320,7 +4321,7 @@ function draftChatVerifiedBase(p) {
   return !!(s && prev && s.verifiedDraftHash && Number(s.topicTs || 0) === Number(p.topicTs || 0) && s.verifiedDraftHash === sha(prev));
 }
 async function runDraftChat(t, body) {
-  const p = await draftChatPrep(t, body);
+  const p = await draftChatPrep(t, Object.assign({}, body, { styleSamples: true }));
   if (p.error) return { ok: false, error: p.error, status: 400 };
   // 相談チャットの案は、スタッフが「この下書きを使う」を押すまで患者へ送られない。
   // そのため照合で懸念が残っても止めずに確認ポイントを添えて返し、文体だけの修正は事実が変わっていなければ照合AIを省く。
@@ -4341,7 +4342,7 @@ async function runDraftChat(t, body) {
   if (draft && borrowsFromSamples(draft, p.styleSampleTexts, String(p.previousDraft || "") + "\n" + String(p.knownText || ""))) {
     reviewed.warning = [reviewed.warning, "書き方の見本（他の患者への返信）と同じ文が含まれています。今回の患者に当てはまるか確認してください"].filter(Boolean).join("／");
   }
-  let reply = String(out.reply || "").trim();
+  let reply = String(out.reply || "").trim().slice(0, 1200);
   if (draft) reply = "返信案を作成しました。下の最終案をご確認ください。この操作では患者様への送信は行っていません。";
   if (!draft && !reply) return { ok: false, error: "invalid_edit_response" };
   // 文章作成中は学習候補の抽出だけ行う。恒久保存は患者への送信後にスタッフが適用範囲を選んで確定する。

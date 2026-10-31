@@ -205,7 +205,7 @@ test("編集チャットは関連ルールだけを選び、両APIが同じ監�
   assert.match(prep, /promptRulesText\(t, ranked\.map\(x => x\.r\), ruleBudget\(t\)\)/);
   assert.match(prep, /filter\(x => x\.n > 0\)\.slice\(0, 20\)\.map\(x => x\.r\), 16000\)/);
   assert.match(prep, /examplesRanked\(t,/);
-  assert.match(prep, /const samples = styleSamples\(t,/);
+  assert.match(prep, /const samples = body\.styleSamples === true \? styleSamples\(t,/);
   assert.match(prep, /styleSamplesBlock\(samples\)/);
   assert.match(prep, /normalizeDraftEditHistory\(requestedEdits\)/);
   const routes = source.slice(source.indexOf('app.post("/api/draft-chat"'), source.indexOf("function staffAppointmentById", source.indexOf('app.post("/api/draft-chat"')));

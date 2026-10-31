@@ -188,7 +188,8 @@ test("空の指示は相談の生成に進まない", () => {
 test("文体だけの編集で照合を省けるのは、否定の数・編集前の語が保たれ、増えた語があいさつの定型だけの時", () => {
   const ok = (a, b) => assert.equal(out.styleEditPreservesContent(a, b), true, b);
   const ng = (a, b) => assert.equal(out.styleEditPreservesContent(a, b), false, b);
-  ok("テスト：お写真ありがとうございます。担当医が確認のうえ、改めてご連絡いたします。", "テスト：お写真をお送りいただき、誠にありがとうございます。担当医が確認のうえ、改めてご連絡いたしますので、少々お待ちくださいませ。");
+  ok("お写真ありがとうございます。担当医が確認のうえ、改めてご連絡いたします。", "お写真をお送りいただき、誠にありがとうございます。担当医が確認のうえ、改めてご連絡いたしますので、少々お待ちくださいませ。");
+  ng("ご来院の際は保険証をお持ちください。", "テスト：ご来院の際は保険証をお持ちくださいませ。", "検証用の文字列も定型句として扱わない");
   ng("診断書をご提出いただいた場合、キャンセル料は免除となります。", "診断書をご提出いただいた場合、キャンセル料は免除とはなりません。");
   ng("適用されます。", "適用されません。");
   ng("対象となります。", "対象外となります。");
@@ -230,4 +231,10 @@ test("書き方の見本と定型のあいさつだけが重なる場合は借�
   const known = "お写真ありがとうございます。担当医が確認いたします。";
   assert.equal(out.borrowsFromSamples("お写真をお送りいただき、誠にありがとうございます。担当医が確認いたします。何かご不明な点がございましたら、お気軽にお問い合わせください。", sample, known), false);
   assert.equal(out.borrowsFromSamples("お写真ありがとうございます。妊娠中とのことですので施術は控えます。", sample, known), true);
+});
+
+test("書き方の見本は相談チャット（runDraftChat）からの呼び出しだけで使い、スタッフLINEの修正では使わない", () => {
+  assert.match(section("async function runDraftChat(", "function staffAppointmentById("), /draftChatPrep\(t, Object\.assign\(\{\}, body, \{ styleSamples: true \}\)\)/);
+  const staffLine = section("async function staffLineReviseDraft(", "const staffLineInFlight");
+  assert.doesNotMatch(staffLine, /styleSamples/);
 });
