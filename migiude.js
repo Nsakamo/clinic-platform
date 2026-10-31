@@ -1518,6 +1518,7 @@ function formatLearnedExamples(exRel) {
 const LEARNED_EXAMPLES_K = 8;
 const LEARNED_EXAMPLES_GATE_K = 4; // 自動送信の根拠に数える件数（変更前と同じ）
 const STYLE_SAMPLES_K = 3;
+const STYLE_SAMPLE_SETTLE_MS = 15 * 60 * 1000;
 const STYLE_SAMPLE_PERSONAL = /痛|腫れ|出血|症状|体調|具合|妊娠|授乳|病|熱|薬|治療|抜歯|術後|副作用|アレルギ|しみ|かゆ|不幸|ご家族|事故|入院|通院|経過|お子/;
 // スタッフが実際に患者へ送った返信を「書き方の見本」にする（同じ法人のものだけ。スタッフが確認する相談チャット専用）。
 // 対象は安全確認で「他の患者にも再利用できる」と判定された学習例だけ（今回限り・個人情報監査不合格・学習失敗の例は使わない）。
@@ -1527,7 +1528,8 @@ function styleSamples(t, query, context, k) {
   learningJobs(t).filter(job => job.status === "processing" && Number(job.exampleId)).forEach(job => pendingIds.add(Number(job.exampleId)));
   const list = Object.values(t.examples || {})
     .filter(e => e && !pendingIds.has(Number(e.id)) && reusableLearningSummary(e) && String(e.q || "").trim() && String(e.final || "").trim().length >= 30
-      && !STYLE_SAMPLE_PERSONAL.test(String(e.q || "") + String(e.final || ""))); // 体調・症状・家庭の事情を含む返信は見本にしない
+      && !STYLE_SAMPLE_PERSONAL.test(String(e.q || "") + String(e.final || "")) // 体調・症状・家庭の事情を含む返信は見本にしない
+      && Date.now() - Number(e.ts || 0) >= STYLE_SAMPLE_SETTLE_MS); // 直近に追加・更新された例は、学習の安全確認が終わるまで使わない
   if (!list.length || !String(query || context || "").trim()) return [];
   return rankLearningExamples(list, { latest: query, context: context || query }, k || STYLE_SAMPLES_K)
     .map(e => ({ id: e.id, intent: LEARNING_INTENT_LABELS[learningIntentKey(e.q)] || "その他", text: maskStyleSample(String(e.final).slice(0, 700)) }))

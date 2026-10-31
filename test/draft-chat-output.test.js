@@ -108,6 +108,7 @@ test("書き方の見本は再利用可と確認済みの学習だけを使い�
     learningIntentKey: () => "price",
     maskStyleSample: out.maskStyleSample,
     STYLE_SAMPLE_PERSONAL: /痛|腫れ|症状|妊娠/,
+    STYLE_SAMPLE_SETTLE_MS: 15 * 60 * 1000,
     reusableLearningSummary: e => (e.learningMeta && e.learningMeta.scope === "reusable" ? "判断手順" : ""),
     STYLE_SAMPLES_K: 3,
   };
@@ -116,7 +117,7 @@ test("書き方の見本は再利用可と確認済みの学習だけを使い�
   const final = "テスト田中様、お問い合わせありがとうございます。料金は3,300円でございます。ご不明点はお気軽にお知らせください。";
   const reusable = { scope: "reusable" }, oneOff = { scope: "one_off" };
   const personal = "テスト：妊娠中とのことですので、施術は控えさせていただきます。ご理解のほどお願いいたします。";
-  const t = { examples: { 1: { id: 1, q: "テスト料金は？", final, learningMeta: reusable }, 2: { id: 2, q: "テスト特例", final, learningMeta: oneOff }, 7: { id: 7, q: "テスト未学習", final }, 3: { id: 3, q: "テスト", final, learningMeta: reusable }, 4: { id: 4, q: "テスト", final, learningMeta: reusable }, 5: { id: 5, q: "テスト", final, learningMeta: reusable }, 6: { id: 6, q: "テスト", final: "短い", learningMeta: reusable }, 8: { id: 8, q: "テスト", final: personal, learningMeta: reusable } } };
+  const t = { examples: { 1: { id: 1, q: "テスト料金は？", final, learningMeta: reusable }, 2: { id: 2, q: "テスト特例", final, learningMeta: oneOff }, 7: { id: 7, q: "テスト未学習", final }, 3: { id: 3, q: "テスト", final, learningMeta: reusable }, 4: { id: 4, q: "テスト", final, learningMeta: reusable }, 5: { id: 5, q: "テスト", final, learningMeta: reusable }, 6: { id: 6, q: "テスト", final: "短い", learningMeta: reusable }, 8: { id: 8, q: "テスト", final: personal, learningMeta: reusable }, 9: { id: 9, q: "テスト直近", final, learningMeta: reusable, ts: Date.now() } } };
   const samples = ctx.styleSamples(t, "テスト料金", "テスト料金");
   assert.equal(JSON.stringify(samples.map(s => s.id)), "[1]");
   assert.doesNotMatch(samples[0].text, /田中|3,300/);
@@ -204,6 +205,9 @@ test("文体だけの編集で照合を省けるのは、否定の数・編集�
   ng("キャンセルの際は前日までにご連絡ください。", "できれば、キャンセルの際は前日までにご連絡くださいませ。");
   ng("施術後24時間は飲酒をお控えください。", "なるべく、施術後24時間は飲酒をお控えくださいませ。");
   ng("キャンセルの際は前日までにご連絡ください。", "キャンセルの際は前日までにご連絡ください、できれば。");
+  ng("ご確認ありがとうございます。はい、そのとおりです。", "ご確認ありがとうございます。少々お待ちくださいませ。");
+  ng("ご確認ありがとうございます。はい。", "ご確認ありがとうございます。");
+  ok("ご確認ありがとうございます。はい、そのとおりです。", "ご確認いただき、誠にありがとうございます。はい、そのとおりです。");
   ok("キャンセルの際は前日までにご連絡ください。", "恐れ入りますが、キャンセルの際は前日までにご連絡くださいませ。");
   ok("お写真ありがとうございます。担当医が確認いたします。", "お写真をお送りいただき、誠にありがとうございます。担当医が確認いたします。何かご不明な点がございましたら、お気軽にお問い合わせください。");
 });
