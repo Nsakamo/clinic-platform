@@ -1,5 +1,6 @@
 "use strict";
 
+const promptStubs = require("./helpers/prompt-stubs");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -133,7 +134,7 @@ test("予約照会を並行実行しても本人未確認時の予約情報をAI
     REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview,
     PATIENT_COURTESY, JP_QUALITY: PATIENT_COURTESY,
     S: () => ({ tone: "", prefs: [] }), activeConversationMessages: c => c.msgs,
-    rulesRankedWithScores: () => [], rulesBlock: () => "", ruleBudget: () => 0,
+    ...promptStubs(), rulesRankedWithScores: () => [], rulesBlock: () => "", ruleBudget: () => 0,
     examplesRanked: () => [], trustedLearningPrecedent: () => false,
     prefsBlock: () => "", notesBlock: () => "", baEnabled: () => true,
     staffLineReviewAll: () => false, PARTNER_KEY: "test-only",
@@ -189,7 +190,7 @@ test("初回生成から自動送信判定まで口語のままなら送信候�
     PATIENT_COURTESY, JP_QUALITY: PATIENT_COURTESY,
     hasConversationalTone, applyCourtesyGate, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction,
     S: () => ({ tone: "", prefs: [] }), activeConversationMessages: c => c.msgs,
-    rulesRankedWithScores: () => [], rulesBlock: () => "", ruleBudget: () => 0,
+    ...promptStubs(), rulesRankedWithScores: () => [], rulesBlock: () => "", ruleBudget: () => 0,
     examplesRanked: () => [], trustedLearningPrecedent: () => false,
     prefsBlock: () => "", notesBlock: () => "", baEnabled: () => false,
     staffLineReviewAll: () => false, PARTNER_KEY: "",
@@ -225,7 +226,7 @@ test("下書き・作り直し・送信前監査が共通のトーン指示と�
   const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
   assert.ok((source.match(/replyToneInstruction\(S\(t\)\.tone/g) || []).length >= 7);
   assert.match(source, /toneRewriteInstruction\(tone, channel\)/);
-  assert.match(source, /finalizeDraftChatEnvelope/);
+  assert.match(source, /buildDraftChatEnvelope\(/);
   assert.match(source, /const JP_QUALITY = .*PATIENT_COURTESY/);
   assert.match(source, /applyCourtesyGate\(out, finalized\.issues\)/);
   assert.match(source, /const courteous = !hasConversationalTone\(revisedDraft \|\| input\.draft\)/);
