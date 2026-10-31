@@ -234,7 +234,9 @@ test("書き方の見本と定型のあいさつだけが重なる場合は借�
 });
 
 test("書き方の見本は相談チャット（runDraftChat）からの呼び出しだけで使い、スタッフLINEの修正では使わない", () => {
-  assert.match(section("async function runDraftChat(", "function staffAppointmentById("), /draftChatPrep\(t, Object\.assign\(\{\}, body, \{ styleSamples: true \}\)\)/);
+  assert.match(section("async function runDraftChat(", "function staffAppointmentById("), /draftChatPrep\(t, Object\.assign\(\{\}, body, \{ consultationChat: true \}\)\)/);
   const staffLine = section("async function staffLineReviseDraft(", "const staffLineInFlight");
-  assert.doesNotMatch(staffLine, /styleSamples/);
+  assert.doesNotMatch(staffLine, /styleSamples|consultationChat/);
+  // 予約照会の短期キャッシュも相談チャットからの呼び出しだけ
+  assert.match(section("async function draftChatPrep(", 'app.get("/api/draft-chat-history"'), /body\.consultationChat === true \? await baContextCached\(t, c, 12000\) : await baCall\(t, c, "context", \{\}, 12000\)/);
 });

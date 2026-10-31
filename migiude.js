@@ -4067,13 +4067,14 @@ async function draftChatPrep(t, body) {
   const exRel = examplesRanked(t, (lastQ || latestInstruction).slice(0, 800), LEARNED_EXAMPLES_K, ruleQuery.slice(0, 1500));
   const examplesTxt = exRel.length ? formatLearnedExamples(exRel) : "";
   // 書き方の見本は「右腕くんに相談」専用（スタッフLINEの修正など他の経路では使わない）
-  const samples = body.styleSamples === true ? styleSamples(t, (lastQ || latestInstruction).slice(0, 800), ruleQuery.slice(0, 1500)) : [];
+  const samples = body.consultationChat === true ? styleSamples(t, (lastQ || latestInstruction).slice(0, 800), ruleQuery.slice(0, 1500)) : [];
   const samplesTxt = styleSamplesBlock(samples);
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = c.channel === "mail" ? "メールなので下書きの最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
   let baCtx = null;
   if (baEnabled(t) && PARTNER_KEY) {
-    try { baCtx = await baContextCached(t, c, 12000); } catch (e) { baCtx = null; }
+    // 90秒の短期キャッシュは「右腕くんに相談」からの呼び出しだけ。スタッフLINEの修正などは毎回照会する。
+    try { baCtx = body.consultationChat === true ? await baContextCached(t, c, 12000) : await baCall(t, c, "context", {}, 12000); } catch (e) { baCtx = null; }
   }
   // 先頭は毎回同じ内容（役割・方針・トーン・共通指示・ルールブック）、後ろに会話ごとに変わる内容を置く（プロンプトキャッシュで速くするため）。
   const base = "あなたは「" + (t.name || "クリニック") + "」の受付スタッフの返信作成アシスタントです。"
@@ -4321,7 +4322,7 @@ function draftChatVerifiedBase(p) {
   return !!(s && prev && s.verifiedDraftHash && Number(s.topicTs || 0) === Number(p.topicTs || 0) && s.verifiedDraftHash === sha(prev));
 }
 async function runDraftChat(t, body) {
-  const p = await draftChatPrep(t, Object.assign({}, body, { styleSamples: true }));
+  const p = await draftChatPrep(t, Object.assign({}, body, { consultationChat: true }));
   if (p.error) return { ok: false, error: p.error, status: 400 };
   // 相談チャットの案は、スタッフが「この下書きを使う」を押すまで患者へ送られない。
   // そのため照合で懸念が残っても止めずに確認ポイントを添えて返し、文体だけの修正は事実が変わっていなければ照合AIを省く。
