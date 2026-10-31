@@ -21,7 +21,7 @@ const { contextualLearningFallback, formatLearningProposal } = require("./lib/le
 const { selectConversationContext, preserveTopicBoundary } = require("./lib/conversation-context");
 const { STAFF_DRAFT_POLICY, formatDraftContext, staffConsultationTranscript, isAcknowledgementOnlyRequest, acknowledgementDraftScope, ACKNOWLEDGEMENT_DRAFT_POLICY } = require("./lib/draft-consultation");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("./lib/draft-edit");
-const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, sentenceCount, borrowsFromSamples, safeText: safeDraftChatText, maskStyleSample } = require("./lib/draft-chat-output");
+const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, styleEditPreservesContent, sentenceCount, borrowsFromSamples, safeText: safeDraftChatText, maskStyleSample } = require("./lib/draft-chat-output");
 const { REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview, inboundMessageTimes } = require("./lib/reply-decision");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
@@ -1958,8 +1958,8 @@ function baEnabled(t) { return !!S(t).bookingActions; }
 const BA_CONTEXT_CACHE_MS = 90 * 1000;
 const baContextCache = new Map();
 // 鍵はテナント・会話・本人確認に使った電話番号（ハッシュ）。メールで別の番号に変わったら別の照会として扱う。
-function baCacheKey(t, c) { const phone = String((c.ba && c.ba.phone) || "").replace(/\D/g, ""); return t.slug + "::" + c.id + "::" + (phone ? sha(phone).slice(0, 16) : ""); }
-function baCacheClear(t, c) { const prefix = t.slug + "::" + c.id + "::"; for (const k of baContextCache.keys()) if (k.startsWith(prefix)) baContextCache.delete(k); }
+function baCacheKey(t, c) { const phone = String((c.ba && c.ba.phone) || "").replace(/\D/g, ""); return JSON.stringify([t.slug, c.id, phone ? sha(phone).slice(0, 16) : ""]); }
+function baCacheClear(t, c) { const prefix = JSON.stringify([t.slug, c.id]).slice(0, -1) + ","; for (const k of baContextCache.keys()) if (k.startsWith(prefix)) baContextCache.delete(k); }
 function baContextCached(t, c, timeoutMs) {
   const key = baCacheKey(t, c), hit = baContextCache.get(key), now = Date.now();
   if (hit && now - hit.at < BA_CONTEXT_CACHE_MS) return hit.promise;
@@ -4204,6 +4204,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
   // 「丁寧に」「短く」など文体だけの指示: 日時・金額・URL・否定・可否などの事実が編集前と同じなら、照合AIを省いてすぐ返す。
   if (p.styleFastPath && text && !acknowledgementOnly && isStyleOnlyInstruction(instruction)
       && String(p.previousDraft || "").trim() && preservesReplyFacts(p.previousDraft, text) && decisionTermsPreserved(p.previousDraft, text)
+      && styleEditPreservesContent(p.previousDraft, text) // 否定の数が同じ・編集前の語がすべて残り・増えた語はあいさつの定型だけ
       && sentenceCount(text) >= sentenceCount(p.previousDraft) // 文が減った（注意事項などを落とした可能性）時は照合する
       && text.length >= String(p.previousDraft).trim().length * 0.4
       && !hasConversationalTone(text) && !explicitEditMismatch(instruction, text, p.previousDraft)
@@ -4328,6 +4329,8 @@ async function runDraftChat(t, body) {
   const out = parseDraftChatOutput(raw) || { reply: "", draft: null };
   // 編集の依頼にAIが形式なしで患者向けの文だけを返した場合は、返事として出さず下書き候補として照合する
   if (out.format === "plain" && !p.consultation && out.reply) { out.draft = out.reply; out.reply = ""; }
+  // 途中で切れた出力から救出した案・形式なしの案は、照合を省かない
+  if (out.format === "salvaged" || out.format === "plain") p.styleFastPath = false;
   const reviewed = p.consultation ? { text: "", error: "" } : await reviewDraftChatCandidate(t, p, out.draft == null ? "" : out.draft);
   if (reviewed.error) return { ok: false, error: reviewed.error };
   const draft = String(reviewed.text || "").trim().slice(0, 4000);

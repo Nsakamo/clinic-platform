@@ -152,6 +152,12 @@ test("相談用の予約照会キャッシュは失敗を覚えず、予約を�
   assert.ok(![...ctx.baContextCache.keys()].some(k => k.includes("0900000000")), "電話番号をそのまま鍵にしない");
   await ctx.baCall(t, c, "confirm");
   assert.equal(ctx.baContextCache.size, 0, "同じ会話の全キャッシュを捨てる");
+  // 会話IDに区切り文字のような文字が含まれても、別の会話のキャッシュを捨てたり取り違えたりしない
+  const a = { id: "line:x" }, b = { id: "line:x::y" };
+  ctx.next = { ok: true, who: "a" }; await ctx.baContextCached(t, a);
+  ctx.next = { ok: true, who: "b" }; await ctx.baContextCached(t, b);
+  await ctx.baCall(t, a, "cancel");
+  assert.equal(ctx.baContextCache.size, 1, "別の会話（b）のキャッシュは残る");
 });
 
 test("初回下書きの自動送信の根拠に数える学習例は、プロンプトの件数を増やしても上位4件のまま", () => {
@@ -172,4 +178,23 @@ test("相談の生成指示は根拠のない安心づけを足してよいと�
 
 test("空の指示は相談の生成に進まない", () => {
   assert.match(source, /edits\[edits\.length - 1\]\.role !== "user" \|\| !String\(latestInstruction \|\| ""\)\.trim\(\)\) return \{ error: "empty" \}/);
+});
+
+test("文体だけの編集で照合を省けるのは、否定の数・編集前の語が保たれ、増えた語があいさつの定型だけの時", () => {
+  const ok = (a, b) => assert.equal(out.styleEditPreservesContent(a, b), true, b);
+  const ng = (a, b) => assert.equal(out.styleEditPreservesContent(a, b), false, b);
+  ok("テスト：お写真ありがとうございます。担当医が確認のうえ、改めてご連絡いたします。", "テスト：お写真をお送りいただき、誠にありがとうございます。担当医が確認のうえ、改めてご連絡いたしますので、少々お待ちくださいませ。");
+  ng("診断書をご提出いただいた場合、キャンセル料は免除となります。", "診断書をご提出いただいた場合、キャンセル料は免除とはなりません。");
+  ng("適用されます。", "適用されません。");
+  ng("対象となります。", "対象外となります。");
+  ng("銀座院へお越しください。", "新宿院へお越しくださいませ。");
+  ng("施術前はお控えください。", "施術後はお控えください。");
+  ng("保険証と診察券をお持ちください。", "保険証をお持ちください。");
+  ng("テスト：担当医が確認いたします。", "テスト：担当医が確認いたします。お手数ですが、改めてお電話にてご連絡ください。");
+  ng("テスト：担当医が確認いたします。", "テスト：担当医が確認いたします。ご来院時は受付にお声がけください。");
+});
+
+test("途中で切れた出力から救出した案は、文体だけの指示でも照合を省かない", () => {
+  const run = section("async function runDraftChat(", "function staffAppointmentById(");
+  assert.match(run, /if \(out\.format === "salvaged" \|\| out\.format === "plain"\) p\.styleFastPath = false;/);
 });
