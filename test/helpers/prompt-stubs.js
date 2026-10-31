@@ -6,6 +6,7 @@ module.exports = function promptStubs() {
     promptRulesText: (_t, ranked) => (Array.isArray(ranked) ? ranked : []).map(r => String((r && r.content) || "")).join("\n"),
     formatLearnedExamples: () => "",
     LEARNED_EXAMPLES_K: 8,
+    LEARNED_EXAMPLES_GATE_K: 4,
     styleSamples: () => [],
     styleSamplesBlock: () => "",
     STAFF_TONE_PRIORITY: "【スタッフの口調指示の優先】",

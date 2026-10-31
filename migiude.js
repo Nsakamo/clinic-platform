@@ -21,7 +21,7 @@ const { contextualLearningFallback, formatLearningProposal } = require("./lib/le
 const { selectConversationContext, preserveTopicBoundary } = require("./lib/conversation-context");
 const { STAFF_DRAFT_POLICY, formatDraftContext, staffConsultationTranscript, isAcknowledgementOnlyRequest, acknowledgementDraftScope, ACKNOWLEDGEMENT_DRAFT_POLICY } = require("./lib/draft-consultation");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("./lib/draft-edit");
-const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, maskStyleSample } = require("./lib/draft-chat-output");
+const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, sentenceCount, safeText: safeDraftChatText, maskStyleSample } = require("./lib/draft-chat-output");
 const { REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview, inboundMessageTimes } = require("./lib/reply-decision");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
@@ -1516,6 +1516,7 @@ function formatLearnedExamples(exRel) {
   }).join("\n");
 }
 const LEARNED_EXAMPLES_K = 8;
+const LEARNED_EXAMPLES_GATE_K = 4; // 自動送信の根拠に数える件数（変更前と同じ）
 const STYLE_SAMPLES_K = 3;
 // スタッフが実際に患者へ送った返信を「書き方の見本」にする（同じ法人のものだけ。スタッフが確認する相談チャット専用）。
 // 対象は安全確認で「他の患者にも再利用できる」と判定された学習例だけ（今回限り・個人情報監査不合格・学習失敗の例は使わない）。
@@ -1968,7 +1969,8 @@ function baContextCached(t, c, timeoutMs) {
 }
 async function baCall(t, c, action, extra, timeoutMs) {
   // 予約を変更し得る操作の前後では、相談用の照会キャッシュを捨てて最新を読み直す（完了後は finally で再度捨てる）
-  const mutating = action !== "context" && action !== "slots" && action !== "result" && t && c;
+  // result（実行結果の照会）も、実行が終わった直後の可能性があるため破棄の対象にする
+  const mutating = action !== "context" && action !== "slots" && t && c;
   if (mutating) baCacheClear(t, c);
   try {
     if (!PARTNER_KEY) return null;
@@ -2294,7 +2296,9 @@ async function genDraft(t, c, opts) {
   const certificateInquiry = /診断書|証明書|受診証明/.test(lastQ);
   const replyRequiresStaff = policyReviewNeeded || certificateInquiry || (isIllnessInquiry(lastQ) && /免除|免責/.test(rulesTxt));
   const exRel = examplesRanked(t, latestQ.slice(0, 800), LEARNED_EXAMPLES_K, lastQ.slice(0, 1500));
-  const trustedPrecedents = exRel.filter(trustedLearningPrecedent);
+  // プロンプトには最大8件渡すが、自動送信の根拠として数えるのは従来どおり上位4件だけ（自動送信の判定を緩めない）
+  const exGate = exRel.slice(0, LEARNED_EXAMPLES_GATE_K);
+  const trustedPrecedents = exGate.filter(trustedLearningPrecedent);
   const examplesTxt = exRel.length ? formatLearnedExamples(exRel) : "";
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = channel === "mail" ? "メールなので返信本文の最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
@@ -2399,7 +2403,7 @@ async function genDraft(t, c, opts) {
         precedentMatches: trustedPrecedents.map(e => ({ id: e.id, trusted: true, score: Number(e.matchScore || 0), confirmedCount: Number(e.confirmedCount || 1) })),
         verifiedBooking: !!(baCtx && baCtx.ok && baCtx.verified),
         verifiedSlots: !!opts.baSlotsTxt,
-        learningExampleCount: exRel.length,
+        learningExampleCount: exGate.length,
       });
       out.replyRequiresStaff = replyRequiresStaff;
       if (replyRequiresStaff) {
@@ -2434,7 +2438,7 @@ async function genDraft(t, c, opts) {
           out.grounding = evaluateResponseGrounding({
             query: lastQ, draft: out.draft, ruleMatches: evidenceRuleMatches,
             precedentMatches: trustedPrecedents.map(e => ({ id: e.id, trusted: true, score: Number(e.matchScore || 0), confirmedCount: Number(e.confirmedCount || 1) })),
-            verifiedBooking: !!(baCtx && baCtx.ok && baCtx.verified), verifiedSlots: !!opts.baSlotsTxt, learningExampleCount: exRel.length,
+            verifiedBooking: !!(baCtx && baCtx.ok && baCtx.verified), verifiedSlots: !!opts.baSlotsTxt, learningExampleCount: exGate.length,
           });
           out.learningReadiness = applyLearningReadinessGate(t, lastQ, out.grounding);
           if (!out.grounding.autoSendAllowed) { out.validation.pass = false; out.validation.reason = out.grounding.reasons[0] || "日本語修正後に再確認が必要です"; }
@@ -4184,6 +4188,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
   // 「丁寧に」「短く」など文体だけの指示: 日時・金額・URL・否定・可否などの事実が編集前と同じなら、照合AIを省いてすぐ返す。
   if (p.styleFastPath && text && !acknowledgementOnly && isStyleOnlyInstruction(instruction)
       && String(p.previousDraft || "").trim() && preservesReplyFacts(p.previousDraft, text) && decisionTermsPreserved(p.previousDraft, text)
+      && sentenceCount(text) >= sentenceCount(p.previousDraft) // 文が減った（注意事項などを落とした可能性）時は照合する
       && text.length >= String(p.previousDraft).trim().length * 0.4
       && !hasConversationalTone(text) && !explicitEditMismatch(instruction, text, p.previousDraft)
       && !/@@\s*(?:REPLY|DRAFT|MEMORY|RULE|ACTION|META)\s*@@/.test(text)
@@ -4262,11 +4267,12 @@ app.post("/api/draft-chat-stream", guard, oneMutationAtATime("draft-chat", req =
   try {
     const r = await runDraftChat(t, req.body);
     if (r.status === 400) { res.status(400).end(r.error); return; }
-    if (!r.ok) { res.write("\n@@META@@" + JSON.stringify({ ok: false, error: r.error })); res.end(); return; }
+    if (!r.ok) { res.write("\n@@META@@" + JSON.stringify({ ok: false, error: r.error }).replace(/@@/g, "\\u0040\\u0040")); res.end(); return; }
     res.write(buildDraftChatEnvelope({ reply: r.reply, draft: r.draft, memory: r.memory, rule: r.rule, action: r.action }));
-    res.write("\n@@META@@" + JSON.stringify({ ok: true, memory: r.memory, rule: r.rule, engine: r.engLabel, action: r.action, warning: r.warning, historySaved: r.historySaved }));
+    // META の中身に @@ が残ると画面が区切りと誤認するため、JSONのエスケープ表記に置き換える（読み取り結果は同じ）
+    res.write("\n@@META@@" + JSON.stringify({ ok: true, memory: r.memory, rule: r.rule, engine: r.engLabel, action: r.action, warning: r.warning, historySaved: r.historySaved }).replace(/@@/g, "\\u0040\\u0040"));
   } catch (e) {
-    try { res.write("\n@@META@@" + JSON.stringify({ ok: false, error: String(e.message || e).slice(0, 80) })); } catch (e2) {}
+    try { res.write("\n@@META@@" + JSON.stringify({ ok: false, error: String(e.message || e).slice(0, 80) }).replace(/@@/g, "\\u0040\\u0040")); } catch (e2) {}
   }
   res.end();
 });
@@ -4304,15 +4310,15 @@ async function runDraftChat(t, body) {
   if (draft) reply = "返信案を作成しました。下の最終案をご確認ください。この操作では患者様への送信は行っていません。";
   if (!draft && !reply) return { ok: false, error: "invalid_edit_response" };
   // 文章作成中は学習候補の抽出だけ行う。恒久保存は患者への送信後にスタッフが適用範囲を選んで確定する。
-  const memory = String(out.memory || "").trim().slice(0, 200);
+  const memory = safeDraftChatText(out.memory).slice(0, 200);
   let rule = null;
   if (out.rule && typeof out.rule === "object") {
-    const title = String(out.rule.title || "").trim().slice(0, 100), content = String(out.rule.content || "").trim().slice(0, 1000);
+    const title = safeDraftChatText(out.rule.title).slice(0, 100), content = safeDraftChatText(out.rule.content).slice(0, 1000);
     if (title && content) rule = { title, content };
   }
   const action = normalizeStaffBookingAction(p, out.action);
   const historySaved = await saveDraftChatSession(t, p, body, draft || reply, draft ? "draft" : "reply", draft ? reviewed.warning : "");
-  return { ok: true, reply: reply.slice(0, 600), draft, memory, rule, action, warning: String(reviewed.warning || ""), fastPath: !!reviewed.fastPath, engLabel: p.engLabel, historySaved };
+  return { ok: true, reply: reply.slice(0, 600), draft, memory, rule, action, warning: safeDraftChatText(reviewed.warning), fastPath: !!reviewed.fastPath, engLabel: p.engLabel, historySaved };
 }
 
 function staffAppointmentById(ctx, id) {
@@ -7121,7 +7127,7 @@ async function dSend(){if(window.__dBusy||window.__voiceBusy||dHistoryLoadingId=
   function restoreFailedInput(){if(dHist.length&&dHist[dHist.length-1].role==="user"&&dHist[dHist.length-1].content===txt)dHist.pop();if(current===owner){x.value=txt;dComposerDrafts[owner]=txt;}}
   const MK_D="@@DRAFT@@",MK_M="@@MEMORY@@",MK_R="@@RULE@@",MK_A="@@ACTION@@",MK_T="@@META@@";
   function applyAcc(acc){
-    const mi=acc.lastIndexOf(MK_T);const body=(mi>=0?acc.slice(0,mi):acc).replace("@@REPLY@@","");
+    const mi=acc.indexOf(MK_T);const body=(mi>=0?acc.slice(0,mi):acc).replace("@@REPLY@@","");
     let reply=body,draft=null;
     const di=body.indexOf(MK_D);
     const marks=[body.indexOf(MK_M),body.indexOf(MK_R),body.indexOf(MK_A)].filter(x=>x>=0).sort((a,b)=>a-b);

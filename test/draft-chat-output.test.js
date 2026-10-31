@@ -150,3 +150,12 @@ test("相談用の予約照会キャッシュは失敗を覚えず、予約を�
   await ctx.baCall(t, c, "confirm");
   assert.equal(ctx.baContextCache.size, 0, "同じ会話の全キャッシュを捨てる");
 });
+
+test("初回下書きの自動送信の根拠に数える学習例は、プロンプトの件数を増やしても上位4件のまま", () => {
+  const draft = section("async function genDraft(t, c, opts) {", "// 毎回承認モード");
+  assert.match(draft, /const exGate = exRel\.slice\(0, LEARNED_EXAMPLES_GATE_K\);/);
+  assert.match(draft, /const trustedPrecedents = exGate\.filter\(trustedLearningPrecedent\);/);
+  assert.equal((draft.match(/learningExampleCount: exGate\.length/g) || []).length, 2);
+  assert.doesNotMatch(draft, /learningExampleCount: exRel\.length/);
+  assert.match(source, /const LEARNED_EXAMPLES_GATE_K = 4;/);
+});
