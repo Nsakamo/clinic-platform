@@ -47,7 +47,7 @@ function harness(outputs,rawResponse,consultation=false){
     app:{post:(route,...args)=>routes.set(route,args.at(-1))},draftChatPrep:async()=>p,
     aiChat:async(_t,sys,messages,_limit,task)=>{calls.push({sys,task});return rawResponse!==undefined&&calls.length===1?rawResponse:outputs.shift()},
     finalizeGeneratedDraft:async(_t,text)=>({text}),
-    saveDraftChatSession:async(_t,_p,_body,text,kind)=>{saved.push({text,kind});return true},
+    saveDraftChatSession:async(_t,_p,_body,text,kind,warning)=>{saved.push(warning?{text,kind,warning}:{text,kind});return true},
     DRAFTCHAT_MEMORY_RULE:"",DRAFTCHAT_RULE_RULE:""};
   vm.createContext(ctx);
   vm.runInContext(section("function normalizeStaffBookingAction(","const DRAFTCHAT_MEMORY_RULE"),ctx);
@@ -129,6 +129,7 @@ test("相談チャットでは照合で懸念が残っても止めず、確認�
   assert.equal(r.meta.ok,true);assert.match(r.meta.warning,/料金/);
   assert.equal(scope.draftChatDraftSection(r.body).text,"ご連絡ありがとうございます。料金は3,300円です。");
   assert.equal(h.calls.length,4,"生成・照合・修復1回・照合");
+  assert.equal(h.saved[0].warning,"料金の記載を確認してください","確認ポイントも履歴に残す");
 });
 
 test("文体だけの指示で事実が変わらなければ照合AIを呼ばずに返す",async()=>{

@@ -21,7 +21,7 @@ const { contextualLearningFallback, formatLearningProposal } = require("./lib/le
 const { selectConversationContext, preserveTopicBoundary } = require("./lib/conversation-context");
 const { STAFF_DRAFT_POLICY, formatDraftContext, staffConsultationTranscript, isAcknowledgementOnlyRequest, acknowledgementDraftScope, ACKNOWLEDGEMENT_DRAFT_POLICY } = require("./lib/draft-consultation");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("./lib/draft-edit");
-const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, maskStyleSample } = require("./lib/draft-chat-output");
+const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, maskStyleSample } = require("./lib/draft-chat-output");
 const { REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview, inboundMessageTimes } = require("./lib/reply-decision");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
@@ -528,7 +528,6 @@ async function staffLineReviseDraft(t, c, instruction) {
     { role: "user", content: String(instruction || "").slice(0, 1200) },
   ] });
   if (p.error || p.consultation) return "";
-  p.styleFastPath = true; // 文体だけの修正で事実が変わっていなければ照合AIを省く（承認はスタッフLINEで行う）
   const out = await aiChat(t, p.base + "\n患者へ送る返信本文の完成形だけを出力する。", p.edits, 1800, "chat");
   if (!String(out || "").trim()) return "";
   return (await reviewDraftChatCandidate(t, p, out)).text;
@@ -1518,13 +1517,14 @@ function formatLearnedExamples(exRel) {
 }
 const LEARNED_EXAMPLES_K = 8;
 const STYLE_SAMPLES_K = 3;
-// スタッフが実際に患者へ送った返信を「書き方の見本」にする（同じ法人のものだけ）。
-// 氏名・連絡先・日時・数字は伏字にし、見本の事実は使わせない。学習の確認待ち・矛盾確認中の例は使わない。
+// スタッフが実際に患者へ送った返信を「書き方の見本」にする（同じ法人のものだけ。スタッフが確認する相談チャット専用）。
+// 対象は安全確認で「他の患者にも再利用できる」と判定された学習例だけ（今回限り・個人情報監査不合格・学習失敗の例は使わない）。
+// 氏名・連絡先・日時・数字は伏字にし、見本の事実は使わせない。学習の確認待ち・矛盾確認中の例も使わない。
 function styleSamples(t, query, context, k) {
   const pendingIds = new Set(learningConflicts(t, true).flatMap(item => item.kind === "rule" ? [Number(item.newId)] : [Number(item.oldId), Number(item.newId)]));
   learningJobs(t).filter(job => job.status === "processing" && Number(job.exampleId)).forEach(job => pendingIds.add(Number(job.exampleId)));
   const list = Object.values(t.examples || {})
-    .filter(e => e && !pendingIds.has(Number(e.id)) && String(e.q || "").trim() && String(e.final || "").trim().length >= 30);
+    .filter(e => e && !pendingIds.has(Number(e.id)) && reusableLearningSummary(e) && String(e.q || "").trim() && String(e.final || "").trim().length >= 30);
   if (!list.length || !String(query || context || "").trim()) return [];
   return rankLearningExamples(list, { latest: query, context: context || query }, k || STYLE_SAMPLES_K)
     .map(e => ({ id: e.id, intent: LEARNING_INTENT_LABELS[learningIntentKey(e.q)] || "その他", text: maskStyleSample(String(e.final).slice(0, 700)) }))
@@ -1951,7 +1951,9 @@ function baEnabled(t) { return !!S(t).bookingActions; }
 // 相談パネルを開いた時点で先に照会しておき、指示を送った時の待ち時間（うけつけるんの起動待ち等）を減らす。
 const BA_CONTEXT_CACHE_MS = 90 * 1000;
 const baContextCache = new Map();
-function baCacheKey(t, c) { return t.slug + "::" + c.id; }
+// 鍵はテナント・会話・本人確認に使った電話番号（ハッシュ）。メールで別の番号に変わったら別の照会として扱う。
+function baCacheKey(t, c) { const phone = String((c.ba && c.ba.phone) || "").replace(/\D/g, ""); return t.slug + "::" + c.id + "::" + (phone ? sha(phone).slice(0, 16) : ""); }
+function baCacheClear(t, c) { const prefix = t.slug + "::" + c.id + "::"; for (const k of baContextCache.keys()) if (k.startsWith(prefix)) baContextCache.delete(k); }
 function baContextCached(t, c, timeoutMs) {
   const key = baCacheKey(t, c), hit = baContextCache.get(key), now = Date.now();
   if (hit && now - hit.at < BA_CONTEXT_CACHE_MS) return hit.promise;
@@ -1965,8 +1967,9 @@ function baContextCached(t, c, timeoutMs) {
   return promise;
 }
 async function baCall(t, c, action, extra, timeoutMs) {
-  // 予約を変更し得る操作の前後では、相談用の照会キャッシュを捨てて最新を読み直す
-  if (action !== "context" && action !== "slots" && action !== "result" && t && c) baContextCache.delete(baCacheKey(t, c));
+  // 予約を変更し得る操作の前後では、相談用の照会キャッシュを捨てて最新を読み直す（完了後は finally で再度捨てる）
+  const mutating = action !== "context" && action !== "slots" && action !== "result" && t && c;
+  if (mutating) baCacheClear(t, c);
   try {
     if (!PARTNER_KEY) return null;
     const body = Object.assign({ action, slug: t.slug, channel: c.channel === "mail" ? "mail" : "line", userId: c.userId }, extra || {});
@@ -1981,6 +1984,7 @@ async function baCall(t, c, action, extra, timeoutMs) {
     if (!r) return null;
     return await r.json().catch(() => null);
   } catch (e) { return null; }
+  finally { if (mutating) baCacheClear(t, c); }
 }
 
 // AI用のシステムプロンプト断片（本人確認の状態・予約一覧・actionの出し方）
@@ -2292,7 +2296,6 @@ async function genDraft(t, c, opts) {
   const exRel = examplesRanked(t, latestQ.slice(0, 800), LEARNED_EXAMPLES_K, lastQ.slice(0, 1500));
   const trustedPrecedents = exRel.filter(trustedLearningPrecedent);
   const examplesTxt = exRel.length ? formatLearnedExamples(exRel) : "";
-  const samplesTxt = styleSamplesBlock(styleSamples(t, latestQ.slice(0, 800), lastQ.slice(0, 1500)));
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = channel === "mail" ? "メールなので返信本文の最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
   const msgsArr = []; let cur = null;
@@ -2352,7 +2355,6 @@ async function genDraft(t, c, opts) {
     + (rulesTxt ? "\n\n【店舗ルール（最優先で従う。料金・規定・対応可否はここに従い、推測で答えない。同じ内容が食い違う場合は更新日が新しいルールを使う）】\n" + rulesTxt : "")
     // ---- ここから下は問い合わせごとに変わる ----
     + (examplesTxt ? "\n\n【今回の問い合わせに近い、スタッフ確認済みの過去対応】\n『再利用できる確定例』は、同じ状況ならスタッフが確定した結論・案内順序・必要な確認事項・通常の料金や規定を次の回答にも引き継ぐ。これが右腕くんの対応学習である。ただし優先順位は、最新の店舗ルール > 本人確認済みシステムデータ > 再利用できる確定例 > 参考例。新しいルールと古い例が矛盾したら必ず新しいルールを使う。個別患者の予約日時・体調・例外対応は他の患者へ引き継がない。『参考例』は文章と手順だけ参考にする。\n" + examplesTxt : "")
-    + (samplesTxt ? "\n\n" + samplesTxt : "")
     + "\n\n返信を作成する現在日は" + today + "です。患者の連絡日時とは区別する。"
     + (opts.only && opts.only.length
         ? "お客様は複数の連絡をしているが、今回はスタッフが選んだ次の項目だけに答えること。選ばれていない項目には一切触れない: 「" + opts.only.map(s => String(s)).join("」「") + "」。会話で既に伝えた内容は繰り返さない。"
@@ -4096,12 +4098,14 @@ app.get("/api/draft-chat-history", guard, (req, res) => {
   res.json({ ok: true, messages, draftAtSave: messages.length ? String(session.draftAtSave || "") : "" });
 });
 
-async function saveDraftChatSession(t, p, body, assistantContent, kind) {
+async function saveDraftChatSession(t, p, body, assistantContent, kind, warning) {
   if (Number(p.c.ts || 0) !== p.topicTs) return false;
+  // 案に付けた「⚠確認ポイント」も履歴に残し、画面を開き直しても通常の案と見分けられるようにする
+  const warn = (m, value) => { const w = m.role === "assistant" && m.kind !== "reply" && typeof value === "string" ? value.trim().slice(0, 200) : ""; if (w) m.warning = w; return m; };
   const messages = (Array.isArray(body.messages) ? body.messages : []).slice(-19)
     .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
-    .map(m => ({ role: m.role, content: m.content.slice(0, 4000), inputMode: m.inputMode === "voice" ? "voice" : "text", kind: m.kind === "reply" ? "reply" : "draft" }));
-  messages.push({ role: "assistant", content: String(assistantContent || "").slice(0, 4000), kind: kind === "reply" ? "reply" : "draft" });
+    .map(m => warn({ role: m.role, content: m.content.slice(0, 4000), inputMode: m.inputMode === "voice" ? "voice" : "text", kind: m.kind === "reply" ? "reply" : "draft" }, m.warning));
+  messages.push(warn({ role: "assistant", content: String(assistantContent || "").slice(0, 4000), kind: kind === "reply" ? "reply" : "draft" }, warning));
   p.c.draftChatSession = { topicTs: p.topicTs, messages: messages.slice(-20), draftAtSave: String(p.c.draft || "").slice(0, 4000), updatedAt: Date.now() };
   return dbSave(t, p.c);
 }
@@ -4179,7 +4183,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
   if (!instruction) return { text, error: "" };
   // 「丁寧に」「短く」など文体だけの指示: 日時・金額・URL・否定・可否などの事実が編集前と同じなら、照合AIを省いてすぐ返す。
   if (p.styleFastPath && text && !acknowledgementOnly && isStyleOnlyInstruction(instruction)
-      && String(p.previousDraft || "").trim() && preservesReplyFacts(p.previousDraft, text)
+      && String(p.previousDraft || "").trim() && preservesReplyFacts(p.previousDraft, text) && decisionTermsPreserved(p.previousDraft, text)
       && text.length >= String(p.previousDraft).trim().length * 0.4
       && !hasConversationalTone(text) && !explicitEditMismatch(instruction, text, p.previousDraft)
       && !/@@\s*(?:REPLY|DRAFT|MEMORY|RULE|ACTION|META)\s*@@/.test(text)
@@ -4307,7 +4311,7 @@ async function runDraftChat(t, body) {
     if (title && content) rule = { title, content };
   }
   const action = normalizeStaffBookingAction(p, out.action);
-  const historySaved = await saveDraftChatSession(t, p, body, draft || reply, draft ? "draft" : "reply");
+  const historySaved = await saveDraftChatSession(t, p, body, draft || reply, draft ? "draft" : "reply", draft ? reviewed.warning : "");
   return { ok: true, reply: reply.slice(0, 600), draft, memory, rule, action, warning: String(reviewed.warning || ""), fastPath: !!reviewed.fastPath, engLabel: p.engLabel, historySaved };
 }
 
@@ -7034,6 +7038,7 @@ function hideDraftChatForConversationSwitch(){
   const panel=document.getElementById("dpanel"),app=document.getElementById("app");
   if(panel)panel.style.display="none";if(app)app.classList.remove("dopen");
 }
+function dWarn(text){return dAdd("sysn","⚠ 確認ポイント："+text+"（内容を確かめてから使ってください）");}
 function dRender(role,text){const d=document.createElement("div");d.className="am "+role;d.textContent=text;dMsgsEl.appendChild(d);dMsgsEl.scrollTop=dMsgsEl.scrollHeight;return d;}
 function dAdd(role,text){dLog.push({type:role,text});return dRender(role,text);}
 function dDraftCard(entry){const card=document.createElement("div");card.className="amcard";
@@ -7086,10 +7091,10 @@ function openDraftChat(){if(!current)return;const openId=current;const c=DATA.fi
       if(currentDraft!==String(j.draftAtSave||"").trim()&&currentDraft!==String(lastSavedDraft&&lastSavedDraft.content||"").trim()){
         dAdd("sysn","現在の下書きが前回の編集時から変わっているため、最新の下書きから開始します。");return;
       }
-      dHist=j.messages.filter(m=>m&&["user","assistant"].includes(m.role)).map(m=>({role:m.role,content:String(m.content||"").slice(0,4000),inputMode:m.inputMode,kind:m.kind}));
+      dHist=j.messages.filter(m=>m&&["user","assistant"].includes(m.role)).map(m=>({role:m.role,content:String(m.content||"").slice(0,4000),inputMode:m.inputMode,kind:m.kind,warning:typeof m.warning==="string"?m.warning.slice(0,200):""}));
       dLog=[];dMsgsEl.innerHTML="";
       dAdd("ai","前回の編集内容を引き継ぎました。");
-      dHist.forEach(m=>{if(m.role==="user")dAdd("user",m.content);else if(m.kind==="reply")dAdd("ai",m.content);else dNewCard(m.content);});
+      dHist.forEach(m=>{if(m.role==="user")dAdd("user",m.content);else if(m.kind==="reply")dAdd("ai",m.content);else{dNewCard(m.content);if(m.warning)dWarn(m.warning);}});
       dSessions[openId]={hist:dHist,log:dLog,ts:c.ts,memory:"",rule:null};
     }).catch(()=>{if(current===openId)dAdd("sysn","前回の編集履歴を読み込めませんでした。現在の下書きから編集できます。");}).finally(()=>{
       if(dHistoryLoadingId===openId){dHistoryLoadingId="";const button=document.getElementById("dSendBtn");if(button)button.disabled=false;}
@@ -7116,7 +7121,7 @@ async function dSend(){if(window.__dBusy||window.__voiceBusy||dHistoryLoadingId=
   function restoreFailedInput(){if(dHist.length&&dHist[dHist.length-1].role==="user"&&dHist[dHist.length-1].content===txt)dHist.pop();if(current===owner){x.value=txt;dComposerDrafts[owner]=txt;}}
   const MK_D="@@DRAFT@@",MK_M="@@MEMORY@@",MK_R="@@RULE@@",MK_A="@@ACTION@@",MK_T="@@META@@";
   function applyAcc(acc){
-    const mi=acc.indexOf(MK_T);const body=(mi>=0?acc.slice(0,mi):acc).replace("@@REPLY@@","");
+    const mi=acc.lastIndexOf(MK_T);const body=(mi>=0?acc.slice(0,mi):acc).replace("@@REPLY@@","");
     let reply=body,draft=null;
     const di=body.indexOf(MK_D);
     const marks=[body.indexOf(MK_M),body.indexOf(MK_R),body.indexOf(MK_A)].filter(x=>x>=0).sort((a,b)=>a-b);
@@ -7143,8 +7148,8 @@ async function dSend(){if(window.__dBusy||window.__voiceBusy||dHistoryLoadingId=
     if(meta.ok===false){aiEl.textContent=draftChatError(meta.error);logEntry.type="sysn";logEntry.text=aiEl.textContent;aiEl.className="am sysn";restoreFailedInput();return;}
     if(!fin.reply&&!fin.draft)throw new Error("stream_empty");
     if(fin.reply&&meta.engine){aiEl.textContent=fin.reply+" 〔"+meta.engine+"で作成〕";logEntry.text=aiEl.textContent;}
-    dHist.push({role:"assistant",content:(fin.draft||fin.reply||"").slice(0,4000),kind:fin.draft?"draft":"reply"});
-    if(meta.warning&&fin.draft)dAdd("sysn","⚠ 確認ポイント："+meta.warning+"（内容を確かめてから使ってください）");
+    dHist.push({role:"assistant",content:(fin.draft||fin.reply||"").slice(0,4000),kind:fin.draft?"draft":"reply",warning:(fin.draft&&meta.warning)||""});
+    if(meta.warning&&fin.draft)dWarn(meta.warning);
     if(meta.memory){if(dSessions[current])dSessions[current].memory=meta.memory;dAdd("sysn","🧠 学習候補：「"+meta.memory+"」（患者への送信後に安全確認し、再利用できる判断手順だけを学習します）");}
     if(meta.rule){if(dSessions[current])dSessions[current].rule=meta.rule;dAdd("sysn","📚 店舗ルール候補：「"+meta.rule.title+"」（患者への送信後に内容を確認して反映できます）");}
     if(meta.action)await dHandleBookingAction(meta.action);
@@ -7158,8 +7163,8 @@ async function dSend(){if(window.__dBusy||window.__voiceBusy||dHistoryLoadingId=
       if(j.ok&&(j.draft||j.reply)){
         aiEl.textContent=j.reply||"できました";logEntry.text=aiEl.textContent;
         if(j.draft){if(!cardEntry)dNewCard(j.draft);else{cardEntry.draft=j.draft;const cEl=cardEntry._el?cardEntry._el.querySelector(".c"):null;if(cEl)cEl.textContent=j.draft;}}
-        dHist.push({role:"assistant",content:j.draft||j.reply,kind:j.draft?"draft":"reply"});
-        if(j.warning&&j.draft)dAdd("sysn","⚠ 確認ポイント："+j.warning+"（内容を確かめてから使ってください）");
+        dHist.push({role:"assistant",content:j.draft||j.reply,kind:j.draft?"draft":"reply",warning:(j.draft&&j.warning)||""});
+        if(j.warning&&j.draft)dWarn(j.warning);
         if(j.memory){if(dSessions[current])dSessions[current].memory=j.memory;dAdd("sysn","🧠 学習候補：「"+j.memory+"」（患者への送信後に安全確認し、再利用できる判断手順だけを学習します）");}
         if(j.rule){if(dSessions[current])dSessions[current].rule=j.rule;dAdd("sysn","📚 店舗ルール候補：「"+j.rule.title+"」（患者への送信後に内容を確認して反映できます）");}
         if(j.action)await dHandleBookingAction(j.action);

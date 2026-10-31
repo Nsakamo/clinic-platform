@@ -344,4 +344,13 @@ test("編集履歴は患者の新着後に旧話題へ上書きせず、同じ�
   assert.equal(response.messages.length, 0);
   assert.equal(await context.saveDraftChatSession(t, { c, topicTs: 100 }, body, "古い案", "draft"), false);
   assert.equal(saves, 1);
+  // 確認ポイントは患者向け案（assistant/draft）にだけ保存し、スタッフ発言や返事には付けない
+  c.ts = 100;
+  const withWarning = { messages: [{ role: "assistant", content: "前の案", kind: "draft", warning: "料金を確認" }, { role: "user", content: "テスト", warning: "偽" }, { role: "assistant", content: "返事", kind: "reply", warning: "偽" }] };
+  await context.saveDraftChatSession(t, { c, topicTs: 100 }, withWarning, "新しい案", "draft", "日時を確認");
+  const stored = c.draftChatSession.messages;
+  assert.equal(stored[0].warning, "料金を確認");
+  assert.equal(stored[1].warning, undefined);
+  assert.equal(stored[2].warning, undefined);
+  assert.equal(stored.at(-1).warning, "日時を確認");
 });
