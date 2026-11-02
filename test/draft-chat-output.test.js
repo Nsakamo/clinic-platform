@@ -219,6 +219,11 @@ test("文体だけの編集で照合を省けるのは、否定の数・編集�
   ok("ご確認ありがとうございます。はい、そのとおりです。", "ご確認いただき、誠にありがとうございます。はい、そのとおりです。");
   ok("キャンセルの際は前日までにご連絡ください。", "恐れ入りますが、キャンセルの際は前日までにご連絡くださいませ。");
   ok("お写真ありがとうございます。担当医が確認いたします。", "お写真をお送りいただき、誠にありがとうございます。担当医が確認いたします。何かご不明な点がございましたら、お気軽にお問い合わせください。");
+  ok("お写真ありがとうございます。担当医が確認いたします。", "お写真をお送りいただき、誠にありがとうございます。担当医が確認いたします。何卒よろしくお願いいたします。");
+  ok("担当医が確認いたします。", "お問い合わせいただき、誠にありがとうございます。担当医が確認いたします。");
+  ok("担当医が確認いたします。", "お問い合わせいただき、誠にありがとうございました。担当医が確認いたします。");
+  ng("担当医が確認いたします。", "担当医が確認いたします。お問い合わせいただき、誠にありがとうございます。担当医が確認いたします。");
+  ng("担当医が確認いたします。前日までにご連絡ください。", "担当医が確認いたします。お問い合わせいただき、誠にありがとうございます。前日までにご連絡ください。");
 });
 
 test("途中で切れた出力から救出した案は、文体だけの指示でも照合を省かない", () => {
@@ -239,4 +244,22 @@ test("書き方の見本は相談チャット（runDraftChat）からの呼び�
   assert.doesNotMatch(staffLine, /styleSamples|consultationChat/);
   // 予約照会の短期キャッシュも相談チャットからの呼び出しだけ
   assert.match(section("async function draftChatPrep(", 'app.get("/api/draft-chat-history"'), /body\.consultationChat === true \? await baContextCached\(t, c, 12000\) : await baCall\(t, c, "context", \{\}, 12000\)/);
+});
+
+test("敬語を上げただけの書き直しは文体だけの編集とみなし、書き出しのお礼は1文まで", () => {
+  assert.equal(out.styleEditPreservesContent("担当医が確認します。", "担当医が確認いたします。"), true);
+  assert.equal(out.styleEditPreservesContent("担当医が確認致します。", "担当医が確認いたします。"), true, "漢字表記のゆれ");
+  assert.equal(out.styleEditPreservesContent("受付は10時からです。", "受付は10時からでございます。"), true);
+  assert.equal(out.styleEditPreservesContent("前日までにご連絡ください。", "恐れ入りますが、前日までにご連絡くださいませ。"), true, "依頼の敬語の度合い");
+  assert.equal(out.styleEditPreservesContent("前日までにご連絡ください。", "恐れ入りますが、前日までにご連絡いただけますと幸いです。"), false, "必ずしていただくことを任意のお願いに読める形にしない");
+  assert.equal(out.styleEditPreservesContent("腫れや痛みが続く場合はご連絡ください。", "恐れ入りますが、腫れや痛みが続く場合はご連絡いただけますと幸いです。"), false);
+  assert.equal(out.styleEditPreservesContent("ご来院くださいませんか。", "ご来院ください。"), false, "依頼の否定が消えた");
+  assert.equal(out.styleEditPreservesContent("施術後24時間は飲酒をお控えください。", "恐れ入りますが、施術後24時間は飲酒をお控えいただけますと幸いです。"), false, "注意事項を任意のお願いに弱めた");
+  assert.equal(out.styleEditPreservesContent("異常があればすぐにご連絡ください。", "異常があればすぐにご連絡いただけますと幸いです。"), false);
+  assert.equal(out.styleEditPreservesContent("施術後24時間は飲酒をお控えください。", "恐れ入りますが、施術後24時間は飲酒をお控えくださいませ。"), true, "注意事項でも『くださいませ』は同じ強さ");
+  assert.equal(out.styleEditPreservesContent("こちらの日時へご変更いただけますでしょうか。", "こちらの日時へご変更ください。"), false, "質問を指示に変えた");
+  assert.equal(out.styleEditPreservesContent("こちらの日時へご変更ください。", "こちらの日時へご変更いただけますでしょうか。"), false, "指示を質問に変えた");
+  assert.equal(out.styleEditPreservesContent("いつでもご予約の変更が可能です。", "ご予約の変更が可能です。"), false, "文頭のひらがなの語を消した");
+  assert.equal(out.styleEditPreservesContent("ご予約を変更いたしました。", "ご予約の変更について確認いたします。"), false, "述語の置き換え");
+  assert.equal(out.styleEditPreservesContent("担当医が確認いたします。", "ご連絡いただき、誠にありがとうございます。お問い合わせいただき、ありがとうございます。担当医が確認いたします。"), false);
 });
