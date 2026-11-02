@@ -253,3 +253,12 @@ test("監査の書き直しが元の文を残して足しただけか、削除�
   assert.equal(out.decisionTermsNotReduced("キャンセルは前日までに。", "キャンセルは前日までに。確認いたします。"), true);
   assert.equal(out.decisionTermsNotReduced("キャンセルは前日までに。", "キャンセルはいつでも。"), false);
 });
+
+test("敬語を上げただけの書き直しは内容の変更とみなさず、書き出しのお礼は1文まで", () => {
+  assert.equal(out.styleEditPreservesContent("担当医が確認します。", "担当医が確認いたします。"), true);
+  assert.equal(out.styleEditPreservesContent("受付は10時からです。", "受付は10時からでございます。"), true);
+  assert.equal(out.contentReduced("担当医が確認します。", "お問い合わせいただき、誠にありがとうございます。担当医が確認いたします。"), false);
+  assert.equal(out.contentReduced("担当医が確認します。前日までにご連絡ください。", "担当医が確認いたします。"), true);
+  assert.equal(out.contentReduced("キャンセル料はかかりません。", "キャンセル料がかかります。"), true);
+  assert.equal(out.styleEditPreservesContent("担当医が確認いたします。", "ご連絡いただき、誠にありがとうございます。お問い合わせいただき、ありがとうございます。担当医が確認いたします。"), false);
+});

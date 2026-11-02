@@ -70,7 +70,7 @@ function qualityFunctions(aiReply, tone = "") {
   return vm.runInNewContext(source.slice(start, end) + "\n({finalizeGeneratedDraft,validateDraftAgainstEvidence})", {
     S: () => ({ tone }), aiChat: async () => aiReply,
     PATIENT_COURTESY, hasConversationalTone, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction,
-    styleEditPreservesContent: draftOutput.styleEditPreservesContent, decisionTermsPreserved: draftOutput.decisionTermsPreserved, keepsOriginalSentences: draftOutput.keepsOriginalSentences, decisionTermsNotReduced: draftOutput.decisionTermsNotReduced,
+    styleEditPreservesContent: draftOutput.styleEditPreservesContent, decisionTermsPreserved: draftOutput.decisionTermsPreserved, contentReduced: draftOutput.contentReduced,
   });
 }
 
@@ -198,6 +198,10 @@ test("送信前監査は口語の修正案を捨て、元の文が口語なら�
   assert.equal(removed.pass, false);
   assert.equal(removed.revisedDraft, "");
   assert.match(removed.reason, /監査の修正で文の内容が変わった/);
+  // 敬語を上げただけの書き直し（します→いたします）は内容の変更とみなさず、合格のまま送る
+  const politer = await qualityFunctions(reply("お問い合わせいただき、誠にありがとうございます。担当医が確認いたします。")).validateDraftAgainstEvidence({}, { ...base, draft: "担当医が確認します。" });
+  assert.equal(politer.pass, true);
+  assert.match(politer.revisedDraft, /確認いたします/);
 });
 
 test("初回生成から自動送信判定まで口語のままなら送信候補にしない", async () => {
