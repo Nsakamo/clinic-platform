@@ -252,6 +252,9 @@ test("敬語を上げただけの書き直しは文体だけの編集とみな�
   assert.equal(out.styleEditPreservesContent("前日までにご連絡ください。", "恐れ入りますが、前日までにご連絡いただけますと幸いです。"), true, "依頼の敬語の言い換え");
   assert.equal(out.styleEditPreservesContent("ご来院くださいませんか。", "ご来院ください。"), false, "依頼の否定が消えた");
   assert.equal(out.styleEditPreservesContent("前日までにご連絡ください。", "前日までにご連絡頂けますと幸いです。"), true, "漢字表記の依頼の言い換え");
+  assert.equal(out.styleEditPreservesContent("施術後24時間は飲酒をお控えください。", "恐れ入りますが、施術後24時間は飲酒をお控えいただけますと幸いです。"), false, "注意事項を任意のお願いに弱めた");
+  assert.equal(out.styleEditPreservesContent("異常があればすぐにご連絡ください。", "異常があればすぐにご連絡いただけますと幸いです。"), false);
+  assert.equal(out.styleEditPreservesContent("施術後24時間は飲酒をお控えください。", "恐れ入りますが、施術後24時間は飲酒をお控えくださいませ。"), true, "注意事項でも『くださいませ』は同じ強さ");
   assert.equal(out.styleEditPreservesContent("こちらの日時へご変更いただけますでしょうか。", "こちらの日時へご変更ください。"), false, "質問を指示に変えた");
   assert.equal(out.styleEditPreservesContent("こちらの日時へご変更ください。", "こちらの日時へご変更いただけますでしょうか。"), false, "指示を質問に変えた");
   assert.equal(out.styleEditPreservesContent("いつでもご予約の変更が可能です。", "ご予約の変更が可能です。"), false, "文頭のひらがなの語を消した");

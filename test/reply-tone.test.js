@@ -37,6 +37,7 @@ test("標準文体は患者様への礼儀を求め、馴れ馴れしい相づ�
   assert.match(PATIENT_COURTESY, /誤った二重敬語/);
   assert.match(PATIENT_COURTESY, /お問い合わせの内容を正確に受け止め/);
   assert.match(PATIENT_COURTESY, /院側が次にどうご案内するか/);
+  assert.match(PATIENT_COURTESY, /注意事項・禁止事項・必ずしていただくこと/);
   // 確認前のご依頼を受け付けたように読める言い方を既定の例にしない
   assert.match(PATIENT_COURTESY, /確認前から『承知いたしました』『かしこまりました』と受け付けたように書かない/);
   // 丁寧さを抑える指示を既定に含めない（スタッフが毎回「丁寧に」と言い直さなくてよいように）
