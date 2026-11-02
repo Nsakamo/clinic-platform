@@ -21,7 +21,7 @@ const { contextualLearningFallback, formatLearningProposal } = require("./lib/le
 const { selectConversationContext, preserveTopicBoundary } = require("./lib/conversation-context");
 const { STAFF_DRAFT_POLICY, formatDraftContext, staffConsultationTranscript, isAcknowledgementOnlyRequest, acknowledgementDraftScope, ACKNOWLEDGEMENT_DRAFT_POLICY } = require("./lib/draft-consultation");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("./lib/draft-edit");
-const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, styleEditPreservesContent, sentenceCount, borrowsFromSamples, safeText: safeDraftChatText, maskStyleSample } = require("./lib/draft-chat-output");
+const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, styleEditPreservesContent, requestsWeakened, sentenceCount, borrowsFromSamples, safeText: safeDraftChatText, maskStyleSample } = require("./lib/draft-chat-output");
 const { REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview, inboundMessageTimes } = require("./lib/reply-decision");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
@@ -1790,7 +1790,7 @@ async function geminiGenerate(systemText, userParts, maxTokens, withUsage) {
 }
 
 // ===== AI brain: shared draft generator (used by LINE + email, in-app) =====
-const JP_QUALITY = "【自然な日本語（最優先）】普通の日本人受付スタッフが実際に送る、簡潔で温かい敬語にする。" + PATIENT_COURTESY + "結論や回答を先に書き、必要事項、次の行動の順にまとめる。LINEは原則2〜6文、メールも必要以上に長くしない。会話の途中では毎回あいさつを繰り返さない。『ございます』『くださいませ』『させていただきます』を重ねて格式張らない。不自然な二重敬語（拝見させていただく、ご確認していただく、お伺いさせていただく）は使わない。同じ結論・謝罪・締めを言い換えて繰り返さない。1文ごとの空行、説明を始める宣言、不要な保険表現、機械翻訳調を避ける。出力前に一度読み直し、口に出して不自然な箇所を直す。";
+const JP_QUALITY = "【日本語の質（最優先）】丁寧な医療機関の受付スタッフが患者様へ実際に送る、とても丁寧でへりくだった敬語にする。" + PATIENT_COURTESY + "お礼の一言（ご不便やお待たせがある場合はお詫びも）のあと、結論や回答、必要事項、次にしていただくことの順にまとめ、丁寧な結びで締める。会話の途中では、前の返信と同じ書き出しのお礼や結びを毎回繰り返さない（直前のご連絡へのお礼は可）。LINEでも丁寧さを優先し、読みやすいよう話題ごとに改行する。同じ結論・謝罪・締めを言い換えて何度も繰り返さない。1文ごとの空行、説明を始める宣言、不要な保険表現、機械翻訳調を避ける。出力前に一度読み直し、患者様に失礼や素っ気なさを感じさせる箇所、不自然な敬語を直す。";
 function cleanDraftText(raw){
   let text = String(raw||"").trim().replace(/^```(?:json|text)?\s*/i,"").replace(/```$/i,"").trim();
   text = text.replace(/^(?:【(?:返信案|返信文|回答)】|返信(?:案|文)[:：])\s*/i,"").trim();
@@ -1802,8 +1802,7 @@ function draftQualityIssues(text){
   if(!text.trim()) issues.push("empty");
   if(hasConversationalTone(text)) issues.push("conversational_tone");
   if(/拝見させていただ|ご確認していただ|お伺いさせていただ|大変良かったでございます/.test(text)) issues.push("wrong_honorific");
-  const formal = (text.match(/ございます|くださいませ|させていただき/g)||[]).length;
-  if(formal >= 3) issues.push("over_formal");
+  // 丁寧な敬語（ございます・くださいませ等）が多いことは問題にしない（患者様へは丁寧さを優先する運用方針）
   const sentences = text.split(/[。！？\n]+/).map(s=>s.trim()).filter(s=>s.length>=8);
   if(new Set(sentences).size < sentences.length) issues.push("repetition");
   if(/^【.*】/.test(text.trim()) || /```/.test(text)) issues.push("meta_text");
@@ -1819,14 +1818,18 @@ async function finalizeGeneratedDraft(t, raw, channel){
   let text = cleanDraftText(raw), issues = draftQualityIssues(text);
   const tone = normalizeReplyTone(S(t).tone);
   if(!issues.length && !tone) return { text, issues:[] };
-  const sys = "患者へ送る日本語文の最終校正者。事実・日時・料金・URL・可否・固有名詞・謝罪の有無を変えず、不自然な敬語、過剰な格式、重複、馴れ馴れしい言い回しを直す。日付や可否の表現は原文の語を保ち、丁寧さはその周囲の言葉で調整する。新しい情報を足さない。" + PATIENT_COURTESY
-    + (channel==="mail" ? "メールの署名は残す。" : "LINE本文として簡潔にする。")
+  const sys = "患者へ送る日本語文の最終校正者。事実・日時・料金・URL・可否・固有名詞・謝罪の有無を変えず、誤った敬語、重複、馴れ馴れしい言い回し、素っ気ない言い切りを直し、とても丁寧でへりくだった敬語に整える。原文に無いお詫び・約束・案内の文は足さない（下の文体の指示にある書き出しのお礼・お詫びの添え方は、新しく返信を書く時のもので、ここでは原文に無ければ足さない）。書き直しで丁寧さを足す時は、お礼・クッション言葉・結びのあいさつで表し、『申し訳ございません』『ございません』『本日』『明日』など否定や日付に当たる語を新たに足さない（事実の照合で別の内容と判定されるため）。日付や可否の表現は原文の語を保ち、丁寧さはその周囲の言葉で調整する。新しい情報を足さない。" + PATIENT_COURTESY
+    + (channel==="mail" ? "メールの署名は残す。" : "LINE本文として、丁寧さを保ったまま話題ごとに改行して読みやすくする。")
     + toneRewriteInstruction(tone, channel)
     + "返信本文だけを出力する。";
   const revised = await aiChat(t, sys, [{role:"user",content:text.slice(0,5000)}], 1800, "finalize");
   if(revised){
     const candidate = cleanDraftText(revised);
-    if(candidate && preservesReplyFacts(text, candidate) && !draftQualityIssues(candidate).some(issue => issue === "empty" || issue === "conversational_tone")) {
+    // 「〜ください」を「いただけますと幸いです」等の任意に読める言い方へ変えた校正は採用しない（必ずしていただくことを弱めない）
+    // 元の文に「〜ください」（していただくこと）がある時は、送信前監査と同じ「文体だけの編集」の検査も通った時だけ採用する
+    // （「ご無理のない範囲でお願いいたします」のような別の文を足して弱める校正を採用しない）
+    const hasRequest = /くださ(?:い|いませ)(?!ん)/.test(String(text).replace(/下さい/g, "ください"));
+    if(candidate && preservesReplyFacts(text, candidate) && !requestsWeakened(text, candidate) && (!hasRequest || styleEditPreservesContent(text, candidate)) && !draftQualityIssues(candidate).some(issue => issue === "empty" || issue === "conversational_tone")) {
       if(tone) issues.push("tone_reviewed");
       text = candidate;
       issues = issues.filter(issue => issue !== "conversational_tone");
@@ -1842,7 +1845,7 @@ async function validateDraftAgainstEvidence(t, input){
     input.slots ? "【リアルタイム空き枠】\n" + input.slots : "",
     input.precedents ? "【類似するスタッフ確定例】\n" + input.precedents : "",
   ].filter(Boolean).join("\n\n") || "（事実の根拠資料なし）";
-  const sys = "あなたは患者返信の送信前監査兼、日本語編集者です。根拠の優先順位は、最新の店舗ルール > 本人確認済みシステムデータ > 類似するスタッフ確定例。同種の店舗ルールが複数あり食い違う場合は更新日が最も新しいものを採用する。新しい店舗ルールと古い確定例が食い違えば必ず店舗ルールを採用する。類似するスタッフ確定例は、同種問い合わせへの結論・案内手順・必要確認・通常の料金や規定の根拠として使えるが、個別患者の予約・体調・特例は引き継がない。根拠にない事実、数字、可否、完了報告、医療判断があればpass:false。回答漏れ、会話との矛盾、別患者情報の混入もpass:false。内容が正しく日本語だけが不自然・冗長な場合は、事実を一切変えず自然で簡潔な受付文へ直してrevised_draftに入れ、pass:trueにできる。一般的な挨拶、謝意、確認する旨、必要情報を尋ねる文は根拠なしでも可。" + PATIENT_COURTESY
+  const sys = "あなたは患者返信の送信前監査兼、日本語編集者です。根拠の優先順位は、最新の店舗ルール > 本人確認済みシステムデータ > 類似するスタッフ確定例。同種の店舗ルールが複数あり食い違う場合は更新日が最も新しいものを採用する。新しい店舗ルールと古い確定例が食い違えば必ず店舗ルールを採用する。類似するスタッフ確定例は、同種問い合わせへの結論・案内手順・必要確認・通常の料金や規定の根拠として使えるが、個別患者の予約・体調・特例は引き継がない。根拠にない事実、数字、可否、完了報告、医療判断があればpass:false。回答漏れ、会話との矛盾、別患者情報の混入もpass:false。内容が正しく日本語だけが不自然・素っ気ない場合は、事実を一切変えず、とても丁寧でへりくだった受付文へ直してrevised_draftに入れ、pass:trueにできる。丁寧な敬語・お礼・お詫び・結びのあいさつを削って短くしてはいけない。原文に無いお詫び・約束・案内の文は足さない（下の文体の指示にある書き出しのお礼・お詫びの添え方は、新しく返信を書く時のもので、ここでは原文に無ければ足さない）。丁寧にする時は、既にある文の中身は変えず、敬語の度合い（します→いたします、です→でございます、ください→くださいませ 等。『ください』を『いただけますと幸いです』のような任意に読める言い方には変えない）と、文の前後のお礼・クッション言葉・結びのあいさつで表す。書き直しで丁寧さを足す時は、お礼・クッション言葉・結びのあいさつで表し、『申し訳ございません』『ございません』『本日』『明日』など否定や日付に当たる語を新たに足さない（事実の照合で別の内容と判定されるため）。一般的な挨拶、謝意、確認する旨、必要情報を尋ねる文は根拠なしでも可。" + PATIENT_COURTESY
     + "監査で文章を修正する場合は、日付や可否の表現を原文の語のまま保ち、丁寧さはその周囲の言葉で調整する。"
     + (replyToneInstruction(S(t).tone) ? "\n\n" + replyToneInstruction(S(t).tone) + "\n監査で文章を修正する場合も、このトーンを弱めてはいけない。" : "")
     + "必ずJSONのみ: {\"pass\":true|false,\"answered\":true|false,\"natural\":true|false,\"revised_draft\":\"修正不要なら空文字\",\"unsupported_claims\":[\"\"],\"contradictions\":[\"\"],\"reason\":\"短い日本語\"}";
@@ -1859,15 +1862,23 @@ async function validateDraftAgainstEvidence(t, input){
     const answered = parsed.answered === true;
     const candidateDraft = cleanDraftText(String(parsed.revised_draft || "")).slice(0, 5000);
     const factChanged = !!candidateDraft && !preservesReplyFacts(input.draft, candidateDraft);
-    const revisedDraft = candidateDraft && !factChanged && !hasConversationalTone(candidateDraft) ? candidateDraft : "";
+    // 監査AIの書き直しは、文体だけの編集（各文の中身を保ち、足すのは敬語の度合い・決まった定型句・あいさつだけ）の時に限り採用する。
+    // 文体だけと確かめられない書き直し（約束・案内・お詫びの追加、削除、置き換え）は採用せず、下の contentRevised でスタッフ確認へ回す。
+    const styleOnlyRevision = !!candidateDraft && styleEditPreservesContent(input.draft, candidateDraft) && decisionTermsPreserved(input.draft, candidateDraft);
+    const revisedDraft = candidateDraft && !factChanged && styleOnlyRevision && !hasConversationalTone(candidateDraft) ? candidateDraft : "";
     const courteous = !hasConversationalTone(revisedDraft || input.draft);
-    const pass = parsed.pass === true && answered && !unsupportedClaims.length && !contradictions.length && courteous && !factChanged;
+    // 監査AIの書き直しが「文体だけの編集」と確かめられない時（文の追加・削除・置き換え）は、元の文にも直すべき点があったとみなし、
+    // 書き直しは採用せずスタッフ確認へ回す。敬語の度合いを上げる・決まったあいさつを足すだけの書き直しは採用して合格のまま送る。
+    // 書き直しが口語に崩れていても、文体だけの編集でなければ元の文に直すべき点があったとみなしてスタッフ確認へ回す。
+    const contentRevised = !!candidateDraft && !factChanged && !styleOnlyRevision;
+    const pass = parsed.pass === true && answered && !unsupportedClaims.length && !contradictions.length && courteous && !factChanged && !contentRevised;
     const reasons = [];
     if (unsupportedClaims.length || contradictions.length) reasons.push("根拠や内容に確認が必要です");
     if (parsed.reason) reasons.push(String(parsed.reason));
     if (!reasons.length) reasons.push(pass ? "根拠監査済み" : "送信前確認が必要です");
     if (!courteous) reasons.push("文体にスタッフ確認が必要です");
     if (factChanged) reasons.push("監査の修正文で日時・金額などの事実が変わったためスタッフ確認が必要です");
+    if (contentRevised) reasons.push("監査の修正で文の内容が変わったためスタッフ確認が必要です");
     return { pass, answered, natural: parsed.natural === true, revisedDraft: pass ? revisedDraft : "", unsupportedClaims, contradictions, reason: reasons.join("／").slice(0, 300) };
   } catch (e) {
     return { pass: false, answered: false, unsupportedClaims: [], contradictions: [], reason: "送信前監査の結果を確認できませんでした" };
@@ -2351,7 +2362,7 @@ async function genDraft(t, c, opts) {
   }
   // 先頭は毎回同じ内容（役割・安全ルール・出力形式・トーン・共通指示・ルールブック）、後ろに今回の会話ごとに変わる内容を置く。
   // 同じ先頭部分はOpenAI側で再利用（プロンプトキャッシュ）され、返信作成が速くなる。
-  const sys = "あなたはクリニック・店舗「" + (t.name || "クリニック") + "」の受付スタッフです。お客様とこの会話をしてきた本人として、最新のメッセージへ、自然で温かく、簡潔な敬語で返信します。"
+  const sys = "あなたはクリニック・店舗「" + (t.name || "クリニック") + "」の受付スタッフです。お客様とこの会話をしてきた本人として、最新のメッセージへ、とても丁寧でへりくだった敬語で、温かく返信します。"
     + REPLY_DECISION
     + "医療判断・診断はしない。「絶対」「完治」など断定的表現は使わない。絵文字は使わない。" + sig
     + "\n\n【事実の安全ルール】料金・金額・割引・期限・規定・営業日・対応可否は店舗ルールに明記された内容だけを答える。予約日時・空き枠・患者固有情報・手続き完了は、本人確認済みのシステム照会結果だけを答える。痛み・症状・薬・安全性は診断や『大丈夫』という断定をせず、スタッフ確認へ回す。根拠が無い場合は推測せず『確認してご案内します』と伝え、needs_human:true、confidence:lowにする。"
@@ -3993,11 +4004,11 @@ app.post("/api/ai-regen", guard, async (req, res) => {
   }
   msgsArr.push({ role: "user", content: "【スタッフからクリニックAIへの内部指示（お客様には見えません）】\nここまでの会話の流れ全体を正確に踏まえて、お客様の最新のメッセージへの返信文を作成してください。\n返信の方向性メモ: " + idea + "\nメモが『あってる』『大丈夫』のように短くても、会話の文脈に当てはめて意味を解釈し、お客様の話題に具体的に触れて答えること。すでに会話で伝えた内容は繰り返さないこと。返信文のみを出力すること。" });
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
-  const sys = "あなたは「" + (t.name || "クリニック") + "」の受付スタッフとして、お客様とこの会話をしてきた本人です。自然で温かく、簡潔な敬語でお客様に対応します。"
+  const sys = "あなたは「" + (t.name || "クリニック") + "」の受付スタッフとして、お客様とこの会話をしてきた本人です。とても丁寧でへりくだった敬語で、温かくお客様に対応します。"
     + "会話の最後に入るスタッフの内部指示メモに沿って、会話の続きとして自然につながる返信を書いてください。"
     + "本日は" + today + "です。キャンセル料など日付が関わる案内では、本日の日付と予約日の差から判断すること（例: 予約日の前日にあたる連絡なら前日扱い、当日なら当日扱い、それより前なら通常はキャンセル料は不要）。憶測で日付を決めない。"
     + "お客様が複数の質問・依頼をしている場合は、その全てにもれなく答えること。1つも取りこぼさない。"
-    + "お客様への敬意と心配りが自然に伝わる表現を選び、ご不便にはお詫びや労いの一言を添える。ただし慇懃無礼にならず、簡潔さと読みやすさも保つ。絵文字は使わない。断定や医療判断は避ける。" + sig
+    + "お客様への敬意と心配りが自然に伝わる表現を選び、ご不便にはお詫びや労いの一言を添える。誤った二重敬語は避け、読みやすさも保つ。絵文字は使わない。断定や医療判断は避ける。" + sig
     + (rulesTxt ? "\n【店舗ルール（従うこと）】\n" + rulesTxt : "")
     + (replyToneInstruction(S(t).tone, 1000) ? "\n\n" + replyToneInstruction(S(t).tone, 1000) : "")
     + (c && notesBlock(c) ? "\n【このお客様への対応でスタッフが以前出した指示メモ（引き続き守る）】\n" + notesBlock(c) : "")
@@ -4029,8 +4040,8 @@ function staffBookingPrompt(ctx) {
     + "\n書き込み操作はactionを出しても即実行されず、画面に対象患者・予約・内容の確認カードが出る。スタッフがそのカードで実行を承認した時だけ処理される。"
     + "\n対象予約が複数あり特定できない、日付・時刻が不足、操作不可、または患者名を別人として指定している場合はactionをnoneにし、必要な確認をスタッフへ質問する。推測でIDや日時を補わない。";
 }
-// スタッフが明示した口調・言い回しの指示は、既定の文体ルール（トーン設定・簡潔さの目安・礼儀ガード）より優先する（運用方針）。
-const STAFF_TONE_PRIORITY = "【スタッフの口調指示の優先】スタッフが口調・言い回し・温度感・長さ（例:「もっと丁寧で温かく」「もっと柔らかく」「短く」）を明示したら、その指示を既定の文体ルール（トーン設定、簡潔さや敬語の量の目安、文数の目安）より優先し、読んで違いがはっきり分かるように返信全文を書き直す。丁寧・温かくの指示では、お問い合わせへのお礼、ご連絡への感謝、お手数への気づかい、締めのあいさつなどを自然に加えてよい。ただし事実・日時・金額・可否・結論・案内先は変えず、『ご安心ください』『よくあることです』のような根拠のない安心づけ、症状や経過への言及、医療判断、新しい約束は加えない。";
+// スタッフが明示した口調・言い回しの指示は、既定の文体ルール（トーン設定、書き出しのお礼や結びのあいさつの付け方）より優先する（運用方針）。
+const STAFF_TONE_PRIORITY = "【スタッフの口調指示の優先】スタッフが口調・言い回し・温度感・長さ（例:「もっと丁寧で温かく」「もっと柔らかく」「短く」）を明示したら、その指示を既定の文体ルール（トーン設定、書き出しのお礼や結びのあいさつの付け方）より優先し、読んで違いがはっきり分かるように返信全文を書き直す。丁寧・温かくの指示では、お問い合わせへのお礼、ご連絡への感謝、お手数への気づかい、締めのあいさつなどを自然に加えてよい。ただし事実・日時・金額・可否・結論・案内先は変えず、『ご安心ください』『よくあることです』のような根拠のない安心づけ、症状や経過への言及、医療判断、新しい約束は加えない。";
 // 共通部（会話文脈＋ルール＋方針）。出力形式はJSONで受け取り、画面向けの形はサーバーで組み立てる。
 async function draftChatPrep(t, body) {
   const c = t.store[body.id] || null;
@@ -4244,7 +4255,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
   }
   let checked = await audit(text);
   if (checked.pass) return { text, error: "" };
-  const repairSystem = "患者様向け返信文の編集者です。患者の前後のやり取りとスタッフ相談履歴に基づき、最新指示を反映した完成文だけを出力する。以前の未撤回の訂正・決定と指摘されていない正しい内容は保ち、最新指示で撤回された内容は戻さない。最新指示と矛盾しないスタッフ共通指示・患者対応メモを保つ。未実施の操作を実施済みと書かない。指示と矛盾する確認待ち表現や不要な追加質問は削る。新しい事実・条件・個人情報の依頼は加えない。医療判断はしない。礼儀正しく簡潔な敬語にする。" + PATIENT_COURTESY;
+  const repairSystem = "患者様向け返信文の編集者です。患者の前後のやり取りとスタッフ相談履歴に基づき、最新指示を反映した完成文だけを出力する。以前の未撤回の訂正・決定と指摘されていない正しい内容は保ち、最新指示で撤回された内容は戻さない。最新指示と矛盾しないスタッフ共通指示・患者対応メモを保つ。未実施の操作を実施済みと書かない。指示と矛盾する確認待ち表現や不要な追加質問は削る。新しい事実・条件・個人情報の依頼は加えない。医療判断はしない。とても丁寧でへりくだった敬語にする。" + PATIENT_COURTESY;
   // 相談チャット（スタッフが確認してから使う案）は修復1回まで。残った懸念は確認ポイントとして案に添える。
   const attempts = p.allowWarning ? 1 : 2;
   for (let attempt = 0; attempt < attempts; attempt++) {
