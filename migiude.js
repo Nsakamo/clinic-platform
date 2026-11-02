@@ -21,7 +21,7 @@ const { contextualLearningFallback, formatLearningProposal } = require("./lib/le
 const { selectConversationContext, preserveTopicBoundary } = require("./lib/conversation-context");
 const { STAFF_DRAFT_POLICY, formatDraftContext, staffConsultationTranscript, isAcknowledgementOnlyRequest, acknowledgementDraftScope, ACKNOWLEDGEMENT_DRAFT_POLICY } = require("./lib/draft-consultation");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("./lib/draft-edit");
-const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, styleEditPreservesContent, contentReduced, sentenceCount, borrowsFromSamples, safeText: safeDraftChatText, maskStyleSample } = require("./lib/draft-chat-output");
+const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, styleEditPreservesContent, contentReduced, keepsOriginalSentences, sentenceCount, borrowsFromSamples, safeText: safeDraftChatText, maskStyleSample } = require("./lib/draft-chat-output");
 const { REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview, inboundMessageTimes } = require("./lib/reply-decision");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
@@ -1863,10 +1863,11 @@ async function validateDraftAgainstEvidence(t, input){
     const styleOnlyRevision = !!candidateDraft && styleEditPreservesContent(input.draft, candidateDraft) && decisionTermsPreserved(input.draft, candidateDraft);
     const revisedDraft = candidateDraft && !factChanged && styleOnlyRevision && !hasConversationalTone(candidateDraft) ? candidateDraft : "";
     const courteous = !hasConversationalTone(revisedDraft || input.draft);
-    // 監査AIが元の文の内容を減らした（語・否定・判断語が減った）書き直しは、元の文にも直すべき点があったとみなしてスタッフ確認へ回す。
+    // 監査AIが元の文の内容を減らした（語・否定・判断語が減った）、または元の文を置き換えた（敬語の度合いをそろえても元の文が順番どおり残らない）書き直しは、
+    // 元の文にも直すべき点があったとみなしてスタッフ確認へ回す。
     // 敬語を上げただけ・文を足しただけの書き直しは、採用しないか（文体だけでない時）採用して、合格のまま送る。口語に崩れた書き直しは捨てるだけ。
     const contentRevised = !!candidateDraft && !factChanged && !styleOnlyRevision && !hasConversationalTone(candidateDraft)
-      && contentReduced(input.draft, candidateDraft);
+      && (contentReduced(input.draft, candidateDraft) || !keepsOriginalSentences(input.draft, candidateDraft)); // 内容が減った、または元の文が順番どおり残っていない（述語の置き換え等）
     const pass = parsed.pass === true && answered && !unsupportedClaims.length && !contradictions.length && courteous && !factChanged && !contentRevised;
     const reasons = [];
     if (unsupportedClaims.length || contradictions.length) reasons.push("根拠や内容に確認が必要です");

@@ -260,5 +260,9 @@ test("敬語を上げただけの書き直しは内容の変更とみなさず�
   assert.equal(out.contentReduced("担当医が確認します。", "お問い合わせいただき、誠にありがとうございます。担当医が確認いたします。"), false);
   assert.equal(out.contentReduced("担当医が確認します。前日までにご連絡ください。", "担当医が確認いたします。"), true);
   assert.equal(out.contentReduced("キャンセル料はかかりません。", "キャンセル料がかかります。"), true);
+  assert.equal(out.contentReduced("ご来院くださいませんか。", "ご来院ください。"), true, "依頼の否定が消えた");
+  assert.equal(out.contentReduced("担当医が確認致します。", "担当医が確認いたします。"), false, "漢字表記のゆれは内容の変更ではない");
+  assert.equal(out.keepsOriginalSentences("担当医が確認します。", "担当医が確認いたします。"), true);
+  assert.equal(out.keepsOriginalSentences("ご予約を変更いたしました。", "ご予約の変更について確認いたします。"), false);
   assert.equal(out.styleEditPreservesContent("担当医が確認いたします。", "ご連絡いただき、誠にありがとうございます。お問い合わせいただき、ありがとうございます。担当医が確認いたします。"), false);
 });

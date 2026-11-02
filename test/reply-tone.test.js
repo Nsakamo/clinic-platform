@@ -70,7 +70,7 @@ function qualityFunctions(aiReply, tone = "") {
   return vm.runInNewContext(source.slice(start, end) + "\n({finalizeGeneratedDraft,validateDraftAgainstEvidence})", {
     S: () => ({ tone }), aiChat: async () => aiReply,
     PATIENT_COURTESY, hasConversationalTone, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction,
-    styleEditPreservesContent: draftOutput.styleEditPreservesContent, decisionTermsPreserved: draftOutput.decisionTermsPreserved, contentReduced: draftOutput.contentReduced,
+    styleEditPreservesContent: draftOutput.styleEditPreservesContent, decisionTermsPreserved: draftOutput.decisionTermsPreserved, contentReduced: draftOutput.contentReduced, keepsOriginalSentences: draftOutput.keepsOriginalSentences,
   });
 }
 
@@ -202,6 +202,10 @@ test("送信前監査は口語の修正案を捨て、元の文が口語なら�
   const politer = await qualityFunctions(reply("お問い合わせいただき、誠にありがとうございます。担当医が確認いたします。")).validateDraftAgainstEvidence({}, { ...base, draft: "担当医が確認します。" });
   assert.equal(politer.pass, true);
   assert.match(politer.revisedDraft, /確認いたします/);
+  // 述語を置き換えた書き直し（完了報告→確認予定）は、元の文に問題があったとしてスタッフ確認へ回す
+  const replaced = await qualityFunctions(reply("ご予約の変更について確認いたします。")).validateDraftAgainstEvidence({}, { ...base, draft: "ご予約を変更いたしました。" });
+  assert.equal(replaced.pass, false);
+  assert.match(replaced.reason, /監査の修正で文の内容が変わった/);
 });
 
 test("初回生成から自動送信判定まで口語のままなら送信候補にしない", async () => {
