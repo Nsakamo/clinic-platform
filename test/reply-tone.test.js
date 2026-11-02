@@ -131,6 +131,10 @@ test("軽量な文体校正が日時・料金・URLを変えた場合は採用�
   const midSoft = await qualityFunctions("異常がございましたら、可能な範囲ですぐにご連絡くださいませ。", "患者様に丁寧に")
     .finalizeGeneratedDraft({}, "異常があればすぐにご連絡ください。", "line");
   assert.equal(midSoft.text, "異常があればすぐにご連絡ください。");
+  for (const extra of ["施術後24時間は飲酒をお控えくださいませ。ご無理のない範囲でお願いいたします。", "施術後24時間は飲酒をお控えくださいませ。可能な範囲で構いません。"]) {
+    const r = await qualityFunctions(extra, "患者様に丁寧に").finalizeGeneratedDraft({}, "施術後24時間は飲酒をお控えください。", "line");
+    assert.equal(r.text, "施術後24時間は飲酒をお控えください。", "別の文を足して弱めた校正は採用しない: " + extra);
+  }
   const optionalized = await qualityFunctions("よろしければ、施術後24時間は飲酒をお控えくださいませ。", "患者様に丁寧に")
     .finalizeGeneratedDraft({}, "施術後24時間は飲酒をお控えください。", "line");
   assert.equal(optionalized.text, "施術後24時間は飲酒をお控えください。", "「よろしければ」で任意に読める形にした校正は採用しない");

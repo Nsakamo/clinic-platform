@@ -1826,7 +1826,10 @@ async function finalizeGeneratedDraft(t, raw, channel){
   if(revised){
     const candidate = cleanDraftText(revised);
     // 「〜ください」を「いただけますと幸いです」等の任意に読める言い方へ変えた校正は採用しない（必ずしていただくことを弱めない）
-    if(candidate && preservesReplyFacts(text, candidate) && !requestsWeakened(text, candidate) && !draftQualityIssues(candidate).some(issue => issue === "empty" || issue === "conversational_tone")) {
+    // 元の文に「〜ください」（していただくこと）がある時は、送信前監査と同じ「文体だけの編集」の検査も通った時だけ採用する
+    // （「ご無理のない範囲でお願いいたします」のような別の文を足して弱める校正を採用しない）
+    const hasRequest = /くださ(?:い|いませ)(?!ん)/.test(String(text).replace(/下さい/g, "ください"));
+    if(candidate && preservesReplyFacts(text, candidate) && !requestsWeakened(text, candidate) && (!hasRequest || styleEditPreservesContent(text, candidate)) && !draftQualityIssues(candidate).some(issue => issue === "empty" || issue === "conversational_tone")) {
       if(tone) issues.push("tone_reviewed");
       text = candidate;
       issues = issues.filter(issue => issue !== "conversational_tone");
