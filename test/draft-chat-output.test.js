@@ -244,3 +244,12 @@ test("書き方の見本は相談チャット（runDraftChat）からの呼び�
   // 予約照会の短期キャッシュも相談チャットからの呼び出しだけ
   assert.match(section("async function draftChatPrep(", 'app.get("/api/draft-chat-history"'), /body\.consultationChat === true \? await baContextCached\(t, c, 12000\) : await baCall\(t, c, "context", \{\}, 12000\)/);
 });
+
+test("監査の書き直しが元の文を残して足しただけか、削除・置き換えを含むかを見分ける", () => {
+  const before = "状態を確認したうえでご案内いたします。キャンセルは前日までにご連絡ください。";
+  assert.equal(out.keepsOriginalSentences(before, "お問い合わせいただき、誠にありがとうございます。状態を確認したうえでご案内いたします。キャンセルは前日までにご連絡くださいませ。"), true);
+  assert.equal(out.keepsOriginalSentences(before, "状態を確認したうえでご案内いたします。"), false, "文を削除");
+  assert.equal(out.keepsOriginalSentences(before, "キャンセルは前日までにご連絡ください。状態を確認したうえでご案内いたします。"), false, "順番の入れ替え");
+  assert.equal(out.decisionTermsNotReduced("キャンセルは前日までに。", "キャンセルは前日までに。確認いたします。"), true);
+  assert.equal(out.decisionTermsNotReduced("キャンセルは前日までに。", "キャンセルはいつでも。"), false);
+});

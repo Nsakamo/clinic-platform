@@ -70,7 +70,7 @@ function qualityFunctions(aiReply, tone = "") {
   return vm.runInNewContext(source.slice(start, end) + "\n({finalizeGeneratedDraft,validateDraftAgainstEvidence})", {
     S: () => ({ tone }), aiChat: async () => aiReply,
     PATIENT_COURTESY, hasConversationalTone, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction,
-    styleEditPreservesContent: draftOutput.styleEditPreservesContent, decisionTermsPreserved: draftOutput.decisionTermsPreserved,
+    styleEditPreservesContent: draftOutput.styleEditPreservesContent, decisionTermsPreserved: draftOutput.decisionTermsPreserved, keepsOriginalSentences: draftOutput.keepsOriginalSentences, decisionTermsNotReduced: draftOutput.decisionTermsNotReduced,
   });
 }
 
@@ -193,6 +193,11 @@ test("送信前監査は口語の修正案を捨て、元の文が口語なら�
   // 書き出しのお礼と決まった結びだけを足した書き直しは採用する
   const politeOnly = await qualityFunctions(reply("お問い合わせいただき、誠にありがとうございます。状態を確認したうえでご案内いたします。何卒よろしくお願いいたします。")).validateDraftAgainstEvidence({}, base);
   assert.match(politeOnly.revisedDraft, /何卒よろしくお願いいたします/);
+  // 元の文を削除・置き換えた書き直しは、元の文にも直すべき点があったとしてスタッフ確認へ回す
+  const removed = await qualityFunctions(reply("状態を確認いたします。")).validateDraftAgainstEvidence({}, { ...base, draft: "状態を確認したうえでご案内いたします。施術後によく見られるものですので、ご安心ください。" });
+  assert.equal(removed.pass, false);
+  assert.equal(removed.revisedDraft, "");
+  assert.match(removed.reason, /監査の修正で文の内容が変わった/);
 });
 
 test("初回生成から自動送信判定まで口語のままなら送信候補にしない", async () => {
@@ -285,5 +290,5 @@ test("丁寧さの書き直しは、否定や日付に当たる語を新たに�
   const finalize = source.slice(source.indexOf("async function finalizeGeneratedDraft("), source.indexOf("async function validateDraftAgainstEvidence("));
   const validate = source.slice(source.indexOf("async function validateDraftAgainstEvidence("), source.indexOf("function salvageDraft("));
   for (const body of [finalize, validate]) assert.match(body, /否定や日付に当たる語を新たに足さない/);
-  assert.match(finalize, /原文に無いお詫びは足さない/);
+  assert.match(finalize, /原文に無いお詫び・約束・案内の文は足さない/);
 });

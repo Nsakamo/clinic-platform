@@ -21,7 +21,7 @@ const { contextualLearningFallback, formatLearningProposal } = require("./lib/le
 const { selectConversationContext, preserveTopicBoundary } = require("./lib/conversation-context");
 const { STAFF_DRAFT_POLICY, formatDraftContext, staffConsultationTranscript, isAcknowledgementOnlyRequest, acknowledgementDraftScope, ACKNOWLEDGEMENT_DRAFT_POLICY } = require("./lib/draft-consultation");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("./lib/draft-edit");
-const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, styleEditPreservesContent, sentenceCount, borrowsFromSamples, safeText: safeDraftChatText, maskStyleSample } = require("./lib/draft-chat-output");
+const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, decisionTermsNotReduced, styleEditPreservesContent, keepsOriginalSentences, sentenceCount, borrowsFromSamples, safeText: safeDraftChatText, maskStyleSample } = require("./lib/draft-chat-output");
 const { REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview, inboundMessageTimes } = require("./lib/reply-decision");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
@@ -1818,7 +1818,7 @@ async function finalizeGeneratedDraft(t, raw, channel){
   let text = cleanDraftText(raw), issues = draftQualityIssues(text);
   const tone = normalizeReplyTone(S(t).tone);
   if(!issues.length && !tone) return { text, issues:[] };
-  const sys = "患者へ送る日本語文の最終校正者。事実・日時・料金・URL・可否・固有名詞・謝罪の有無を変えず、誤った敬語、重複、馴れ馴れしい言い回し、素っ気ない言い切りを直し、とても丁寧でへりくだった敬語に整える。原文に無いお詫びは足さない。書き直しで丁寧さを足す時は、お礼・クッション言葉・結びのあいさつで表し、『申し訳ございません』『ございません』『本日』『明日』など否定や日付に当たる語を新たに足さない（事実の照合で別の内容と判定されるため）。日付や可否の表現は原文の語を保ち、丁寧さはその周囲の言葉で調整する。新しい情報を足さない。" + PATIENT_COURTESY
+  const sys = "患者へ送る日本語文の最終校正者。事実・日時・料金・URL・可否・固有名詞・謝罪の有無を変えず、誤った敬語、重複、馴れ馴れしい言い回し、素っ気ない言い切りを直し、とても丁寧でへりくだった敬語に整える。原文に無いお詫び・約束・案内の文は足さない。書き直しで丁寧さを足す時は、お礼・クッション言葉・結びのあいさつで表し、『申し訳ございません』『ございません』『本日』『明日』など否定や日付に当たる語を新たに足さない（事実の照合で別の内容と判定されるため）。日付や可否の表現は原文の語を保ち、丁寧さはその周囲の言葉で調整する。新しい情報を足さない。" + PATIENT_COURTESY
     + (channel==="mail" ? "メールの署名は残す。" : "LINE本文として、丁寧さを保ったまま話題ごとに改行して読みやすくする。")
     + toneRewriteInstruction(tone, channel)
     + "返信本文だけを出力する。";
@@ -1863,13 +1863,18 @@ async function validateDraftAgainstEvidence(t, input){
     const styleOnlyRevision = !!candidateDraft && styleEditPreservesContent(input.draft, candidateDraft) && decisionTermsPreserved(input.draft, candidateDraft);
     const revisedDraft = candidateDraft && !factChanged && styleOnlyRevision && !hasConversationalTone(candidateDraft) ? candidateDraft : "";
     const courteous = !hasConversationalTone(revisedDraft || input.draft);
-    const pass = parsed.pass === true && answered && !unsupportedClaims.length && !contradictions.length && courteous && !factChanged;
+    // 監査AIが元の文を削除・置き換えた（判断語が減った）書き直しは、元の文にも直すべき点があったとみなしてスタッフ確認へ回す。
+    // 文を足しただけの書き直しは採用せず、合格した元の文のまま送る。口語に崩れた書き直しは捨てるだけ。
+    const contentRevised = !!candidateDraft && !factChanged && !styleOnlyRevision && !hasConversationalTone(candidateDraft)
+      && (!keepsOriginalSentences(input.draft, candidateDraft) || !decisionTermsNotReduced(input.draft, candidateDraft));
+    const pass = parsed.pass === true && answered && !unsupportedClaims.length && !contradictions.length && courteous && !factChanged && !contentRevised;
     const reasons = [];
     if (unsupportedClaims.length || contradictions.length) reasons.push("根拠や内容に確認が必要です");
     if (parsed.reason) reasons.push(String(parsed.reason));
     if (!reasons.length) reasons.push(pass ? "根拠監査済み" : "送信前確認が必要です");
     if (!courteous) reasons.push("文体にスタッフ確認が必要です");
     if (factChanged) reasons.push("監査の修正文で日時・金額などの事実が変わったためスタッフ確認が必要です");
+    if (contentRevised) reasons.push("監査の修正で文の内容が変わったためスタッフ確認が必要です");
     return { pass, answered, natural: parsed.natural === true, revisedDraft: pass ? revisedDraft : "", unsupportedClaims, contradictions, reason: reasons.join("／").slice(0, 300) };
   } catch (e) {
     return { pass: false, answered: false, unsupportedClaims: [], contradictions: [], reason: "送信前監査の結果を確認できませんでした" };
