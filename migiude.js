@@ -1866,8 +1866,8 @@ async function validateDraftAgainstEvidence(t, input){
     const courteous = !hasConversationalTone(revisedDraft || input.draft);
     // 監査AIの書き直しが「文体だけの編集」と確かめられない時（文の追加・削除・置き換え）は、元の文にも直すべき点があったとみなし、
     // 書き直しは採用せずスタッフ確認へ回す。敬語の度合いを上げる・決まったあいさつを足すだけの書き直しは採用して合格のまま送る。
-    // 口語に崩れた書き直しは捨てるだけ（元の文で判定する）。
-    const contentRevised = !!candidateDraft && !factChanged && !styleOnlyRevision && !hasConversationalTone(candidateDraft);
+    // 書き直しが口語に崩れていても、文体だけの編集でなければ元の文に直すべき点があったとみなしてスタッフ確認へ回す。
+    const contentRevised = !!candidateDraft && !factChanged && !styleOnlyRevision;
     const pass = parsed.pass === true && answered && !unsupportedClaims.length && !contradictions.length && courteous && !factChanged && !contentRevised;
     const reasons = [];
     if (unsupportedClaims.length || contradictions.length) reasons.push("根拠や内容に確認が必要です");

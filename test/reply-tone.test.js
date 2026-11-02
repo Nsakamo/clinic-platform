@@ -124,10 +124,18 @@ test("軽量な文体校正が日時・料金・URLを変えた場合は採用�
   const cushion = await qualityFunctions("写真をお送りいたしました。お手数ですが、ご確認くださいませ。", "患者様に丁寧に")
     .finalizeGeneratedDraft({}, "写真をお送りいたしました。ご確認ください。", "line");
   assert.match(cushion.text, /お手数ですが、ご確認くださいませ/, "クッション言葉を足しただけの校正は採用する");
+  for (const soft of ["恐れ入りますが、施術後24時間はなるべく飲酒をお控えくださいませ。", "施術後24時間は、可能な範囲で飲酒をお控えくださいませ。"]) {
+    const r = await qualityFunctions(soft, "患者様に丁寧に").finalizeGeneratedDraft({}, "施術後24時間は飲酒をお控えください。", "line");
+    assert.equal(r.text, "施術後24時間は飲酒をお控えください。", soft);
+  }
+  const midSoft = await qualityFunctions("異常がございましたら、可能な範囲ですぐにご連絡くださいませ。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "異常があればすぐにご連絡ください。", "line");
+  assert.equal(midSoft.text, "異常があればすぐにご連絡ください。");
   const optionalized = await qualityFunctions("よろしければ、施術後24時間は飲酒をお控えくださいませ。", "患者様に丁寧に")
     .finalizeGeneratedDraft({}, "施術後24時間は飲酒をお控えください。", "line");
   assert.equal(optionalized.text, "施術後24時間は飲酒をお控えください。", "「よろしければ」で任意に読める形にした校正は採用しない");
-  const kept = await qualityFunctions("恐れ入りますが、異常がございましたら、すぐにご連絡くださいませ。ご不明な点がございましたら、お気軽にお問い合わせくださいませ。", "患者様に丁寧に")
+  // 依頼の文の中身を保ち、前後に丁寧さを足しただけの校正は採用する（文の途中の言い換えは、安全のため採用しない）
+  const kept = await qualityFunctions("恐れ入りますが、異常があればすぐにご連絡くださいませ。ご不明な点がございましたら、お気軽にお問い合わせくださいませ。", "患者様に丁寧に")
     .finalizeGeneratedDraft({}, "異常があればすぐにご連絡ください。", "line");
   assert.match(kept.text, /すぐにご連絡くださいませ/);
   for (const soft of ["恐れ入りますが、施術後24時間は飲酒をお控えくださいますと幸いです。", "施術後24時間は飲酒をお控えくださいますでしょうか。"]) {
@@ -197,8 +205,9 @@ test("予約照会を並行実行しても本人未確認時の予約情報をAI
 test("送信前監査は口語の修正案を捨て、元の文が口語なら送信を止める", async () => {
   const reply = (revised, unsupported = []) => JSON.stringify({ pass: true, answered: true, natural: true, revised_draft: revised, unsupported_claims: unsupported, contradictions: [], reason: "内容を確認しました" });
   const base = { query: "保定装置のままホワイトニングできますか", draft: "状態を確認したうえでご案内いたします。" };
+  // 口語に崩れた書き直しは採用しない。文体だけの編集でもないので、元の文に直すべき点があったとみなしてスタッフ確認へ
   const revisedOnly = await qualityFunctions(reply("気になりますよね。状態を確認いたします。")).validateDraftAgainstEvidence({}, base);
-  assert.equal(revisedOnly.pass, true);
+  assert.equal(revisedOnly.pass, false);
   assert.equal(revisedOnly.revisedDraft, "");
   const original = await qualityFunctions(reply("")).validateDraftAgainstEvidence({}, { ...base, draft: "気になりますよね。状態を確認いたします。" });
   assert.equal(original.pass, false);
