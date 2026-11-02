@@ -27,10 +27,14 @@ test("設定したトーンを参考情報ではなく返信全文の必須条�
 });
 
 test("標準文体は患者様への礼儀を求め、馴れ馴れしい相づちを検出する", () => {
-  assert.match(PATIENT_COURTESY, /礼儀正しく/);
-  assert.match(PATIENT_COURTESY, /お問い合わせの内容を正確に受け止め/);
-  assert.match(PATIENT_COURTESY, /受付側から一歩控えた姿勢/);
-  assert.match(PATIENT_COURTESY, /負担へ配慮/);
+  assert.match(PATIENT_COURTESY, /受付側が一歩へりくだった姿勢/);
+  assert.match(PATIENT_COURTESY, /とても丁寧な敬語/);
+  assert.match(PATIENT_COURTESY, /お礼/);
+  assert.match(PATIENT_COURTESY, /負担への配慮/);
+  assert.match(PATIENT_COURTESY, /丁寧な結び/);
+  assert.match(PATIENT_COURTESY, /誤った二重敬語/);
+  // 丁寧さを抑える指示を既定に含めない（スタッフが毎回「丁寧に」と言い直さなくてよいように）
+  assert.doesNotMatch(PATIENT_COURTESY, /過剰な敬語|簡潔に添え|格式張/);
   for (const text of [
     "保定装置がある中でのホワイトニングは、気になりますよね。",
     "気になりますよね、状態を確認いたします。",
@@ -246,4 +250,16 @@ test("品質テストは最終トーン確認が成功した場合だけ確認�
   const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
   assert.match(source, /toneApplied:Array\.isArray\(out\.qualityIssues\)&&out\.qualityIssues\.includes\("tone_reviewed"\)/);
   assert.doesNotMatch(source, /toneApplied:!!normalizeReplyTone/);
+});
+
+test("既定の返信指示は丁寧さを抑えず、敬語が多いことを問題として削らない", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
+  const jp = source.match(/const JP_QUALITY = "([^"]*)"/)[1];
+  assert.match(jp, /とても丁寧でへりくだった敬語/);
+  assert.doesNotMatch(jp, /簡潔で温かい敬語|2〜6文|格式張らない/);
+  assert.doesNotMatch(source, /issues\.push\("over_formal"\)/);
+  assert.doesNotMatch(source, /自然で簡潔な受付文/);
+  assert.doesNotMatch(source, /簡潔な敬語で返信します|簡潔な敬語でお客様に対応します|礼儀正しく簡潔な敬語にする/);
+  const { replyToneInstruction } = require("../lib/reply-tone");
+  assert.doesNotMatch(replyToneInstruction("丁寧に"), /過剰に格式張った/);
 });
