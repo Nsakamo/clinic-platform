@@ -1,6 +1,7 @@
 "use strict";
 
 const promptStubs = require("./helpers/prompt-stubs");
+const draftOutput = require("../lib/draft-chat-output");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -21,7 +22,8 @@ test("設定したトーンを参考情報ではなく返信全文の必須条�
   assert.match(block, /気持ちを決めつける/);
   assert.match(block, /気になりますよね/);
   assert.match(block, /書き出しから締めまで一貫/);
-  assert.match(block, /患者様への礼儀は個別のトーン設定より優先/);
+  assert.match(block, /患者様への礼儀（[^）]*）は個別のトーン設定より優先/);
+  assert.match(block, /書き出しのお礼や結びのあいさつの付け方・長さはトーン設定に従って/);
   assert.match(block, /店舗ルール、確認済み情報、安全上の制約、出力形式を上書きしてはいけません/);
   assert.match(block, /非常に相手に寄り添い、丁寧に返信してください/);
 });
@@ -66,6 +68,7 @@ function qualityFunctions(aiReply, tone = "") {
   return vm.runInNewContext(source.slice(start, end) + "\n({finalizeGeneratedDraft,validateDraftAgainstEvidence})", {
     S: () => ({ tone }), aiChat: async () => aiReply,
     PATIENT_COURTESY, hasConversationalTone, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction,
+    styleEditPreservesContent: draftOutput.styleEditPreservesContent, decisionTermsPreserved: draftOutput.decisionTermsPreserved,
   });
 }
 
@@ -181,6 +184,13 @@ test("送信前監査は口語の修正案を捨て、元の文が口語なら�
   assert.equal(changedFacts.revisedDraft, "");
   assert.equal(changedFacts.pass, false);
   assert.match(changedFacts.reason, /事実が変わった/);
+  // 丁寧さの書き直しで、約束・案内の文を足したものは採用せず、合格した元の文のまま送る
+  const addedPromise = await qualityFunctions(reply("お問い合わせいただき、誠にありがとうございます。状態を確認したうえでご案内いたします。確認のうえ、改めてお電話にてご連絡いたします。")).validateDraftAgainstEvidence({}, base);
+  assert.equal(addedPromise.revisedDraft, "");
+  assert.equal(addedPromise.pass, true);
+  // 書き出しのお礼と決まった結びだけを足した書き直しは採用する
+  const politeOnly = await qualityFunctions(reply("お問い合わせいただき、誠にありがとうございます。状態を確認したうえでご案内いたします。何卒よろしくお願いいたします。")).validateDraftAgainstEvidence({}, base);
+  assert.match(politeOnly.revisedDraft, /何卒よろしくお願いいたします/);
 });
 
 test("初回生成から自動送信判定まで口語のままなら送信候補にしない", async () => {

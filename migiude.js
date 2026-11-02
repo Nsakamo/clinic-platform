@@ -1841,7 +1841,7 @@ async function validateDraftAgainstEvidence(t, input){
     input.slots ? "【リアルタイム空き枠】\n" + input.slots : "",
     input.precedents ? "【類似するスタッフ確定例】\n" + input.precedents : "",
   ].filter(Boolean).join("\n\n") || "（事実の根拠資料なし）";
-  const sys = "あなたは患者返信の送信前監査兼、日本語編集者です。根拠の優先順位は、最新の店舗ルール > 本人確認済みシステムデータ > 類似するスタッフ確定例。同種の店舗ルールが複数あり食い違う場合は更新日が最も新しいものを採用する。新しい店舗ルールと古い確定例が食い違えば必ず店舗ルールを採用する。類似するスタッフ確定例は、同種問い合わせへの結論・案内手順・必要確認・通常の料金や規定の根拠として使えるが、個別患者の予約・体調・特例は引き継がない。根拠にない事実、数字、可否、完了報告、医療判断があればpass:false。回答漏れ、会話との矛盾、別患者情報の混入もpass:false。内容が正しく日本語だけが不自然・素っ気ない場合は、事実を一切変えず、とても丁寧でへりくだった受付文へ直してrevised_draftに入れ、pass:trueにできる。丁寧な敬語・お礼・お詫び・結びのあいさつを削って短くしてはいけない。書き直しで丁寧さを足す時は、お礼・クッション言葉・結びのあいさつで表し、『申し訳ございません』『ございません』『本日』『明日』など否定や日付に当たる語を新たに足さない（事実の照合で別の内容と判定されるため）。一般的な挨拶、謝意、確認する旨、必要情報を尋ねる文は根拠なしでも可。" + PATIENT_COURTESY
+  const sys = "あなたは患者返信の送信前監査兼、日本語編集者です。根拠の優先順位は、最新の店舗ルール > 本人確認済みシステムデータ > 類似するスタッフ確定例。同種の店舗ルールが複数あり食い違う場合は更新日が最も新しいものを採用する。新しい店舗ルールと古い確定例が食い違えば必ず店舗ルールを採用する。類似するスタッフ確定例は、同種問い合わせへの結論・案内手順・必要確認・通常の料金や規定の根拠として使えるが、個別患者の予約・体調・特例は引き継がない。根拠にない事実、数字、可否、完了報告、医療判断があればpass:false。回答漏れ、会話との矛盾、別患者情報の混入もpass:false。内容が正しく日本語だけが不自然・素っ気ない場合は、事実を一切変えず、とても丁寧でへりくだった受付文へ直してrevised_draftに入れ、pass:trueにできる。丁寧な敬語・お礼・お詫び・結びのあいさつを削って短くしてはいけない。原文に無いお詫び・約束・案内の文は足さない。書き直しで丁寧さを足す時は、お礼・クッション言葉・結びのあいさつで表し、『申し訳ございません』『ございません』『本日』『明日』など否定や日付に当たる語を新たに足さない（事実の照合で別の内容と判定されるため）。一般的な挨拶、謝意、確認する旨、必要情報を尋ねる文は根拠なしでも可。" + PATIENT_COURTESY
     + "監査で文章を修正する場合は、日付や可否の表現を原文の語のまま保ち、丁寧さはその周囲の言葉で調整する。"
     + (replyToneInstruction(S(t).tone) ? "\n\n" + replyToneInstruction(S(t).tone) + "\n監査で文章を修正する場合も、このトーンを弱めてはいけない。" : "")
     + "必ずJSONのみ: {\"pass\":true|false,\"answered\":true|false,\"natural\":true|false,\"revised_draft\":\"修正不要なら空文字\",\"unsupported_claims\":[\"\"],\"contradictions\":[\"\"],\"reason\":\"短い日本語\"}";
@@ -1858,7 +1858,10 @@ async function validateDraftAgainstEvidence(t, input){
     const answered = parsed.answered === true;
     const candidateDraft = cleanDraftText(String(parsed.revised_draft || "")).slice(0, 5000);
     const factChanged = !!candidateDraft && !preservesReplyFacts(input.draft, candidateDraft);
-    const revisedDraft = candidateDraft && !factChanged && !hasConversationalTone(candidateDraft) ? candidateDraft : "";
+    // 監査AIの書き直しは、文体だけの編集（各文の中身を保ち、足すのは決まった定型句・締めのあいさつだけ）の時に限り採用する。
+    // 約束・案内・お詫びの文を足した書き直しは捨て、監査に合格した元の文を使う（書き直しは自動送信の本文になるため）。
+    const styleOnlyRevision = !!candidateDraft && styleEditPreservesContent(input.draft, candidateDraft) && decisionTermsPreserved(input.draft, candidateDraft);
+    const revisedDraft = candidateDraft && !factChanged && styleOnlyRevision && !hasConversationalTone(candidateDraft) ? candidateDraft : "";
     const courteous = !hasConversationalTone(revisedDraft || input.draft);
     const pass = parsed.pass === true && answered && !unsupportedClaims.length && !contradictions.length && courteous && !factChanged;
     const reasons = [];
