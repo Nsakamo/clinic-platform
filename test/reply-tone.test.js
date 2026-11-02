@@ -33,6 +33,8 @@ test("標準文体は患者様への礼儀を求め、馴れ馴れしい相づ�
   assert.match(PATIENT_COURTESY, /負担への配慮/);
   assert.match(PATIENT_COURTESY, /丁寧な結び/);
   assert.match(PATIENT_COURTESY, /誤った二重敬語/);
+  assert.match(PATIENT_COURTESY, /お問い合わせの内容を正確に受け止め/);
+  assert.match(PATIENT_COURTESY, /院側が次にどうご案内するか/);
   // 丁寧さを抑える指示を既定に含めない（スタッフが毎回「丁寧に」と言い直さなくてよいように）
   assert.doesNotMatch(PATIENT_COURTESY, /過剰な敬語|簡潔に添え|格式張/);
   for (const text of [
@@ -254,7 +256,7 @@ test("品質テストは最終トーン確認が成功した場合だけ確認�
 
 test("既定の返信指示は丁寧さを抑えず、敬語が多いことを問題として削らない", () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
-  const jp = source.match(/const JP_QUALITY = "([^"]*)"/)[1];
+  const jp = source.match(/const JP_QUALITY = [\s\S]*?;\n/)[0]; // 文全体（+ PATIENT_COURTESY + の後ろも含む）
   assert.match(jp, /とても丁寧でへりくだった敬語/);
   assert.doesNotMatch(jp, /簡潔で温かい敬語|2〜6文|格式張らない/);
   assert.doesNotMatch(source, /issues\.push\("over_formal"\)/);
@@ -262,4 +264,12 @@ test("既定の返信指示は丁寧さを抑えず、敬語が多いことを�
   assert.doesNotMatch(source, /簡潔な敬語で返信します|簡潔な敬語でお客様に対応します|礼儀正しく簡潔な敬語にする/);
   const { replyToneInstruction } = require("../lib/reply-tone");
   assert.doesNotMatch(replyToneInstruction("丁寧に"), /過剰に格式張った/);
+});
+
+test("丁寧さの書き直しは、否定や日付に当たる語を新たに足さないよう校正・送信前監査へ指示する", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
+  const finalize = source.slice(source.indexOf("async function finalizeGeneratedDraft("), source.indexOf("async function validateDraftAgainstEvidence("));
+  const validate = source.slice(source.indexOf("async function validateDraftAgainstEvidence("), source.indexOf("function salvageDraft("));
+  for (const body of [finalize, validate]) assert.match(body, /否定や日付に当たる語を新たに足さない/);
+  assert.match(finalize, /原文に無いお詫びは足さない/);
 });
