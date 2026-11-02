@@ -70,7 +70,7 @@ function qualityFunctions(aiReply, tone = "") {
   return vm.runInNewContext(source.slice(start, end) + "\n({finalizeGeneratedDraft,validateDraftAgainstEvidence})", {
     S: () => ({ tone }), aiChat: async () => aiReply,
     PATIENT_COURTESY, hasConversationalTone, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction,
-    styleEditPreservesContent: draftOutput.styleEditPreservesContent, decisionTermsPreserved: draftOutput.decisionTermsPreserved, contentReduced: draftOutput.contentReduced, keepsOriginalSentences: draftOutput.keepsOriginalSentences,
+    styleEditPreservesContent: draftOutput.styleEditPreservesContent, decisionTermsPreserved: draftOutput.decisionTermsPreserved,
   });
 }
 
@@ -189,10 +189,11 @@ test("送信前監査は口語の修正案を捨て、元の文が口語なら�
   // 丁寧さの書き直しで、約束・案内の文を足したものは採用せず、合格した元の文のまま送る
   const addedPromise = await qualityFunctions(reply("お問い合わせいただき、誠にありがとうございます。状態を確認したうえでご案内いたします。確認のうえ、改めてお電話にてご連絡いたします。")).validateDraftAgainstEvidence({}, base);
   assert.equal(addedPromise.revisedDraft, "");
-  assert.equal(addedPromise.pass, true);
+  assert.equal(addedPromise.pass, false, "文体だけでない書き直しはスタッフ確認へ");
   // 書き出しのお礼と決まった結びだけを足した書き直しは採用する
   const politeOnly = await qualityFunctions(reply("お問い合わせいただき、誠にありがとうございます。状態を確認したうえでご案内いたします。何卒よろしくお願いいたします。")).validateDraftAgainstEvidence({}, base);
   assert.match(politeOnly.revisedDraft, /何卒よろしくお願いいたします/);
+  assert.equal(politeOnly.pass, true);
   // 元の文を削除・置き換えた書き直しは、元の文にも直すべき点があったとしてスタッフ確認へ回す
   const removed = await qualityFunctions(reply("状態を確認いたします。")).validateDraftAgainstEvidence({}, { ...base, draft: "状態を確認したうえでご案内いたします。施術後によく見られるものですので、ご安心ください。" });
   assert.equal(removed.pass, false);
@@ -202,6 +203,11 @@ test("送信前監査は口語の修正案を捨て、元の文が口語なら�
   const politer = await qualityFunctions(reply("お問い合わせいただき、誠にありがとうございます。担当医が確認いたします。")).validateDraftAgainstEvidence({}, { ...base, draft: "担当医が確認します。" });
   assert.equal(politer.pass, true);
   assert.match(politer.revisedDraft, /確認いたします/);
+  const politeRequest = await qualityFunctions(reply("恐れ入りますが、前日までにご連絡いただけますと幸いです。")).validateDraftAgainstEvidence({}, { ...base, draft: "前日までにご連絡ください。" });
+  assert.equal(politeRequest.pass, true);
+  assert.match(politeRequest.revisedDraft, /幸いです/);
+  const droppedAdverb = await qualityFunctions(reply("ご予約の変更が可能です。")).validateDraftAgainstEvidence({}, { ...base, draft: "いつでもご予約の変更が可能です。" });
+  assert.equal(droppedAdverb.pass, false);
   // 述語を置き換えた書き直し（完了報告→確認予定）は、元の文に問題があったとしてスタッフ確認へ回す
   const replaced = await qualityFunctions(reply("ご予約の変更について確認いたします。")).validateDraftAgainstEvidence({}, { ...base, draft: "ご予約を変更いたしました。" });
   assert.equal(replaced.pass, false);

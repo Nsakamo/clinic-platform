@@ -21,7 +21,7 @@ const { contextualLearningFallback, formatLearningProposal } = require("./lib/le
 const { selectConversationContext, preserveTopicBoundary } = require("./lib/conversation-context");
 const { STAFF_DRAFT_POLICY, formatDraftContext, staffConsultationTranscript, isAcknowledgementOnlyRequest, acknowledgementDraftScope, ACKNOWLEDGEMENT_DRAFT_POLICY } = require("./lib/draft-consultation");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("./lib/draft-edit");
-const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, styleEditPreservesContent, contentReduced, keepsOriginalSentences, sentenceCount, borrowsFromSamples, safeText: safeDraftChatText, maskStyleSample } = require("./lib/draft-chat-output");
+const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, styleEditPreservesContent, sentenceCount, borrowsFromSamples, safeText: safeDraftChatText, maskStyleSample } = require("./lib/draft-chat-output");
 const { REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview, inboundMessageTimes } = require("./lib/reply-decision");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
@@ -1841,7 +1841,7 @@ async function validateDraftAgainstEvidence(t, input){
     input.slots ? "【リアルタイム空き枠】\n" + input.slots : "",
     input.precedents ? "【類似するスタッフ確定例】\n" + input.precedents : "",
   ].filter(Boolean).join("\n\n") || "（事実の根拠資料なし）";
-  const sys = "あなたは患者返信の送信前監査兼、日本語編集者です。根拠の優先順位は、最新の店舗ルール > 本人確認済みシステムデータ > 類似するスタッフ確定例。同種の店舗ルールが複数あり食い違う場合は更新日が最も新しいものを採用する。新しい店舗ルールと古い確定例が食い違えば必ず店舗ルールを採用する。類似するスタッフ確定例は、同種問い合わせへの結論・案内手順・必要確認・通常の料金や規定の根拠として使えるが、個別患者の予約・体調・特例は引き継がない。根拠にない事実、数字、可否、完了報告、医療判断があればpass:false。回答漏れ、会話との矛盾、別患者情報の混入もpass:false。内容が正しく日本語だけが不自然・素っ気ない場合は、事実を一切変えず、とても丁寧でへりくだった受付文へ直してrevised_draftに入れ、pass:trueにできる。丁寧な敬語・お礼・お詫び・結びのあいさつを削って短くしてはいけない。原文に無いお詫び・約束・案内の文は足さない。書き直しで丁寧さを足す時は、お礼・クッション言葉・結びのあいさつで表し、『申し訳ございません』『ございません』『本日』『明日』など否定や日付に当たる語を新たに足さない（事実の照合で別の内容と判定されるため）。一般的な挨拶、謝意、確認する旨、必要情報を尋ねる文は根拠なしでも可。" + PATIENT_COURTESY
+  const sys = "あなたは患者返信の送信前監査兼、日本語編集者です。根拠の優先順位は、最新の店舗ルール > 本人確認済みシステムデータ > 類似するスタッフ確定例。同種の店舗ルールが複数あり食い違う場合は更新日が最も新しいものを採用する。新しい店舗ルールと古い確定例が食い違えば必ず店舗ルールを採用する。類似するスタッフ確定例は、同種問い合わせへの結論・案内手順・必要確認・通常の料金や規定の根拠として使えるが、個別患者の予約・体調・特例は引き継がない。根拠にない事実、数字、可否、完了報告、医療判断があればpass:false。回答漏れ、会話との矛盾、別患者情報の混入もpass:false。内容が正しく日本語だけが不自然・素っ気ない場合は、事実を一切変えず、とても丁寧でへりくだった受付文へ直してrevised_draftに入れ、pass:trueにできる。丁寧な敬語・お礼・お詫び・結びのあいさつを削って短くしてはいけない。原文に無いお詫び・約束・案内の文は足さない。丁寧にする時は、既にある文の中身は変えず、敬語の度合い（します→いたします、ください→いただけますと幸いです 等）と、文の前後のお礼・クッション言葉・結びのあいさつで表す。書き直しで丁寧さを足す時は、お礼・クッション言葉・結びのあいさつで表し、『申し訳ございません』『ございません』『本日』『明日』など否定や日付に当たる語を新たに足さない（事実の照合で別の内容と判定されるため）。一般的な挨拶、謝意、確認する旨、必要情報を尋ねる文は根拠なしでも可。" + PATIENT_COURTESY
     + "監査で文章を修正する場合は、日付や可否の表現を原文の語のまま保ち、丁寧さはその周囲の言葉で調整する。"
     + (replyToneInstruction(S(t).tone) ? "\n\n" + replyToneInstruction(S(t).tone) + "\n監査で文章を修正する場合も、このトーンを弱めてはいけない。" : "")
     + "必ずJSONのみ: {\"pass\":true|false,\"answered\":true|false,\"natural\":true|false,\"revised_draft\":\"修正不要なら空文字\",\"unsupported_claims\":[\"\"],\"contradictions\":[\"\"],\"reason\":\"短い日本語\"}";
@@ -1863,11 +1863,10 @@ async function validateDraftAgainstEvidence(t, input){
     const styleOnlyRevision = !!candidateDraft && styleEditPreservesContent(input.draft, candidateDraft) && decisionTermsPreserved(input.draft, candidateDraft);
     const revisedDraft = candidateDraft && !factChanged && styleOnlyRevision && !hasConversationalTone(candidateDraft) ? candidateDraft : "";
     const courteous = !hasConversationalTone(revisedDraft || input.draft);
-    // 監査AIが元の文の内容を減らした（語・否定・判断語が減った）、または元の文を置き換えた（敬語の度合いをそろえても元の文が順番どおり残らない）書き直しは、
-    // 元の文にも直すべき点があったとみなしてスタッフ確認へ回す。
-    // 敬語を上げただけ・文を足しただけの書き直しは、採用しないか（文体だけでない時）採用して、合格のまま送る。口語に崩れた書き直しは捨てるだけ。
-    const contentRevised = !!candidateDraft && !factChanged && !styleOnlyRevision && !hasConversationalTone(candidateDraft)
-      && (contentReduced(input.draft, candidateDraft) || !keepsOriginalSentences(input.draft, candidateDraft)); // 内容が減った、または元の文が順番どおり残っていない（述語の置き換え等）
+    // 監査AIの書き直しが「文体だけの編集」と確かめられない時（文の追加・削除・置き換え）は、元の文にも直すべき点があったとみなし、
+    // 書き直しは採用せずスタッフ確認へ回す。敬語の度合いを上げる・決まったあいさつを足すだけの書き直しは採用して合格のまま送る。
+    // 口語に崩れた書き直しは捨てるだけ（元の文で判定する）。
+    const contentRevised = !!candidateDraft && !factChanged && !styleOnlyRevision && !hasConversationalTone(candidateDraft);
     const pass = parsed.pass === true && answered && !unsupportedClaims.length && !contradictions.length && courteous && !factChanged && !contentRevised;
     const reasons = [];
     if (unsupportedClaims.length || contradictions.length) reasons.push("根拠や内容に確認が必要です");

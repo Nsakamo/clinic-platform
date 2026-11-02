@@ -245,24 +245,13 @@ test("書き方の見本は相談チャット（runDraftChat）からの呼び�
   assert.match(section("async function draftChatPrep(", 'app.get("/api/draft-chat-history"'), /body\.consultationChat === true \? await baContextCached\(t, c, 12000\) : await baCall\(t, c, "context", \{\}, 12000\)/);
 });
 
-test("監査の書き直しが元の文を残して足しただけか、削除・置き換えを含むかを見分ける", () => {
-  const before = "状態を確認したうえでご案内いたします。キャンセルは前日までにご連絡ください。";
-  assert.equal(out.keepsOriginalSentences(before, "お問い合わせいただき、誠にありがとうございます。状態を確認したうえでご案内いたします。キャンセルは前日までにご連絡くださいませ。"), true);
-  assert.equal(out.keepsOriginalSentences(before, "状態を確認したうえでご案内いたします。"), false, "文を削除");
-  assert.equal(out.keepsOriginalSentences(before, "キャンセルは前日までにご連絡ください。状態を確認したうえでご案内いたします。"), false, "順番の入れ替え");
-  assert.equal(out.decisionTermsNotReduced("キャンセルは前日までに。", "キャンセルは前日までに。確認いたします。"), true);
-  assert.equal(out.decisionTermsNotReduced("キャンセルは前日までに。", "キャンセルはいつでも。"), false);
-});
-
-test("敬語を上げただけの書き直しは内容の変更とみなさず、書き出しのお礼は1文まで", () => {
+test("敬語を上げただけの書き直しは文体だけの編集とみなし、書き出しのお礼は1文まで", () => {
   assert.equal(out.styleEditPreservesContent("担当医が確認します。", "担当医が確認いたします。"), true);
+  assert.equal(out.styleEditPreservesContent("担当医が確認致します。", "担当医が確認いたします。"), true, "漢字表記のゆれ");
   assert.equal(out.styleEditPreservesContent("受付は10時からです。", "受付は10時からでございます。"), true);
-  assert.equal(out.contentReduced("担当医が確認します。", "お問い合わせいただき、誠にありがとうございます。担当医が確認いたします。"), false);
-  assert.equal(out.contentReduced("担当医が確認します。前日までにご連絡ください。", "担当医が確認いたします。"), true);
-  assert.equal(out.contentReduced("キャンセル料はかかりません。", "キャンセル料がかかります。"), true);
-  assert.equal(out.contentReduced("ご来院くださいませんか。", "ご来院ください。"), true, "依頼の否定が消えた");
-  assert.equal(out.contentReduced("担当医が確認致します。", "担当医が確認いたします。"), false, "漢字表記のゆれは内容の変更ではない");
-  assert.equal(out.keepsOriginalSentences("担当医が確認します。", "担当医が確認いたします。"), true);
-  assert.equal(out.keepsOriginalSentences("ご予約を変更いたしました。", "ご予約の変更について確認いたします。"), false);
+  assert.equal(out.styleEditPreservesContent("前日までにご連絡ください。", "恐れ入りますが、前日までにご連絡いただけますと幸いです。"), true, "依頼の敬語の言い換え");
+  assert.equal(out.styleEditPreservesContent("ご来院くださいませんか。", "ご来院ください。"), false, "依頼の否定が消えた");
+  assert.equal(out.styleEditPreservesContent("いつでもご予約の変更が可能です。", "ご予約の変更が可能です。"), false, "文頭のひらがなの語を消した");
+  assert.equal(out.styleEditPreservesContent("ご予約を変更いたしました。", "ご予約の変更について確認いたします。"), false, "述語の置き換え");
   assert.equal(out.styleEditPreservesContent("担当医が確認いたします。", "ご連絡いただき、誠にありがとうございます。お問い合わせいただき、ありがとうございます。担当医が確認いたします。"), false);
 });
