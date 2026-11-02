@@ -37,6 +37,8 @@ test("標準文体は患者様への礼儀を求め、馴れ馴れしい相づ�
   assert.match(PATIENT_COURTESY, /誤った二重敬語/);
   assert.match(PATIENT_COURTESY, /お問い合わせの内容を正確に受け止め/);
   assert.match(PATIENT_COURTESY, /院側が次にどうご案内するか/);
+  // 確認前のご依頼を受け付けたように読める言い方を既定の例にしない
+  assert.match(PATIENT_COURTESY, /確認前から『承知いたしました』『かしこまりました』と受け付けたように書かない/);
   // 丁寧さを抑える指示を既定に含めない（スタッフが毎回「丁寧に」と言い直さなくてよいように）
   assert.doesNotMatch(PATIENT_COURTESY, /過剰な敬語|簡潔に添え|格式張/);
   for (const text of [
@@ -269,6 +271,8 @@ test("既定の返信指示は丁寧さを抑えず、敬語が多いことを�
   const jp = source.match(/const JP_QUALITY = [\s\S]*?;\n/)[0]; // 文全体（+ PATIENT_COURTESY + の後ろも含む）
   assert.match(jp, /とても丁寧でへりくだった敬語/);
   assert.doesNotMatch(jp, /簡潔で温かい敬語|2〜6文|格式張らない/);
+  assert.match(jp, /会話の途中では、前の返信と同じ書き出しのお礼や結びを毎回繰り返さない/);
+  assert.match(jp, /ご不便やお待たせがある場合はお詫びも/);
   assert.doesNotMatch(source, /issues\.push\("over_formal"\)/);
   assert.doesNotMatch(source, /自然で簡潔な受付文/);
   assert.doesNotMatch(source, /簡潔な敬語で返信します|簡潔な敬語でお客様に対応します|礼儀正しく簡潔な敬語にする/);
