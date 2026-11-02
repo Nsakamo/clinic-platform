@@ -121,6 +121,12 @@ test("軽量な文体校正が日時・料金・URLを変えた場合は採用�
   const bulletWeakened = await qualityFunctions("施術後の注意事項です。\n・恐れ入りますが、施術後24時間は飲酒をお控えいただけますと幸いです\n・ご不明点があればご連絡ください。", "患者様に丁寧に")
     .finalizeGeneratedDraft({}, bullets, "line");
   assert.equal(bulletWeakened.text, bullets, "改行で終わる箇条書きの注意事項の弱め方も見逃さない");
+  const cushion = await qualityFunctions("写真をお送りいたしました。お手数ですが、ご確認くださいませ。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "写真をお送りいたしました。ご確認ください。", "line");
+  assert.match(cushion.text, /お手数ですが、ご確認くださいませ/, "クッション言葉を足しただけの校正は採用する");
+  const optionalized = await qualityFunctions("よろしければ、施術後24時間は飲酒をお控えくださいませ。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "施術後24時間は飲酒をお控えください。", "line");
+  assert.equal(optionalized.text, "施術後24時間は飲酒をお控えください。", "「よろしければ」で任意に読める形にした校正は採用しない");
   const kept = await qualityFunctions("恐れ入りますが、異常がございましたら、すぐにご連絡くださいませ。ご不明な点がございましたら、お気軽にお問い合わせくださいませ。", "患者様に丁寧に")
     .finalizeGeneratedDraft({}, "異常があればすぐにご連絡ください。", "line");
   assert.match(kept.text, /すぐにご連絡くださいませ/);
