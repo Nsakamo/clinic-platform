@@ -1,6 +1,7 @@
 "use strict";
 
 const promptStubs = require("./helpers/prompt-stubs");
+const draftOutput = require("../lib/draft-chat-output");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -21,16 +22,26 @@ test("設定したトーンを参考情報ではなく返信全文の必須条�
   assert.match(block, /気持ちを決めつける/);
   assert.match(block, /気になりますよね/);
   assert.match(block, /書き出しから締めまで一貫/);
-  assert.match(block, /患者様への礼儀は個別のトーン設定より優先/);
+  assert.match(block, /患者様への礼儀（[^）]*）は個別のトーン設定より優先/);
+  assert.match(block, /書き出しのお礼や結びのあいさつの付け方・長さはトーン設定に従って/);
   assert.match(block, /店舗ルール、確認済み情報、安全上の制約、出力形式を上書きしてはいけません/);
   assert.match(block, /非常に相手に寄り添い、丁寧に返信してください/);
 });
 
 test("標準文体は患者様への礼儀を求め、馴れ馴れしい相づちを検出する", () => {
-  assert.match(PATIENT_COURTESY, /礼儀正しく/);
+  assert.match(PATIENT_COURTESY, /受付側が一歩へりくだった姿勢/);
+  assert.match(PATIENT_COURTESY, /とても丁寧な敬語/);
+  assert.match(PATIENT_COURTESY, /お礼/);
+  assert.match(PATIENT_COURTESY, /負担への配慮/);
+  assert.match(PATIENT_COURTESY, /丁寧な結び/);
+  assert.match(PATIENT_COURTESY, /誤った二重敬語/);
   assert.match(PATIENT_COURTESY, /お問い合わせの内容を正確に受け止め/);
-  assert.match(PATIENT_COURTESY, /受付側から一歩控えた姿勢/);
-  assert.match(PATIENT_COURTESY, /負担へ配慮/);
+  assert.match(PATIENT_COURTESY, /院側が次にどうご案内するか/);
+  assert.match(PATIENT_COURTESY, /注意事項・禁止事項・必ずしていただくこと/);
+  // 確認前のご依頼を受け付けたように読める言い方を既定の例にしない
+  assert.match(PATIENT_COURTESY, /確認前から『承知いたしました』『かしこまりました』と受け付けたように書かない/);
+  // 丁寧さを抑える指示を既定に含めない（スタッフが毎回「丁寧に」と言い直さなくてよいように）
+  assert.doesNotMatch(PATIENT_COURTESY, /過剰な敬語|簡潔に添え|格式張/);
   for (const text of [
     "保定装置がある中でのホワイトニングは、気になりますよね。",
     "気になりますよね、状態を確認いたします。",
@@ -60,6 +71,7 @@ function qualityFunctions(aiReply, tone = "") {
   return vm.runInNewContext(source.slice(start, end) + "\n({finalizeGeneratedDraft,validateDraftAgainstEvidence})", {
     S: () => ({ tone }), aiChat: async () => aiReply,
     PATIENT_COURTESY, hasConversationalTone, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction,
+    styleEditPreservesContent: draftOutput.styleEditPreservesContent, decisionTermsPreserved: draftOutput.decisionTermsPreserved, requestsWeakened: draftOutput.requestsWeakened,
   });
 }
 
@@ -92,12 +104,48 @@ test("軽量な文体校正が日時・料金・URLを変えた場合は採用�
     assert.match(result.text, /3,900/);
     assert.match(result.text, /example\.test/);
   }
-  const accepted = await qualityFunctions("10月3日15:00のご予約は¥3,900です。お手数ですが、https://example.test/booking をご確認いただけますと幸いです。", "患者様に丁寧に")
+  const accepted = await qualityFunctions("10月3日15:00のご予約は¥3,900です。お手数ですが、https://example.test/booking をご確認くださいませ。", "患者様に丁寧に")
     .finalizeGeneratedDraft({}, original, "line");
   assert.match(accepted.text, /お手数ですが/);
-  const inlineUrl = await qualityFunctions("https://example.test/bookingをご確認いただけますと幸いです。", "患者様に丁寧に")
+  const inlineUrl = await qualityFunctions("恐れ入りますが、https://example.test/bookingをご確認くださいませ。", "患者様に丁寧に")
     .finalizeGeneratedDraft({}, "https://example.test/bookingをご確認ください。", "line");
-  assert.match(inlineUrl.text, /いただけますと幸いです/);
+  assert.match(inlineUrl.text, /くださいませ/);
+  // 「〜ください」を任意に読める言い方へ弱めた校正は採用しない
+  const weakened = await qualityFunctions("恐れ入りますが、施術後24時間は飲酒をお控えいただけますと幸いです。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "施術後24時間は飲酒をお控えください。", "line");
+  assert.equal(weakened.text, "施術後24時間は飲酒をお控えください。");
+  const hidden = await qualityFunctions("恐れ入りますが、異常がございましたら、すぐにご連絡いただけますと幸いです。ご不明な点がございましたら、お気軽にお問い合わせくださいませ。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "異常があればすぐにご連絡ください。", "line");
+  assert.equal(hidden.text, "異常があればすぐにご連絡ください。", "締めの「くださいませ」を足しても、元の依頼の弱め方は見逃さない");
+  const bullets = "施術後の注意事項です。\n・施術後24時間は飲酒をお控えください\n・ご不明点があればご連絡ください。";
+  const bulletWeakened = await qualityFunctions("施術後の注意事項です。\n・恐れ入りますが、施術後24時間は飲酒をお控えいただけますと幸いです\n・ご不明点があればご連絡ください。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, bullets, "line");
+  assert.equal(bulletWeakened.text, bullets, "改行で終わる箇条書きの注意事項の弱め方も見逃さない");
+  const cushion = await qualityFunctions("写真をお送りいたしました。お手数ですが、ご確認くださいませ。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "写真をお送りいたしました。ご確認ください。", "line");
+  assert.match(cushion.text, /お手数ですが、ご確認くださいませ/, "クッション言葉を足しただけの校正は採用する");
+  for (const soft of ["恐れ入りますが、施術後24時間はなるべく飲酒をお控えくださいませ。", "施術後24時間は、可能な範囲で飲酒をお控えくださいませ。"]) {
+    const r = await qualityFunctions(soft, "患者様に丁寧に").finalizeGeneratedDraft({}, "施術後24時間は飲酒をお控えください。", "line");
+    assert.equal(r.text, "施術後24時間は飲酒をお控えください。", soft);
+  }
+  const midSoft = await qualityFunctions("異常がございましたら、可能な範囲ですぐにご連絡くださいませ。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "異常があればすぐにご連絡ください。", "line");
+  assert.equal(midSoft.text, "異常があればすぐにご連絡ください。");
+  for (const extra of ["施術後24時間は飲酒をお控えくださいませ。ご無理のない範囲でお願いいたします。", "施術後24時間は飲酒をお控えくださいませ。可能な範囲で構いません。"]) {
+    const r = await qualityFunctions(extra, "患者様に丁寧に").finalizeGeneratedDraft({}, "施術後24時間は飲酒をお控えください。", "line");
+    assert.equal(r.text, "施術後24時間は飲酒をお控えください。", "別の文を足して弱めた校正は採用しない: " + extra);
+  }
+  const optionalized = await qualityFunctions("よろしければ、施術後24時間は飲酒をお控えくださいませ。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "施術後24時間は飲酒をお控えください。", "line");
+  assert.equal(optionalized.text, "施術後24時間は飲酒をお控えください。", "「よろしければ」で任意に読める形にした校正は採用しない");
+  // 依頼の文の中身を保ち、前後に丁寧さを足しただけの校正は採用する（文の途中の言い換えは、安全のため採用しない）
+  const kept = await qualityFunctions("恐れ入りますが、異常があればすぐにご連絡くださいませ。ご不明な点がございましたら、お気軽にお問い合わせくださいませ。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "異常があればすぐにご連絡ください。", "line");
+  assert.match(kept.text, /すぐにご連絡くださいませ/);
+  for (const soft of ["恐れ入りますが、施術後24時間は飲酒をお控えくださいますと幸いです。", "施術後24時間は飲酒をお控えくださいますでしょうか。"]) {
+    const r = await qualityFunctions(soft, "患者様に丁寧に").finalizeGeneratedDraft({}, "施術後24時間は飲酒をお控えください。", "line");
+    assert.equal(r.text, "施術後24時間は飲酒をお控えください。", soft);
+  }
   const changedMeaning = await qualityFunctions("明後日午後はご予約できます。", "患者様に丁寧に")
     .finalizeGeneratedDraft({}, "明日午前はご予約できません。", "line");
   assert.equal(changedMeaning.text, "明日午前はご予約できません。");
@@ -161,8 +209,9 @@ test("予約照会を並行実行しても本人未確認時の予約情報をAI
 test("送信前監査は口語の修正案を捨て、元の文が口語なら送信を止める", async () => {
   const reply = (revised, unsupported = []) => JSON.stringify({ pass: true, answered: true, natural: true, revised_draft: revised, unsupported_claims: unsupported, contradictions: [], reason: "内容を確認しました" });
   const base = { query: "保定装置のままホワイトニングできますか", draft: "状態を確認したうえでご案内いたします。" };
+  // 口語に崩れた書き直しは採用しない。文体だけの編集でもないので、元の文に直すべき点があったとみなしてスタッフ確認へ
   const revisedOnly = await qualityFunctions(reply("気になりますよね。状態を確認いたします。")).validateDraftAgainstEvidence({}, base);
-  assert.equal(revisedOnly.pass, true);
+  assert.equal(revisedOnly.pass, false);
   assert.equal(revisedOnly.revisedDraft, "");
   const original = await qualityFunctions(reply("")).validateDraftAgainstEvidence({}, { ...base, draft: "気になりますよね。状態を確認いたします。" });
   assert.equal(original.pass, false);
@@ -175,6 +224,35 @@ test("送信前監査は口語の修正案を捨て、元の文が口語なら�
   assert.equal(changedFacts.revisedDraft, "");
   assert.equal(changedFacts.pass, false);
   assert.match(changedFacts.reason, /事実が変わった/);
+  // 丁寧さの書き直しで約束・案内の文を足したものは採用せず、スタッフ確認へ回す
+  const addedPromise = await qualityFunctions(reply("お問い合わせいただき、誠にありがとうございます。状態を確認したうえでご案内いたします。確認のうえ、改めてお電話にてご連絡いたします。")).validateDraftAgainstEvidence({}, base);
+  assert.equal(addedPromise.revisedDraft, "");
+  assert.equal(addedPromise.pass, false, "文体だけでない書き直しはスタッフ確認へ");
+  // 書き出しのお礼と決まった結びだけを足した書き直しは採用する
+  const politeOnly = await qualityFunctions(reply("お問い合わせいただき、誠にありがとうございます。状態を確認したうえでご案内いたします。何卒よろしくお願いいたします。")).validateDraftAgainstEvidence({}, base);
+  assert.match(politeOnly.revisedDraft, /何卒よろしくお願いいたします/);
+  assert.equal(politeOnly.pass, true);
+  // 元の文を削除・置き換えた書き直しは、元の文にも直すべき点があったとしてスタッフ確認へ回す
+  const removed = await qualityFunctions(reply("状態を確認いたします。")).validateDraftAgainstEvidence({}, { ...base, draft: "状態を確認したうえでご案内いたします。施術後によく見られるものですので、ご安心ください。" });
+  assert.equal(removed.pass, false);
+  assert.equal(removed.revisedDraft, "");
+  assert.match(removed.reason, /監査の修正で文の内容が変わった/);
+  // 敬語を上げただけの書き直し（します→いたします）は内容の変更とみなさず、合格のまま送る
+  const politer = await qualityFunctions(reply("お問い合わせいただき、誠にありがとうございます。担当医が確認いたします。")).validateDraftAgainstEvidence({}, { ...base, draft: "担当医が確認します。" });
+  assert.equal(politer.pass, true);
+  assert.match(politer.revisedDraft, /確認いたします/);
+  const politeRequest = await qualityFunctions(reply("恐れ入りますが、前日までにご連絡くださいませ。")).validateDraftAgainstEvidence({}, { ...base, draft: "前日までにご連絡ください。" });
+  assert.equal(politeRequest.pass, true);
+  assert.match(politeRequest.revisedDraft, /くださいませ/);
+  // 「ください」を任意のお願いに読める言い方へ変えた書き直しはスタッフ確認へ
+  const weakened = await qualityFunctions(reply("恐れ入りますが、腫れや痛みが続く場合はご連絡いただけますと幸いです。")).validateDraftAgainstEvidence({}, { ...base, draft: "腫れや痛みが続く場合はご連絡ください。" });
+  assert.equal(weakened.pass, false);
+  const droppedAdverb = await qualityFunctions(reply("ご予約の変更が可能です。")).validateDraftAgainstEvidence({}, { ...base, draft: "いつでもご予約の変更が可能です。" });
+  assert.equal(droppedAdverb.pass, false);
+  // 述語を置き換えた書き直し（完了報告→確認予定）は、元の文に問題があったとしてスタッフ確認へ回す
+  const replaced = await qualityFunctions(reply("ご予約の変更について確認いたします。")).validateDraftAgainstEvidence({}, { ...base, draft: "ご予約を変更いたしました。" });
+  assert.equal(replaced.pass, false);
+  assert.match(replaced.reason, /監査の修正で文の内容が変わった/);
 });
 
 test("初回生成から自動送信判定まで口語のままなら送信候補にしない", async () => {
@@ -246,4 +324,26 @@ test("品質テストは最終トーン確認が成功した場合だけ確認�
   const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
   assert.match(source, /toneApplied:Array\.isArray\(out\.qualityIssues\)&&out\.qualityIssues\.includes\("tone_reviewed"\)/);
   assert.doesNotMatch(source, /toneApplied:!!normalizeReplyTone/);
+});
+
+test("既定の返信指示は丁寧さを抑えず、敬語が多いことを問題として削らない", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
+  const jp = source.match(/const JP_QUALITY = [\s\S]*?;\n/)[0]; // 文全体（+ PATIENT_COURTESY + の後ろも含む）
+  assert.match(jp, /とても丁寧でへりくだった敬語/);
+  assert.doesNotMatch(jp, /簡潔で温かい敬語|2〜6文|格式張らない/);
+  assert.match(jp, /会話の途中では、前の返信と同じ書き出しのお礼や結びを毎回繰り返さない/);
+  assert.match(jp, /ご不便やお待たせがある場合はお詫びも/);
+  assert.doesNotMatch(source, /issues\.push\("over_formal"\)/);
+  assert.doesNotMatch(source, /自然で簡潔な受付文/);
+  assert.doesNotMatch(source, /簡潔な敬語で返信します|簡潔な敬語でお客様に対応します|礼儀正しく簡潔な敬語にする/);
+  const { replyToneInstruction } = require("../lib/reply-tone");
+  assert.doesNotMatch(replyToneInstruction("丁寧に"), /過剰に格式張った/);
+});
+
+test("丁寧さの書き直しは、否定や日付に当たる語を新たに足さないよう校正・送信前監査へ指示する", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
+  const finalize = source.slice(source.indexOf("async function finalizeGeneratedDraft("), source.indexOf("async function validateDraftAgainstEvidence("));
+  const validate = source.slice(source.indexOf("async function validateDraftAgainstEvidence("), source.indexOf("function salvageDraft("));
+  for (const body of [finalize, validate]) assert.match(body, /否定や日付に当たる語を新たに足さない/);
+  assert.match(finalize, /原文に無いお詫び・約束・案内の文は足さない/);
 });
