@@ -114,6 +114,10 @@ test("軽量な文体校正が日時・料金・URLを変えた場合は採用�
   const weakened = await qualityFunctions("恐れ入りますが、施術後24時間は飲酒をお控えいただけますと幸いです。", "患者様に丁寧に")
     .finalizeGeneratedDraft({}, "施術後24時間は飲酒をお控えください。", "line");
   assert.equal(weakened.text, "施術後24時間は飲酒をお控えください。");
+  for (const soft of ["恐れ入りますが、施術後24時間は飲酒をお控えくださいますと幸いです。", "施術後24時間は飲酒をお控えくださいますでしょうか。"]) {
+    const r = await qualityFunctions(soft, "患者様に丁寧に").finalizeGeneratedDraft({}, "施術後24時間は飲酒をお控えください。", "line");
+    assert.equal(r.text, "施術後24時間は飲酒をお控えください。", soft);
+  }
   const changedMeaning = await qualityFunctions("明後日午後はご予約できます。", "患者様に丁寧に")
     .finalizeGeneratedDraft({}, "明日午前はご予約できません。", "line");
   assert.equal(changedMeaning.text, "明日午前はご予約できません。");
