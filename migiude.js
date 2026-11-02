@@ -21,7 +21,7 @@ const { contextualLearningFallback, formatLearningProposal } = require("./lib/le
 const { selectConversationContext, preserveTopicBoundary } = require("./lib/conversation-context");
 const { STAFF_DRAFT_POLICY, formatDraftContext, staffConsultationTranscript, isAcknowledgementOnlyRequest, acknowledgementDraftScope, ACKNOWLEDGEMENT_DRAFT_POLICY } = require("./lib/draft-consultation");
 const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation } = require("./lib/draft-edit");
-const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, styleEditPreservesContent, sentenceCount, borrowsFromSamples, safeText: safeDraftChatText, maskStyleSample } = require("./lib/draft-chat-output");
+const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, styleEditPreservesContent, requestsWeakened, sentenceCount, borrowsFromSamples, safeText: safeDraftChatText, maskStyleSample } = require("./lib/draft-chat-output");
 const { REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview, inboundMessageTimes } = require("./lib/reply-decision");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
@@ -1825,7 +1825,8 @@ async function finalizeGeneratedDraft(t, raw, channel){
   const revised = await aiChat(t, sys, [{role:"user",content:text.slice(0,5000)}], 1800, "finalize");
   if(revised){
     const candidate = cleanDraftText(revised);
-    if(candidate && preservesReplyFacts(text, candidate) && !draftQualityIssues(candidate).some(issue => issue === "empty" || issue === "conversational_tone")) {
+    // 「〜ください」を「いただけますと幸いです」等の任意に読める言い方へ変えた校正は採用しない（必ずしていただくことを弱めない）
+    if(candidate && preservesReplyFacts(text, candidate) && !requestsWeakened(text, candidate) && !draftQualityIssues(candidate).some(issue => issue === "empty" || issue === "conversational_tone")) {
       if(tone) issues.push("tone_reviewed");
       text = candidate;
       issues = issues.filter(issue => issue !== "conversational_tone");
@@ -1858,8 +1859,8 @@ async function validateDraftAgainstEvidence(t, input){
     const answered = parsed.answered === true;
     const candidateDraft = cleanDraftText(String(parsed.revised_draft || "")).slice(0, 5000);
     const factChanged = !!candidateDraft && !preservesReplyFacts(input.draft, candidateDraft);
-    // 監査AIの書き直しは、文体だけの編集（各文の中身を保ち、足すのは決まった定型句・締めのあいさつだけ）の時に限り採用する。
-    // 約束・案内・お詫びの文を足した書き直しは捨て、監査に合格した元の文を使う（書き直しは自動送信の本文になるため）。
+    // 監査AIの書き直しは、文体だけの編集（各文の中身を保ち、足すのは敬語の度合い・決まった定型句・あいさつだけ）の時に限り採用する。
+    // 文体だけと確かめられない書き直し（約束・案内・お詫びの追加、削除、置き換え）は採用せず、下の contentRevised でスタッフ確認へ回す。
     const styleOnlyRevision = !!candidateDraft && styleEditPreservesContent(input.draft, candidateDraft) && decisionTermsPreserved(input.draft, candidateDraft);
     const revisedDraft = candidateDraft && !factChanged && styleOnlyRevision && !hasConversationalTone(candidateDraft) ? candidateDraft : "";
     const courteous = !hasConversationalTone(revisedDraft || input.draft);

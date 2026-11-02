@@ -71,7 +71,7 @@ function qualityFunctions(aiReply, tone = "") {
   return vm.runInNewContext(source.slice(start, end) + "\n({finalizeGeneratedDraft,validateDraftAgainstEvidence})", {
     S: () => ({ tone }), aiChat: async () => aiReply,
     PATIENT_COURTESY, hasConversationalTone, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction,
-    styleEditPreservesContent: draftOutput.styleEditPreservesContent, decisionTermsPreserved: draftOutput.decisionTermsPreserved,
+    styleEditPreservesContent: draftOutput.styleEditPreservesContent, decisionTermsPreserved: draftOutput.decisionTermsPreserved, requestsWeakened: draftOutput.requestsWeakened,
   });
 }
 
@@ -104,12 +104,16 @@ test("軽量な文体校正が日時・料金・URLを変えた場合は採用�
     assert.match(result.text, /3,900/);
     assert.match(result.text, /example\.test/);
   }
-  const accepted = await qualityFunctions("10月3日15:00のご予約は¥3,900です。お手数ですが、https://example.test/booking をご確認いただけますと幸いです。", "患者様に丁寧に")
+  const accepted = await qualityFunctions("10月3日15:00のご予約は¥3,900です。お手数ですが、https://example.test/booking をご確認くださいませ。", "患者様に丁寧に")
     .finalizeGeneratedDraft({}, original, "line");
   assert.match(accepted.text, /お手数ですが/);
-  const inlineUrl = await qualityFunctions("https://example.test/bookingをご確認いただけますと幸いです。", "患者様に丁寧に")
+  const inlineUrl = await qualityFunctions("恐れ入りますが、https://example.test/bookingをご確認くださいませ。", "患者様に丁寧に")
     .finalizeGeneratedDraft({}, "https://example.test/bookingをご確認ください。", "line");
-  assert.match(inlineUrl.text, /いただけますと幸いです/);
+  assert.match(inlineUrl.text, /くださいませ/);
+  // 「〜ください」を任意に読める言い方へ弱めた校正は採用しない
+  const weakened = await qualityFunctions("恐れ入りますが、施術後24時間は飲酒をお控えいただけますと幸いです。", "患者様に丁寧に")
+    .finalizeGeneratedDraft({}, "施術後24時間は飲酒をお控えください。", "line");
+  assert.equal(weakened.text, "施術後24時間は飲酒をお控えください。");
   const changedMeaning = await qualityFunctions("明後日午後はご予約できます。", "患者様に丁寧に")
     .finalizeGeneratedDraft({}, "明日午前はご予約できません。", "line");
   assert.equal(changedMeaning.text, "明日午前はご予約できません。");
@@ -187,7 +191,7 @@ test("送信前監査は口語の修正案を捨て、元の文が口語なら�
   assert.equal(changedFacts.revisedDraft, "");
   assert.equal(changedFacts.pass, false);
   assert.match(changedFacts.reason, /事実が変わった/);
-  // 丁寧さの書き直しで、約束・案内の文を足したものは採用せず、合格した元の文のまま送る
+  // 丁寧さの書き直しで約束・案内の文を足したものは採用せず、スタッフ確認へ回す
   const addedPromise = await qualityFunctions(reply("お問い合わせいただき、誠にありがとうございます。状態を確認したうえでご案内いたします。確認のうえ、改めてお電話にてご連絡いたします。")).validateDraftAgainstEvidence({}, base);
   assert.equal(addedPromise.revisedDraft, "");
   assert.equal(addedPromise.pass, false, "文体だけでない書き直しはスタッフ確認へ");
