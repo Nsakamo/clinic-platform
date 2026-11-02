@@ -249,9 +249,10 @@ test("敬語を上げただけの書き直しは文体だけの編集とみな�
   assert.equal(out.styleEditPreservesContent("担当医が確認します。", "担当医が確認いたします。"), true);
   assert.equal(out.styleEditPreservesContent("担当医が確認致します。", "担当医が確認いたします。"), true, "漢字表記のゆれ");
   assert.equal(out.styleEditPreservesContent("受付は10時からです。", "受付は10時からでございます。"), true);
-  assert.equal(out.styleEditPreservesContent("前日までにご連絡ください。", "恐れ入りますが、前日までにご連絡いただけますと幸いです。"), true, "依頼の敬語の言い換え");
+  assert.equal(out.styleEditPreservesContent("前日までにご連絡ください。", "恐れ入りますが、前日までにご連絡くださいませ。"), true, "依頼の敬語の度合い");
+  assert.equal(out.styleEditPreservesContent("前日までにご連絡ください。", "恐れ入りますが、前日までにご連絡いただけますと幸いです。"), false, "必ずしていただくことを任意のお願いに読める形にしない");
+  assert.equal(out.styleEditPreservesContent("腫れや痛みが続く場合はご連絡ください。", "恐れ入りますが、腫れや痛みが続く場合はご連絡いただけますと幸いです。"), false);
   assert.equal(out.styleEditPreservesContent("ご来院くださいませんか。", "ご来院ください。"), false, "依頼の否定が消えた");
-  assert.equal(out.styleEditPreservesContent("前日までにご連絡ください。", "前日までにご連絡頂けますと幸いです。"), true, "漢字表記の依頼の言い換え");
   assert.equal(out.styleEditPreservesContent("施術後24時間は飲酒をお控えください。", "恐れ入りますが、施術後24時間は飲酒をお控えいただけますと幸いです。"), false, "注意事項を任意のお願いに弱めた");
   assert.equal(out.styleEditPreservesContent("異常があればすぐにご連絡ください。", "異常があればすぐにご連絡いただけますと幸いです。"), false);
   assert.equal(out.styleEditPreservesContent("施術後24時間は飲酒をお控えください。", "恐れ入りますが、施術後24時間は飲酒をお控えくださいませ。"), true, "注意事項でも『くださいませ』は同じ強さ");

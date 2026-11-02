@@ -204,9 +204,12 @@ test("送信前監査は口語の修正案を捨て、元の文が口語なら�
   const politer = await qualityFunctions(reply("お問い合わせいただき、誠にありがとうございます。担当医が確認いたします。")).validateDraftAgainstEvidence({}, { ...base, draft: "担当医が確認します。" });
   assert.equal(politer.pass, true);
   assert.match(politer.revisedDraft, /確認いたします/);
-  const politeRequest = await qualityFunctions(reply("恐れ入りますが、前日までにご連絡いただけますと幸いです。")).validateDraftAgainstEvidence({}, { ...base, draft: "前日までにご連絡ください。" });
+  const politeRequest = await qualityFunctions(reply("恐れ入りますが、前日までにご連絡くださいませ。")).validateDraftAgainstEvidence({}, { ...base, draft: "前日までにご連絡ください。" });
   assert.equal(politeRequest.pass, true);
-  assert.match(politeRequest.revisedDraft, /幸いです/);
+  assert.match(politeRequest.revisedDraft, /くださいませ/);
+  // 「ください」を任意のお願いに読める言い方へ変えた書き直しはスタッフ確認へ
+  const weakened = await qualityFunctions(reply("恐れ入りますが、腫れや痛みが続く場合はご連絡いただけますと幸いです。")).validateDraftAgainstEvidence({}, { ...base, draft: "腫れや痛みが続く場合はご連絡ください。" });
+  assert.equal(weakened.pass, false);
   const droppedAdverb = await qualityFunctions(reply("ご予約の変更が可能です。")).validateDraftAgainstEvidence({}, { ...base, draft: "いつでもご予約の変更が可能です。" });
   assert.equal(droppedAdverb.pass, false);
   // 述語を置き換えた書き直し（完了報告→確認予定）は、元の文に問題があったとしてスタッフ確認へ回す
