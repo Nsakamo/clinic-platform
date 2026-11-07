@@ -345,7 +345,7 @@ test("感染症のスタッフ確認ゲートを予約の自動提案も迂回�
     const context = {
       ...decision, cancelAutoReply: () => {}, colorFor: () => "", nowt: () => "テスト", statBump: () => {}, lastText: () => "テスト", dbSave: () => {},
       preserveTopicBoundary,
-      baEnabled: () => true, PARTNER_KEY: "テスト", baHandlePending: async () => false, staffLineReviewAll: () => false,
+      baEnabled: () => true, PARTNER_KEY: "テスト", baHandlePending: async () => false, staffLineReviewAll: () => false, staffBookingSuggestEnabled: () => false,
       genDraft: async () => ({ draft: "テスト：証明書はスタッフが確認します。", confidence: "high", needs_human: blocked, replyRequiresStaff: blocked,
         grounding: { autoSendAllowed: false, reasons: [] }, validation: { pass: false }, action: { type: "cancel", appointmentId: "テスト将来予約" } }),
       startLearningUsageTrace: async () => {}, baAction: async () => { proposed++; return true; }, S: () => ({ autoReply: false }),
