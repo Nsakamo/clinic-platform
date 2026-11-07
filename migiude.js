@@ -2607,6 +2607,7 @@ async function handleInboundCore(t, opts) {
   if (med || baDone || typeof opts.draft === "string") c.bookingSuggestion = null; // 新しい受信で古い提案は使わない
   if (typeof opts.draft !== "string" && !med && !baDone) { // generate draft in-app for text messages
     const suggestionBefore = c.bookingSuggestion;
+    const basisMsgCount = Array.isArray(c.msgs) ? c.msgs.length : 0; // 下書き生成前の時点（生成中に届いた連絡は提案の後の連絡として扱う）
     let g = await genDraft(t, c);
     if (g && staffLineReviewAll(t)) g = await enrichStaffLineBookingPreview(t, c, g);
     if (g) {
@@ -2627,7 +2628,7 @@ async function handleInboundCore(t, opts) {
       if (staffBookingSuggestEnabled(t) && PARTNER_KEY) {
         const suggestion = bookingSuggestionFromDraft(g);
         // 実行後の案内文は下書きを置き換えず、提案カードの「参考案」としてだけ持つ（スタッフが実行後に自分で入れる）
-        if (suggestion && !executedDuringDraft) c.bookingSuggestion = Object.assign(suggestion, { basisMsgCount: Array.isArray(c.msgs) ? c.msgs.length : 0, afterActionDraft: String(g.after_action_draft || "").trim().slice(0, 2000) });
+        if (suggestion && !executedDuringDraft) c.bookingSuggestion = Object.assign(suggestion, { basisMsgCount, afterActionDraft: String(g.after_action_draft || "").trim().slice(0, 2000) });
       }
     }
     // ===== 予約自動受付: AIが操作依頼(action)を出したら、確認文の送信までを自動処理 =====
@@ -4373,7 +4374,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
     // スタッフ指示を最優先する相談では、修正で指示から離れた案ではなく、指示どおりに作った最初の案を返す
     // ただし最初の案が安全面（医療判断・本人確認・未実施操作の完了表記）で不合格、または照合自体ができなかった場合は、最初の案は返さない
     const firstUsable = String(firstText || "").trim() && !/@@\s*(?:REPLY|DRAFT|MEMORY|RULE|ACTION|META)\s*@@/.test(firstText)
-      && !draftQualityIssues(firstText).some(issue => issue === "empty" || issue === "meta_text");
+      && !draftQualityIssues(firstText).some(issue => issue === "empty" || issue === "meta_text") && !hasConversationalTone(firstText);
     const useFirst = staffFirst && firstUsable && firstChecked.audited === true && !firstChecked.safety && !firstChecked.mismatch;
     const shown = useFirst ? firstText : text;
     const reason = useFirst ? firstChecked.reason : checked.reason;
@@ -4586,6 +4587,7 @@ app.post("/api/staff-booking-confirm", guard, async (req, res) => {
       else if (result && result.ok && result.status === "failed") out = { ok: false, error: "failed" };
     }
   }
+  if (!out && suggestionGone) { c.staffBookingPending = null; dbSave(t, c); return res.status(409).json({ ok: false, error: "suggestion_changed", text: "確認中に患者様から新しい連絡があり提案が更新されたため、実行しませんでした。うけつけるんの予約詳細で状態をご確認ください。" }); }
   if (!out) return res.status(504).json({ ok: false, error: "result_unknown", text: "結果を確認できません。うけつけるんの予約詳細で状態を確認してください。" });
   c.staffBookingPending = null;
   if (approve && out.ok && c.bookingSuggestion && String(c.bookingSuggestion.appointmentId) === String(pending.appointmentId) && c.bookingSuggestion.type === pending.type
@@ -7255,9 +7257,10 @@ function renderBookingSuggestion(r){
   }
   el.onclick=function(e){var btn=e.target&&e.target.closest?e.target.closest("[data-bk]"):null;if(!btn)return;var act=btn.getAttribute("data-bk");if(act==="run")runBookingSuggestion(btn);else if(act==="dismiss")dismissBookingSuggestion(btn);else if(act==="useafter")useAfterActionDraft();};
 }
-function useAfterActionDraft(){
+async function useAfterActionDraft(){
   var r=DATA.find(function(x){return x.id===current;}); var b=r&&r.bookingSuggestion; var d=document.getElementById("draft");
   if(!b||!d||!String(b.afterActionDraft||"").trim())return;
+  if(String(d.value||"").trim()&&String(d.value).trim()!==String(b.afterActionDraft).trim()&&!(await uiConfirm("今の下書きを、実行後の案内文に置き換えますか？")))return;
   d.value=String(b.afterActionDraft).trim(); draftEdited(); d.focus();
 }
 async function runBookingSuggestion(btn){
@@ -7271,7 +7274,7 @@ async function runBookingSuggestion(btn){
     var ok=await uiConfirm("次の内容で実行します。よろしいですか？\\n\\n"+(j.summary||"")+"\\n\\n※実行すると、うけつけるんの予約が変更されます。");
     var res2=await api("/api/staff-booking-confirm",{id:j.conversationId||id,requestId:j.requestId,approve:!!ok}); var j2=await res2.json();
     if(!ok){uiAlert("実行を取り消しました。予約は変更していません。");return;}
-    if(j2.ok&&j2.done){b.status="executed";showLearnResult(j2.text||"予約操作が完了しました");custCache[id]=null;if(current===id){renderBookingSuggestion(r);loadCustomer(id);}}
+    if(j2.ok&&j2.done){b.status="executed";showLearnResult(j2.text||"予約操作が完了しました");custCache[id]=null;window.__bkBusy=false;if(current===id){renderBookingSuggestion(r);loadCustomer(id);}}
     else uiAlert((j2.text||staffBookingError(j2.error))+"\\nうけつけるんの予約詳細で状態をご確認ください。");
   }catch(e){uiAlert("うけつけるんへ接続できませんでした。予約は変更していない可能性があります。うけつけるんで状態をご確認ください。");}
   finally{window.__bkBusy=false;if(btn&&document.body.contains(btn)){btn.disabled=false;btn.textContent=label;}}
