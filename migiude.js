@@ -1966,6 +1966,9 @@ async function fetchBooking(t, c) {
 // 曖昧な返信では絶対に実行しない。確認文・結果文はうけつけるん生成の定型文をそのまま送る（AIが改変しない）。
 const BA_URL = PARTNER_BASE + "/appointment-actions";
 function baEnabled(t) { return !!S(t).bookingActions; }
+// 予約操作の「スタッフ確認つき提案」: 自動実行しない設定・スタッフ確認が必要な返信でも、AIが読み取ったキャンセル・日時変更を
+// 下書き欄の確認カードとして出し、スタッフが内容を確かめてから実行できるようにする（既定オン。設定で staffBookingSuggest:false なら無効）。
+function staffBookingSuggestEnabled(t) { return S(t).staffBookingSuggest !== false; }
 // 「右腕くんに相談」用の予約照会の短期キャッシュ（スタッフが確認してから使う下書き専用。自動送信の経路では使わない）。
 // 相談パネルを開いた時点で先に照会しておき、指示を送った時の待ち時間（うけつけるんの起動待ち等）を減らす。
 const BA_CONTEXT_CACHE_MS = 90 * 1000;
@@ -2012,9 +2015,10 @@ async function baCall(t, c, action, extra, timeoutMs) {
 }
 
 // AI用のシステムプロンプト断片（本人確認の状態・予約一覧・actionの出し方）
-function baPromptBlock(ctx) {
+function baPromptBlock(ctx, opts) {
   if (!ctx || ctx.ok === false) return "";
-  let s = "\n\n【予約自動受付（うけつけるん連携・最優先で従う）】\n";
+  const staffMode = !!(opts && opts.staffMode);
+  let s = staffMode ? "\n\n【予約の照会と操作の提案（うけつけるん連携・最優先で従う）】\n" : "\n\n【予約自動受付（うけつけるん連携・最優先で従う）】\n";
   if (ctx.verified) {
     s += "本人確認: 済み（" + ((ctx.patient && ctx.patient.name) || "") + " 様 / 診察券番号 " + ((ctx.patient && ctx.patient.patientNo) || "") + "）\n";
     const list = Array.isArray(ctx.appointments) ? ctx.appointments : [];
@@ -2040,7 +2044,11 @@ function baPromptBlock(ctx) {
     + "・空き時間の質問・日付だけ決まった変更希望・条件付きの空き照会（「一番遅い時間」「18時以降で」「直近の土日」など） → {\"type\":\"slots\",\"appointmentId\":\"ID\",\"dates\":[\"YYYY-MM-DD\"]}（条件に合いそうな日付を本日基準・近い順に最大7つ。単日の質問なら1つ。結果はシステムが取得し、あなたが次の生成で条件に沿って答える）\n"
     + "・LINE連携（電話・メール2点がそろったら） → {\"type\":\"link\",\"phone\":\"…\",\"email\":\"…\"}\n"
     + "・メールの本人確認（電話番号が出たら） → {\"type\":\"verify\",\"phone\":\"…\"}\n"
-    + "actionを出すとき、draftは短い繋ぎ文でよい（システムが正式な確認文・結果文を患者に送る）。";
+    + (staffMode
+      ? "この医院では予約操作を自動実行しない。cancel・reschedule の action はスタッフへの『実行の提案』として画面に表示され、スタッフが内容を確認してから実行する。"
+        + "cancel・reschedule の action を出すときは、draft に『スタッフがその操作を実行した後に送る完了のご案内』（キャンセル・日時変更を承った旨、変更後の日時、該当する規定）を書く。slots・link・verify のときは通常どおり質問や案内を書く。"
+      : "actionを出すとき、draftは短い繋ぎ文でよい（システムが正式な確認文・結果文を患者に送る）。"
+        + "cancel・reschedule の action を出すときは、after_action_draft に『スタッフがその操作を実行した後に送る完了のご案内』も書く（スタッフ確認に回った場合に使う）。");
   return s;
 }
 
@@ -2339,7 +2347,9 @@ async function genDraft(t, c, opts) {
   let baCtx = null, baTxt = "";
   // 予約の自動操作がOFFでも、スタッフLINEの毎回承認モードでは安全な読み取り照会を使う。
   // handleInbound側で書き込みactionは実行しないため、予約・顧客情報を返信案へ反映するだけになる。
-  const needsBaContext = !opts.skipExternal && (baEnabled(t) || staffLineReviewAll(t)) && PARTNER_KEY;
+  const needsBaContext = !opts.skipExternal && (baEnabled(t) || staffLineReviewAll(t) || staffBookingSuggestEnabled(t)) && PARTNER_KEY;
+  // 自動受付がOFFの医院では、予約操作をスタッフ確認つきの提案として扱う（スタッフLINEで毎回承認する医院は従来の書き方のまま）
+  const staffBookingMode = !baEnabled(t) && !staffLineReviewAll(t);
   if (!opts.skipExternal) {
     // 独立した読み取り照会を同時に始め、双方の完了後に本人確認の境界を適用する。
     [bookingTxt, baCtx] = await Promise.all([
@@ -2348,7 +2358,7 @@ async function genDraft(t, c, opts) {
     ]);
   }
   if (needsBaContext) {
-    baTxt = baPromptBlock(baCtx);
+    baTxt = baPromptBlock(baCtx, { staffMode: staffBookingMode });
     // 本人確認が取れていない相手（照会失敗も含む）には既存の照会テキストも渡さない（個人情報を出させない）
     if (!(baCtx && baCtx.ok && baCtx.verified)) bookingTxt = "";
     if (c.ba && c.ba.pending && c.ba.pending.expiresAt && Date.parse(c.ba.pending.expiresAt) > Date.now()) {
@@ -2368,7 +2378,7 @@ async function genDraft(t, c, opts) {
     + "\n\n【事実の安全ルール】料金・金額・割引・期限・規定・営業日・対応可否は店舗ルールに明記された内容だけを答える。予約日時・空き枠・患者固有情報・手続き完了は、本人確認済みのシステム照会結果だけを答える。痛み・症状・薬・安全性は診断や『大丈夫』という断定をせず、スタッフ確認へ回す。根拠が無い場合は推測せず『確認してご案内します』と伝え、needs_human:true、confidence:lowにする。"
     + "\n\n" + JP_QUALITY
     + "\n\n出力は必ず次のJSONのみ（前後に説明や```やかぎ括弧を付けない）: {\"draft\":\"お客様への返信文\",\"confidence\":\"high|medium|low\",\"is_urgent\":true|false,\"needs_human\":true|false,\"site_alert\":\"遅刻|当日キャンセル|緊急来院|none\",\"site_summary\":\"現場向け一行要約。site_alertがnoneなら空文字\",\"topics\":[{\"q\":\"短い質問ラベル\",\"need\":true}]"
-    + (baTxt ? ",\"action\":{\"type\":\"none|cancel|reschedule|slots|link|verify\",\"appointmentId\":\"\",\"newDateTime\":\"\",\"dates\":[\"YYYY-MM-DD\"],\"phone\":\"\",\"email\":\"\"}" : "")
+    + (baTxt ? ",\"action\":{\"type\":\"none|cancel|reschedule|slots|link|verify\",\"appointmentId\":\"\",\"newDateTime\":\"\",\"dates\":[\"YYYY-MM-DD\"],\"phone\":\"\",\"email\":\"\"},\"after_action_draft\":\"cancel・rescheduleの時だけ。操作完了後の案内文\"" : "")
     + "}"
     + "\nconfidence: ルールと会話から自信を持って答えられればhigh、判断に迷う/情報不足ならlow。"
     + (baTxt
@@ -2572,6 +2582,19 @@ async function handleInboundCore(t, opts) {
       c.draft = String(g.draft || ""); c.draft0 = c.draft; confidence = g.confidence; needsHuman = g.needs_human; urgent = g.is_urgent; siteAlert = g.site_alert; siteSummary = g.site_summary; c.topics = Array.isArray(g.topics) ? g.topics : []; c.learningRefs = Array.isArray(g.learningRefs) ? g.learningRefs : []; c.learningUsage = g.learningUsage || null; c.grounding = g.grounding || null; c.validation = g.validation || null; c.learningReadiness = g.learningReadiness || null;
       await startLearningUsageTrace(t, c, g, "inbound");
     }
+    // ===== 予約操作のスタッフ確認つき提案（自動実行しない場合） =====
+    c.bookingSuggestion = null;
+    const autoBooking = !!(g && !g.replyRequiresStaff && !staffLineReviewAll(t) && baEnabled(t));
+    if (g && !autoBooking && staffBookingSuggestEnabled(t) && PARTNER_KEY) {
+      const suggestion = bookingSuggestionFromDraft(g);
+      if (suggestion) {
+        c.bookingSuggestion = suggestion;
+        const after = String(g.after_action_draft || "").trim();
+        // スタッフLINEの承認では予約操作のボタンが無いため、完了の案内文を下書きにするのは画面で確認する場合だけ
+        if (after && baEnabled(t) && !staffLineReviewAll(t)) { c.draft = after.slice(0, 5000); c.draft0 = c.draft; }
+        needsHuman = true; // 予約操作の完了を伝える文面は、スタッフが実行するまで自動送信しない
+      }
+    }
     // ===== 予約自動受付: AIが操作依頼(action)を出したら、確認文の送信までを自動処理 =====
     if (g && !g.replyRequiresStaff && !staffLineReviewAll(t) && baEnabled(t) && PARTNER_KEY && g.action && typeof g.action === "object" && g.action.type && g.action.type !== "none") {
       try { baDone = await baAction(t, c, g.action, g.baCtx); } catch (e) { console.error("ba action:", e && e.message); }
@@ -2623,7 +2646,9 @@ async function handleInboundCore(t, opts) {
   } else if (exceptionNeedsReview || String(needsHuman) === "true" || String(urgent) === "true" || c.flag) {
     const groundingReason = c.grounding && Array.isArray(c.grounding.reasons) && c.grounding.reasons[0];
     const reason = String(urgent) === "true" ? "緊急性のある問い合わせとAIが判定しました" : (c.flag ? "要対応フラグが付いています" : (!groundedForStaffLine ? (groundingReason || "送信前の根拠監査を通らなかったため確認が必要です") : (!confOkForStaffLine ? "自動送信に必要な確信率を満たさないため確認が必要です" : "AIが人による判断を必要と判定しました")));
-    if (c.draft && c.draft.trim() && S(t).staffLineEnabled && S(t).staffLineReplyMode === "exceptions" && staffLineReady(t)) staffLineRequestApproval(t, c, reason).catch(() => {});
+    // 未実行の予約操作の提案がある返信は、スタッフLINEの承認だけで送れないようにする（予約操作は画面の確認カードで実行）
+    const pendingBookingSuggestion = !!(c.bookingSuggestion && c.bookingSuggestion.status !== "executed");
+    if (!pendingBookingSuggestion && c.draft && c.draft.trim() && S(t).staffLineEnabled && S(t).staffLineReplyMode === "exceptions" && staffLineReady(t)) staffLineRequestApproval(t, c, reason).catch(() => {});
     else staffLineEscalate(t, c, reason).catch(() => {});
   }
   const usageStore = aiUsageContext.getStore();
@@ -3218,7 +3243,7 @@ app.post("/api/send", guard, async (req, res) => {
     const learningChat = sanitizeLearningChat(Array.isArray(req.body.learningChat) && req.body.learningChat.length ? req.body.learningChat : (useSavedEdits ? savedMessages : []));
     const reviewText = String(req.body.learningText || "").trim().slice(0, 800);
     await finishLearningUsageTrace(t, c, text, "staff");
-    appendDeliveredBundle(c, text, files, baseUrl, { learningRefs: c.learningRefs || [] }); c.draft = ""; c.draft0 = ""; c.learningRefs = []; delete c.draftChatSession; c.status = "done"; c.flag = false; c.lastAuto = false; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
+    appendDeliveredBundle(c, text, files, baseUrl, { learningRefs: c.learningRefs || [] }); c.draft = ""; c.draft0 = ""; c.learningRefs = []; delete c.draftChatSession; c.bookingSuggestion = null; c.status = "done"; c.flag = false; c.lastAuto = false; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
     statBump(t, "staff");
     if (text && shouldOfferLearningConsent(q0, text)) {
       try {
@@ -4166,6 +4191,26 @@ function normalizeStaffBookingAction(p, raw) {
   const dt = new Date(newDateTime + ":00+09:00");
   return !isNaN(dt.getTime()) && dt.getTime() > Date.now() ? { type, appointmentId, newDateTime } : null;
 }
+// 受信時の下書きが出した予約操作を、スタッフ確認つきの提案カード用に検証して要約する（本人確認済み・本人の予約・変更可・未来日時だけ）。
+function bookingSuggestionFromDraft(g) {
+  if (!g || !g.action || typeof g.action !== "object") return null;
+  const type = String(g.action.type || "none");
+  if (type !== "cancel" && type !== "reschedule") return null;
+  const normalized = normalizeStaffBookingAction({ baCtx: g.baCtx }, g.action);
+  if (!normalized || (normalized.type !== "cancel" && normalized.type !== "reschedule")) return null;
+  const appts = Array.isArray(g.baCtx && g.baCtx.appointments) ? g.baCtx.appointments : [];
+  const appt = appts.find(a => String(a.id) === normalized.appointmentId) || {};
+  let target = "";
+  if (normalized.type === "reschedule") {
+    const dt = new Date(normalized.newDateTime + ":00+09:00");
+    target = dt.toLocaleString("ja-JP", { timeZone: "Asia/Tokyo", month: "long", day: "numeric", weekday: "short", hour: "2-digit", minute: "2-digit" });
+  }
+  return {
+    type: normalized.type, appointmentId: normalized.appointmentId, newDateTime: normalized.newDateTime || "",
+    appointmentLabel: String(appt.label || "").slice(0, 80), menu: String(appt.menu || "").slice(0, 80), location: String(appt.location || "").slice(0, 60),
+    targetLabel: target, feeNote: String(appt.feeNote || "").slice(0, 120), createdAt: Date.now(), status: "proposed",
+  };
+}
 const DRAFTCHAT_MEMORY_RULE = "memory: スタッフの指示の中に『他の返信でも再利用できる、書き方・対応の方針』が含まれていれば、簡潔なルール文にして入れる。『今後』『常に』と明示していなくても、再利用できる方針なら拾う（例:「冒頭に様を付けない」「短めにする」「絵文字を使わない」「結論から書く」「予約はWeb予約に誘導する」「謝罪を一言入れる」等）。"
   + "ただし次は絶対にmemoryに入れない（空にする）: (1)その問い合わせ固有の事実・数値・個別判断（例:「この件は3営業日」「今回はキャンセル無料」「この人には◯◯と伝える」）。 (2)『今は』『今回は』『一旦』『今だけ』『この返信は』『とりあえず』など“今回限り・一時的”を少しでも示す指示。スタッフが今回だけのつもりで言った可能性が少しでもあれば入れない。明確に毎回・恒久的に守るべき方針だと確信できる時だけ入れる。"
   + "複数あれば最も方針性が高い1つだけ。再利用できる恒久方針が無ければ空にする。";
@@ -4441,6 +4486,15 @@ app.post("/api/staff-booking-action", guard, async (req, res) => {
   res.json({ ok: true, kind: "confirm", conversationId: c.id, requestId: proposed.requestId, expiresAt: proposed.expiresAt, summary, warning: "まだ実行されていません。対象患者・予約・内容を確認してください。" });
 });
 
+app.post("/api/booking-suggestion-dismiss", guard, async (req, res) => {
+  const t = req.tenant;
+  const c = t.store[String(req.body.id || "")];
+  if (!c) return res.status(404).json({ ok: false, error: "no_conv" });
+  c.bookingSuggestion = null;
+  await dbSave(t, c);
+  res.json({ ok: true });
+});
+
 app.post("/api/staff-booking-confirm", guard, async (req, res) => {
   const t = req.tenant;
   const c = t.store[String(req.body.id || "")];
@@ -4461,6 +4515,9 @@ app.post("/api/staff-booking-confirm", guard, async (req, res) => {
   }
   if (!out) return res.status(504).json({ ok: false, error: "result_unknown", text: "結果を確認できません。うけつけるんの予約詳細で状態を確認してください。" });
   c.staffBookingPending = null;
+  if (approve && out.ok && c.bookingSuggestion && String(c.bookingSuggestion.appointmentId) === String(pending.appointmentId) && c.bookingSuggestion.type === pending.type) {
+    c.bookingSuggestion = Object.assign({}, c.bookingSuggestion, { status: "executed", executedAt: Date.now() });
+  }
   dbSave(t, c);
   if (!approve) return res.json({ ok: true, done: false, text: "実行を取り消しました。予約は変更していません。" });
   if (!out.ok) return res.status(400).json({ ok: false, error: out.error || "failed", text: out.text || "処理できませんでした。うけつけるんで予約状態を確認してください。", alternatives: out.alternatives });
@@ -5770,6 +5827,26 @@ const PAGE = `<!DOCTYPE html>
   .custPanel{transition:max-height .28s ease,opacity .2s ease;overflow:hidden;}
   .cpGrip{display:flex;align-items:center;justify-content:center;gap:8px;padding:3px;border-top:1px solid #f3f4f6;cursor:pointer;}
   .cpGripBar{width:34px;height:4px;border-radius:3px;background:#d1d5db;}
+  /* 連携済み患者: 初期は最小表示（次回・前回だけ）。下へスワイプ／▼で全情報、上へスワイプ／▲で最小表示へ戻す */
+  .cpCompact{display:flex;align-items:center;gap:8px;min-height:30px;cursor:pointer;user-select:none;-webkit-user-select:none;}
+  .cpCompact .cpCName{font-weight:700;white-space:nowrap;max-width:9em;overflow:hidden;text-overflow:ellipsis;}
+  .cpCompact .cpCItems{display:flex;flex-wrap:wrap;gap:2px 12px;flex:1;min-width:0;font-size:12px;}
+  .cpCompact .cpCItem{white-space:nowrap;}
+  .cpCompact .cpCItem b{font-weight:700;}
+  .cpCompact .cpCLbl{color:var(--muted);font-size:11px;margin-right:3px;}
+  .cpCToggle{flex-shrink:0;font-size:11px;font-weight:600;color:#0f766e;background:#f0fdfa;border:1px solid #99f6e4;border-radius:9999px;padding:3px 10px;cursor:pointer;white-space:nowrap;}
+  .cpFullWrap{overflow:hidden;transition:max-height .32s cubic-bezier(.2,.8,.2,1),opacity .24s ease;}
+  .custPanel.cpIsCompact .cpFullWrap{max-height:0;opacity:0;}
+  .custPanel:not(.cpIsCompact) .cpCompact{display:none;}
+  .custPanel.cpIsCompact .cpCompact{display:flex;}
+  .custPanel:not(.cpIsCompact) .cpFullWrap{overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;}
+  .bkSug{margin:2px 0 6px;border:1px solid #fcd34d;background:#fffbeb;border-radius:10px;padding:8px 10px;font-size:12px;line-height:1.5;color:#1f2937;}
+  .bkSug.done{border-color:#86efac;background:#f0fdf4;}
+  .bkSug .bkTtl{font-weight:700;font-size:12.5px;}
+  .bkSug .bkBtns{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;}
+  .bkSug .bkRun{border:1px solid #b45309;background:#b45309;color:#fff;border-radius:8px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer;min-height:34px;}
+  .bkSug .bkSkip{border:1px solid #d1d5db;background:#fff;color:#374151;border-radius:8px;padding:6px 10px;font-size:12px;cursor:pointer;min-height:34px;}
+  .bkSug button:disabled{opacity:.6;cursor:default;}
   .custTab{display:flex;align-items:center;justify-content:center;gap:6px;background:#f0fdf4;border-bottom:1px solid #e5e7eb;padding:5px;font-size:11px;color:#15803d;cursor:pointer;}
   .cpCancel{border-color:#f0999b;background:#fdecec;color:#b3261e;}
   .cpKarte{border-color:#0f766e;background:#0f766e;color:#fff;}
@@ -6482,9 +6559,9 @@ function openChat(id,keep){if((window.__dBusy||window.__voiceBusy)&&current&&cur
     '<div id="custTab" class="custTab" style="display:none;" onclick="cpExpand()">うけつけるん情報を表示 ⌄</div>'+
     '<div id="custPanel" class="custPanel">読み込み中…</div>'+
     '<div id="msgs">'+bubbles+'</div>'+
-    '<div id="composer"><div id="aiLabel"><span class="patientModeTitle">🟢 患者への返信を編集中</span><span class="patientModeNote">この入力欄の内容は患者へ送信されます</span></div><div id="groundingUsed" style="display:'+(groundingText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:'+(r.grounding&&r.grounding.autoSendAllowed&&r.validation&&r.validation.pass?'#047857':'#b45309')+';margin:2px 0 5px;">'+esc(groundingText(r))+'</div><div id="topicChips" style="display:none;"></div><div id="scheduledList"></div><div id="pendingAttachments"></div><div id="draftRow"><button id="attach" onclick="attach()" title="画像・ファイルを追加">📎</button><textarea id="draft" oninput="draftEdited()" onpaste="handleDraftPaste(event)" placeholder="患者へのメッセージ。画像やファイルもここへ貼り付けできます">'+esc(r.draft||"")+'</textarea></div><div class="enterHint">Enter＝改行　送信はボタンのみ</div>'+
+    '<div id="composer"><div id="aiLabel"><span class="patientModeTitle">🟢 患者への返信を編集中</span><span class="patientModeNote">この入力欄の内容は患者へ送信されます</span></div><div id="groundingUsed" style="display:'+(groundingText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:'+(r.grounding&&r.grounding.autoSendAllowed&&r.validation&&r.validation.pass?'#047857':'#b45309')+';margin:2px 0 5px;">'+esc(groundingText(r))+'</div><div id="topicChips" style="display:none;"></div><div id="scheduledList"></div><div id="bookingSuggest"></div><div id="pendingAttachments"></div><div id="draftRow"><button id="attach" onclick="attach()" title="画像・ファイルを追加">📎</button><textarea id="draft" oninput="draftEdited()" onpaste="handleDraftPaste(event)" placeholder="患者へのメッセージ。画像やファイルもここへ貼り付けできます">'+esc(r.draft||"")+'</textarea></div><div class="enterHint">Enter＝改行　送信はボタンのみ</div>'+
     '<div id="cbtns"><div class="composerSecondary"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ 右腕くんに相談</button>'+staffReviewButton+'<button id="markDoneBtn" class="cbtn done" onclick="markDone()">対応済み</button></div><div class="composerPrimary"><button class="cbtn schedule" onclick="openScheduledMessage()">🕒 予約送信</button><button class="cbtn send" onclick="sendMsg()">患者へ送信</button></div></div></div>';
-  const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.setAttribute("data-day",messageDayKey());m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r);renderPendingAttachments();renderScheduledMessages(r); loadCustomer(id); if(!keep)renderList(); showReadyLearningFor(id);
+  const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.setAttribute("data-day",messageDayKey());m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r);renderPendingAttachments();renderScheduledMessages(r);renderBookingSuggestion(r); loadCustomer(id); if(!keep)renderList(); showReadyLearningFor(id);
 }
 function closeChat(){hideDraftChatForConversationSwitch();appEl.classList.remove("chatopen");current=null;renderList();}
 // ===== うけつけるん 顧客情報パネル =====
@@ -6506,13 +6583,19 @@ async function copyUnans(btn,apptId){
   }catch(e){ if(btn) btn.textContent=o; uiAlert("URLを取得できませんでした"); }
   finally{if(btn)btn.disabled=false;}
 }
-function cpGripHtml(){ return '<div data-cp="collapse" class="cpGrip"><span class="cpGripBar"></span><span class="cpMuted">▲ 隠す</span></div>'; }
+// 描画直後の状態: その会話で全情報を開いていなければ最小表示
+function cpApplyState(el,id){
+  var w=document.getElementById("cpFullWrap");
+  if(cpExpandedFor===id){ el.classList.remove("cpIsCompact"); if(w) w.style.maxHeight=cpFullMax()+"px"; var c=el.querySelector(".cpCToggle"); if(c) c.setAttribute("aria-expanded","true"); }
+  else { el.classList.add("cpIsCompact"); if(w) w.style.maxHeight="0px"; }
+}
+function cpGripHtml(){ return '<div data-cp="collapse" class="cpGrip"><span class="cpGripBar"></span><span class="cpMuted">▲ 小さく戻す</span></div>'; }
 function renderCustomer(id,j){
   if(current!==id)return; // 会話を切り替えていたら古い結果で描画しない
   var el=document.getElementById("custPanel"); if(!el)return;
   if(!j){ el.innerHTML=""; return; }
-  if(j.found){ el.innerHTML=custFoundHtml(j); custPid=(j.patient&&j.patient.id!=null)?j.patient.id:null; el.setAttribute("data-pid", custPid!=null?encodeURIComponent(String(custPid)):""); cpKarteHeaderLoad(id); }
-  else { el.innerHTML=custUnlinkedHtml(id); custPid=null; }
+  if(j.found){ el.innerHTML=custFoundHtml(j); cpApplyState(el,id); custPid=(j.patient&&j.patient.id!=null)?j.patient.id:null; el.setAttribute("data-pid", custPid!=null?encodeURIComponent(String(custPid)):""); cpKarteHeaderLoad(id); }
+  else { el.classList.remove("cpIsCompact"); el.innerHTML=custUnlinkedHtml(id); custPid=null; }
   el.onclick=cpPanelClick; // data-cp ボタンをイベント委譲で処理
 }
 // ── ヘッダー内カルテ（内部スクロール・過去の記録まで全件） ──
@@ -6558,7 +6641,8 @@ function cpKScrollUpd(){
 }
 function loadCustomer(id){
   var el=document.getElementById("custPanel"); if(!el)return;
-  cpExpand(); cpBindTouch();
+  if(cpExpandedFor!==id) cpExpandedFor=null;
+  cpShowPanel(); cpBindTouch();
   var cached=custCache[id];
   if(cached){ renderCustomer(id,cached); } // キャッシュあり=体感ゼロ待ちで即描画
   else { el.innerHTML='<span class="cpMuted">うけつけるん情報を読み込み中…</span>'; }
@@ -6568,21 +6652,52 @@ function loadCustomer(id){
     renderCustomer(id,j); // current!==id なら renderCustomer 内で破棄
   }).catch(function(e){ if(!cached && current===id){ var el2=document.getElementById("custPanel"); if(el2) el2.innerHTML=""; } });
 }
+// 連携済み（最小表示あり）なら 最小表示⇄全情報 を切り替える。未連携の案内は従来どおり 全部隠す⇄表示。
+var cpExpandedFor=null; // 全情報を開いている会話ID（同じ会話の再描画では開いたまま）
+function cpHasCompact(){ return !!document.getElementById("cpFullWrap"); }
+function cpFullMax(){ return Math.round(Math.max(160,(window.innerHeight||700)*0.6)); }
 function cpCollapse(){
   var el=document.getElementById("custPanel"); var tab=document.getElementById("custTab");
+  if(el&&cpHasCompact()){
+    var w=document.getElementById("cpFullWrap");
+    if(w){ w.style.maxHeight=w.offsetHeight+"px"; void w.offsetHeight; w.style.maxHeight="0px"; }
+    el.classList.add("cpIsCompact"); cpExpandedFor=null;
+    var c=el.querySelector(".cpCToggle"); if(c) c.setAttribute("aria-expanded","false");
+    if(tab) tab.style.display="none";
+    return;
+  }
   if(el){ el.style.maxHeight="0"; el.style.opacity="0"; el.style.paddingTop="0"; el.style.paddingBottom="0"; }
   if(tab){ tab.style.display="flex"; }
 }
 function cpExpand(){
   var el=document.getElementById("custPanel"); var tab=document.getElementById("custTab");
-  if(el){ el.style.maxHeight="600px"; el.style.opacity="1"; el.style.paddingTop=""; el.style.paddingBottom=""; }
+  if(el){ el.style.maxHeight=""; el.style.opacity="1"; el.style.paddingTop=""; el.style.paddingBottom=""; }
+  if(tab){ tab.style.display="none"; }
+  if(el&&cpHasCompact()){
+    var w=document.getElementById("cpFullWrap");
+    el.classList.remove("cpIsCompact"); cpExpandedFor=current;
+    var c=el.querySelector(".cpCToggle"); if(c) c.setAttribute("aria-expanded","true");
+    if(w){ w.scrollTop=0; w.style.maxHeight="0px"; void w.offsetHeight; w.style.maxHeight=cpFullMax()+"px"; }
+  }
+}
+function cpShowPanel(){ // 読み込み中・未連携の表示用（隠していた場合だけ元に戻す）
+  var el=document.getElementById("custPanel"); var tab=document.getElementById("custTab");
+  if(el){ el.style.maxHeight=""; el.style.opacity="1"; el.style.paddingTop=""; el.style.paddingBottom=""; }
   if(tab){ tab.style.display="none"; }
 }
 function cpBindTouch(){
   var el=document.getElementById("custPanel"); var tab=document.getElementById("custTab");
   if(el&&!el.__cpb){ el.__cpb=1; var sy=0;
     el.addEventListener("touchstart",function(e){ sy=e.touches[0].clientY; },{passive:true});
-    el.addEventListener("touchend",function(e){ var dy=sy-e.changedTouches[0].clientY; if(dy>24) cpCollapse(); });
+    el.addEventListener("touchend",function(e){
+      var dy=sy-e.changedTouches[0].clientY;
+      if(cpHasCompact()&&el.classList.contains("cpIsCompact")){ if(dy< -16) cpExpand(); return; }
+      // 全情報の中をスクロールしている途中は閉じない（先頭まで戻っている時だけ上スワイプで最小表示へ）
+      var w=document.getElementById("cpFullWrap"); var sc=e.target&&e.target.closest?e.target.closest(".cpKScroll"):null;
+      if(sc) return;
+      if(w&&w.scrollTop>0&&w.scrollHeight>w.clientHeight+2) return;
+      if(dy>24) cpCollapse();
+    });
   }
   if(tab&&!tab.__cpb){ tab.__cpb=1; var ty=0;
     tab.addEventListener("touchstart",function(e){ ty=e.touches[0].clientY; },{passive:true});
@@ -6591,7 +6706,7 @@ function cpBindTouch(){
 }
 // "YYYY-MM-DD HH:MM" → {d:"M月D日(曜)", t:"HH:MM"}（うけつけるんカレンダーと同じ表記）
 function cpJpDate(ds){
-  var m=/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}:\d{2})/.exec(ds||"");
+  var m=/^(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{2}:\\d{2})/.exec(ds||"");
   if(!m) return {d:ds||"", t:""};
   var wd="日月火水木金土".charAt(new Date(+m[1],+m[2]-1,+m[3]).getDay());
   return {d:(+m[2])+"月"+(+m[3])+"日("+wd+")", t:m[4]};
@@ -6624,7 +6739,22 @@ function cpApptCardHtml(b,kind){
     '<div class="cpWhen">'+esc(when)+'</div>'+
     '<div class="cpMenuLine">'+chip+esc(b.menu||"")+loc+'</div></div>';
 }
-function custFoundHtml(j){
+function custFoundHtml(j){ return cpCompactHtml(j)+'<div class="cpFullWrap" id="cpFullWrap">'+custFullHtml(j)+'</div>'; }
+function cpLastVisit(past){ for(var li=0;li<(past||[]).length;li++){ var lk=past[li].statusKey||""; if(lk!=="cancelled"&&lk!=="no_show") return past[li]; } return null; }
+function cpShortWhen(b){ if(!b) return ""; var jp=cpJpDate(b.date); if(jp.t) return (jp.d+" "+jp.t).trim(); return String(b.dateJp||b.date||"").trim(); }
+// 最小表示: 氏名・次回予約・前回来院だけ（タップ・下へスワイプで全情報）
+function cpCompactHtml(j){
+  var p=(j&&j.patient)||{}; var bk=(j&&j.bookings)||{};
+  var next=((bk.upcoming)||[])[0]||null; var last=cpLastVisit(bk.past);
+  var lastJp=last?cpJpDate(last.date):null;
+  var nextTxt=next?('<b>'+esc(cpShortWhen(next))+'</b>'+(next.menu?' <span class="cpMuted">'+esc(next.menu)+'</span>':'')):'<span class="cpMuted">なし</span>';
+  var lastTxt=last?('<b>'+esc((lastJp&&lastJp.t)?lastJp.d:(last.dateJp||last.date||""))+'</b>'):'<span class="cpMuted">なし</span>';
+  return '<div class="cpCompact" data-cp="expand">'+
+    '<span class="cpCName">👤 '+esc(p.name||"顧客")+'</span>'+
+    '<span class="cpCItems"><span class="cpCItem"><span class="cpCLbl">次回</span>'+nextTxt+'</span><span class="cpCItem"><span class="cpCLbl">前回来院</span>'+lastTxt+'</span></span>'+
+    '<button type="button" class="cpCToggle" data-cp="expand" aria-expanded="false" aria-controls="cpFullWrap">▼ 詳しく</button></div>';
+}
+function custFullHtml(j){
   var p=(j&&j.patient)||{};
   var bk=(j&&j.bookings)||{};
   var past=(bk.past)||[];
@@ -6855,6 +6985,7 @@ function cpPanelClick(e){
   else if(act==="karteedit") karteEdit(val);
   else if(act==="karteclose") closeKarte();
   else if(act==="collapse") cpCollapse();
+  else if(act==="expand") cpExpand();
   else if(act==="linktoggle") linkToggle();
 }
 function custUnlinkedHtml(id){
@@ -7017,7 +7148,45 @@ async function decideLearningConsent(learn,silent){
     refreshLearningBadge();
   }catch(e){if(learn&&!silent)showLearningOutcome({type:"error",title:"学習を開始できませんでした",message:e.message==="consent_expired"?"3秒を過ぎたため、今回は記録していません":"患者への送信は完了しています。今回は学習していません"});}
 }
-async function sendMsg(){if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="患者へ送信中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat});let json={};try{json=await response.json();}catch(e){}if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";showLearnResult(json.learningJob?"送信しました。確認済みの返信を学習中です":"送信しました");await load();pollLearningJobs();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
+// ── 予約操作の提案カード（受信時に右腕くんが読み取ったキャンセル・日時変更。スタッフが確認して実行） ──
+function bookingSuggestText(b){var t=b.type==="cancel"?"キャンセル":"日時変更";var head=(b.appointmentLabel||"")+(b.menu?" "+b.menu:"")+(b.location?"（"+b.location+"）":"");return {op:t,head:head.trim(),target:b.targetLabel||""};}
+function renderBookingSuggestion(r){
+  var el=document.getElementById("bookingSuggest"); if(!el)return;
+  var b=r&&r.bookingSuggestion; if(!b||!b.type){el.innerHTML="";return;}
+  var x=bookingSuggestText(b);
+  if(b.status==="executed"){
+    el.innerHTML='<div class="bkSug done"><div class="bkTtl">✅ 予約の'+esc(x.op)+'を実行しました</div><div>'+esc(x.head)+(x.target?' → '+esc(x.target):'')+'</div><div class="cpMuted">下の返信文を確認して「患者へ送信」してください。</div></div>';
+    return;
+  }
+  el.innerHTML='<div class="bkSug"><div class="bkTtl">📅 右腕くんの提案：この予約を'+esc(x.op)+'する</div>'+
+    '<div>'+esc(x.head||"対象のご予約")+(x.target?' → <b>'+esc(x.target)+'</b>':'')+'</div>'+
+    (b.feeNote?'<div class="cpMuted">※'+esc(b.feeNote)+'</div>':'')+
+    '<div class="cpMuted">まだ実行していません。下の返信文は実行後に送る案内です。</div>'+
+    '<div class="bkBtns"><button type="button" class="bkRun" onclick="runBookingSuggestion(this)">内容を確認して'+esc(x.op)+'を実行</button><button type="button" class="bkSkip" onclick="dismissBookingSuggestion(this)">提案を消す</button></div></div>';
+}
+async function runBookingSuggestion(btn){
+  var id=current; var r=DATA.find(function(x){return x.id===id;}); var b=r&&r.bookingSuggestion; if(!b||window.__bkBusy)return;
+  window.__bkBusy=true; if(btn){btn.disabled=true;btn.textContent="うけつけるんで確認中…";}
+  try{
+    var payload={id:id,type:b.type,appointmentId:b.appointmentId}; if(b.type==="reschedule")payload.newDateTime=b.newDateTime;
+    var res=await api("/api/staff-booking-action",payload); var j=await res.json();
+    if(!(j.ok&&j.kind==="confirm")){var msg=j.text||staffBookingError(j.error);if(j.alternatives&&j.alternatives.length)msg+="\\n空き候補: "+j.alternatives.map(function(a){return a.label;}).join(" / ");uiAlert("予約操作を準備できませんでした。予約は変更していません。\\n"+msg);return;}
+    var ok=await uiConfirm("次の内容で実行します。よろしいですか？\\n\\n"+(j.summary||"")+"\\n\\n※実行すると、うけつけるんの予約が変更されます。");
+    var res2=await api("/api/staff-booking-confirm",{id:j.conversationId||id,requestId:j.requestId,approve:!!ok}); var j2=await res2.json();
+    if(!ok){uiAlert("実行を取り消しました。予約は変更していません。");return;}
+    if(j2.ok&&j2.done){b.status="executed";renderBookingSuggestion(r);showLearnResult(j2.text||"予約操作が完了しました");custCache[id]=null;if(current===id)loadCustomer(id);}
+    else uiAlert((j2.text||staffBookingError(j2.error))+"\\nうけつけるんの予約詳細で状態をご確認ください。");
+  }catch(e){uiAlert("うけつけるんへ接続できませんでした。予約は変更していない可能性があります。うけつけるんで状態をご確認ください。");}
+  finally{window.__bkBusy=false;if(btn&&document.body.contains(btn)){btn.disabled=false;btn.textContent="内容を確認して実行";}}
+}
+async function dismissBookingSuggestion(btn){
+  var id=current; if(btn&&btn.disabled)return; if(btn)btn.disabled=true;
+  try{await api("/api/booking-suggestion-dismiss",{id:id});var r=DATA.find(function(x){return x.id===id;});if(r)r.bookingSuggestion=null;renderBookingSuggestion(r);}
+  catch(e){uiAlert("提案を消せませんでした。もう一度お試しください。");}
+  finally{if(btn&&document.body.contains(btn))btn.disabled=false;}
+}
+async function sendMsg(){{const sr=DATA.find(x=>x.id===current);const sb=sr&&sr.bookingSuggestion;if(sb&&sb.type&&sb.status!=="executed"&&!window.__sendBusy){const go=await uiConfirm("右腕くんが提案した予約の"+(sb.type==="cancel"?"キャンセル":"日時変更")+"をまだ実行していません。\\nこのまま返信だけ送信しますか？");if(!go)return;}}
+if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="患者へ送信中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat});let json={};try{json=await response.json();}catch(e){}if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";showLearnResult(json.learningJob?"送信しました。確認済みの返信を学習中です":"送信しました");await load();pollLearningJobs();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
 let scheduledMessageDraft=null;
 function localDateTimeValue(date){const pad=n=>String(n).padStart(2,"0");return date.getFullYear()+"-"+pad(date.getMonth()+1)+"-"+pad(date.getDate())+"T"+pad(date.getHours())+":"+pad(date.getMinutes());}
 function openScheduledMessage(){
