@@ -2377,7 +2377,7 @@ async function genDraft(t, c, opts) {
     // 本人確認が取れていない相手（照会失敗も含む）には既存の照会テキストも渡さない（個人情報を出させない）
     // 自動受付OFFの医院（提案のためだけの照会）は、従来どおりの照会テキストの扱いを変えない
     if (!staffBookingMode && !(baCtx && baCtx.ok && baCtx.verified)) bookingTxt = "";
-    if (c.ba && c.ba.pending && c.ba.pending.expiresAt && Date.parse(c.ba.pending.expiresAt) > Date.now()) {
+    if (!staffBookingMode && c.ba && c.ba.pending && c.ba.pending.expiresAt && Date.parse(c.ba.pending.expiresAt) > Date.now()) {
       baTxt += "\n現在、次の確認への返信待ち:「" + String(c.ba.pending.confirmText || "").slice(0, 120) + "」。患者が別の話をしていればそれに答えつつ、手続きを続ける場合は「はい」と返信いただくよう最後に一言添える。";
     }
     if (opts.baSlotsTxt) {
@@ -4283,7 +4283,7 @@ function draftChatNote(t, c, edits) {
 async function reviewDraftChatCandidate(t, p, raw) {
   // 相談チャットの照合・修正: スタッフが明示した対応は店舗ルールと違っても正しいものとして扱う（「ルールはこうだから」で指示を戻さない）
   const STAFF_FIRST_AUDIT = "【スタッフ指示を最優先する照合】スタッフが最新指示・相談で明示した対応（料金・免除・案内する内容・条件や規定を書かないこと・書き方）は、店舗ルールや通常の条件と違っていても正しいものとして扱う。『ルールの条件・料金・提出物が欠けている』『ルールと違う』という理由だけでpass:falseにしない。"
-  + "pass:falseにするのは、(1)最新指示や未撤回の決定が反映されていない・逆の内容になっている、(2)日時・医院・金額などの取り違えや、指示にも根拠資料にもない新しい事実の追加、(3)診断・治療の安全判断、本人確認・個人情報、未実施の予約操作を完了と書く、のいずれかだけ。(3)に当たる時は JSON に \"safety\":true も付ける（それ以外は false）。";
+  + "pass:falseにするのは、(1)最新指示や未撤回の決定が反映されていない・逆の内容になっている、(2)日時・医院・金額などの取り違えや、指示にも根拠資料にもない新しい事実の追加、(3)診断・治療の安全判断、本人確認・個人情報、未実施の予約操作を完了と書く、のいずれかだけ。JSON には必ず \"safety\" を付け、(3)に当たる時は true、それ以外は false にする。";
   const STAFF_FIRST_REPAIR = "照合の指摘のうち、最新指示の未反映・事実の取り違え・安全上の問題だけを直す。スタッフが指示で外した条件・料金・規定や確認事項を戻さない。新しい推測は加えない。";
   if (p.consultation) return { text: "", error: "" };
   const instruction = String(p.latestInstruction || "").slice(0, 4000);
@@ -4330,7 +4330,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
       const match = rawAudit.match(/\{[\s\S]*\}/);
       const result = JSON.parse(match ? match[0] : rawAudit);
       const casual = hasConversationalTone(candidate);
-      return { pass: result.pass === true && !mismatch && !casual, audited: true, mismatch: !!mismatch, safety: result.safety === true, reason: mismatch || (casual ? "患者様向けの敬語になっていません" : String(result.reason || "").slice(0, 200)) };
+      return { pass: result.pass === true && !mismatch && !casual, audited: typeof result.safety === "boolean", mismatch: !!mismatch, safety: result.safety === true, reason: mismatch || (casual ? "患者様向けの敬語になっていません" : String(result.reason || "").slice(0, 200)) };
     } catch (e) { return { pass: false, reason: "編集指示の照合結果を読み取れませんでした" }; }
   }
   let checked = await audit(text);
@@ -4466,8 +4466,10 @@ function staffContextText(ctx) {
   if (!list.length) return patient + "様の今後の予約はありません。";
   return patient + "様の予約:\n" + list.map(a => "・" + a.label + " " + (a.menu || "") + "（" + (a.statusJa || a.status || "") + "）").join("\n");
 }
-async function staffBookingContext(t, c) {
-  if (!baEnabled(t) || !PARTNER_KEY) return { error: "not_linked" };
+async function staffBookingContext(t, c, opts) {
+  // 自動受付OFFでも、右腕くんが出した提案カードと同じ操作（種別・予約・新日時が一致）だけはスタッフ確認つきで実行できる
+  const viaSuggestion = !!(opts && opts.viaSuggestion && staffBookingSuggestEnabled(t));
+  if ((!baEnabled(t) && !viaSuggestion) || !PARTNER_KEY) return { error: "not_linked" };
   const ctx = await baCall(t, c, "context", {}, 15000);
   if (!ctx || !ctx.ok) return { error: "partner_unavailable" };
   if (!ctx.verified) return { error: "patient_not_verified" };
@@ -4490,7 +4492,11 @@ app.post("/api/staff-booking-action", guard, async (req, res) => {
   if (!c) return res.status(404).json({ ok: false, error: "no_conv" });
   const type = String(req.body.type || "");
   if (!["context", "slots", "cancel", "reschedule"].includes(type)) return res.status(400).json({ ok: false, error: "bad_action" });
-  const checked = await staffBookingContext(t, c);
+  const sug = c.bookingSuggestion;
+  const viaSuggestion = !!(sug && sug.status !== "executed" && ["cancel", "reschedule"].includes(type) && sug.type === type
+    && String(sug.appointmentId || "") === String(req.body.appointmentId || "")
+    && (type !== "reschedule" || String(sug.newDateTime || "") === String(req.body.newDateTime || "")));
+  const checked = await staffBookingContext(t, c, { viaSuggestion });
   if (checked.error) return res.status(400).json({ ok: false, error: checked.error });
   const ctx = checked.ctx;
   if (type === "context") return res.json({ ok: true, kind: "info", text: staffContextText(ctx) });
@@ -7255,7 +7261,7 @@ async function dismissBookingSuggestion(btn){
   catch(e){uiAlert("提案を消せませんでした。もう一度お試しください。");}
   finally{if(btn&&document.body.contains(btn))btn.disabled=false;}
 }
-async function confirmUnexecutedBooking(){const r=DATA.find(x=>x.id===current);if(!bookingSuggestionPending(r))return true;const b=r.bookingSuggestion;return await uiConfirm("右腕くんが提案した予約の"+(b.type==="cancel"?"キャンセル":"日時変更")+"をまだ実行していません。\\nこのまま返信だけ送りますか？");}
+async function confirmUnexecutedBooking(){const r=DATA.find(x=>x.id===current);if(!bookingSuggestionPending(r))return true;const b=r.bookingSuggestion;return await uiConfirm("右腕くんが提案した予約の"+(b.type==="cancel"?"キャンセル":"日時変更")+"をまだ実行していません。\\n返信を送ると、この提案カードは消えます（予約は変更されません）。\\nこのまま返信だけ送りますか？");}
 async function sendMsg(){if(!window.__sendBusy&&!(await confirmUnexecutedBooking()))return;
 if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="患者へ送信中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat});let json={};try{json=await response.json();}catch(e){}if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";showLearnResult(json.learningJob?"送信しました。確認済みの返信を学習中です":"送信しました");await load();pollLearningJobs();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
 let scheduledMessageDraft=null;
