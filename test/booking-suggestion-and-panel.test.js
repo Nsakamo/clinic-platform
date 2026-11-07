@@ -191,6 +191,11 @@ test("テスト：自動受付オフの医院は、予約の確認・キャン�
   const grounding = gen.match(/verifiedBooking: [^,]+/g);
   assert.equal(grounding.length, 2);
   for (const g of grounding) assert.match(g, /^verifiedBooking: !staffBookingMode && /);
+  // 送信前の監査AIへ渡す予約情報も、自動受付オフの医院では空のまま（従来どおり）
+  assert.match(gen, /booking: !staffBookingMode && baCtx && baCtx\.ok && baCtx\.verified \? bookingTxt : "",/);
+  assert.equal((gen.match(/\bbooking: /g) || []).length, 1);
+  // JSONの書式例に見本の文を入れない（そのまま返されてカードに出ないように）
+  assert.match(gen, /\\"after_action_draft\\":\\"\\"/);
 });
 
 test("テスト：スタッフLINEの送信ボタンと古い画面の「提案を消す」は、未実行・新しい提案を飛ばさない", () => {
