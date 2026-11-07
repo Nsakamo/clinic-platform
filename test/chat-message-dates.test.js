@@ -92,7 +92,7 @@ test("テスト：会話を開く際に日本時間の日付を記録する", ()
   const { context: c } = browser("2026-10-10T15:00:00Z", element);
   Object.assign(c, { window: {}, current: null, DATA: [{ id: "test", name: "テスト", channel: "line", msgs: [{ from: "them", text: "テスト", sentAt: Date.parse("2026-10-10T15:00:00Z") }] }], appEl: { classList: { add() {} } }, chatEl: { innerHTML: "" } });
   for (const name of ["av", "groundingText"]) c[name] = () => "";
-  for (const name of ["renderTopicChips", "renderPendingAttachments", "renderScheduledMessages", "loadCustomer", "renderList", "showReadyLearningFor"]) c[name] = () => {};
+  for (const name of ["renderTopicChips", "renderPendingAttachments", "renderScheduledMessages", "renderBookingSuggestion", "loadCustomer", "renderList", "showReadyLearningFor"]) c[name] = () => {};
   const openChat = script.slice(script.indexOf("function openChat("), script.indexOf("function closeChat("));
   vm.runInContext(openChat, c);
   c.openChat("test");
