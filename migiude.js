@@ -2394,8 +2394,9 @@ async function genDraft(t, c, opts) {
     + "\n\n【事実の安全ルール】料金・金額・割引・期限・規定・営業日・対応可否は店舗ルールに明記された内容だけを答える。予約日時・空き枠・患者固有情報・手続き完了は、本人確認済みのシステム照会結果だけを答える。痛み・症状・薬・安全性は診断や『大丈夫』という断定をせず、スタッフ確認へ回す。根拠が無い場合は推測せず『確認してご案内します』と伝え、needs_human:true、confidence:lowにする。"
     + "\n\n" + JP_QUALITY
     + "\n\n出力は必ず次のJSONのみ（前後に説明や```やかぎ括弧を付けない）: {\"draft\":\"お客様への返信文\",\"confidence\":\"high|medium|low\",\"is_urgent\":true|false,\"needs_human\":true|false,\"site_alert\":\"遅刻|当日キャンセル|緊急来院|none\",\"site_summary\":\"現場向け一行要約。site_alertがnoneなら空文字\",\"topics\":[{\"q\":\"短い質問ラベル\",\"need\":true}]"
-    + (baTxt ? ",\"action\":{\"type\":\"none|cancel|reschedule|slots|link|verify\",\"appointmentId\":\"\",\"newDateTime\":\"\",\"dates\":[\"YYYY-MM-DD\"],\"phone\":\"\",\"email\":\"\"},\"after_action_draft\":\"cancel・rescheduleの時だけ。操作完了後の案内文\"" : "")
+    + (baTxt ? ",\"action\":{\"type\":\"none|cancel|reschedule|slots|link|verify\",\"appointmentId\":\"\",\"newDateTime\":\"\",\"dates\":[\"YYYY-MM-DD\"],\"phone\":\"\",\"email\":\"\"},\"after_action_draft\":\"\"" : "")
     + "}"
+    + (baTxt ? "\nafter_action_draft: actionがcancel・rescheduleの時だけ、操作完了後に送る案内文を書く。それ以外は空文字。" : "")
     + "\nconfidence: ルールと会話から自信を持って答えられればhigh、判断に迷う/情報不足ならlow。"
     + (baTxt && staffBookingMode
         ? "\nneeds_human: 予約状況の確認・キャンセル・日時変更の依頼・キャンセル例外判断・クレーム・支払いトラブル・偽物疑惑などスタッフ確認が必要ならtrue（この医院は予約操作を自動で行わない。キャンセル・日時変更の依頼はactionに入れたうえで必ずtrue）。"
@@ -2480,7 +2481,7 @@ async function genDraft(t, c, opts) {
           query: lastQ,
           draft: out.draft,
           rules: relevantRulesTxt,
-          booking: baCtx && baCtx.ok && baCtx.verified ? bookingTxt : "",
+          booking: !staffBookingMode && baCtx && baCtx.ok && baCtx.verified ? bookingTxt : "",
           slots: opts.baSlotsTxt || "",
           precedents: precedentsTxt,
         });
@@ -4329,7 +4330,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
       const match = rawAudit.match(/\{[\s\S]*\}/);
       const result = JSON.parse(match ? match[0] : rawAudit);
       const casual = hasConversationalTone(candidate);
-      return { pass: result.pass === true && !mismatch && !casual, audited: true, safety: result.safety === true, reason: mismatch || (casual ? "患者様向けの敬語になっていません" : String(result.reason || "").slice(0, 200)) };
+      return { pass: result.pass === true && !mismatch && !casual, audited: true, mismatch: !!mismatch, safety: result.safety === true, reason: mismatch || (casual ? "患者様向けの敬語になっていません" : String(result.reason || "").slice(0, 200)) };
     } catch (e) { return { pass: false, reason: "編集指示の照合結果を読み取れませんでした" }; }
   }
   let checked = await audit(text);
@@ -4358,7 +4359,9 @@ async function reviewDraftChatCandidate(t, p, raw) {
       && !draftQualityIssues(text).some(issue => issue === "empty" || issue === "meta_text")) {
     // スタッフ指示を最優先する相談では、修正で指示から離れた案ではなく、指示どおりに作った最初の案を返す
     // ただし最初の案が安全面（医療判断・本人確認・未実施操作の完了表記）で不合格、または照合自体ができなかった場合は、最初の案は返さない
-    const useFirst = staffFirst && String(firstText || "").trim() && firstChecked.audited === true && !firstChecked.safety;
+    const firstUsable = String(firstText || "").trim() && !/@@\s*(?:REPLY|DRAFT|MEMORY|RULE|ACTION|META)\s*@@/.test(firstText)
+      && !draftQualityIssues(firstText).some(issue => issue === "empty" || issue === "meta_text");
+    const useFirst = staffFirst && firstUsable && firstChecked.audited === true && !firstChecked.safety && !firstChecked.mismatch;
     const shown = useFirst ? firstText : text;
     const reason = useFirst ? firstChecked.reason : checked.reason;
     return { text: shown, error: "", warning: String(reason || "内容をご確認ください").slice(0, 200) };
