@@ -1971,6 +1971,8 @@ function baEnabled(t) { return !!S(t).bookingActions; }
 // 予約操作の「スタッフ確認つき提案」: 自動実行しない設定・スタッフ確認が必要な返信でも、AIが読み取ったキャンセル・日時変更を
 // 下書き欄の確認カードとして出し、スタッフが内容を確かめてから実行できるようにする（既定オン。設定で staffBookingSuggest:false なら無効）。
 function staffBookingSuggestEnabled(t) { return S(t).staffBookingSuggest !== false; }
+// 提案カードのためだけの照会（自動受付OFFの医院）は、下書き生成を長く待たせない（従来の予約照会 fetchBooking と同程度）
+const STAFF_BOOKING_SUGGEST_TIMEOUT_MS = 5000;
 // 「右腕くんに相談」用の予約照会の短期キャッシュ（スタッフが確認してから使う下書き専用。自動送信の経路では使わない）。
 // 相談パネルを開いた時点で先に照会しておき、指示を送った時の待ち時間（うけつけるんの起動待ち等）を減らす。
 const BA_CONTEXT_CACHE_MS = 90 * 1000;
@@ -2369,7 +2371,7 @@ async function genDraft(t, c, opts) {
     // 独立した読み取り照会を同時に始め、双方の完了後に本人確認の境界を適用する。
     [bookingTxt, baCtx] = await Promise.all([
       fetchBooking(t, c).catch(() => ""),
-      needsBaContext ? baCall(t, c, "context", { email: (c.ba && c.ba.email) || undefined }).catch(() => null) : Promise.resolve(null),
+      needsBaContext ? baCall(t, c, "context", { email: (c.ba && c.ba.email) || undefined }, staffBookingMode ? STAFF_BOOKING_SUGGEST_TIMEOUT_MS : undefined).catch(() => null) : Promise.resolve(null),
     ]);
   }
   if (needsBaContext) {
@@ -2596,6 +2598,7 @@ async function handleInboundCore(t, opts) {
   }
   if (med || baDone || typeof opts.draft === "string") c.bookingSuggestion = null; // 新しい受信で古い提案は使わない
   if (typeof opts.draft !== "string" && !med && !baDone) { // generate draft in-app for text messages
+    const suggestionBefore = c.bookingSuggestion;
     let g = await genDraft(t, c);
     if (g && staffLineReviewAll(t)) g = await enrichStaffLineBookingPreview(t, c, g);
     if (g) {
@@ -2605,7 +2608,9 @@ async function handleInboundCore(t, opts) {
       await startLearningUsageTrace(t, c, g, "inbound");
     }
     // ===== 予約操作のスタッフ確認つき提案（自動実行しない場合） =====
-    c.bookingSuggestion = null;
+    // 下書き生成中にスタッフが提案を実行した場合は、その「実行済み」表示（実行後の案内文）を残す
+    const executedDuringDraft = !!(c.bookingSuggestion && c.bookingSuggestion !== suggestionBefore && c.bookingSuggestion.status === "executed");
+    if (!executedDuringDraft) c.bookingSuggestion = null;
     const autoBooking = !!(g && !g.replyRequiresStaff && !staffLineReviewAll(t) && baEnabled(t));
     const bookingOp = !!(g && g.action && typeof g.action === "object" && ["cancel", "reschedule"].includes(String(g.action.type)));
     if (g && bookingOp && !autoBooking) {
@@ -2614,7 +2619,7 @@ async function handleInboundCore(t, opts) {
       if (staffBookingSuggestEnabled(t) && PARTNER_KEY) {
         const suggestion = bookingSuggestionFromDraft(g);
         // 実行後の案内文は下書きを置き換えず、提案カードの「参考案」としてだけ持つ（スタッフが実行後に自分で入れる）
-        if (suggestion) c.bookingSuggestion = Object.assign(suggestion, { afterActionDraft: String(g.after_action_draft || "").trim().slice(0, 2000) });
+        if (suggestion && !executedDuringDraft) c.bookingSuggestion = Object.assign(suggestion, { afterActionDraft: String(g.after_action_draft || "").trim().slice(0, 2000) });
       }
     }
     // ===== 予約自動受付: AIが操作依頼(action)を出したら、確認文の送信までを自動処理 =====
@@ -4555,7 +4560,13 @@ app.post("/api/staff-booking-confirm", guard, async (req, res) => {
   const requestId = String(req.body.requestId || "");
   if (!pending || !requestId || pending.requestId !== requestId) return res.status(409).json({ ok: false, error: "no_pending" });
   if (!pending.expiresAt || Date.parse(pending.expiresAt) <= Date.now()) { c.staffBookingPending = null; dbSave(t, c); return res.status(409).json({ ok: false, error: "expired" }); }
-  const approve = req.body.approve === true;
+  let approve = req.body.approve === true;
+  // 自動受付OFFの医院では、確認中に提案が消えた・変わった（患者の新しい連絡など）場合は実行せず取り消す
+  const sugNow = c.bookingSuggestion;
+  const stillSuggested = !!(sugNow && sugNow.status !== "executed" && sugNow.type === pending.type && String(sugNow.appointmentId) === String(pending.appointmentId)
+    && (pending.type !== "reschedule" || String(sugNow.newDateTime || "") === String(pending.newDateTime || "")));
+  const suggestionGone = approve && !baEnabled(t) && !stillSuggested;
+  if (suggestionGone) approve = false;
   let out = await baCall(t, c, "confirm", { requestId, approve, actor: "staff" }, 25000);
   if (!out && approve) {
     for (let i = 0; i < 2 && !out; i++) {
@@ -4572,6 +4583,7 @@ app.post("/api/staff-booking-confirm", guard, async (req, res) => {
     c.bookingSuggestion = Object.assign({}, c.bookingSuggestion, { status: "executed", executedAt: Date.now() });
   }
   dbSave(t, c);
+  if (suggestionGone) return res.status(409).json({ ok: false, error: "suggestion_changed", text: "確認中に患者様から新しい連絡があり提案が更新されたため、実行を取り消しました。予約は変更していません。最新のメッセージをご確認ください。" });
   if (!approve) return res.json({ ok: true, done: false, text: "実行を取り消しました。予約は変更していません。" });
   if (!out.ok) return res.status(400).json({ ok: false, error: out.error || "failed", text: out.text || "処理できませんでした。うけつけるんで予約状態を確認してください。", alternatives: out.alternatives });
   res.json({ ok: true, done: true, text: out.text || "予約操作が完了しました。" });
@@ -7261,12 +7273,12 @@ async function dismissBookingSuggestion(btn){
   catch(e){uiAlert("提案を消せませんでした。もう一度お試しください。");}
   finally{if(btn&&document.body.contains(btn))btn.disabled=false;}
 }
-async function confirmUnexecutedBooking(){const r=DATA.find(x=>x.id===current);if(!bookingSuggestionPending(r))return true;const b=r.bookingSuggestion;return await uiConfirm("右腕くんが提案した予約の"+(b.type==="cancel"?"キャンセル":"日時変更")+"をまだ実行していません。\\n返信を送ると、この提案カードは消えます（予約は変更されません）。\\nこのまま返信だけ送りますか？");}
+async function confirmUnexecutedBooking(scheduled){const r=DATA.find(x=>x.id===current);if(!bookingSuggestionPending(r))return true;const b=r.bookingSuggestion;return await uiConfirm("右腕くんが提案した予約の"+(b.type==="cancel"?"キャンセル":"日時変更")+"をまだ実行していません。\\n"+(scheduled?"予約送信を設定しても予約は変更されません。":"返信を送ると、この提案カードは消えます（予約は変更されません）。")+"\\n"+(scheduled?"このまま予約送信を設定しますか？":"このまま返信だけ送りますか？"));}
 async function sendMsg(){if(!window.__sendBusy&&!(await confirmUnexecutedBooking()))return;
 if(window.__sendBusy||window.__composerUploadBusy)return;const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id);if(!text&&!files.length)return;window.__sendBusy=true;const button=document.querySelector("#cbtns .send");if(button){button.disabled=true;button.textContent="患者へ送信中…";}try{const learning=draftLearningPayload(id,text),response=await api("/api/send",{id,text,fileIds:files.map(file=>file.id),instr:learning.instr,learningText:learning.learningText,learningChat:learning.learningChat});let json={};try{json=await response.json();}catch(e){}if(json.sent){if(draft)draft.value="";pendingAttachmentsByConversation[id]=[];renderPendingAttachments();const conversation=DATA.find(x=>x.id===id);if(conversation)conversation.draft="";showLearnResult(json.learningJob?"送信しました。確認済みの返信を学習中です":"送信しました");await load();pollLearningJobs();}else{const message={mail_send_pending:"メール送信は準備中です",LINE_400:"LINE送信失敗：相手がお友だち未登録か、無効なIDの可能性",no_send_config:"送信設定が未完了です",unsupported_file:"添付できないファイル形式です",no_file:"添付ファイルを確認できませんでした",too_many_files:"添付は4件までです",public_url_missing:"添付ファイルの公開URL設定が未完了です",already_processing:"同じ会話へ送信処理中です。少し待ってもう一度お試しください"}[json.sendErr]||("送信失敗: "+(json.sendErr||json.error||"不明"));uiAlert(message+"\\n（本文と添付は消えていません）");}}finally{window.__sendBusy=false;const next=document.querySelector("#cbtns .send");if(next){next.disabled=false;next.textContent="患者へ送信";}}}
 let scheduledMessageDraft=null;
 function localDateTimeValue(date){const pad=n=>String(n).padStart(2,"0");return date.getFullYear()+"-"+pad(date.getMonth()+1)+"-"+pad(date.getDate())+"T"+pad(date.getHours())+":"+pad(date.getMinutes());}
-async function openScheduledMessage(){if(!(await confirmUnexecutedBooking()))return;
+async function openScheduledMessage(){if(!(await confirmUnexecutedBooking(true)))return;
   if(window.__composerUploadBusy){uiAlert("添付の準備が終わってから予約してください");return;}
   const id=current,draft=document.getElementById("draft"),text=String(draft&&draft.value||"").trim(),files=pendingAttachments(id).slice();
   if(!text&&!files.length){uiAlert("予約する本文または添付ファイルを追加してください");return;}
