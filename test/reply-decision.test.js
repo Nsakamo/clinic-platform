@@ -180,7 +180,7 @@ test("証明書提出後は案内済みの条件の再掲を必須にせず、�
 test("通常の治療予約の変更を感染症・証明書専用ゲートで止めない", async () => {
   const start = source.indexOf("async function genDraft(t, c, opts) {"), end = source.indexOf("// 毎回承認モード", start);
   const context = {
-    ...decision, activeConversationMessages: c => c.msgs, S: () => ({ tone: "", prefs: [] }),
+    ...decision, activeConversationMessages: c => c.msgs, precedingReference: require("../lib/conversation-context").precedingReference, formatDraftContext: require("../lib/draft-consultation").formatDraftContext, S: () => ({ tone: "", prefs: [] }),
     ...promptStubs(), rulesRankedWithScores: () => [{ r: { content: rules }, n: 3, score: 0.5 }], rulesBlock: () => rules, ruleBudget: () => 16000,
     examplesRanked: () => [], trustedLearningPrecedent: () => false, prefsBlock: () => "", notesBlock: () => "", replyToneInstruction: () => "",
     JP_QUALITY: "", PATIENT_COURTESY: "", baEnabled: () => false, staffLineReviewAll: () => false, PARTNER_KEY: "",
@@ -246,7 +246,7 @@ test("初回生成は人の確認が必要でも免除案内の漏れを照合�
   const end = source.indexOf("// 毎回承認モード", start);
   let reviewed = false, prompt = "";
   const context = {
-    ...decision, activeConversationMessages: c => c.msgs,
+    ...decision, activeConversationMessages: c => c.msgs, precedingReference: require("../lib/conversation-context").precedingReference, formatDraftContext: require("../lib/draft-consultation").formatDraftContext,
     S: () => ({ tone: "", prefs: [] }),
     ...promptStubs(), rulesRankedWithScores: () => [{ r: { content: rules }, n: 3, score: 0.5 }], rulesBlock: () => rules, ruleBudget: () => 16000,
     examplesRanked: () => [], trustedLearningPrecedent: () => false, prefsBlock: () => "", notesBlock: () => "", replyToneInstruction: () => "",
@@ -274,7 +274,7 @@ test("証明書発行だけの問い合わせへ免除案内を強制せず、�
   for (const infection of [false, true]) {
     let reviewed = false;
     const context = {
-      ...decision, activeConversationMessages: c => c.msgs, S: () => ({ tone: "", prefs: [] }),
+      ...decision, activeConversationMessages: c => c.msgs, precedingReference: require("../lib/conversation-context").precedingReference, formatDraftContext: require("../lib/draft-consultation").formatDraftContext, S: () => ({ tone: "", prefs: [] }),
       ...promptStubs(), rulesRankedWithScores: () => [{ r: { content: rules }, n: 3, score: 0.5 }], rulesBlock: () => rules, ruleBudget: () => 16000,
       examplesRanked: () => [], trustedLearningPrecedent: () => false, prefsBlock: () => "", notesBlock: () => "", replyToneInstruction: () => "",
       JP_QUALITY: "", PATIENT_COURTESY: "", baEnabled: () => false, staffLineReviewAll: () => false, PARTNER_KEY: "",
@@ -322,7 +322,7 @@ test("非定型の感染症連絡は発行だけと断定せず、関連する�
   const start = source.indexOf("async function genDraft(t, c, opts) {"), end = source.indexOf("// 毎回承認モード", start);
   let inspected = false;
   const context = {
-    ...decision, activeConversationMessages: c => c.msgs, S: () => ({ tone: "", prefs: [] }),
+    ...decision, activeConversationMessages: c => c.msgs, precedingReference: require("../lib/conversation-context").precedingReference, formatDraftContext: require("../lib/draft-consultation").formatDraftContext, S: () => ({ tone: "", prefs: [] }),
     ...promptStubs(), rulesRankedWithScores: () => [{ r: { content: rules }, n: 3, score: 0.5 }], rulesBlock: () => rules, ruleBudget: () => 16000,
     examplesRanked: () => [], trustedLearningPrecedent: () => false, prefsBlock: () => "", notesBlock: () => "", replyToneInstruction: () => "",
     JP_QUALITY: "", PATIENT_COURTESY: "", baEnabled: () => false, staffLineReviewAll: () => false, PARTNER_KEY: "",
