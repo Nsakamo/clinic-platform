@@ -170,7 +170,7 @@ test("テスト：提案カードは未実行のまま送ろうとすると確�
   assert.match(send, /await confirmUnexecutedBooking\(\)/);
   assert.match(slice("async function confirmUnexecutedBooking(", "async function sendMsg("), /まだ実行していません/);
   assert.match(slice("async function openScheduledMessage(", "{"), /openScheduledMessage/);
-  assert.match(script, /async function openScheduledMessage\(\)\{if\(!\(await confirmUnexecutedBooking\(\)\)\)return;/);
+  assert.match(script, /async function openScheduledMessage\(\)\{if\(!\(await confirmUnexecutedBooking\(true\)\)\)return;/);
   assert.match(source, /if \(c\.bookingSuggestion && c\.bookingSuggestion\.status !== "executed"\) return res\.status\(409\)\.json\(\{ ok: false, error: "booking_suggestion_pending" \}\)/);
   assert.match(source, /Object\.prototype\.hasOwnProperty\.call\(t\.store, id\)/);
   assert.match(source, /if \(approve && out\.ok && c\.bookingSuggestion && String\(c\.bookingSuggestion\.appointmentId\) === String\(pending\.appointmentId\)/);
@@ -254,4 +254,39 @@ test("テスト：自動受付オフの医院でも、提案カードと同じ�
   const re = await call({ type: "reschedule", appointmentId: "a1", newDateTime: ymd + "T10:00" }, { suggestion: { type: "reschedule", appointmentId: "a1", newDateTime: ymd + "T10:00", status: "proposed" } });
   assert.equal(re.json.kind, "confirm");
   assert.equal(re.c.staffBookingPending.newDateTime, ymd + "T10:00");
+});
+
+test("テスト：確定時に提案が一致すれば実行済みにし、自動受付オフで確認中に提案が消えていたら実行せず取り消す", async () => {
+  const src = slice("app.post(\"/api/staff-booking-confirm\"", "// ---- staff file uploads", source);
+  async function confirm({ suggestion, bookingActions = false, approve = true }) {
+    const routes = {}, sent = [];
+    const ctx = { app: { post: (p, ...h) => { routes[p] = h[h.length - 1]; } }, guard: () => {}, dbSave: () => {}, baEnabled: () => bookingActions, setTimeout,
+      baCall: async (_t, _c, action, extra) => { sent.push([action, extra.approve]); return extra.approve ? { ok: true, done: true, text: "テスト完了" } : { ok: true }; } };
+    vm.runInNewContext(src, ctx);
+    const c = { id: "テスト", bookingSuggestion: suggestion, staffBookingPending: { requestId: "r1", expiresAt: new Date(Date.now() + 6e5).toISOString(), type: "cancel", appointmentId: "a1", newDateTime: "" } };
+    let status = 200, json = null;
+    await routes["/api/staff-booking-confirm"]({ tenant: { store: { テスト: c } }, body: { id: "テスト", requestId: "r1", approve } }, { status(s) { status = s; return this; }, json(j) { json = j; return this; } });
+    return { status, json, sent, c };
+  }
+  const sug = { type: "cancel", appointmentId: "a1", status: "proposed", afterActionDraft: "テスト" };
+  const ok = await confirm({ suggestion: { ...sug } });
+  assert.deepEqual(ok.sent, [["confirm", true]]);
+  assert.equal(ok.c.bookingSuggestion.status, "executed");
+  const gone = await confirm({ suggestion: null });
+  assert.deepEqual(gone.sent, [["confirm", false]], "パートナーへは取り消しで送る");
+  assert.equal(gone.json.error, "suggestion_changed");
+  const changed = await confirm({ suggestion: { ...sug, appointmentId: "a9" } });
+  assert.deepEqual(changed.sent, [["confirm", false]]);
+  // 自動受付オンの医院（提案カード以外の相談操作）は従来どおり
+  const on = await confirm({ suggestion: null, bookingActions: true });
+  assert.deepEqual(on.sent, [["confirm", true]]);
+  assert.equal(on.json.done, true);
+});
+
+test("テスト：提案のためだけの予約照会は短い待ち時間にし、下書き生成中に実行された提案は消さない", () => {
+  const gen = slice("async function genDraft(", "async function enrichStaffLineBookingPreview(", source);
+  assert.match(gen, /baCall\(t, c, "context", \{ email: \(c\.ba && c\.ba\.email\) \|\| undefined \}, staffBookingMode \? STAFF_BOOKING_SUGGEST_TIMEOUT_MS : undefined\)/);
+  assert.match(source, /const STAFF_BOOKING_SUGGEST_TIMEOUT_MS = 5000;/);
+  assert.match(source, /const executedDuringDraft = !!\(c\.bookingSuggestion && c\.bookingSuggestion !== suggestionBefore && c\.bookingSuggestion\.status === "executed"\);/);
+  assert.match(source, /if \(suggestion && !executedDuringDraft\) c\.bookingSuggestion = /);
 });
