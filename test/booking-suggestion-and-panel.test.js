@@ -214,3 +214,44 @@ test("テスト：スタッフLINEの送信ボタンと古い画面の「提案�
   assert.equal(el.renders, 2);
   assert.match(el.html, /実行しました/);
 });
+
+test("テスト：自動受付オフの医院でも、提案カードと同じ操作だけはスタッフ確認つきで準備でき、違う操作・未確認・変更不可は拒否する", async () => {
+  const src = slice("function staffAppointmentById(", "app.get(\"/api/staff-booking-pending\"", source)
+    + "\n" + slice("app.post(\"/api/staff-booking-action\"", "app.post(\"/api/booking-suggestion-dismiss\"", source);
+  const future = new Date(Date.now() + 3 * 864e5);
+  const ymd = future.toISOString().slice(0, 10);
+  async function call(body, { suggestion, verified = true, suggestOn = true, bookingActions = false } = {}) {
+    const routes = {}, calls = [];
+    const ctx = {
+      app: { post: (path, ...h) => { routes[path] = h[h.length - 1]; } }, guard: () => {}, PARTNER_KEY: "テスト", dbSave: () => {},
+      baEnabled: () => bookingActions, staffBookingSuggestEnabled: () => suggestOn,
+      baCall: async (_t, _c, action) => { calls.push(action); if (action === "context") return { ok: true, verified, patient: { name: "テスト" }, appointments: [{ id: "a1", label: "テスト枠", changeable: true }, { id: "a2", label: "テスト枠2", changeable: false }] }; if (action === "propose") return { ok: true, requestId: "r1", expiresAt: new Date(Date.now() + 6e5).toISOString() }; return null; },
+      Date,
+    };
+    vm.runInNewContext(src, ctx);
+    const c = { id: "テスト", bookingSuggestion: suggestion || null };
+    const t = { store: { テスト: c } };
+    let status = 200, json = null;
+    await routes["/api/staff-booking-action"]({ tenant: t, body: Object.assign({ id: "テスト" }, body) }, { status(s) { status = s; return this; }, json(j) { json = j; return this; } });
+    return { status, json, calls, c };
+  }
+  const sug = { type: "cancel", appointmentId: "a1", status: "proposed", createdAt: 1 };
+  const ok = await call({ type: "cancel", appointmentId: "a1" }, { suggestion: sug });
+  assert.equal(ok.json.kind, "confirm");
+  assert.deepEqual(ok.calls, ["context", "propose"]);
+  assert.equal(ok.c.staffBookingPending.appointmentId, "a1");
+  // 提案と違う操作・提案なし・設定オフは、従来どおり連携無効として拒否（照会もしない）
+  for (const [body, opt] of [[{ type: "cancel", appointmentId: "a2" }, { suggestion: sug }], [{ type: "reschedule", appointmentId: "a1", newDateTime: ymd + "T10:00" }, { suggestion: sug }],
+    [{ type: "cancel", appointmentId: "a1" }, {}], [{ type: "cancel", appointmentId: "a1" }, { suggestion: sug, suggestOn: false }],
+    [{ type: "context" }, { suggestion: sug }], [{ type: "cancel", appointmentId: "a1" }, { suggestion: { ...sug, status: "executed" } }]]) {
+    const r = await call(body, opt);
+    assert.equal(r.json.error, "not_linked", JSON.stringify(body));
+    assert.deepEqual(r.calls, []);
+  }
+  // 提案と一致していても、本人確認が無い・変更不可はサーバーで拒否
+  assert.equal((await call({ type: "cancel", appointmentId: "a1" }, { suggestion: sug, verified: false })).json.error, "patient_not_verified");
+  assert.equal((await call({ type: "cancel", appointmentId: "a2" }, { suggestion: { ...sug, appointmentId: "a2" } })).json.error, "not_changeable");
+  const re = await call({ type: "reschedule", appointmentId: "a1", newDateTime: ymd + "T10:00" }, { suggestion: { type: "reschedule", appointmentId: "a1", newDateTime: ymd + "T10:00", status: "proposed" } });
+  assert.equal(re.json.kind, "confirm");
+  assert.equal(re.c.staffBookingPending.newDateTime, ymd + "T10:00");
+});
