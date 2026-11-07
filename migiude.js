@@ -514,6 +514,7 @@ async function staffLineReplyOrPush(t, replyToken, groupId, messages) {
 }
 async function staffLineApplyRevision(t, c, approval, instruction, userId, replyToken) {
   const beforeHash = approval.draftHash;
+  if (c.bookingSuggestion && c.bookingSuggestion.status !== "executed") return false; // 未実行の予約操作の提案がある間は送信ボタン付きカードを出し直さない
   const revised = await staffLineReviseDraft(t, c, instruction);
   if (!revised || c.staffLineApproval !== approval || approval.status !== "pending" || approval.expiresAt < Date.now()
       || approval.assignedUserId !== userId || !staffLineCardMatches(c, approval, beforeHash)) return false;
@@ -1973,6 +1974,13 @@ function baEnabled(t) { return !!S(t).bookingActions; }
 function staffBookingSuggestEnabled(t) { return S(t).staffBookingSuggest !== false; }
 // 提案カードのためだけの照会（自動受付OFFの医院）は、下書き生成を長く待たせない（従来の予約照会 fetchBooking と同程度）
 const STAFF_BOOKING_SUGGEST_TIMEOUT_MS = 5000;
+// 提案を作った後に患者から新しい連絡が届いていれば、その提案はもう患者の最新の希望とは限らない
+function bookingSuggestionSuperseded(c, sug) {
+  if (!sug) return true;
+  const basis = Number(sug.basisMsgCount);
+  if (!Number.isFinite(basis) || basis < 0) return true;
+  return (Array.isArray(c && c.msgs) ? c.msgs.slice(basis) : []).some(m => m && m.from === "them");
+}
 // 「右腕くんに相談」用の予約照会の短期キャッシュ（スタッフが確認してから使う下書き専用。自動送信の経路では使わない）。
 // 相談パネルを開いた時点で先に照会しておき、指示を送った時の待ち時間（うけつけるんの起動待ち等）を減らす。
 const BA_CONTEXT_CACHE_MS = 90 * 1000;
@@ -2619,7 +2627,7 @@ async function handleInboundCore(t, opts) {
       if (staffBookingSuggestEnabled(t) && PARTNER_KEY) {
         const suggestion = bookingSuggestionFromDraft(g);
         // 実行後の案内文は下書きを置き換えず、提案カードの「参考案」としてだけ持つ（スタッフが実行後に自分で入れる）
-        if (suggestion && !executedDuringDraft) c.bookingSuggestion = Object.assign(suggestion, { afterActionDraft: String(g.after_action_draft || "").trim().slice(0, 2000) });
+        if (suggestion && !executedDuringDraft) c.bookingSuggestion = Object.assign(suggestion, { basisMsgCount: Array.isArray(c.msgs) ? c.msgs.length : 0, afterActionDraft: String(g.after_action_draft || "").trim().slice(0, 2000) });
       }
     }
     // ===== 予約自動受付: AIが操作依頼(action)を出したら、確認文の送信までを自動処理 =====
@@ -4498,7 +4506,7 @@ app.post("/api/staff-booking-action", guard, async (req, res) => {
   const type = String(req.body.type || "");
   if (!["context", "slots", "cancel", "reschedule"].includes(type)) return res.status(400).json({ ok: false, error: "bad_action" });
   const sug = c.bookingSuggestion;
-  const viaSuggestion = !!(sug && sug.status !== "executed" && ["cancel", "reschedule"].includes(type) && sug.type === type
+  const viaSuggestion = !!(sug && sug.status !== "executed" && !bookingSuggestionSuperseded(c, sug) && ["cancel", "reschedule"].includes(type) && sug.type === type
     && String(sug.appointmentId || "") === String(req.body.appointmentId || "")
     && (type !== "reschedule" || String(sug.newDateTime || "") === String(req.body.newDateTime || "")));
   const checked = await staffBookingContext(t, c, { viaSuggestion });
@@ -4535,7 +4543,7 @@ app.post("/api/staff-booking-action", guard, async (req, res) => {
   if (!proposed || !proposed.ok || !proposed.requestId) return res.status(400).json({ ok: false, error: (proposed && proposed.error) || "partner_unavailable", alternatives: proposed && proposed.alternatives });
   const patientName = (ctx.patient && ctx.patient.name) || c.name || "患者";
   const summary = "対象患者: " + patientName + "様\n対象予約: " + appt.label + " " + (appt.menu || "") + "\n実行内容: " + operation;
-  c.staffBookingPending = { requestId: proposed.requestId, expiresAt: proposed.expiresAt, summary, type, appointmentId, newDateTime: type === "reschedule" ? String(req.body.newDateTime || "") : "" };
+  c.staffBookingPending = { requestId: proposed.requestId, expiresAt: proposed.expiresAt, summary, type, appointmentId, viaSuggestion, newDateTime: type === "reschedule" ? String(req.body.newDateTime || "") : "" };
   dbSave(t, c);
   res.json({ ok: true, kind: "confirm", conversationId: c.id, requestId: proposed.requestId, expiresAt: proposed.expiresAt, summary, warning: "まだ実行されていません。対象患者・予約・内容を確認してください。" });
 });
@@ -4565,7 +4573,9 @@ app.post("/api/staff-booking-confirm", guard, async (req, res) => {
   const sugNow = c.bookingSuggestion;
   const stillSuggested = !!(sugNow && sugNow.status !== "executed" && sugNow.type === pending.type && String(sugNow.appointmentId) === String(pending.appointmentId)
     && (pending.type !== "reschedule" || String(sugNow.newDateTime || "") === String(pending.newDateTime || "")));
-  const suggestionGone = approve && !baEnabled(t) && !stillSuggested;
+  // 確認ダイアログ中に患者から新しい連絡が届いた（下書き生成中で提案がまだ残っている場合も含む）・設定がオフになった場合も実行しない
+  const suggestionGone = approve && (pending.viaSuggestion || !baEnabled(t))
+    && (!stillSuggested || bookingSuggestionSuperseded(c, sugNow) || !staffBookingSuggestEnabled(t));
   if (suggestionGone) approve = false;
   let out = await baCall(t, c, "confirm", { requestId, approve, actor: "staff" }, 25000);
   if (!out && approve) {

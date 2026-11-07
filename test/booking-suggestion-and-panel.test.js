@@ -216,7 +216,7 @@ test("テスト：スタッフLINEの送信ボタンと古い画面の「提案�
 });
 
 test("テスト：自動受付オフの医院でも、提案カードと同じ操作だけはスタッフ確認つきで準備でき、違う操作・未確認・変更不可は拒否する", async () => {
-  const src = slice("function staffAppointmentById(", "app.get(\"/api/staff-booking-pending\"", source)
+  const src = slice("function bookingSuggestionSuperseded(", "const BA_CONTEXT_CACHE_MS", source) + "\n" + slice("function staffAppointmentById(", "app.get(\"/api/staff-booking-pending\"", source)
     + "\n" + slice("app.post(\"/api/staff-booking-action\"", "app.post(\"/api/booking-suggestion-dismiss\"", source);
   const future = new Date(Date.now() + 3 * 864e5);
   const ymd = future.toISOString().slice(0, 10);
@@ -229,13 +229,13 @@ test("テスト：自動受付オフの医院でも、提案カードと同じ�
       Date,
     };
     vm.runInNewContext(src, ctx);
-    const c = { id: "テスト", bookingSuggestion: suggestion || null };
+    const c = { id: "テスト", msgs: [{ from: "them", text: "テスト" }], bookingSuggestion: suggestion || null };
     const t = { store: { テスト: c } };
     let status = 200, json = null;
     await routes["/api/staff-booking-action"]({ tenant: t, body: Object.assign({ id: "テスト" }, body) }, { status(s) { status = s; return this; }, json(j) { json = j; return this; } });
     return { status, json, calls, c };
   }
-  const sug = { type: "cancel", appointmentId: "a1", status: "proposed", createdAt: 1 };
+  const sug = { type: "cancel", appointmentId: "a1", status: "proposed", createdAt: 1, basisMsgCount: 1 };
   const ok = await call({ type: "cancel", appointmentId: "a1" }, { suggestion: sug });
   assert.equal(ok.json.kind, "confirm");
   assert.deepEqual(ok.calls, ["context", "propose"]);
@@ -251,24 +251,28 @@ test("テスト：自動受付オフの医院でも、提案カードと同じ�
   // 提案と一致していても、本人確認が無い・変更不可はサーバーで拒否
   assert.equal((await call({ type: "cancel", appointmentId: "a1" }, { suggestion: sug, verified: false })).json.error, "patient_not_verified");
   assert.equal((await call({ type: "cancel", appointmentId: "a2" }, { suggestion: { ...sug, appointmentId: "a2" } })).json.error, "not_changeable");
-  const re = await call({ type: "reschedule", appointmentId: "a1", newDateTime: ymd + "T10:00" }, { suggestion: { type: "reschedule", appointmentId: "a1", newDateTime: ymd + "T10:00", status: "proposed" } });
+  // 提案の後に患者から新しい連絡があれば、提案カードからは準備しない（基準が無い古い提案も同じ）
+  assert.equal((await call({ type: "cancel", appointmentId: "a1" }, { suggestion: { ...sug, basisMsgCount: 0 } })).json.error, "not_linked");
+  assert.equal((await call({ type: "cancel", appointmentId: "a1" }, { suggestion: { ...sug, basisMsgCount: undefined } })).json.error, "not_linked");
+  const re = await call({ type: "reschedule", appointmentId: "a1", newDateTime: ymd + "T10:00" }, { suggestion: { type: "reschedule", appointmentId: "a1", newDateTime: ymd + "T10:00", status: "proposed", basisMsgCount: 1 } });
   assert.equal(re.json.kind, "confirm");
   assert.equal(re.c.staffBookingPending.newDateTime, ymd + "T10:00");
 });
 
 test("テスト：確定時に提案が一致すれば実行済みにし、自動受付オフで確認中に提案が消えていたら実行せず取り消す", async () => {
-  const src = slice("app.post(\"/api/staff-booking-confirm\"", "// ---- staff file uploads", source);
-  async function confirm({ suggestion, bookingActions = false, approve = true }) {
+  const src = slice("function bookingSuggestionSuperseded(", "const BA_CONTEXT_CACHE_MS", source) + "\n" + slice("app.post(\"/api/staff-booking-confirm\"", "// ---- staff file uploads", source);
+  async function confirm({ suggestion, bookingActions = false, approve = true, newer = false, suggestOn = true, viaSuggestion = true }) {
     const routes = {}, sent = [];
-    const ctx = { app: { post: (p, ...h) => { routes[p] = h[h.length - 1]; } }, guard: () => {}, dbSave: () => {}, baEnabled: () => bookingActions, setTimeout,
+    const ctx = { app: { post: (p, ...h) => { routes[p] = h[h.length - 1]; } }, guard: () => {}, dbSave: () => {}, baEnabled: () => bookingActions, staffBookingSuggestEnabled: () => suggestOn, setTimeout,
       baCall: async (_t, _c, action, extra) => { sent.push([action, extra.approve]); return extra.approve ? { ok: true, done: true, text: "テスト完了" } : { ok: true }; } };
     vm.runInNewContext(src, ctx);
-    const c = { id: "テスト", bookingSuggestion: suggestion, staffBookingPending: { requestId: "r1", expiresAt: new Date(Date.now() + 6e5).toISOString(), type: "cancel", appointmentId: "a1", newDateTime: "" } };
+    const msgs = [{ from: "them", text: "テスト" }].concat(newer ? [{ from: "them", text: "テスト：やっぱりやめます" }] : []);
+    const c = { id: "テスト", msgs, bookingSuggestion: suggestion, staffBookingPending: { requestId: "r1", expiresAt: new Date(Date.now() + 6e5).toISOString(), type: "cancel", appointmentId: "a1", newDateTime: "", viaSuggestion } };
     let status = 200, json = null;
     await routes["/api/staff-booking-confirm"]({ tenant: { store: { テスト: c } }, body: { id: "テスト", requestId: "r1", approve } }, { status(s) { status = s; return this; }, json(j) { json = j; return this; } });
     return { status, json, sent, c };
   }
-  const sug = { type: "cancel", appointmentId: "a1", status: "proposed", afterActionDraft: "テスト" };
+  const sug = { type: "cancel", appointmentId: "a1", status: "proposed", afterActionDraft: "テスト", basisMsgCount: 1 };
   const ok = await confirm({ suggestion: { ...sug } });
   assert.deepEqual(ok.sent, [["confirm", true]]);
   assert.equal(ok.c.bookingSuggestion.status, "executed");
@@ -277,8 +281,15 @@ test("テスト：確定時に提案が一致すれば実行済みにし、自�
   assert.equal(gone.json.error, "suggestion_changed");
   const changed = await confirm({ suggestion: { ...sug, appointmentId: "a9" } });
   assert.deepEqual(changed.sent, [["confirm", false]]);
+  // 確認中に患者から新しい連絡が届いた（下書き生成中で提案がまだ残っている）・設定オフ: 実行しない（自動受付オンの提案カード経由も同じ）
+  for (const opt of [{ newer: true }, { suggestOn: false }, { newer: true, bookingActions: true }]) {
+    const r = await confirm({ suggestion: { ...sug }, ...opt });
+    assert.deepEqual(r.sent, [["confirm", false]], JSON.stringify(opt));
+    assert.equal(r.json.error, "suggestion_changed");
+    assert.notEqual(r.c.bookingSuggestion.status, "executed");
+  }
   // 自動受付オンの医院（提案カード以外の相談操作）は従来どおり
-  const on = await confirm({ suggestion: null, bookingActions: true });
+  const on = await confirm({ suggestion: null, bookingActions: true, viaSuggestion: false, newer: true });
   assert.deepEqual(on.sent, [["confirm", true]]);
   assert.equal(on.json.done, true);
 });
