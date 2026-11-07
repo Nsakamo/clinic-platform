@@ -38,3 +38,19 @@ test("時刻を持たない旧履歴は互換性を保って直近文脈とし�
   const result = selectConversationContext({ msgs: [msg("them", "質問1"), msg("us", "回答1"), msg("them", "質問2")] });
   assert.equal(result.current.length, 3);
 });
+
+test("テスト：今回の話題より前の直近のやり取りを参考として返す（対応済み・時間が空いた後の短い返事のため）", () => {
+  const { precedingReference } = require("../lib/conversation-context");
+  const day = 864e5, base = Date.parse("2026-11-01T10:00:00+09:00");
+  const msgs = [
+    { from: "them", text: "テスト：古い用件", sentAt: base - 20 * day },
+    { from: "them", text: "テスト：予約を変えたいです", sentAt: base },
+    { from: "us", text: "テスト：15日と16日どちらがよろしいですか", sentAt: base + 60e3 },
+    { from: "them", text: "テスト：15日でお願いします", sentAt: base + 2 * day },
+  ];
+  const current = [msgs[3]];
+  const ref = precedingReference({ msgs }, current, { max: 10 });
+  assert.deepEqual(ref.map(m => m.text), ["テスト：予約を変えたいです", "テスト：15日と16日どちらがよろしいですか"], "14日より古いものは含めない");
+  assert.deepEqual(precedingReference({ msgs }, msgs, { max: 10 }), [], "全部が今回の話題なら参考は無し");
+  assert.equal(precedingReference({ msgs }, current, { max: 1 }).length, 1);
+});

@@ -195,3 +195,41 @@ test("文体以外の指示でも、書き方の見本の文をそのまま含�
   assert.equal(r.meta.ok,true);assert.match(r.meta.warning,/書き方の見本/);
   assert.equal(h.saved[0].warning.includes("書き方の見本"),true);
 });
+
+test("テスト：相談で明示したスタッフの対応は店舗ルールより優先して照合し、修正で指示から離れたら指示どおりの最初の案を返す",async()=>{
+  const first="テスト：今回はキャンセル料なしで承ります。";
+  const h=harness(['{"pass":false,"safety":false,"reason":"規定のキャンセル料の案内が欠けています"}',"テスト：前日のため1,100円のキャンセル料がかかります。",'{"pass":false,"safety":false,"reason":"指示と逆です"}'],JSON.stringify({reply:"作りました",draft:first}));
+  h.p.acknowledgementOnly=false;h.p.latestInstruction="今回はキャンセル料なしでいいと伝えて";
+  const r=await runStream(h);
+  assert.equal(r.meta.ok,true);
+  assert.equal(scope.draftChatDraftSection(r.body).text,first,"ルールに戻した修正案ではなく、指示どおりの案を返す");
+  // 照合がsafetyを明示しなかった場合（判定不能）は、最初の案へ戻さない
+  const h2=harness(['{"pass":false,"reason":"規定のキャンセル料の案内が欠けています"}',"テスト：前日のため1,100円のキャンセル料がかかります。",'{"pass":false,"reason":"指示と逆です"}'],JSON.stringify({reply:"作りました",draft:first}));
+  h2.p.acknowledgementOnly=false;h2.p.latestInstruction="今回はキャンセル料なしでいいと伝えて";
+  const r2=await runStream(h2);
+  assert.notEqual(scope.draftChatDraftSection(r2.body).text,first);
+  assert.match(r.meta.warning,/規定のキャンセル料/,"返す案（最初の案）に対する照合の理由を確認ポイントにする");
+  const audit=h.calls.find(c=>c.task==="audit");
+  assert.match(audit.sys,/スタッフ指示を最優先する照合/);
+  assert.doesNotMatch(audit.sys,/まだ案内が必要な条件・提出物・料金が欠ける/,"相談ではルールの条件漏れを理由に不合格にしない");
+  const repair=h.calls.find((c,i)=>i>0&&c.task==="chat");
+  assert.match(repair.sys,/スタッフが指示で外した条件・料金・規定や確認事項を戻さない/);
+});
+
+test("テスト：スタッフ相談の履歴がない初回の照合では、従来どおり店舗ルールの条件漏れを確認する",async()=>{
+  const h=harness(['{"pass":true}'],JSON.stringify({reply:"作りました",draft:"テスト：ご連絡ありがとうございます。"}));
+  h.p.acknowledgementOnly=false;h.p.staffHistory="";h.p.latestInstruction="テスト：返信を作って";
+  await runStream(h);
+  const audit=h.calls.find(c=>c.task==="audit");
+  assert.match(audit.sys,/まだ案内が必要な条件・提出物・料金が欠ける/);
+  assert.doesNotMatch(audit.sys,/スタッフ指示を最優先する照合/);
+});
+
+test("テスト：最初の案が安全面（未実施の操作を完了と書く等）で不合格なら、指示どおりの案でも返さない",async()=>{
+  const first="テスト：キャンセルを完了しました。";
+  const h=harness(['{"pass":false,"safety":true,"reason":"未実施の予約操作を完了と書いています"}',"テスト：キャンセルのご希望を承りました。スタッフが確認いたします。",'{"pass":false,"safety":false,"reason":"言い回しを確認してください"}'],JSON.stringify({reply:"作りました",draft:first}));
+  h.p.acknowledgementOnly=false;h.p.latestInstruction="キャンセルしたと伝えて";
+  const r=await runStream(h);
+  assert.equal(scope.draftChatDraftSection(r.body).text,"テスト：キャンセルのご希望を承りました。スタッフが確認いたします。");
+  assert.match(r.meta.warning,/言い回し/);
+});
