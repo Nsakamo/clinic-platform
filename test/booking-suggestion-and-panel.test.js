@@ -106,38 +106,49 @@ test("テスト：受信時の予約操作は、本人確認済み・本人の�
   assert.equal(ctx.bookingSuggestionFromDraft({ baCtx, action: { type: "slots", appointmentId: "a1", date: ymd } }), null);
 });
 
-test("テスト：自動受付が動かない時は予約操作を実行せず、提案カードと実行後の案内文を下書きにして自動送信しない", async () => {
+test("テスト：自動で実行しないキャンセル・変更は、提案カードを作り、下書きは置き換えず、自動送信・スタッフLINE承認だけでは送らない", async () => {
   const start = source.indexOf("async function handleInboundCore("), end = source.indexOf("// ===== 複数アカウント対応", start);
   const helpers = {};
   vm.runInNewContext(slice("function normalizeStaffBookingAction(", "const DRAFTCHAT_MEMORY_RULE", source), helpers);
   const decision = require("../lib/reply-decision.js");
   const { preserveTopicBoundary } = require("../lib/conversation-context.js");
-  for (const mode of ["off", "staffReview", "autoNeedsStaff"]) {
+  const cases = [
+    { mode: "off", appt: "a1", suggestion: true },
+    { mode: "staffReview", appt: "a1", suggestion: true },
+    { mode: "autoNeedsStaff", appt: "a1", suggestion: true },
+    { mode: "off", appt: "a2", suggestion: false }, // 受付期限外: 提案は作れないが、自動送信もしない
+  ];
+  for (const k of cases) {
     let executed = 0, delivered = 0, approvals = 0;
     const context = {
       ...decision, preserveTopicBoundary, cancelAutoReply: () => {}, colorFor: () => "", nowt: () => "テスト", statBump: () => {}, lastText: () => "テスト", dbSave: () => {},
       normalizeStaffBookingAction: helpers.normalizeStaffBookingAction, bookingSuggestionFromDraft: helpers.bookingSuggestionFromDraft,
-      baEnabled: () => mode !== "off", staffLineReviewAll: () => mode === "staffReview", staffBookingSuggestEnabled: () => true,
+      baEnabled: () => k.mode !== "off", staffLineReviewAll: () => k.mode === "staffReview", staffBookingSuggestEnabled: () => true,
       PARTNER_KEY: "テスト", baHandlePending: async () => false, enrichStaffLineBookingPreview: async (_t, _c, g) => g,
-      genDraft: async () => ({ draft: "テスト：キャンセルを確認いたします。", after_action_draft: "テスト：キャンセルを承りました。", confidence: "high", needs_human: mode === "autoNeedsStaff", replyRequiresStaff: mode === "autoNeedsStaff",
+      genDraft: async () => ({ draft: "テスト：ご希望を承りました。スタッフが確認してご案内いたします。", after_action_draft: "テスト：キャンセルを承りました。", confidence: "high",
+        needs_human: k.mode === "autoNeedsStaff", replyRequiresStaff: k.mode === "autoNeedsStaff",
         grounding: { autoSendAllowed: true, reasons: [] }, validation: { pass: true },
-        action: { type: "cancel", appointmentId: "a1" },
-        baCtx: { ok: true, verified: true, appointments: [{ id: "a1", label: "11月12日(木) 14:00", menu: "テスト", changeable: true }] } }),
+        action: { type: "cancel", appointmentId: k.appt },
+        baCtx: { ok: true, verified: true, appointments: [{ id: "a1", label: "11月12日(木) 14:00", menu: "テスト", changeable: true }, { id: "a2", label: "11月13日(金) 10:00", menu: "テスト", changeable: false }] } }),
       startLearningUsageTrace: async () => {}, baAction: async () => { executed++; return true; }, S: () => ({ autoReply: true, staffLineEnabled: true, staffLineReplyMode: "exceptions" }),
-      deliverText: async () => { delivered++; return { sent: true }; }, notifyAll: () => {}, staffLineEscalate: async () => {}, staffLineRequestApproval: async () => { if (mode !== "staffReview") approvals++; }, staffLineReady: () => true, scheduleAutoReply: () => { delivered++; },
+      deliverText: async () => { delivered++; return { sent: true }; }, notifyAll: () => {}, staffLineEscalate: async () => {},
+      staffLineRequestApproval: async () => { if (k.mode !== "staffReview") approvals++; }, staffLineReady: () => true, scheduleAutoReply: () => { delivered++; },
       aiUsageContext: { getStore: () => ({ entries: [] }) }, forwardToPartner: async () => {},
     };
     vm.runInNewContext(source.slice(start, end), context);
     const t = { slug: "テスト", store: {} };
-    await context.handleInboundCore(t, { channel: "line", uid: "テスト", text: "テスト：11/12の予約をキャンセルしたいです" });
+    await context.handleInboundCore(t, { channel: "line", uid: "テスト", text: "テスト：予約をキャンセルしたいです" });
     const c = t.store["line:テスト"];
-    assert.equal(executed, 0, mode);
-    assert.equal(delivered, 0, mode);
-    assert.equal(c.bookingSuggestion.type, "cancel");
-    assert.equal(c.bookingSuggestion.appointmentId, "a1");
-    // スタッフLINEの毎回承認では完了の案内文を下書きにしない（LINEの承認だけで送れてしまうため）。OFFの医院では draft 自体が実行後の案内文
-    assert.equal(c.draft, mode === "autoNeedsStaff" ? "テスト：キャンセルを承りました。" : "テスト：キャンセルを確認いたします。", mode);
-    assert.equal(approvals, 0, mode + " スタッフLINEの承認だけで完了文を送らない");
+    const label = k.mode + "/" + k.appt;
+    assert.equal(executed, 0, label);
+    assert.equal(delivered, 0, label + " 自動送信しない");
+    // 未実行の提案がある時は、スタッフLINEの承認だけでは送らない（提案が無ければ、完了を書かない下書きを通常どおり承認依頼へ）
+    assert.equal(approvals, k.suggestion ? 0 : 1, label);
+    assert.equal(c.draft, "テスト：ご希望を承りました。スタッフが確認してご案内いたします。", label + " 下書きは置き換えない");
+    if (k.suggestion) {
+      assert.equal(c.bookingSuggestion.type, "cancel", label);
+      assert.equal(c.bookingSuggestion.afterActionDraft, "テスト：キャンセルを承りました。", label);
+    } else assert.equal(c.bookingSuggestion, null, label);
   }
 });
 
@@ -146,8 +157,14 @@ test("テスト：提案カードは未実行のまま送ろうとすると確�
   assert.match(fn, /api\("\/api\/staff-booking-action"/);
   assert.match(fn, /await uiConfirm\(/);
   assert.match(fn, /api\("\/api\/staff-booking-confirm",\{[^}]*approve:!!ok/);
+  assert.match(fn, /if\(current===id\)\{renderBookingSuggestion\(r\);/, "別の会話へ切り替えていたら描画しない");
   const send = slice("async function sendMsg(", "if(window.__sendBusy");
-  assert.match(send, /まだ実行していません/);
+  assert.match(send, /await confirmUnexecutedBooking\(\)/);
+  assert.match(slice("async function confirmUnexecutedBooking(", "async function sendMsg("), /まだ実行していません/);
+  assert.match(slice("async function openScheduledMessage(", "{"), /openScheduledMessage/);
+  assert.match(script, /async function openScheduledMessage\(\)\{if\(!\(await confirmUnexecutedBooking\(\)\)\)return;/);
+  assert.match(source, /if \(c\.bookingSuggestion && c\.bookingSuggestion\.status !== "executed"\) return res\.status\(409\)\.json\(\{ ok: false, error: "booking_suggestion_pending" \}\)/);
+  assert.match(source, /Object\.prototype\.hasOwnProperty\.call\(t\.store, id\)/);
   assert.match(source, /if \(approve && out\.ok && c\.bookingSuggestion && String\(c\.bookingSuggestion\.appointmentId\) === String\(pending\.appointmentId\)/);
   assert.match(source, /delete c\.draftChatSession; c\.bookingSuggestion = null;/);
 });
