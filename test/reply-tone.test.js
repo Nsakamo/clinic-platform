@@ -181,7 +181,7 @@ test("予約照会を並行実行しても本人未確認時の予約情報をAI
   const { genDraft } = vm.runInNewContext(source.slice(start, end) + "\n({genDraft})", {
     REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview,
     PATIENT_COURTESY, JP_QUALITY: PATIENT_COURTESY,
-    S: () => ({ tone: "", prefs: [] }), activeConversationMessages: c => c.msgs,
+    S: () => ({ tone: "", prefs: [] }), activeConversationMessages: c => c.msgs, precedingReference: require("../lib/conversation-context").precedingReference, formatDraftContext: require("../lib/draft-consultation").formatDraftContext,
     ...promptStubs(), rulesRankedWithScores: () => [], rulesBlock: () => "", ruleBudget: () => 0,
     examplesRanked: () => [], trustedLearningPrecedent: () => false,
     prefsBlock: () => "", notesBlock: () => "", baEnabled: () => true,
@@ -267,7 +267,7 @@ test("初回生成から自動送信判定まで口語のままなら送信候�
     REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview,
     PATIENT_COURTESY, JP_QUALITY: PATIENT_COURTESY,
     hasConversationalTone, applyCourtesyGate, normalizeReplyTone, replyToneInstruction, toneRewriteInstruction,
-    S: () => ({ tone: "", prefs: [] }), activeConversationMessages: c => c.msgs,
+    S: () => ({ tone: "", prefs: [] }), activeConversationMessages: c => c.msgs, precedingReference: require("../lib/conversation-context").precedingReference, formatDraftContext: require("../lib/draft-consultation").formatDraftContext,
     ...promptStubs(), rulesRankedWithScores: () => [], rulesBlock: () => "", ruleBudget: () => 0,
     examplesRanked: () => [], trustedLearningPrecedent: () => false,
     prefsBlock: () => "", notesBlock: () => "", baEnabled: () => false,

@@ -195,3 +195,27 @@ test("文体以外の指示でも、書き方の見本の文をそのまま含�
   assert.equal(r.meta.ok,true);assert.match(r.meta.warning,/書き方の見本/);
   assert.equal(h.saved[0].warning.includes("書き方の見本"),true);
 });
+
+test("テスト：相談で明示したスタッフの対応は店舗ルールより優先して照合し、修正で指示から離れたら指示どおりの最初の案を返す",async()=>{
+  const first="テスト：今回はキャンセル料なしで承ります。";
+  const h=harness(['{"pass":false,"reason":"規定のキャンセル料の案内が欠けています"}',"テスト：前日のため1,100円のキャンセル料がかかります。",'{"pass":false,"reason":"指示と逆です"}'],JSON.stringify({reply:"作りました",draft:first}));
+  h.p.acknowledgementOnly=false;h.p.latestInstruction="今回はキャンセル料なしでいいと伝えて";
+  const r=await runStream(h);
+  assert.equal(r.meta.ok,true);
+  assert.equal(scope.draftChatDraftSection(r.body).text,first,"ルールに戻した修正案ではなく、指示どおりの案を返す");
+  assert.match(r.meta.warning,/指示と逆/);
+  const audit=h.calls.find(c=>c.task==="audit");
+  assert.match(audit.sys,/スタッフ指示を最優先する照合/);
+  assert.doesNotMatch(audit.sys,/まだ案内が必要な条件・提出物・料金が欠ける/,"相談ではルールの条件漏れを理由に不合格にしない");
+  const repair=h.calls.find((c,i)=>i>0&&c.task==="chat");
+  assert.match(repair.sys,/スタッフが指示で外した条件・料金・規定や確認事項を戻さない/);
+});
+
+test("テスト：スタッフ相談の履歴がない初回の照合では、従来どおり店舗ルールの条件漏れを確認する",async()=>{
+  const h=harness(['{"pass":true}'],JSON.stringify({reply:"作りました",draft:"テスト：ご連絡ありがとうございます。"}));
+  h.p.acknowledgementOnly=false;h.p.staffHistory="";h.p.latestInstruction="テスト：返信を作って";
+  await runStream(h);
+  const audit=h.calls.find(c=>c.task==="audit");
+  assert.match(audit.sys,/まだ案内が必要な条件・提出物・料金が欠ける/);
+  assert.doesNotMatch(audit.sys,/スタッフ指示を最優先する照合/);
+});
