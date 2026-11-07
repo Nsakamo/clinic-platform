@@ -39,6 +39,9 @@ API を変える／足すときは、まず正本を更新し、右腕くん（`
 - `POST /api/partner/appointment-actions` … 予約自動受付（context/slots/propose/confirm）。
   テナント設定 `settings.bookingActions`（既定OFF）が有効なときのみ呼ぶ。本人確認と
   患者の「はい」承認（二段階）はうけつけるん側が強制する。詳細は正本 docs/19 の B-2。
+  `bookingActions` がOFFでも `settings.staffBookingSuggest`（既定ON）なら、下書き作成時に `context` を照会し（5秒打ち切り）、
+  キャンセル・日時変更の「予約操作の提案カード」を出す。実行はスタッフがカードから操作した時だけで、
+  保存済みの提案と一致し提案後に患者の新しい連絡が無い時だけ `actor:"staff"` の `propose` → 確認 → `confirm` を呼ぶ。
 - `POST /api/partner/appointment-cancel` … 顧客情報パネルからのスタッフ取消。画面で最終確認後、
   `channel + userId (+ mail時phone) + confirmed:true` を渡し、うけつけるん側で会話相手と予約患者を再照合する。
 
@@ -56,4 +59,5 @@ stagingのうけつけるんがVercel Deployment Protection下にある場合は
 - `PUBLIC_BASE_URL`（または `APP_URL` / Railway公開ドメイン）が設定されていれば、Slack通知から該当会話を直接開ける。
 - `settings.bookingActions=true` の連携テナントでは、スタッフ用AIチャットから予約一覧・空き枠を照会できる。
   キャンセル・日時変更は `propose` → 対象患者/予約/内容の確認カード → スタッフ承認 → `confirm` の順で行う。
+- `settings.bookingActions=false` のテナントでは、スタッフ用AIチャットの照会・操作は使わない。予約操作は上記の提案カード経由だけ。
 - 右腕くん単体テナントでは予約操作を表示・実行せず、LINE/メール・AI・Slackだけで正常に動く。

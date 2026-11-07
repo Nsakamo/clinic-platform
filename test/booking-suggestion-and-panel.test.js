@@ -206,7 +206,7 @@ test("テスト：スタッフLINEの送信ボタンと古い画面の「提案�
   const el = { attrs: {}, firstChild: null, setAttribute(k, v) { this.attrs[k] = v; }, getAttribute(k) { return this.attrs[k]; }, removeAttribute(k) { delete this.attrs[k]; }, set innerHTML(v) { this.html = v; this.firstChild = v ? {} : null; this.renders = (this.renders || 0) + 1; }, get innerHTML() { return this.html; } };
   const ctx = { esc, window: {}, document: { getElementById: () => el } };
   vm.createContext(ctx);
-  vm.runInContext(slice("function bookingSuggestText(", "function useAfterActionDraft("), ctx);
+  vm.runInContext(slice("function bookingSuggestText(", "async function useAfterActionDraft("), ctx);
   const r = { id: "テスト", bookingSuggestion: { type: "cancel", appointmentId: "a1", createdAt: 1, status: "proposed", appointmentLabel: "テスト" } };
   ctx.renderBookingSuggestion(r); ctx.renderBookingSuggestion(r);
   assert.equal(el.renders, 1);
