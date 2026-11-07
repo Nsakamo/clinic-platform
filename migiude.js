@@ -489,6 +489,7 @@ async function staffLineRequestApproval(t, c, reason, opts) {
   opts = opts || {};
   const draft = String(c && c.draft || "").trim(), groupId = String(t.config.conn.staffLineGroupId || "");
   if (!S(t).staffLineEnabled || !staffLineReady(t) || !draft || !groupId) return false;
+  if (c.bookingSuggestion && c.bookingSuggestion.status !== "executed") return false; // 予約操作は右腕くん画面の提案カードで実行してから送る
   const latest = (c.msgs || []).slice().reverse().find(m => m && m.from === "them") || {};
   const eventKey = sha([t.slug, c.id, latest.time || "", latest.text || "", draft].join("|"));
   const existing = c.staffLineApproval && c.staffLineApproval.eventKey === eventKey && c.staffLineApproval.status === "pending" ? c.staffLineApproval : null;
@@ -535,7 +536,8 @@ async function staffLineReviseDraft(t, c, instruction) {
 const staffLineInFlight = new Set();
 async function staffLineEscalate(t, c, reason) {
   if (!S(t).staffLineEnabled || !staffLineReady(t) || !c) return false;
-  if (String(c.draft || "").trim()) return staffLineRequestApproval(t, c, reason);
+  // 未実行の予約操作の提案がある時は承認カード（送信ボタン付き）を出さず、通知だけにする
+  if (String(c.draft || "").trim() && !(c.bookingSuggestion && c.bookingSuggestion.status !== "executed")) return staffLineRequestApproval(t, c, reason);
   const incoming = (c.msgs || []).slice().reverse().find(m => m && m.from === "them") || {};
   const eventKey = sha([t.slug, c.id, incoming.time || "", incoming.text || "", incoming.media || ""].join("|"));
   if (c.staffLineLastEventKey === eventKey || staffLineInFlight.has(eventKey)) return false;
@@ -2395,7 +2397,9 @@ async function genDraft(t, c, opts) {
     + (baTxt ? ",\"action\":{\"type\":\"none|cancel|reschedule|slots|link|verify\",\"appointmentId\":\"\",\"newDateTime\":\"\",\"dates\":[\"YYYY-MM-DD\"],\"phone\":\"\",\"email\":\"\"},\"after_action_draft\":\"cancel・rescheduleの時だけ。操作完了後の案内文\"" : "")
     + "}"
     + "\nconfidence: ルールと会話から自信を持って答えられればhigh、判断に迷う/情報不足ならlow。"
-    + (baTxt
+    + (baTxt && staffBookingMode
+        ? "\nneeds_human: 予約状況の確認・キャンセル・日時変更の依頼・キャンセル例外判断・クレーム・支払いトラブル・偽物疑惑などスタッフ確認が必要ならtrue（この医院は予約操作を自動で行わない。キャンセル・日時変更の依頼はactionに入れたうえで必ずtrue）。"
+        : baTxt
         ? "\nneeds_human: クレーム・支払いトラブル・偽物疑惑・キャンセル料の例外判断などスタッフの人間判断が必要ならtrue。予約の確認・キャンセル・日時変更は下の【予約自動受付】のactionで処理できるため、それだけならfalseでよい。"
         : "\nneeds_human: 予約状況の確認・キャンセル例外判断・クレーム・支払いトラブル・偽物疑惑などスタッフ確認が必要ならtrue。")
     + "\nis_urgent: 痛み・出血・腫れ・強い不調など緊急性があればtrue。"
@@ -2449,7 +2453,7 @@ async function genDraft(t, c, opts) {
         draft: out.draft,
         ruleMatches: evidenceRuleMatches,
         precedentMatches: trustedPrecedents.map(e => ({ id: e.id, trusted: true, score: Number(e.matchScore || 0), confirmedCount: Number(e.confirmedCount || 1) })),
-        verifiedBooking: !!(baCtx && baCtx.ok && baCtx.verified),
+        verifiedBooking: !staffBookingMode && !!(baCtx && baCtx.ok && baCtx.verified),
         verifiedSlots: !!opts.baSlotsTxt,
         learningExampleCount: exGate.length,
       });
@@ -2486,7 +2490,7 @@ async function genDraft(t, c, opts) {
           out.grounding = evaluateResponseGrounding({
             query: lastQ, draft: out.draft, ruleMatches: evidenceRuleMatches,
             precedentMatches: trustedPrecedents.map(e => ({ id: e.id, trusted: true, score: Number(e.matchScore || 0), confirmedCount: Number(e.confirmedCount || 1) })),
-            verifiedBooking: !!(baCtx && baCtx.ok && baCtx.verified), verifiedSlots: !!opts.baSlotsTxt, learningExampleCount: exGate.length,
+            verifiedBooking: !staffBookingMode && !!(baCtx && baCtx.ok && baCtx.verified), verifiedSlots: !!opts.baSlotsTxt, learningExampleCount: exGate.length,
           });
           out.learningReadiness = applyLearningReadinessGate(t, lastQ, out.grounding);
           if (!out.grounding.autoSendAllowed) { out.validation.pass = false; out.validation.reason = out.grounding.reasons[0] || "日本語修正後に再確認が必要です"; }
@@ -2658,7 +2662,9 @@ async function handleInboundCore(t, opts) {
   const groundedForStaffLine = !!(c.grounding && c.grounding.autoSendAllowed && c.validation && c.validation.pass);
   const safeForStaffLine = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med && groundedForStaffLine;
   const exceptionNeedsReview = S(t).autoReply && S(t).staffLineEnabled && S(t).staffLineReplyMode === "exceptions" && !baDone && c.draft && c.draft.trim() && (!confOkForStaffLine || !safeForStaffLine);
-  if (staffLineReviewAll(t) && !baDone && c.draft && c.draft.trim()) {
+  if (staffLineReviewAll(t) && !baDone && c.draft && c.draft.trim() && c.bookingSuggestion && c.bookingSuggestion.status !== "executed") {
+    staffLineEscalate(t, c, "予約操作の提案があります。右腕くんの画面で予約を確認・実行してから返信してください").catch(() => {});
+  } else if (staffLineReviewAll(t) && !baDone && c.draft && c.draft.trim()) {
     staffLineRequestApproval(t, c, "毎回確認モードのため、送信前に承認が必要です").catch(() => {});
   } else if (exceptionNeedsReview || String(needsHuman) === "true" || String(urgent) === "true" || c.flag) {
     const groundingReason = c.grounding && Array.isArray(c.grounding.reasons) && c.grounding.reasons[0];
@@ -2967,11 +2973,12 @@ app.post("/webhook/staff-line", async (req, res) => {
         found.approval.status = "cancelled";
         found.approval.cancelledAt = Date.now();
         found.c.handledThroughIndex = Array.isArray(found.c.msgs) ? found.c.msgs.length : 0;
-        found.c.draft = ""; found.c.draft0 = ""; found.c.topics = []; found.c.learningRefs = [];
+        found.c.draft = ""; found.c.draft0 = ""; found.c.topics = []; found.c.learningRefs = []; found.c.bookingSuggestion = null;
         found.c.status = "done"; found.c.flag = false; found.c.lastAuto = false;
         found.c.time = nowt(); found.c.ts = Date.now(); found.c.last = lastText(found.c); dbSave(t, found.c);
         await staffLineReply(t, ev.replyToken, [staffLineText("⛔ 今回は患者様へ送信せず、この案件を対応済みとして終了しました。次の新着は新しい問い合わせとして判定します。")]); continue;
       }
+      if (action === "send" && found.c.bookingSuggestion && found.c.bookingSuggestion.status !== "executed") { await staffLineReply(t, ev.replyToken, [staffLineText("この会話には未実行の予約操作（キャンセル・日時変更）の提案があります。右腕くんの画面で予約を確認・実行してから送信してください。")]); continue; }
       if (action !== "send" || !staffLineCardMatches(found.c, found.approval, q.get("h"))) { await staffLineReply(t, ev.replyToken, [staffLineText("返信案が更新されています。最新の承認依頼を確認してください。")]); continue; }
       const lockKey = t.slug + "::" + found.c.id;
       if (sendLocks.has(lockKey)) { await staffLineReply(t, ev.replyToken, [staffLineText("送信処理中です。しばらくお待ちください。")]); continue; }
@@ -2985,7 +2992,7 @@ app.post("/webhook/staff-line", async (req, res) => {
         if (!sent.sent) { found.approval.status = "pending"; dbSave(t, found.c); await staffLineReply(t, ev.replyToken, [staffLineText("⚠️ 送信に失敗しました。患者様には送られていません。右腕くんで送信設定を確認してください。")]); continue; }
         await finishLearningUsageTrace(t, found.c, outgoing, "staff_line");
         found.c.msgs.push({ from: "us", text: outgoing, auto: false, approvedVia: "staff_line", approvedBy: userId, approvedByName: staff.name, learningRefs: found.c.learningRefs || [], time: nowt(), sentAt: Date.now() });
-        found.c.draft = ""; found.c.draft0 = ""; found.c.learningRefs = []; found.c.status = "done"; found.c.flag = false; found.c.lastAuto = false; found.c.time = nowt(); found.c.ts = Date.now(); found.c.last = lastText(found.c); found.approval.status = "sent"; dbSave(t, found.c); statBump(t, "staff");
+        found.c.draft = ""; found.c.draft0 = ""; found.c.learningRefs = []; found.c.bookingSuggestion = null; found.c.status = "done"; found.c.flag = false; found.c.lastAuto = false; found.c.time = nowt(); found.c.ts = Date.now(); found.c.last = lastText(found.c); found.approval.status = "sent"; dbSave(t, found.c); statBump(t, "staff");
         let learned = null;
         try { learned = await queueStaffLearning(t, found.c, { q: question, final: outgoing, draft0: initialDraft, instr: editInstruction, source: "staff_line" }); }
         catch (learningError) { console.error("staff line learning queue:", learningError && learningError.message); }
@@ -3646,7 +3653,7 @@ app.post("/api/settings", guard, oneMutationAtATime("settings"), async (req, res
   res.json(Object.assign({ ok: true }, publicSettings(t)));
 });
 app.post("/api/done", guard, (req, res) => { const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" }); cancelAutoReply(t, c.id); c.status = "done"; c.flag = false; c.bookingSuggestion = null; dbSave(t, c); res.json({ ok: true }); });
-app.post("/api/done-all", guard, oneMutationAtATime("done-all"), (req, res) => { const t = req.tenant; let count = 0; Object.values(t.store).forEach(c => { if (c.status !== "done" || c.flag) { cancelAutoReply(t, c.id); c.status = "done"; c.flag = false; dbSave(t, c); count++; } }); res.json({ ok: true, count }); });
+app.post("/api/done-all", guard, oneMutationAtATime("done-all"), (req, res) => { const t = req.tenant; let count = 0; Object.values(t.store).forEach(c => { if (c.status !== "done" || c.flag) { cancelAutoReply(t, c.id); c.status = "done"; c.flag = false; c.bookingSuggestion = null; dbSave(t, c); count++; } }); res.json({ ok: true, count }); });
 app.post("/api/tag", guard, (req, res) => { const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" }); c.flag = !c.flag; if (c.flag) { c.order = Math.max(0, ...Object.values(t.store).filter(x => x.flag).map(x => x.order || 0)) + 1; c.status = "todo"; } dbSave(t, c); res.json({ ok: true, flag: c.flag }); });
 
 // ルール蒸留トーストの「取り消す」用。学習直後のルールを1件削除する。
@@ -4316,13 +4323,13 @@ async function reviewDraftChatCandidate(t, p, raw) {
       + "\n【最新のスタッフ指示】\n" + instruction
       + evidence
       + "\n【編集後の下書き】\n" + candidate;
-    const rawAudit = await aiChat(t, auditSystem + (acknowledgementOnly ? replyScope : staffFirst ? STAFF_FIRST_AUDIT : REPLY_DECISION + "今回の最新連絡・選択した返信対象でまだ案内が必要な条件・提出物・料金が欠ける、無関係な規定や予約を持ち出す、患者の申告だけで免除を確定する、または未確認の証明書を確認済みとする場合はpass:false。患者へ既に伝えた条件・料金の再掲は合格条件ではない。既に条件を案内し証明書を提出済みなら、受領のお礼とスタッフ確認待ちの案内だけでよく、条件・期限・料金の再案内を必須としない。証明書発行だけの依頼にキャンセル規定を強制せず、スタッフが選ばなかった話題を追加しない。") + staffPolicy, [{ role: "user", content: prompt }], 900, "audit");
+    const rawAudit = await aiChat(t, auditSystem + (acknowledgementOnly ? replyScope : (staffFirst ? STAFF_FIRST_AUDIT : REPLY_DECISION + "今回の最新連絡・選択した返信対象でまだ案内が必要な条件・提出物・料金が欠ける、無関係な規定や予約を持ち出す、患者の申告だけで免除を確定する、または未確認の証明書を確認済みとする場合はpass:false。患者へ既に伝えた条件・料金の再掲は合格条件ではない。既に条件を案内し証明書を提出済みなら、受領のお礼とスタッフ確認待ちの案内だけでよく、条件・期限・料金の再案内を必須としない。証明書発行だけの依頼にキャンセル規定を強制せず、スタッフが選ばなかった話題を追加しない。") + staffPolicy), [{ role: "user", content: prompt }], 900, "audit");
     if (!rawAudit) return { pass: false, reason: "編集指示の照合ができませんでした" };
     try {
       const match = rawAudit.match(/\{[\s\S]*\}/);
       const result = JSON.parse(match ? match[0] : rawAudit);
       const casual = hasConversationalTone(candidate);
-      return { pass: result.pass === true && !mismatch && !casual, safety: result.safety === true, reason: mismatch || (casual ? "患者様向けの敬語になっていません" : String(result.reason || "").slice(0, 200)) };
+      return { pass: result.pass === true && !mismatch && !casual, audited: true, safety: result.safety === true, reason: mismatch || (casual ? "患者様向けの敬語になっていません" : String(result.reason || "").slice(0, 200)) };
     } catch (e) { return { pass: false, reason: "編集指示の照合結果を読み取れませんでした" }; }
   }
   let checked = await audit(text);
@@ -4350,8 +4357,8 @@ async function reviewDraftChatCandidate(t, p, raw) {
   if (p.allowWarning && String(text || "").trim() && !/@@\s*(?:REPLY|DRAFT|MEMORY|RULE|ACTION|META)\s*@@/.test(text)
       && !draftQualityIssues(text).some(issue => issue === "empty" || issue === "meta_text")) {
     // スタッフ指示を最優先する相談では、修正で指示から離れた案ではなく、指示どおりに作った最初の案を返す
-    // ただし最初の案が安全面（医療判断・本人確認・未実施操作の完了表記）で不合格なら、最初の案は返さない
-    const useFirst = staffFirst && String(firstText || "").trim() && !firstChecked.safety;
+    // ただし最初の案が安全面（医療判断・本人確認・未実施操作の完了表記）で不合格、または照合自体ができなかった場合は、最初の案は返さない
+    const useFirst = staffFirst && String(firstText || "").trim() && firstChecked.audited === true && !firstChecked.safety;
     const shown = useFirst ? firstText : text;
     const reason = useFirst ? firstChecked.reason : checked.reason;
     return { text: shown, error: "", warning: String(reason || "内容をご確認ください").slice(0, 200) };
@@ -4524,6 +4531,8 @@ app.post("/api/booking-suggestion-dismiss", guard, async (req, res) => {
   const id = String(req.body.id || "");
   const c = Object.prototype.hasOwnProperty.call(t.store, id) ? t.store[id] : null;
   if (!c) return res.status(404).json({ ok: false, error: "no_conv" });
+  // 古い画面の「提案を消す」で、後から届いた新しい提案を消さない
+  if (req.body.createdAt != null && c.bookingSuggestion && Number(c.bookingSuggestion.createdAt) !== Number(req.body.createdAt)) return res.status(409).json({ ok: false, error: "stale" });
   c.bookingSuggestion = null;
   await dbSave(t, c);
   res.json({ ok: true });
@@ -7194,7 +7203,12 @@ function bookingSuggestText(b){var t=b.type==="cancel"?"キャンセル":"日時
 function bookingSuggestionPending(r){var b=r&&r.bookingSuggestion;return !!(b&&b.type&&b.status!=="executed");}
 function renderBookingSuggestion(r){
   var el=document.getElementById("bookingSuggest"); if(!el)return;
-  var b=r&&r.bookingSuggestion; if(!b||!b.type){el.innerHTML="";return;}
+  var b=r&&r.bookingSuggestion; if(!b||!b.type){el.innerHTML="";el.removeAttribute("data-key");return;}
+  // 6秒ごとの再読込で同じ提案を作り直さない（開いた案内文や実行中ボタンを保つ）
+  var key=[r.id,b.type,b.appointmentId,b.newDateTime||"",b.createdAt||"",b.status||"",String(b.afterActionDraft||"").length].join("|");
+  if(el.getAttribute("data-key")===key&&el.firstChild)return;
+  if(window.__bkBusy&&el.firstChild)return;
+  el.setAttribute("data-key",key);
   var x=bookingSuggestText(b);
   var after=String(b.afterActionDraft||"").trim();
   var afterHtml=after?'<details class="bkAfter"><summary>実行後に送る案内文（案）</summary><div class="bkAfterText">'+esc(after)+'</div></details>':'';
@@ -7233,7 +7247,8 @@ async function runBookingSuggestion(btn){
 }
 async function dismissBookingSuggestion(btn){
   var id=current; if(btn&&btn.disabled)return; if(btn)btn.disabled=true;
-  try{await api("/api/booking-suggestion-dismiss",{id:id});var r=DATA.find(function(x){return x.id===id;});if(r)r.bookingSuggestion=null;if(current===id)renderBookingSuggestion(r);}
+  var cur=DATA.find(function(x){return x.id===id;});var cb=cur&&cur.bookingSuggestion;
+  try{var dr=await api("/api/booking-suggestion-dismiss",{id:id,createdAt:cb&&cb.createdAt||null});var dj={};try{dj=await dr.json();}catch(e){}if(dj&&dj.error==="stale"){uiAlert("新しい提案が届いています。内容を確認してください。");return;}var r=DATA.find(function(x){return x.id===id;});if(r)r.bookingSuggestion=null;if(current===id)renderBookingSuggestion(r);}
   catch(e){uiAlert("提案を消せませんでした。もう一度お試しください。");}
   finally{if(btn&&document.body.contains(btn))btn.disabled=false;}
 }
