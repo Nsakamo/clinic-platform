@@ -188,7 +188,7 @@ test("予約照会を並行実行しても本人未確認時の予約情報をAI
     staffLineReviewAll: () => false, PARTNER_KEY: "test-only",
     fetchBooking: () => { bookingStarted = true; return booking; },
     baCall: () => { contextStarted = true; return context; },
-    baPromptBlock: () => "", replyToneInstruction,
+    baPromptBlock: () => "", BOOKING_INFO_USE: "照会結果で答える", replyToneInstruction,
     aiChat: async (_t, system) => { prompt = system; return null; },
   });
   const pending = genDraft({ name: "テスト医院" }, { channel: "line", msgs: [{ from: "them", text: "テスト：予約を確認したいです" }] });
@@ -204,6 +204,7 @@ test("予約照会を並行実行しても本人未確認時の予約情報をAI
   releaseContext({ ok: true, verified: true });
   await verified;
   assert.match(prompt, /機密の予約日時/);
+  assert.match(prompt, /照会結果で答える/);
 });
 
 test("送信前監査は口語の修正案を捨て、元の文が口語なら送信を止める", async () => {
