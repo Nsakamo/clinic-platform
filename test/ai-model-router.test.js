@@ -66,3 +66,10 @@ test("GPT-6.1 Sol can be chosen per role and never receives an unsupported reaso
   assert.ok(catalog.some(item => item.id === "gpt-6.1-sol" && item.label === "GPT-6.1 Sol"));
   assert.equal(publicModelCatalog(["gpt-6.1-sol"]).filter(item => item.id === "gpt-6.1-sol").length, 1);
 });
+
+test("GPT-6.1 Sol snapshot IDs registered for rollout also avoid the unsupported effort", () => {
+  const routes = normalizeAiRoutes({ draft: { model: "GPT-6.1-sol-2026-10-01", reasoningEffort: "none" } }, ["GPT-6.1-sol-2026-10-01"]);
+  assert.equal(routes.draft.model, "GPT-6.1-sol-2026-10-01");
+  assert.equal(routes.draft.reasoningEffort, "low");
+  assert.equal(normalizeAiRoutes({ draft: { model: "gpt-6.1-solar", reasoningEffort: "none" } }, ["gpt-6.1-solar"]).draft.reasoningEffort, "none");
+});
