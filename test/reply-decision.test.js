@@ -229,7 +229,7 @@ test("編集準備は関連証明書ルールと会話日時を照合資料へ�
     ...promptStubs(), rulesRankedWithScores: (_t, q) => { queries.push(q); return [{ n: 2, r: { content: rules } }]; },
     rulesBlock: rel => rel.map(r => r.content).join("\n"),
     S: () => ({ engine: "gpt", tone: "" }), notesBlock: () => "", prefsBlock: () => "", replyToneInstruction: () => "",
-    baEnabled: () => false, PARTNER_KEY: "", staffBookingPrompt: () => "", fetchBooking: async () => "", BOOKING_INFO_USE: "照会結果で答える", ANTHROPIC_KEY: "", process: { env: {} }, JP_QUALITY: "",
+    baEnabled: () => false, PARTNER_KEY: "", staffBookingPrompt: () => "", fetchBooking: async () => "", BOOKING_INFO_USE: "照会結果で答える", staffLineReviewAll: () => false, STAFF_BOOKING_SUGGEST_TIMEOUT_MS: 5000, ANTHROPIC_KEY: "", process: { env: {} }, JP_QUALITY: "",
   };
   vm.runInNewContext(source.slice(start, end), context);
   const c = { id: "テスト患者", channel: "line", ts: 1, msgs: [{ from: "them", text: query, sentAt: Date.parse("2026-10-03T00:54:00Z"), at: Date.parse("2026-10-03T00:54:00Z") }] };
