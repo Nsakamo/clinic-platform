@@ -3461,26 +3461,29 @@ app.post("/api/conn", guard, oneMutationAtATime("connection"), async (req, res) 
 });
 
 // 新モデル検知：役割別ルーターで使用中の世代より新しいGPT世代が利用可能か判定する。
+// キャッシュは全法人共通なので、OpenAIから得た最新世代だけを保存し、比較は法人ごとに行う（他法人のモデル名を出さない）。
 let MODEL_CHECK_CACHE = { ts: 0, latest: "", latestVersion: 0, error: null };
 async function checkNewerModel(t) {
   const now = Date.now();
   const routes=normalizeAiRoutes(S(t).aiRoutes,configuredExtraOpenAiModels()), currentModels=[...new Set(Object.values(routes).map(route=>route.model))];
   const ver=id=>{const m=/^gpt-(\d+(?:\.\d+)?)(?:-(?:sol|terra|luna))?$/.exec(String(id||""));return m?parseFloat(m[1]):null;};
   const currentVersion=Math.max(0,...currentModels.map(ver).filter(v=>v!=null));
-  if (MODEL_CHECK_CACHE.ts && now - MODEL_CHECK_CACHE.ts < 24 * 60 * 60 * 1000) return Object.assign({},MODEL_CHECK_CACHE,{current:currentModels.join(" / "),newer:MODEL_CHECK_CACHE.latestVersion>currentVersion});
-  let latest = currentModels[0]||"gpt-6-sol", latestVersion=currentVersion, error = null;
-  try {
-    if (process.env.OPENAI_KEY) {
-      const r = await fetch("https://api.openai.com/v1/models", { headers: { "Authorization": "Bearer " + process.env.OPENAI_KEY } });
-      if (r.ok) {
-        const d = await r.json();
-        const ids = (d.data || []).map(m => m.id);
-        ids.forEach(id => { const v = ver(id); if (v != null && v > latestVersion) { latestVersion=v; latest=id; } });
-      } else { error = "models_" + r.status; }
-    } else { error = "no_key"; }
-  } catch (e) { error = String(e.message || e).slice(0, 80); }
-  MODEL_CHECK_CACHE = { ts: now, latest, latestVersion, error };
-  return Object.assign({},MODEL_CHECK_CACHE,{current:currentModels.join(" / "),newer:latestVersion>currentVersion});
+  if (!MODEL_CHECK_CACHE.ts || now - MODEL_CHECK_CACHE.ts >= 24 * 60 * 60 * 1000) {
+    let latest = "", latestVersion = 0, error = null;
+    try {
+      if (process.env.OPENAI_KEY) {
+        const r = await fetch("https://api.openai.com/v1/models", { headers: { "Authorization": "Bearer " + process.env.OPENAI_KEY } });
+        if (r.ok) {
+          const d = await r.json();
+          const ids = (d.data || []).map(m => m.id);
+          ids.forEach(id => { const v = ver(id); if (v != null && v > latestVersion) { latestVersion=v; latest=id; } });
+        } else { error = "models_" + r.status; }
+      } else { error = "no_key"; }
+    } catch (e) { error = String(e.message || e).slice(0, 80); }
+    MODEL_CHECK_CACHE = { ts: now, latest, latestVersion, error };
+  }
+  const c = MODEL_CHECK_CACHE, newer = !c.error && !!c.latest && c.latestVersion > currentVersion;
+  return { ts: c.ts, error: c.error, current: currentModels.join(" / "), newer, latest: newer ? c.latest : (currentModels[0] || ""), latestVersion: newer ? c.latestVersion : currentVersion };
 }
 app.get("/api/model-check", guard, async (req, res) => { res.json(await checkNewerModel(req.tenant)); });
 function publicSettings(t) {

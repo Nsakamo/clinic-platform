@@ -51,3 +51,25 @@ test("booking keeps critical reasoning while style review uses low effort by def
   assert.equal(resolveAiRoute({}, "finalize").reasoningEffort, "low");
   assert.equal(resolveAiRoute({ aiRoutes: { finalize: { model: "gpt-6-luna", reasoningEffort: "low" } } }, "finalize").model, "gpt-6-luna");
 });
+
+test("GPT-6.1 Sol can be chosen per role and never receives an unsupported reasoning effort", () => {
+  const routes = normalizeAiRoutes({ draft: { model: "gpt-6.1-sol", reasoningEffort: "medium" }, chat: { model: "gpt-6.1-sol", reasoningEffort: "none" }, critical: { model: "gpt-6.1-sol", reasoningEffort: "high" } });
+  assert.equal(routes.draft.model, "gpt-6.1-sol");
+  assert.equal(routes.draft.reasoningEffort, "medium");
+  assert.equal(routes.chat.model, "gpt-6.1-sol");
+  assert.equal(routes.chat.reasoningEffort, "low");
+  assert.equal(routes.critical.reasoningEffort, "high");
+  assert.equal(routes.classify.model, "gpt-6-luna");
+  assert.equal(resolveAiRoute({}, "draft", { override: { model: "gpt-6.1-sol", reasoningEffort: "none" } }).reasoningEffort, "low");
+  assert.equal(normalizeAiRoutes({ draft: { model: "gpt-6-sol", reasoningEffort: "none" } }).draft.reasoningEffort, "none");
+  const catalog = publicModelCatalog();
+  assert.ok(catalog.some(item => item.id === "gpt-6.1-sol" && item.label === "GPT-6.1 Sol"));
+  assert.equal(publicModelCatalog(["gpt-6.1-sol"]).filter(item => item.id === "gpt-6.1-sol").length, 1);
+});
+
+test("GPT-6.1 Sol snapshot IDs registered for rollout also avoid the unsupported effort", () => {
+  const routes = normalizeAiRoutes({ draft: { model: "GPT-6.1-sol-2026-10-01", reasoningEffort: "none" } }, ["GPT-6.1-sol-2026-10-01"]);
+  assert.equal(routes.draft.model, "GPT-6.1-sol-2026-10-01");
+  assert.equal(routes.draft.reasoningEffort, "low");
+  assert.equal(normalizeAiRoutes({ draft: { model: "gpt-6.1-solar", reasoningEffort: "none" } }, ["gpt-6.1-solar"]).draft.reasoningEffort, "none");
+});
