@@ -10,7 +10,7 @@ const edit = require("../lib/draft-edit");
 const { selectConversationContext, TOPIC_GAP_MS } = require("../lib/conversation-context");
 const source = fs.readFileSync(require.resolve("../migiude.js"), "utf8");
 function section(start, end) { return source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start))); }
-function harness(responses = []) {
+function harness(responses = [], overrides = {}) {
   const calls = [], queries = [];
   const ctx = {
     ...consultation, ...decision, ...edit, selectConversationContext,
@@ -18,9 +18,10 @@ function harness(responses = []) {
     ...promptStubs(), rulesRankedWithScores: (_t, query) => { queries.push(query); return [{ n: 1, r: { content: "通常の当日キャンセル料は3,300円です。" } }]; },
     rulesBlock: rel => rel.map(r => r.content).join("\n"),
     notesBlock: () => "", prefsBlock: () => "", replyToneInstruction: () => "",
-    baEnabled: () => false, PARTNER_KEY: "", staffBookingPrompt: () => "", ANTHROPIC_KEY: "", process: { env: {} }, JP_QUALITY: "", PATIENT_COURTESY: "丁寧に",
+    baEnabled: () => false, PARTNER_KEY: "", staffBookingPrompt: () => "", fetchBooking: async () => "", BOOKING_INFO_USE: "照会結果で答える", staffLineReviewAll: () => false, STAFF_BOOKING_SUGGEST_TIMEOUT_MS: 5000, ANTHROPIC_KEY: "", process: { env: {} }, JP_QUALITY: "", PATIENT_COURTESY: "丁寧に",
     hasConversationalTone: () => false, finalizeGeneratedDraft: async (_t, text) => ({ text }),
     aiChat: async (_t, sys, messages, limit, task) => { calls.push({ sys, messages, limit, task }); return responses.shift(); },
+    ...overrides,
   };
   vm.createContext(ctx);
   vm.runInContext(section("async function draftChatPrep(", 'app.get("/api/draft-chat-history"'), ctx);
@@ -153,4 +154,50 @@ test("実際のスタッフ相談がない初回案の照合には特例上書�
     assert.match(call.sys, /実際のスタッフ相談履歴はありません/);
     assert.doesNotMatch(call.sys, /通常ルールと異なる形に決定できる/);
   }
+});
+
+test("相談でもうけつけるんの予約・回数券の照会結果を渡し、自動受付ONで本人未確認なら渡さない", async () => {
+  const at = Date.now();
+  const c = { id: "テスト照会", msgs: [msg("them", "テスト：明後日の予約は回数券があと何回残っていて、どこの医院ですか", at)] };
+  const info = "【お客様情報（うけつけるん・参考）】\n予約: 2026-11-11 10:00 テスト公式回数券＠銀座本院(確定)\n保有回数券: テスト公式回数券 残3";
+  const h = harness([], { fetchBooking: async () => info });
+  let p = await h.draftChatPrep(tenant(c), { id: c.id, messages: [{ role: "user", content: "回答を作って" }] });
+  assert.match(p.base, /＠銀座本院/);
+  assert.match(p.base, /残3/);
+  assert.match(p.base, /照会結果で答える/);
+  assert.match(p.evidence, /残3/);
+  // 自動受付ONの医院: 本人確認が取れない相手には予約情報を渡さない
+  let verified = false;
+  const ba = async () => ({ ok: true, verified });
+  const h2 = harness([], { fetchBooking: async () => info, baEnabled: () => true, PARTNER_KEY: "test-only", baContextCached: ba, baCall: ba });
+  p = await h2.draftChatPrep(tenant(c), { id: c.id, messages: [{ role: "user", content: "回答を作って" }], consultationChat: true });
+  assert.doesNotMatch(p.base, /銀座本院|残3/);
+  assert.doesNotMatch(p.evidence, /銀座本院|残3/);
+  verified = true;
+  p = await h2.draftChatPrep(tenant(c), { id: c.id, messages: [{ role: "user", content: "回答を作って" }], consultationChat: true });
+  assert.match(p.base, /残3/);
+  // 照合資料には照会データだけを入れ、指示文は入れない
+  assert.match(p.evidence, /残3/);
+  assert.doesNotMatch(p.evidence, /照会結果で答える/);
+});
+
+test("スタッフLINEで毎回承認する医院では、相談・LINE修正とも本人未確認の相手に予約情報を渡さない", async () => {
+  const at = Date.now();
+  const c = { id: "テスト毎回承認", msgs: [msg("them", "テスト：予約の医院と回数券の残りを教えてください", at)] };
+  const info = "予約: 2026-11-11 10:00 テスト＠銀座本院(確定)\n保有回数券: テスト公式回数券 残3";
+  let verified = false, contextCalls = 0;
+  const h = harness([], { fetchBooking: async () => info, staffLineReviewAll: () => true, PARTNER_KEY: "test-only",
+    baCall: async (_t, _c, action) => { if (action === "context") contextCalls++; return { ok: true, verified }; } });
+  for (const consultationChat of [true, false]) {
+    const p = await h.draftChatPrep(tenant(c), { id: c.id, messages: [{ role: "user", content: "回答を作って" }], consultationChat });
+    assert.doesNotMatch(p.base + p.evidence, /銀座本院|残3/);
+  }
+  assert.equal(contextCalls, 2);
+  verified = true;
+  const p = await h.draftChatPrep(tenant(c), { id: c.id, messages: [{ role: "user", content: "回答を作って" }] });
+  assert.match(p.base, /残3/);
+  // 照会に失敗した場合も渡さない
+  const h2 = harness([], { fetchBooking: async () => info, staffLineReviewAll: () => true, PARTNER_KEY: "test-only", baCall: async () => { throw new Error("テスト照会失敗"); } });
+  const p2 = await h2.draftChatPrep(tenant(c), { id: c.id, messages: [{ role: "user", content: "回答を作って" }] });
+  assert.doesNotMatch(p2.base + p2.evidence, /銀座本院|残3/);
 });
