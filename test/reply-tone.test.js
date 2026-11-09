@@ -188,7 +188,7 @@ test("予約照会を並行実行しても本人未確認時の予約情報をAI
     staffLineReviewAll: () => false, PARTNER_KEY: "test-only",
     fetchBooking: () => { bookingStarted = true; return booking; },
     baCall: () => { contextStarted = true; return context; },
-    baPromptBlock: () => "", BOOKING_INFO_USE: "照会結果で答える", replyToneInstruction,
+    baPromptBlock: () => "", BOOKING_INFO_USE: "照会結果で答える", BOOKING_INFO_USE_UNVERIFIED: "照会結果で答える（要スタッフ確認）", replyToneInstruction,
     aiChat: async (_t, system) => { prompt = system; return null; },
   });
   const pending = genDraft({ name: "テスト医院" }, { channel: "line", msgs: [{ from: "them", text: "テスト：予約を確認したいです" }] });
@@ -204,6 +204,34 @@ test("予約照会を並行実行しても本人未確認時の予約情報をAI
   releaseContext({ ok: true, verified: true });
   await verified;
   assert.match(prompt, /機密の予約日時/);
+  assert.match(prompt, /照会結果で答える/);
+  assert.doesNotMatch(prompt, /要スタッフ確認/);
+});
+
+test("自動受付OFF医院で本人未確認の相手の自動下書きは、照会結果をスタッフ確認前提で使う", async () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "migiude.js"), "utf8");
+  const start = source.indexOf("async function genDraft(t, c, opts) {");
+  const end = source.indexOf("// 毎回承認モード", start);
+  let prompt = "", verified = false;
+  const { genDraft } = vm.runInNewContext(source.slice(start, end) + "\n({genDraft})", {
+    REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview,
+    PATIENT_COURTESY, JP_QUALITY: PATIENT_COURTESY,
+    S: () => ({ tone: "", prefs: [] }), activeConversationMessages: c => c.msgs, precedingReference: require("../lib/conversation-context").precedingReference, formatDraftContext: require("../lib/draft-consultation").formatDraftContext,
+    ...promptStubs(), rulesRankedWithScores: () => [], rulesBlock: () => "", ruleBudget: () => 0,
+    examplesRanked: () => [], trustedLearningPrecedent: () => false,
+    prefsBlock: () => "", notesBlock: () => "", baEnabled: () => false, staffBookingSuggestEnabled: () => true,
+    staffLineReviewAll: () => false, PARTNER_KEY: "test-only", STAFF_BOOKING_SUGGEST_TIMEOUT_MS: 5000,
+    fetchBooking: async () => "テスト予約 11月11日 ＠銀座本院 残3",
+    baCall: async () => ({ ok: true, verified }), staffBookingSuggestPromptBlock: () => "",
+    baPromptBlock: () => "", BOOKING_INFO_USE: "照会結果で答える", BOOKING_INFO_USE_UNVERIFIED: "照会結果で答える（要スタッフ確認）", replyToneInstruction,
+    aiChat: async (_t, system) => { prompt = system; return null; },
+  });
+  await genDraft({ name: "テスト医院" }, { channel: "line", msgs: [{ from: "them", text: "テスト：予約の医院を教えて" }] });
+  assert.match(prompt, /＠銀座本院/);
+  assert.match(prompt, /要スタッフ確認/);
+  verified = true;
+  await genDraft({ name: "テスト医院" }, { channel: "line", msgs: [{ from: "them", text: "テスト：予約の医院を教えて" }] });
+  assert.doesNotMatch(prompt, /要スタッフ確認/);
   assert.match(prompt, /照会結果で答える/);
 });
 
