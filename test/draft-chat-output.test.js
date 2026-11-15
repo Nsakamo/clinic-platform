@@ -115,6 +115,8 @@ test("書き方の見本は再利用可と確認済みの学習だけを使い�
     STYLE_SAMPLE_SETTLE_MS: 15 * 60 * 1000,
     reusableLearningSummary: e => (e.learningMeta && e.learningMeta.scope === "reusable" ? "判断手順" : ""),
     STYLE_SAMPLES_K: 3,
+    retiredTermsOf: () => [],
+    learningUsesRetiredTerms: require("../lib/booking-facts").learningUsesRetiredTerms,
   };
   vm.createContext(ctx);
   vm.runInContext(section("function styleSamples(", "// ---------- helpers ----------"), ctx);
