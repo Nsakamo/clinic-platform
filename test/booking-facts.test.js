@@ -131,14 +131,17 @@ test("下書きに旧予約サイト・語句が残ったら、自動送信を�
   const gen = section("async function genDraft(", "async function enrichStaffLineBookingPreview(");
   assert.ok(gen.indexOf("applyRetiredTermGate(t, out)") > gen.indexOf("validateDraftAgainstEvidence(t, {"));
   assert.match(gen, /bookingPage: bookingFactsOf\(t\)/);
-  assert.match(section("async function validateDraftAgainstEvidence(", "\n}\n"), /【設定の予約ページのURL（予約ページを案内する場合の正しいURL。キャンセル・変更の受付方法は店舗ルールに従う）】/);
+  assert.match(section("async function validateDraftAgainstEvidence(", "\n}\n"), /【設定の予約ページのURL（自院の予約ページを案内する場合の正しいURL。キャンセル・変更の受付方法や他の媒体の案内は店舗ルールに従う）】/);
   assert.match(out.grounding.reasons[0], /使わなくなった予約サイト/, "スタッフLINEは先頭の理由だけ出すので先頭に入れる");
 });
 
 test("キャンセル・変更の依頼では、尋ねられていなくてもキャンセル料・変更料の規定は省かない", () => {
   assert.match(ANSWER_FIRST_POLICY, /キャンセル・日時変更の依頼に対するキャンセル料・変更料、免除条件など）は、尋ねられていなくても店舗ルールどおり案内する/);
   assert.doesNotMatch(ANSWER_FIRST_POLICY, /尋ねていない用件（キャンセル料/);
-  assert.match(bookingFactsBlock({ bookingPageUrl: "https://example.com/b" }), /別の予約サイトのURLが書かれていても、URLはこちらを使う/);
+  // 現役の他媒体（トリビュー等）の案内は置き換えない。置き換えるのは使わなくなったサイトだけ
+  assert.match(bookingFactsBlock({ bookingPageUrl: "https://example.com/b" }), /今も使っている他の媒体・サービスの案内やURLは店舗ルールどおりに案内し、このURLに置き換えない/);
+  assert.doesNotMatch(bookingFactsBlock({ bookingPageUrl: "https://example.com/b" }), /別の予約サイトのURLが書かれていても/);
+  assert.match(bookingFactsBlock({ bookingPageUrl: "https://example.com/b", retiredTerms: ["kalonade"] }), /使わなくなった予約サイトの案内が.*その部分だけ上の予約ページのURLに置き換える/);
   assert.doesNotMatch(bookingFactsBlock({ bookingPageUrl: "https://example.com/b" }), /より優先する/);
 });
 
@@ -154,4 +157,22 @@ test("使わなくなった語句・テンプレートの入力は文字列以�
   assert.deepEqual(T.saveTemplate([], { title: { a: 1 }, body: "テスト" }), { ok: false, error: "required" });
   const r = T.saveTemplate([], { title: "テスト", body: "テスト" }, 1);
   assert.deepEqual(T.moveTemplate(r.templates, r.template.id, "abc"), { ok: false, error: "invalid_direction" });
+});
+
+test("スタッフLINEの承認でも、旧予約サイト・語句が残る返信案は送らない", () => {
+  const route = section('const action = q.get("migiude"), found = staffLineApprovalById(t, q.get("id"));', "sendLocks.add(lockKey)");
+  assert.match(route, /action === "send" && textMentionsRetiredTerm\(/);
+  assert.ok(route.indexOf("textMentionsRetiredTerm(") < route.indexOf("const lockKey"), "送信ロックの前に断る");
+});
+
+test("設定の取得ではテンプレート本文を返さず件数だけ返す", () => {
+  assert.match(source, /templates: undefined,\n    templateCount: normalizeTemplates\(S\(t\)\.templates\)\.length,/);
+  assert.match(source, /tplSetCount\(s\.templateCount\)/);
+});
+
+test("旧語句の照合は全角・半角の違いでもすり抜けない／送信待ちの下書きも送信の直前に確かめる", () => {
+  assert.equal(textMentionsRetiredTerm("ＨＴＴＰＳ：／／ＨＢ－ＣＬＩＮＩＣ．ＫＡＬＯＮＡＤＥ．ＣＯＭ", ["kalonade"]), true);
+  assert.equal(textMentionsRetiredTerm("ｶﾛﾈｰﾄﾞから", ["カロネード"]), true);
+  const sched = section("function scheduleAutoReply(", "cur.lastAuto = true;");
+  assert.match(sched, /if \(textMentionsRetiredTerm\(cur\.draft, retiredTermsOf\(t\)\)\) return;/);
 });
