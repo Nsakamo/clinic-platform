@@ -169,3 +169,10 @@ test("設定の取得ではテンプレート本文を返さず件数だけ返�
   assert.match(source, /templates: undefined,\n    templateCount: normalizeTemplates\(S\(t\)\.templates\)\.length,/);
   assert.match(source, /tplSetCount\(s\.templateCount\)/);
 });
+
+test("旧語句の照合は全角・半角の違いでもすり抜けない／送信待ちの下書きも送信の直前に確かめる", () => {
+  assert.equal(textMentionsRetiredTerm("ＨＴＴＰＳ：／／ＨＢ－ＣＬＩＮＩＣ．ＫＡＬＯＮＡＤＥ．ＣＯＭ", ["kalonade"]), true);
+  assert.equal(textMentionsRetiredTerm("ｶﾛﾈｰﾄﾞから", ["カロネード"]), true);
+  const sched = section("function scheduleAutoReply(", "cur.lastAuto = true;");
+  assert.match(sched, /if \(textMentionsRetiredTerm\(cur\.draft, retiredTermsOf\(t\)\)\) return;/);
+});

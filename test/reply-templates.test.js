@@ -128,3 +128,9 @@ test("並び替えは同じ分類の中で入れ替える（分類ごとに表�
   assert.deepEqual(T.moveTemplate(list, "tpl_b", -1).templates.map(t => t.id), ["tpl_b", "tpl_x", "tpl_a"]);
   assert.deepEqual(T.moveTemplate(list, "tpl_x", 1).templates.map(t => t.id), ["tpl_a", "tpl_x", "tpl_b"], "同じ分類に隣が無ければ動かない");
 });
+
+test("分類「その他」は分類なしとして保存し、画面の欄と並び替えをそろえる", () => {
+  const r = T.saveTemplate([], { title: "テスト", category: "その他", body: "テスト" }, 1);
+  assert.equal(r.template.category, "");
+  assert.equal(T.normalizeTemplates([{ id: "tpl_a", title: "テスト", category: "その他", body: "テスト" }])[0].category, "");
+});

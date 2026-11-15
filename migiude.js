@@ -2358,6 +2358,7 @@ function scheduleAutoReply(t, c, draftText, recvAt, delayMin) {
       if (cur.status === "done" || cur.flag) return; // 既に対応済み/フラグ付き
       if (!(cur.grounding && cur.grounding.autoSendAllowed && cur.validation && cur.validation.pass)) return; // 生成時の根拠監査を通っていない下書きは送らない
       if (!cur.draft || cur.draft.trim() !== draftText) return; // 下書きが変わった/消えた
+      if (textMentionsRetiredTerm(cur.draft, retiredTermsOf(t))) return; // 待機中に「使わなくなった語句」が登録された場合も送らない（スタッフ確認のまま）
       const lastMsg = cur.msgs[cur.msgs.length - 1];
       if (!lastMsg || lastMsg.from !== "them") return; // 待機中に誰かが返信した
       const r = await deliverText(t, cur, draftText);
