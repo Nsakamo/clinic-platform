@@ -29,7 +29,7 @@ test("テンプレートを追加・更新・削除・並び替えできる", ()
   assert.equal(r.template.title, "テスト 予約ページの案内");
   assert.equal(r.template.body, "{お名前}様\nテスト本文 {予約ページ}");
   const firstId = r.template.id;
-  r = T.saveTemplate(r.templates, { title: "テスト 2件目", category: "キャンセル", body: "テスト" }, 2000);
+  r = T.saveTemplate(r.templates, { title: "テスト 2件目", category: "予約", body: "テスト" }, 2000);
   const secondId = r.template.id;
   assert.notEqual(firstId, secondId);
   r = T.saveTemplate(r.templates, { id: firstId, title: "テスト 更新", category: "予約", body: "テスト更新本文" }, 3000);
@@ -117,4 +117,14 @@ test("テンプレートのAPIはログイン必須で、変更は1件ずつ順�
   }
   const apply = between(source, "async function applyTemplateChange(", 'app.get("/api/templates"');
   assert.match(apply, /catch \(e\) \{ S\(t\)\.templates = before;/, "保存に失敗したら元に戻す");
+});
+
+test("並び替えは同じ分類の中で入れ替える（分類ごとに表示しているため）", () => {
+  const list = [
+    { id: "tpl_a", title: "テストA", category: "予約", body: "テスト" },
+    { id: "tpl_x", title: "テストX", category: "キャンセル", body: "テスト" },
+    { id: "tpl_b", title: "テストB", category: "予約", body: "テスト" },
+  ];
+  assert.deepEqual(T.moveTemplate(list, "tpl_b", -1).templates.map(t => t.id), ["tpl_b", "tpl_x", "tpl_a"]);
+  assert.deepEqual(T.moveTemplate(list, "tpl_x", 1).templates.map(t => t.id), ["tpl_a", "tpl_x", "tpl_b"], "同じ分類に隣が無ければ動かない");
 });
