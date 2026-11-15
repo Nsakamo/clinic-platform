@@ -48,10 +48,13 @@ test("旧サイトを案内した学習例を見分ける（AIの初回案だけ
 test("予約ページの案内文は、設定が無ければ何も足さず、あれば案内先と旧サイトの禁止を書く", () => {
   assert.equal(bookingFactsBlock({}), "");
   const block = bookingFactsBlock({ bookingPageUrl: "https://app.uketsuke-run.online/booking/smilemedi", retiredTerms: ["kalonade", "カロネード"] });
-  assert.match(block, /https:\/\/app\.uketsuke-run\.online\/booking\/smilemedi だけを使う/);
+  assert.match(block, /空き枠の確認を案内するときの予約ページのURLは https:\/\/app\.uketsuke-run\.online\/booking\/smilemedi /);
+  assert.match(block, /予約の確認・変更・キャンセルの受付方法（予約ページ・電話・LINEなど）は店舗ルールに従う/);
   assert.match(block, /kalonade \/ カロネード/);
   assert.match(block, /過去の対応例・書き方の見本・会話履歴・ルールに出てきても/);
-  assert.match(block, /上の予約ページに置き換えて案内する/);
+  assert.match(block, /上の予約ページのURLに置き換える/);
+  // 予約ページのURLに含まれる語は旧語句として扱わない
+  assert.doesNotMatch(bookingFactsBlock({ bookingPageUrl: "https://app.uketsuke-run.online/booking/smilemedi", retiredTerms: ["uketsuke", "kalonade"] }), /uketsuke \//);
   assert.doesNotMatch(bookingFactsBlock({ bookingPageUrl: "http://bad" }), /http:\/\/bad/);
 });
 
@@ -104,7 +107,8 @@ test("設定画面で予約ページURLと使わなくなった語句を保存�
   const validateAt = route.indexOf("booking_page_url_invalid");
   const firstMutation = route.indexOf("S(t).autoReply =");
   assert.ok(validateAt > 0 && validateAt < firstMutation, "URLの検証は設定を書き換える前に行う");
-  assert.match(route, /S\(t\)\.retiredTerms = normalizeRetiredTerms\(req\.body\.retiredTerms\)/);
+  assert.match(route, /S\(t\)\.retiredTerms = kept;/);
+  assert.ok(route.indexOf("retired_terms_invalid") < firstMutation, "語句の形式チェックも書き換え前");
   assert.match(source, /id="setBookingPageUrl" type="url"/);
   assert.match(source, /id="setRetiredTerms"/);
   assert.match(source, /level,tone,bookingPageUrl,retiredTerms,engine,aiRoutes,autoDelayMin/);
@@ -127,17 +131,27 @@ test("下書きに旧予約サイト・語句が残ったら、自動送信を�
   const gen = section("async function genDraft(", "async function enrichStaffLineBookingPreview(");
   assert.ok(gen.indexOf("applyRetiredTermGate(t, out)") > gen.indexOf("validateDraftAgainstEvidence(t, {"));
   assert.match(gen, /bookingPage: bookingFactsOf\(t\)/);
-  assert.match(section("async function validateDraftAgainstEvidence(", "\n}\n"), /【設定の予約ページ（予約の案内先として正しい）】/);
+  assert.match(section("async function validateDraftAgainstEvidence(", "\n}\n"), /【設定の予約ページのURL（予約ページを案内する場合の正しいURL。キャンセル・変更の受付方法は店舗ルールに従う）】/);
+  assert.match(out.grounding.reasons[0], /使わなくなった予約サイト/, "スタッフLINEは先頭の理由だけ出すので先頭に入れる");
 });
 
 test("キャンセル・変更の依頼では、尋ねられていなくてもキャンセル料・変更料の規定は省かない", () => {
   assert.match(ANSWER_FIRST_POLICY, /キャンセル・日時変更の依頼に対するキャンセル料・変更料、免除条件など）は、尋ねられていなくても店舗ルールどおり案内する/);
   assert.doesNotMatch(ANSWER_FIRST_POLICY, /尋ねていない用件（キャンセル料/);
-  assert.match(bookingFactsBlock({ bookingPageUrl: "https://example.com/b" }), /店舗ルール・スタッフの共通指示・過去の対応例より優先する/);
+  assert.match(bookingFactsBlock({ bookingPageUrl: "https://example.com/b" }), /別の予約サイトのURLが書かれていても、URLはこちらを使う/);
+  assert.doesNotMatch(bookingFactsBlock({ bookingPageUrl: "https://example.com/b" }), /より優先する/);
 });
 
 test("設定画面に、旧語句がルールブック・共通指示に残っている件数と学習例の除外件数を出す", () => {
   assert.match(source, /retiredTermHits: retiredTermHits\(t\),/);
   assert.match(source, /function renderRetiredTermWarn\(h\)/);
   assert.match(source, /学習例の半数以上/);
+});
+
+test("使わなくなった語句・テンプレートの入力は文字列以外を受け付けず、並び替えの向きは上下だけ", () => {
+  const T = require("../lib/reply-templates");
+  assert.deepEqual(normalizeRetiredTerms([{ toString: 1 }, "kalonade", 5]), ["kalonade"]);
+  assert.deepEqual(T.saveTemplate([], { title: { a: 1 }, body: "テスト" }), { ok: false, error: "required" });
+  const r = T.saveTemplate([], { title: "テスト", body: "テスト" }, 1);
+  assert.deepEqual(T.moveTemplate(r.templates, r.template.id, "abc"), { ok: false, error: "invalid_direction" });
 });

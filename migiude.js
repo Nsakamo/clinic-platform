@@ -24,7 +24,7 @@ const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation
 const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, styleEditPreservesContent, requestsWeakened, sentenceCount, borrowsFromSamples, safeText: safeDraftChatText, maskStyleSample } = require("./lib/draft-chat-output");
 const { REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview, inboundMessageTimes } = require("./lib/reply-decision");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
-const { ANSWER_FIRST_POLICY, bookingFactsBlock, learningUsesRetiredTerms, normalizeBookingPageUrl, normalizeRetiredTerms, textMentionsRetiredTerm } = require("./lib/booking-facts");
+const { ANSWER_FIRST_POLICY, bookingFactsBlock, learningUsesRetiredTerms, normalizeBookingPageUrl, normalizeRetiredTerms, retiredTermsExcludingUrl, textMentionsRetiredTerm } = require("./lib/booking-facts");
 const { normalizeTemplates, saveTemplate, deleteTemplate, moveTemplate } = require("./lib/reply-templates");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
 const { AiUsageSpool, resolveAiUsageSpoolPath } = require("./lib/ai-usage-spool");
@@ -960,7 +960,8 @@ function applyRetiredTermGate(t, out) {
   if (!out.grounding || typeof out.grounding !== "object") out.grounding = { autoSendAllowed: false, reasons: [], sources: [] };
   out.grounding.autoSendAllowed = false;
   if (!Array.isArray(out.grounding.reasons)) out.grounding.reasons = [];
-  out.grounding.reasons.push("使わなくなった予約サイト・語句が含まれています。設定の予約ページに書き換えてから送信してください");
+  // スタッフLINEの承認依頼は先頭の理由だけを表示するため、先頭に入れる
+  out.grounding.reasons.unshift("使わなくなった予約サイト・語句が含まれています。設定の予約ページに書き換えてから送信してください");
   if (out.validation && typeof out.validation === "object") { out.validation.pass = false; out.validation.reason = "使わなくなった予約サイト・語句が含まれています"; }
   return true;
 }
@@ -977,7 +978,7 @@ function retiredTermHits(t) {
     examplesTotal: examples.length,
   };
 }
-function retiredTermsOf(t) { return normalizeRetiredTerms(S(t).retiredTerms); }
+function retiredTermsOf(t) { return retiredTermsExcludingUrl(S(t).retiredTerms, normalizeBookingPageUrl(S(t).bookingPageUrl) || ""); }
 function bookingFactsOf(t) { return bookingFactsBlock({ bookingPageUrl: S(t).bookingPageUrl, retiredTerms: S(t).retiredTerms }); }
 // 全体の返信方針（恒久ルール）を生成プロンプト用のテキストに整形
 function prefsBlock(t) {
@@ -1879,7 +1880,7 @@ async function finalizeGeneratedDraft(t, raw, channel){
 async function validateDraftAgainstEvidence(t, input){
   input = input || {};
   const evidence = [
-    input.bookingPage ? "【設定の予約ページ（予約の案内先として正しい）】\n" + input.bookingPage : "",
+    input.bookingPage ? "【設定の予約ページのURL（予約ページを案内する場合の正しいURL。キャンセル・変更の受付方法は店舗ルールに従う）】\n" + input.bookingPage : "",
     input.rules ? "【関連店舗ルール】\n" + input.rules : "",
     input.booking ? "【本人確認済み予約・患者情報】\n" + input.booking : "",
     input.slots ? "【リアルタイム空き枠】\n" + input.slots : "",
@@ -3705,6 +3706,9 @@ app.post("/api/settings", guard, oneMutationAtATime("settings"), async (req, res
   // 予約ページURLは何も変更する前に検証する（不正なら設定を一切変えずに返す）
   const bookingPageUrl = typeof req.body.bookingPageUrl === "string" ? normalizeBookingPageUrl(req.body.bookingPageUrl) : undefined;
   if (bookingPageUrl === null) return res.status(400).json({ ok: false, error: "booking_page_url_invalid" });
+  const rawRetired = req.body.retiredTerms;
+  if (rawRetired !== undefined && !(typeof rawRetired === "string" || (Array.isArray(rawRetired) && rawRetired.every(x => typeof x === "string"))))
+    return res.status(400).json({ ok: false, error: "retired_terms_invalid" });
   if (typeof req.body.autoReply === "boolean") S(t).autoReply = req.body.autoReply;
   if (typeof req.body.bookingActions === "boolean") S(t).bookingActions = req.body.bookingActions;
   if (typeof req.body.staffBookingSuggest === "boolean") S(t).staffBookingSuggest = req.body.staffBookingSuggest;
@@ -3718,12 +3722,19 @@ app.post("/api/settings", guard, oneMutationAtATime("settings"), async (req, res
   if (req.body.level === "high" || req.body.level === "medium") S(t).level = req.body.level;
   if (typeof req.body.tone === "string") S(t).tone = req.body.tone.slice(0, 1500);
   if (bookingPageUrl !== undefined) S(t).bookingPageUrl = bookingPageUrl;
-  if (Array.isArray(req.body.retiredTerms) || typeof req.body.retiredTerms === "string") S(t).retiredTerms = normalizeRetiredTerms(req.body.retiredTerms);
+  let retiredTermsDropped = [];
+  if (rawRetired !== undefined) {
+    // 予約ページのURLに含まれる語は登録しない（新しい予約ページの案内まで止めてしまうため）
+    const wanted = normalizeRetiredTerms(rawRetired);
+    const kept = retiredTermsExcludingUrl(wanted, normalizeBookingPageUrl(S(t).bookingPageUrl) || "");
+    retiredTermsDropped = wanted.filter(term => !kept.includes(term));
+    S(t).retiredTerms = kept;
+  }
   if (req.body.autoDelayMin != null && isFinite(Number(req.body.autoDelayMin))) S(t).autoDelayMin = Math.min(60, Math.max(0, Math.round(Number(req.body.autoDelayMin))));
   if (["claude", "gpt", "gemini"].includes(req.body.engine)) S(t).engine = req.body.engine;
   if (req.body.aiRoutes && typeof req.body.aiRoutes === "object") S(t).aiRoutes = normalizeAiRoutes(req.body.aiRoutes, configuredExtraOpenAiModels());
   try { await saveTenantConfig(t); } catch (e) {}
-  res.json(Object.assign({ ok: true }, publicSettings(t)));
+  res.json(Object.assign({ ok: true, retiredTermsDropped }, publicSettings(t)));
 });
 app.post("/api/done", guard, (req, res) => { const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" }); cancelAutoReply(t, c.id); c.status = "done"; c.flag = false; c.bookingSuggestion = null; dbSave(t, c); res.json({ ok: true }); });
 app.post("/api/done-all", guard, oneMutationAtATime("done-all"), (req, res) => { const t = req.tenant; let count = 0; Object.values(t.store).forEach(c => { if (c.status !== "done" || c.flag) { cancelAutoReply(t, c.id); c.status = "done"; c.flag = false; c.bookingSuggestion = null; dbSave(t, c); count++; } }); res.json({ ok: true, count }); });
@@ -7995,7 +8006,7 @@ async function deleteStaffLineStaff(id,btn){if(!await uiConfirm("このスタッ
 async function runQualityPreview(){const input=document.getElementById("qualityPreviewInput"),out=document.getElementById("qualityPreviewResult"),btn=document.getElementById("qualityPreviewBtn"),inquiry=input.value.trim();if(!inquiry){uiAlert("テストする問い合わせ文を入力してください");return;}btn.disabled=true;btn.textContent="生成中…";out.style.display="block";out.textContent="返信案を生成しています…";try{const r=await api("/api/quality-preview",{inquiry,channel:document.getElementById("qualityPreviewChannel").value}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"failed");const label=({gpt:"GPT",gemini:"Gemini",claude:"Claude"})[j.engine]||j.engine;const refs=Array.isArray(j.learningRefs)?j.learningRefs:[];const g=j.grounding||{},v=j.validation||{};const audit=g.autoSendAllowed&&v.pass?" / 根拠監査OK":" / スタッフ確認: "+((g.reasons&&g.reasons[0])||v.reason||"根拠不足");out.textContent=j.draft+"\\n\\n―― "+label+" / 確信率 "+(j.confidence||"不明")+(j.toneApplied?" / 設定トーン確認済み":j.qualityIssues&&j.qualityIssues.length?" / 自動校正済み":"")+(refs.length?" / 過去対応 "+refs.length+"件参照":" / 過去対応の該当なし")+audit;}catch(e){out.textContent=e.message==="no_ai_key"?"AIキーが未設定のため生成できません。運営にAI接続設定を依頼してください。":e.message==="policy_review_failed"?"登録ルールに沿った返信か確認できなかったため、案を採用しませんでした。患者やLINEには送信されていません。":e.message==="ai_failed"?"登録済みのAIキーを確認できませんでした。キーの失効・利用上限・モデル権限を運営側で確認してください。患者やLINEには送信されていません。":"生成できませんでした。時間をおいて再度お試しください。";}finally{btn.disabled=false;btn.textContent="返信案をテスト生成";}}
 async function runShadowPreview(){const inquiry=document.getElementById("qualityPreviewInput").value.trim(),out=document.getElementById("qualityPreviewResult"),btn=document.getElementById("shadowPreviewBtn"),routes=collectAiRoutes();if(!inquiry){uiAlert("テストする問い合わせ文を入力してください");return;}btn.disabled=true;btn.textContent="2つのモデルを比較中…";out.style.display="block";out.textContent="本番回答には使わず、並行テストしています…";try{const r=await api("/api/model-shadow-preview",{inquiry,channel:document.getElementById("qualityPreviewChannel").value,candidate:routes.draft}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"failed");out.textContent="【現在のモデル "+j.active.route.model+"】\\n"+j.active.draft+"\\n\\n【候補モデル "+j.candidate.route.model+"】\\n"+j.candidate.draft+"\\n\\n※患者への送信・会話保存・学習は行っていません。";}catch(e){out.textContent=e.message==="no_openai_key"?"OpenAI APIが未接続です。":"並行テストを実行できませんでした。";}finally{btn.disabled=false;btn.textContent="候補モデルを並行テスト（回答には使用しない）";}}
 let settingsSaveBusy=false;
-async function saveSet(){if(settingsSaveBusy)return;const btn=document.getElementById("saveSettingsBtn");settingsSaveBusy=true;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>保存中…';}const autoReply=document.getElementById("setAuto").checked;const bookingActions=document.getElementById("setBookingActions").checked;const staffBookingSuggest=document.getElementById("setStaffBookingSuggest").checked;const inboxOrder=document.getElementById("setInboxOrder").value;const staffLineEnabled=document.getElementById("setStaffLineEnabled").checked;const staffLineReplyMode=document.getElementById("setStaffLineReplyMode").value;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const bookingPageUrl=document.getElementById("setBookingPageUrl").value.trim();const retiredTerms=document.getElementById("setRetiredTerms").value;const engine=document.getElementById("setEngine").value;const aiRoutes=collectAiRoutes();const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{const r=await api("/api/settings",{autoReply,bookingActions,staffBookingSuggest,inboxOrder,staffLineEnabled,staffLineReplyMode,level,tone,bookingPageUrl,retiredTerms,engine,aiRoutes,autoDelayMin});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");await load();uiAlert("設定を保存しました");closeSet();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"先に法人専用スタッフLINEと通知グループを接続してください":e.message==="booking_page_url_invalid"?"予約ページのURLは https:// から始まる正しいURLを入力してください":e.message==="no_ai_key"?"AIキーが未設定のため自動返信を有効にできません。運営へ接続設定を依頼してください":"保存に失敗しました");}finally{settingsSaveBusy=false;if(btn){btn.disabled=false;btn.removeAttribute("aria-busy");btn.textContent="設定を保存";}}}
+async function saveSet(){if(settingsSaveBusy)return;const btn=document.getElementById("saveSettingsBtn");settingsSaveBusy=true;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>保存中…';}const autoReply=document.getElementById("setAuto").checked;const bookingActions=document.getElementById("setBookingActions").checked;const staffBookingSuggest=document.getElementById("setStaffBookingSuggest").checked;const inboxOrder=document.getElementById("setInboxOrder").value;const staffLineEnabled=document.getElementById("setStaffLineEnabled").checked;const staffLineReplyMode=document.getElementById("setStaffLineReplyMode").value;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const bookingPageUrl=document.getElementById("setBookingPageUrl").value.trim();const retiredTerms=document.getElementById("setRetiredTerms").value;const engine=document.getElementById("setEngine").value;const aiRoutes=collectAiRoutes();const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{const r=await api("/api/settings",{autoReply,bookingActions,staffBookingSuggest,inboxOrder,staffLineEnabled,staffLineReplyMode,level,tone,bookingPageUrl,retiredTerms,engine,aiRoutes,autoDelayMin});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");await load();uiAlert((j.retiredTermsDropped&&j.retiredTermsDropped.length)?"設定を保存しました。予約ページのURLに含まれる語は「使わなくなった語句」に登録できないため外しました: "+j.retiredTermsDropped.join("、"):"設定を保存しました");closeSet();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"先に法人専用スタッフLINEと通知グループを接続してください":e.message==="booking_page_url_invalid"?"予約ページのURLは https:// から始まる正しいURLを入力してください":e.message==="retired_terms_invalid"?"使わなくなった語句の形式が正しくありません":e.message==="no_ai_key"?"AIキーが未設定のため自動返信を有効にできません。運営へ接続設定を依頼してください":"保存に失敗しました");}finally{settingsSaveBusy=false;if(btn){btn.disabled=false;btn.removeAttribute("aria-busy");btn.textContent="設定を保存";}}}
 async function changeLoginId(){
   const next=await uiPrompt("新しいログインID（半角英数字3〜30文字。スタッフ全員のログインに使います）");if(!next)return;
   const btn=document.getElementById("changeLoginIdBtn");await withBusy("change-login-id",btn,"変更中…",async()=>{try{const r=await api("/api/change-loginid",{next:next.trim()});const j=await r.json();
