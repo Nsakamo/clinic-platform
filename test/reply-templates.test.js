@@ -78,6 +78,7 @@ test("画面の差し込み（tplFill）はサーバーの fillTemplate と同�
   const cases = [
     { cache: { c1: { found: true, patient: { name: "テスト 花子" } } }, meta: { bookingPageUrl: "https://example.com/b", clinicName: "テスト医院" }, name: "テスト 花子" },
     { cache: { c1: { found: false } }, meta: { bookingPageUrl: "", clinicName: "" }, name: "" },
+    { cache: { c1: { found: true, patient: { name: "テスト{医院名}" } } }, meta: { bookingPageUrl: "https://example.com/{お名前}", clinicName: "テスト医院" }, name: "テスト{医院名}" },
   ];
   for (const c of cases) {
     const ctx = { current: "c1", custCache: c.cache, tplMeta: c.meta };

@@ -109,3 +109,35 @@ test("設定画面で予約ページURLと使わなくなった語句を保存�
   assert.match(source, /id="setRetiredTerms"/);
   assert.match(source, /level,tone,bookingPageUrl,retiredTerms,engine,aiRoutes,autoDelayMin/);
 });
+
+test("下書きに旧予約サイト・語句が残ったら、自動送信を止めてスタッフ確認へ回す", () => {
+  const ctx = { textMentionsRetiredTerm, retiredTermsOf: () => ["kalonade"] };
+  vm.createContext(ctx);
+  vm.runInContext(section("function applyRetiredTermGate(", "// 設定画面の注意表示"), ctx);
+  const out = { draft: "テスト https://hb-clinic.kalonade.com/x からご予約ください", needs_human: false, confidence: "high", qualityIssues: [], grounding: { autoSendAllowed: true, reasons: [] }, validation: { pass: true } };
+  assert.equal(ctx.applyRetiredTermGate({}, out), true);
+  assert.equal(out.needs_human, true);
+  assert.equal(out.grounding.autoSendAllowed, false);
+  assert.equal(out.validation.pass, false);
+  assert.ok(out.qualityIssues.includes("retired_booking_site"));
+  const ok = { draft: "テスト https://app.uketsuke-run.online/booking/x", grounding: { autoSendAllowed: true, reasons: [] } };
+  assert.equal(ctx.applyRetiredTermGate({}, ok), false);
+  assert.equal(ok.grounding.autoSendAllowed, true);
+  // 監査の書き直しの後（最終の下書き）で判定し、送信前監査にも設定の予約ページを根拠として渡す
+  const gen = section("async function genDraft(", "async function enrichStaffLineBookingPreview(");
+  assert.ok(gen.indexOf("applyRetiredTermGate(t, out)") > gen.indexOf("validateDraftAgainstEvidence(t, {"));
+  assert.match(gen, /bookingPage: bookingFactsOf\(t\)/);
+  assert.match(section("async function validateDraftAgainstEvidence(", "\n}\n"), /【設定の予約ページ（予約の案内先として正しい）】/);
+});
+
+test("キャンセル・変更の依頼では、尋ねられていなくてもキャンセル料・変更料の規定は省かない", () => {
+  assert.match(ANSWER_FIRST_POLICY, /キャンセル・日時変更の依頼に対するキャンセル料・変更料、免除条件など）は、尋ねられていなくても店舗ルールどおり案内する/);
+  assert.doesNotMatch(ANSWER_FIRST_POLICY, /尋ねていない用件（キャンセル料/);
+  assert.match(bookingFactsBlock({ bookingPageUrl: "https://example.com/b" }), /店舗ルール・スタッフの共通指示・過去の対応例より優先する/);
+});
+
+test("設定画面に、旧語句がルールブック・共通指示に残っている件数と学習例の除外件数を出す", () => {
+  assert.match(source, /retiredTermHits: retiredTermHits\(t\),/);
+  assert.match(source, /function renderRetiredTermWarn\(h\)/);
+  assert.match(source, /学習例の半数以上/);
+});

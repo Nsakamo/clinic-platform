@@ -24,7 +24,7 @@ const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation
 const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, styleEditPreservesContent, requestsWeakened, sentenceCount, borrowsFromSamples, safeText: safeDraftChatText, maskStyleSample } = require("./lib/draft-chat-output");
 const { REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview, inboundMessageTimes } = require("./lib/reply-decision");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
-const { ANSWER_FIRST_POLICY, bookingFactsBlock, learningUsesRetiredTerms, normalizeBookingPageUrl, normalizeRetiredTerms } = require("./lib/booking-facts");
+const { ANSWER_FIRST_POLICY, bookingFactsBlock, learningUsesRetiredTerms, normalizeBookingPageUrl, normalizeRetiredTerms, textMentionsRetiredTerm } = require("./lib/booking-facts");
 const { normalizeTemplates, saveTemplate, deleteTemplate, moveTemplate } = require("./lib/reply-templates");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
 const { AiUsageSpool, resolveAiUsageSpoolPath } = require("./lib/ai-usage-spool");
@@ -951,6 +951,32 @@ async function exampleAdd(t, obj) {
   return ex;
 }
 // 予約ページと使わなくなった予約サイト・語句（設定画面で法人ごとに登録）
+// 生成・監査の書き直しの後に、旧予約サイト・語句が残っていれば自動送信せずスタッフ確認へ回す（プロンプトだけに頼らない）。
+function applyRetiredTermGate(t, out) {
+  if (!out || !textMentionsRetiredTerm(out.draft, retiredTermsOf(t))) return false;
+  out.needs_human = true;
+  out.confidence = "low";
+  out.qualityIssues = Array.from(new Set([...(Array.isArray(out.qualityIssues) ? out.qualityIssues : []), "retired_booking_site"]));
+  if (!out.grounding || typeof out.grounding !== "object") out.grounding = { autoSendAllowed: false, reasons: [], sources: [] };
+  out.grounding.autoSendAllowed = false;
+  if (!Array.isArray(out.grounding.reasons)) out.grounding.reasons = [];
+  out.grounding.reasons.push("使わなくなった予約サイト・語句が含まれています。設定の予約ページに書き換えてから送信してください");
+  if (out.validation && typeof out.validation === "object") { out.validation.pass = false; out.validation.reason = "使わなくなった予約サイト・語句が含まれています"; }
+  return true;
+}
+// 設定画面の注意表示: 使わなくなった語句がルールブック・共通指示に残っている件数と、除外している学習例の件数
+function retiredTermHits(t) {
+  const terms = retiredTermsOf(t);
+  if (!terms.length) return { rules: 0, prefs: 0, examples: 0, examplesTotal: Object.keys(t.examples || {}).length };
+  const prefs = (Array.isArray(S(t).prefs) ? S(t).prefs : []).map(p => String(typeof p === "string" ? p : ((p && p.text) || "")));
+  const examples = Object.values(t.examples || {});
+  return {
+    rules: rulesList(t).filter(r => textMentionsRetiredTerm(String(r.title || "") + "\n" + String(r.content || ""), terms)).length,
+    prefs: prefs.filter(p => textMentionsRetiredTerm(p, terms)).length,
+    examples: examples.filter(e => learningUsesRetiredTerms(e, terms)).length,
+    examplesTotal: examples.length,
+  };
+}
 function retiredTermsOf(t) { return normalizeRetiredTerms(S(t).retiredTerms); }
 function bookingFactsOf(t) { return bookingFactsBlock({ bookingPageUrl: S(t).bookingPageUrl, retiredTerms: S(t).retiredTerms }); }
 // 全体の返信方針（恒久ルール）を生成プロンプト用のテキストに整形
@@ -1853,6 +1879,7 @@ async function finalizeGeneratedDraft(t, raw, channel){
 async function validateDraftAgainstEvidence(t, input){
   input = input || {};
   const evidence = [
+    input.bookingPage ? "【設定の予約ページ（予約の案内先として正しい）】\n" + input.bookingPage : "",
     input.rules ? "【関連店舗ルール】\n" + input.rules : "",
     input.booking ? "【本人確認済み予約・患者情報】\n" + input.booking : "",
     input.slots ? "【リアルタイム空き枠】\n" + input.slots : "",
@@ -2514,6 +2541,7 @@ async function genDraft(t, c, opts) {
           booking: !staffBookingMode && baCtx && baCtx.ok && baCtx.verified ? bookingTxt : "",
           slots: opts.baSlotsTxt || "",
           precedents: precedentsTxt,
+          bookingPage: bookingFactsOf(t),
         });
         if (out.validation.pass && out.validation.revisedDraft && out.validation.revisedDraft !== out.draft) {
           out.draft = out.validation.revisedDraft;
@@ -2534,6 +2562,7 @@ async function genDraft(t, c, opts) {
       } else {
         out.validation = { pass: false, skipped: true, reason: "根拠不足・緊急性・人の判断のいずれかにより自動送信対象外です" };
       }
+      applyRetiredTermGate(t, out);
       out.learningUsage = {
         rules: Array.isArray(out.grounding && out.grounding.ruleRefs) ? out.grounding.ruleRefs : [],
         prefs: (Array.isArray(S(t).prefs) ? S(t).prefs : []).map(p => String(typeof p === "string" ? p : ((p && p.text) || ""))).filter(Boolean).slice(-8),
@@ -3517,6 +3546,7 @@ function publicSettings(t) {
     aiRoutes: normalizeAiRoutes(S(t).aiRoutes, configuredExtraOpenAiModels()),
     aiModelCatalog: publicModelCatalog(configuredExtraOpenAiModels()),
     learningConflictsPending: learningConflicts(t, true).length,
+    retiredTermHits: retiredTermHits(t),
     learningAutomation: { ready: performance.filter(item => item.ready).length, tracked: performance.filter(item => item.key !== "other").length },
     rules: { chars: rulesCharTotal(t), count: rulesList(t).length, budget: ruleBudget(t), budgets: RULE_BUDGETS }
   });
@@ -6462,7 +6492,8 @@ const PAGE = `<!DOCTYPE html>
     <input id="setBookingPageUrl" type="url" inputmode="url" placeholder="https://app.uketsuke-run.online/booking/..." style="width:100%;box-sizing:border-box;border:1px solid #d1d5db;border-radius:8px;padding:8px;font-size:13px;">
     <label for="setRetiredTerms" style="display:block;font-size:13px;margin:10px 0 4px;">🚫 使わなくなった予約サイト・URL・語句（1行に1つ）</label>
     <textarea id="setRetiredTerms" placeholder="例：kalonade&#10;カロネード" style="width:100%;box-sizing:border-box;min-height:56px;border:1px solid #d1d5db;border-radius:8px;padding:8px;font-size:13px;font-family:inherit;"></textarea>
-    <div style="font-size:11px;color:#6b7280;margin-top:2px;line-height:1.55;">AI下書き・自動返信・右腕くんへの相談では、予約の案内先を上の予約ページに統一します。下の語句を含む過去の学習例・書き方の見本は使わず、患者へも案内しません。テンプレートの {予約ページ} にもこのURLが入ります。</div>
+    <div style="font-size:11px;color:#6b7280;margin-top:2px;line-height:1.55;">AI下書き・自動返信・右腕くんへの相談では、予約の案内先を上の予約ページに統一します。下の語句を含む過去の学習例・書き方の見本は使いません。下書きに下の語句が残った場合は自動送信せず、スタッフ確認に回します。テンプレートの {予約ページ} にもこのURLが入ります。</div>
+    <div id="retiredTermWarn" style="font-size:11px;color:#b45309;margin-top:4px;line-height:1.55;display:none;"></div>
   </div>
   <div class="settingsSection">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
@@ -7723,12 +7754,13 @@ async function reloadLearning(){
 }
 function openLearning(){document.getElementById("learnManagePop").style.display="flex";reloadLearning();}
 function closeLearning(){document.getElementById("learnManagePop").style.display="none";}
+function renderRetiredTermWarn(h){var el=document.getElementById("retiredTermWarn");if(!el)return;h=h||{};var parts=[];if(h.rules)parts.push("ルールブック "+h.rules+"件");if(h.prefs)parts.push("記憶させた指示 "+h.prefs+"件");var msg="";if(parts.length)msg+="⚠ 使わなくなった語句が "+parts.join("・")+" に残っています。学習データ管理から書き換えてください。";if(h.examples&&h.examplesTotal&&h.examples*2>h.examplesTotal)msg+=(msg?" ":"")+"⚠ 学習例の半数以上（"+h.examples+"/"+h.examplesTotal+"件）を除外しています。一般的な語を登録していないか確認してください。";else if(h.examples)msg+=(msg?" ":"")+"学習例 "+h.examples+"件を除外中です。";el.textContent=msg;el.style.display=msg?"block":"none";}
 // ===== 返信テンプレート（返信欄の📋から差し込み／設定から管理） =====
 var tplCache=null,tplMeta={bookingPageUrl:"",clinicName:""},tplCat="",tplEditing="",tplBusy=false;
 function tplSetCache(list){if(Array.isArray(list))tplCache=list;var el=document.getElementById("tplCountSummary");if(el)el.textContent=tplCache?"（登録 "+tplCache.length+"件）":"";}
 async function tplLoad(){var r=await fetch("/api/templates");var j=await r.json().catch(function(){return {};});if(!r.ok||!j.ok)throw new Error(j.error||"load");tplMeta={bookingPageUrl:j.bookingPageUrl||"",clinicName:j.clinicName||""};tplSetCache(j.templates||[]);return tplCache;}
 function tplPatientName(){try{var cc=current&&custCache[current];if(cc&&cc.found&&cc.patient&&cc.patient.name)return String(cc.patient.name).trim();}catch(e){}return "";}
-function tplFill(body){var m={"{お名前}":tplPatientName()||"（お名前）","{予約ページ}":tplMeta.bookingPageUrl||"（予約ページURL）","{医院名}":tplMeta.clinicName||"（医院名）"};var out=String(body||"");Object.keys(m).forEach(function(k){out=out.split(k).join(m[k]);});return out;}
+function tplFill(body){var m={"{お名前}":tplPatientName()||"（お名前）","{予約ページ}":tplMeta.bookingPageUrl||"（予約ページURL）","{医院名}":tplMeta.clinicName||"（医院名）"};return String(body||"").replace(/\\{(お名前|予約ページ|医院名)\\}/g,function(k){return m[k];});}
 function tplCategories(list){var seen={},out=[];(list||[]).forEach(function(t){var c=t.category||"その他";if(!seen[c]){seen[c]=1;out.push(c);}});return out;}
 function tplMatches(t,q){if(!q)return true;q=q.toLowerCase();return (t.title+"\\n"+(t.category||"")+"\\n"+t.body).toLowerCase().indexOf(q)>=0;}
 function renderTplPicker(){var pop=document.getElementById("tplPop");if(!pop)return;var qEl=document.getElementById("tplSearch");var q=qEl?qEl.value.trim():"";var list=tplCache||[];var cats=tplCategories(list);if(tplCat&&cats.indexOf(tplCat)<0)tplCat="";
@@ -7894,7 +7926,7 @@ const AI_ROUTE_LABELS={draft:"下書き・自動返信",finalize:"文体の最�
 function renderAiRouteFields(settings){const box=document.getElementById("aiRouteFields");if(!box)return;const routes=settings.aiRoutes||{},catalog=Array.isArray(settings.aiModelCatalog)?settings.aiModelCatalog:[];box.innerHTML=Object.keys(AI_ROUTE_LABELS).map(task=>{const current=routes[task]&&routes[task].model||"";return '<label style="font-size:10.5px;color:#475569;">'+AI_ROUTE_LABELS[task]+'<select data-ai-route="'+task+'" style="width:100%;padding:7px;border:1px solid #d1d5db;border-radius:7px;font-size:11px;margin-top:2px;">'+catalog.map(m=>'<option value="'+esc(m.id)+'"'+(m.id===current?' selected':'')+'>'+esc(m.label)+'</option>').join("")+'</select></label>';}).join("");}
 function collectAiRoutes(){const out={};document.querySelectorAll("[data-ai-route]").forEach(el=>{out[el.getAttribute("data-ai-route")]={model:el.value};});return out;}
 async function openSet(){try{const ar=await fetch("/api/account");const a=await ar.json();document.getElementById("accountLoginId").textContent="ログインID: "+(a.loginId||"");document.getElementById("setAccountEmail").value=a.accountEmail||"";document.getElementById("accountEmailStat").textContent=(a.accountEmail?"再設定メールアドレス登録済み":"再設定メールアドレス未登録")+(a.resetEmailReady?"・メール送信可能":"・送信メール設定が必要");}catch(e){}
-  try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setBookingActions").checked=!!s.bookingActions;document.getElementById("setStaffBookingSuggest").checked=s.staffBookingSuggest!==false;document.getElementById("setInboxOrder").value=s.inboxOrder||"unanswered_first";document.getElementById("setStaffLineEnabled").checked=!!s.staffLineEnabled;document.getElementById("setStaffLineReplyMode").value=s.staffLineReplyMode||"exceptions";document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setBookingPageUrl").value=s.bookingPageUrl||"";document.getElementById("setRetiredTerms").value=(Array.isArray(s.retiredTerms)?s.retiredTerms:[]).join("\\n");tplSetCache(s.templates);document.getElementById("setEngine").value=s.engine||"gpt";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);renderAiRouteFields(s);window.__rules=s.rules||null;renderRuleGauge();renderPrefs(s.prefs||[]);const lcs=document.getElementById("learningConflictSummary");if(lcs)lcs.textContent=s.learningConflictsPending?" ⚠ 学習確認待ち "+s.learningConflictsPending+"件":"";const las=document.getElementById("learningAutomationSummary"),la=s.learningAutomation||{};if(las)las.textContent=la.ready?" ✅ 自動対応候補 "+la.ready+"種類":" 学習実績を蓄積中";
+  try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setBookingActions").checked=!!s.bookingActions;document.getElementById("setStaffBookingSuggest").checked=s.staffBookingSuggest!==false;document.getElementById("setInboxOrder").value=s.inboxOrder||"unanswered_first";document.getElementById("setStaffLineEnabled").checked=!!s.staffLineEnabled;document.getElementById("setStaffLineReplyMode").value=s.staffLineReplyMode||"exceptions";document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setBookingPageUrl").value=s.bookingPageUrl||"";document.getElementById("setRetiredTerms").value=(Array.isArray(s.retiredTerms)?s.retiredTerms:[]).join("\\n");tplSetCache(s.templates);renderRetiredTermWarn(s.retiredTermHits);document.getElementById("setEngine").value=s.engine||"gpt";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);renderAiRouteFields(s);window.__rules=s.rules||null;renderRuleGauge();renderPrefs(s.prefs||[]);const lcs=document.getElementById("learningConflictSummary");if(lcs)lcs.textContent=s.learningConflictsPending?" ⚠ 学習確認待ち "+s.learningConflictsPending+"件":"";const las=document.getElementById("learningAutomationSummary"),la=s.learningAutomation||{};if(las)las.textContent=la.ready?" ✅ 自動対応候補 "+la.ready+"種類":" 学習実績を蓄積中";
   if(s.engines){const n=document.getElementById("engineNote");const active=({gpt:"GPT",gemini:"Gemini",claude:"Claude"})[s.activeEngine]||"なし";n.textContent="設定状況: GPT"+(s.engines.gpt?"✓設定済み":"⚠キー未設定")+"・Gemini"+(s.engines.gemini?"✓設定済み":"⚠キー未設定")+"・Claude"+(s.engines.claude?"✓設定済み":"⚠キー未設定")+"。優先エンジン: "+active+"（✓はキーの登録を示します。実際の有効性は下の文章品質テストで確認してください。失敗時は次の設定済みAIへ自動切替します）。";}}catch(e){}
   refreshModelAlert();
   try{const cr=await fetch("/api/conn");const c=await cr.json();document.getElementById("connStat").textContent=(c.lineConfigured?"LINE✓ ":"LINE未 ")+(c.mailConfigured?"メール✓":"メール未");document.getElementById("cSmtpHost").value=c.smtpHost||"";document.getElementById("cSmtpPort").value=c.smtpPort||"";document.getElementById("cSmtpUser").value=c.smtpUser||"";document.getElementById("cImapHost").value=c.imapHost||"";document.getElementById("cImapPort").value=c.imapPort||"";document.getElementById("cImapUser").value=c.imapUser||"";document.getElementById("cEmailInternal").checked=!!c.emailInternal;renderAccts(c);}catch(e){}
