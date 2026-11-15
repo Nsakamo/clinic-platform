@@ -24,6 +24,8 @@ const { explicitEditMismatch, normalizeDraftEditHistory, isDraftChatConsultation
 const { parseDraftChatOutput, buildDraftChatEnvelope, isStyleOnlyInstruction, decisionTermsPreserved, styleEditPreservesContent, requestsWeakened, sentenceCount, borrowsFromSamples, safeText: safeDraftChatText, maskStyleSample } = require("./lib/draft-chat-output");
 const { REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery, replyMessageText, needsCancellationPolicyReview, inboundMessageTimes } = require("./lib/reply-decision");
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
+const { ANSWER_FIRST_POLICY, bookingFactsBlock, learningUsesRetiredTerms, normalizeBookingPageUrl, normalizeRetiredTerms } = require("./lib/booking-facts");
+const { normalizeTemplates, saveTemplate, deleteTemplate, moveTemplate } = require("./lib/reply-templates");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
 const { AiUsageSpool, resolveAiUsageSpoolPath } = require("./lib/ai-usage-spool");
 const app = express();
@@ -948,6 +950,9 @@ async function exampleAdd(t, obj) {
   while (ids.length > EXAMPLE_MAX) { const old = ids.shift(); delete t.examples[old]; if (pool) pool.query("DELETE FROM examples WHERE tenant=$1 AND id=$2", [t.slug, old]).catch(() => {}); }
   return ex;
 }
+// 予約ページと使わなくなった予約サイト・語句（設定画面で法人ごとに登録）
+function retiredTermsOf(t) { return normalizeRetiredTerms(S(t).retiredTerms); }
+function bookingFactsOf(t) { return bookingFactsBlock({ bookingPageUrl: S(t).bookingPageUrl, retiredTerms: S(t).retiredTerms }); }
 // 全体の返信方針（恒久ルール）を生成プロンプト用のテキストに整形
 function prefsBlock(t) {
   const a = (S(t).prefs && Array.isArray(S(t).prefs)) ? S(t).prefs : [];
@@ -958,8 +963,10 @@ function examplesRanked(t, query, k, context) {
   // 「学習する」選択後も、安全確認が終わるまでは新規候補を患者回答へ使わない。
   learningJobs(t).filter(job => job.status === "processing" && !job.reused && Number(job.exampleId)).forEach(job => pendingIds.add(Number(job.exampleId)));
   // 別患者の生の質問・返信は再利用しない。安全確認済みの一般化メモリだけを検索・下書き根拠に使う。
+  // 使わなくなった予約サイト・URLを案内している学習例は根拠にしない（予約システムの乗り換え後に旧サイトへ誘導しない）。
+  const retired = retiredTermsOf(t);
   const list = Object.values(t.examples || {})
-    .filter(example => !pendingIds.has(Number(example.id)) && reusableLearningSummary(example))
+    .filter(example => !pendingIds.has(Number(example.id)) && reusableLearningSummary(example) && !learningUsesRetiredTerms(example, retired))
     .map(example => Object.assign({}, example, { q: learningMetaSearchText(example) }));
   if (!list.length) return [];
   return rankLearningExamples(list, { latest: query, context: context || query }, k || 4);
@@ -976,7 +983,8 @@ async function checkConflict(t, q, newFinal, excludeId) {
   // 新しい例を先に保存した後で検索するため、ランキング前に除外する。
   // ランキング後に除外すると類似例の重複排除で古い回答まで消え、矛盾を見逃す。
   const pendingIds = new Set(learningConflicts(t, true).flatMap(item => item.kind === "rule" ? [Number(item.newId)] : [Number(item.oldId), Number(item.newId)]));
-  const candidates = Object.values(t.examples || {}).filter(example => Number(example.id) !== Number(excludeId) && !pendingIds.has(Number(example.id))).map(example => Object.assign({}, example, { originalQ: example.q, q: learningMetaSearchText(example) }));
+  const retired = retiredTermsOf(t);
+  const candidates = Object.values(t.examples || {}).filter(example => Number(example.id) !== Number(excludeId) && !pendingIds.has(Number(example.id)) && !learningUsesRetiredTerms(example, retired)).map(example => Object.assign({}, example, { originalQ: example.q, q: learningMetaSearchText(example) }));
   const cand = rankLearningExamples(candidates, { latest: q, context: q }, 3);
   if (!cand.length) return null;
   const old = cand[0];
@@ -1529,8 +1537,10 @@ const STYLE_SAMPLE_PERSONAL = /痛|腫れ|出血|症状|体調|具合|妊娠|授
 function styleSamples(t, query, context, k) {
   const pendingIds = new Set(learningConflicts(t, true).flatMap(item => item.kind === "rule" ? [Number(item.newId)] : [Number(item.oldId), Number(item.newId)]));
   learningJobs(t).filter(job => job.status === "processing" && Number(job.exampleId)).forEach(job => pendingIds.add(Number(job.exampleId)));
+  const retired = retiredTermsOf(t);
   const list = Object.values(t.examples || {})
     .filter(e => e && !pendingIds.has(Number(e.id)) && reusableLearningSummary(e) && String(e.q || "").trim() && String(e.final || "").trim().length >= 30
+      && !learningUsesRetiredTerms(e, retired) // 使わなくなった予約サイト・URLを含む返信は見本にしない
       && !STYLE_SAMPLE_PERSONAL.test(String(e.q || "") + String(e.final || "")) // 体調・症状・家庭の事情を含む返信は見本にしない
       && Date.now() - Number(e.ts || 0) >= STYLE_SAMPLE_SETTLE_MS); // 直近に追加・更新された例は、学習の安全確認が終わるまで使わない
   if (!list.length || !String(query || context || "").trim()) return [];
@@ -2409,7 +2419,8 @@ async function genDraft(t, c, opts) {
   const sys = "あなたはクリニック・店舗「" + (t.name || "クリニック") + "」の受付スタッフです。お客様とこの会話をしてきた本人として、最新のメッセージへ、とても丁寧でへりくだった敬語で、温かく返信します。"
     + REPLY_DECISION
     + "医療判断・診断はしない。「絶対」「完治」など断定的表現は使わない。絵文字は使わない。" + sig
-    + "\n\n【事実の安全ルール】料金・金額・割引・期限・規定・営業日・対応可否は店舗ルールに明記された内容だけを答える。予約日時・空き枠・患者固有情報・手続き完了は、本人確認済みのシステム照会結果だけを答える。痛み・症状・薬・安全性は診断や『大丈夫』という断定をせず、スタッフ確認へ回す。根拠が無い場合は推測せず『確認してご案内します』と伝え、needs_human:true、confidence:lowにする。"
+    + "\n\n【事実の安全ルール】料金・金額・割引・期限・規定・営業日・対応可否は店舗ルールに明記された内容だけを答える。予約日時・空き枠・患者固有情報・手続き完了は、本人確認済みのシステム照会結果だけを答える。痛み・症状・薬・安全性は診断や『大丈夫』という断定をせず、スタッフ確認へ回す。根拠が無い部分は推測で埋めず、下の【保留にしない答え方】に従う（答えられる部分は答え、患者側の情報が足りなければ具体的に尋ね、医院側の確認が要る部分だけ何を確認するかを書いて『確認してご案内します』とする）。医院側の確認が要る部分が残る場合は needs_human:true、confidence:low にする。"
+    + "\n\n" + ANSWER_FIRST_POLICY
     + "\n\n" + JP_QUALITY
     + "\n\n出力は必ず次のJSONのみ（前後に説明や```やかぎ括弧を付けない）: {\"draft\":\"お客様への返信文\",\"confidence\":\"high|medium|low\",\"is_urgent\":true|false,\"needs_human\":true|false,\"site_alert\":\"遅刻|当日キャンセル|緊急来院|none\",\"site_summary\":\"現場向け一行要約。site_alertがnoneなら空文字\",\"topics\":[{\"q\":\"短い質問ラベル\",\"need\":true}]"
     + (baTxt ? ",\"action\":{\"type\":\"none|cancel|reschedule|slots|link|verify\",\"appointmentId\":\"\",\"newDateTime\":\"\",\"dates\":[\"YYYY-MM-DD\"],\"phone\":\"\",\"email\":\"\"},\"after_action_draft\":\"\"" : "")
@@ -2425,6 +2436,7 @@ async function genDraft(t, c, opts) {
     + "\ntopics: お客様の直近メッセージにある「返信すべき質問・依頼」を、それぞれ短い日本語ラベル(q)で列挙する（最大5件）。状況連絡・挨拶・お礼や、時間が経って既に解決済みと思われるもの（例: かなり前に届いた『遅れます』）は need:false。それ以外は need:true。質問が1つだけなら1件でよい。"
     + (replyToneInstruction(S(t).tone) ? "\n\n" + replyToneInstruction(S(t).tone) : "")
     + (prefsBlock(t) ? "\n\n【スタッフが記憶させた指示（全返信で必ず守る。トーン指示と同格で最優先）】\n" + prefsBlock(t) : "")
+    + (bookingFactsOf(t) ? "\n\n" + bookingFactsOf(t) : "")
     + (rulesTxt ? "\n\n【店舗ルール（最優先で従う。料金・規定・対応可否はここに従い、推測で答えない。同じ内容が食い違う場合は更新日が新しいルールを使う）】\n" + rulesTxt : "")
     // ---- ここから下は問い合わせごとに変わる ----
     + (examplesTxt ? "\n\n【今回の問い合わせに近い、スタッフ確認済みの過去対応】\n『再利用できる確定例』は、同じ状況ならスタッフが確定した結論・案内順序・必要な確認事項・通常の料金や規定を次の回答にも引き継ぐ。これが右腕くんの対応学習である。ただし優先順位は、最新の店舗ルール > 本人確認済みシステムデータ > 再利用できる確定例 > 参考例。新しいルールと古い例が矛盾したら必ず新しいルールを使う。個別患者の予約日時・体調・例外対応は他の患者へ引き継がない。『参考例』は文章と手順だけ参考にする。\n" + examplesTxt : "")
@@ -3660,6 +3672,9 @@ app.post("/api/staff-line/disconnect", guard, oneMutationAtATime("staff-line"), 
 app.post("/api/settings", guard, oneMutationAtATime("settings"), async (req, res) => {
   const t = req.tenant;
   if (req.body.autoReply === true && !activeAiEngine(t)) return res.status(409).json({ ok:false, error:"no_ai_key" });
+  // 予約ページURLは何も変更する前に検証する（不正なら設定を一切変えずに返す）
+  const bookingPageUrl = typeof req.body.bookingPageUrl === "string" ? normalizeBookingPageUrl(req.body.bookingPageUrl) : undefined;
+  if (bookingPageUrl === null) return res.status(400).json({ ok: false, error: "booking_page_url_invalid" });
   if (typeof req.body.autoReply === "boolean") S(t).autoReply = req.body.autoReply;
   if (typeof req.body.bookingActions === "boolean") S(t).bookingActions = req.body.bookingActions;
   if (typeof req.body.staffBookingSuggest === "boolean") S(t).staffBookingSuggest = req.body.staffBookingSuggest;
@@ -3672,6 +3687,8 @@ app.post("/api/settings", guard, oneMutationAtATime("settings"), async (req, res
   S(t).staffLineReplyMode = nextStaffLineMode;
   if (req.body.level === "high" || req.body.level === "medium") S(t).level = req.body.level;
   if (typeof req.body.tone === "string") S(t).tone = req.body.tone.slice(0, 1500);
+  if (bookingPageUrl !== undefined) S(t).bookingPageUrl = bookingPageUrl;
+  if (Array.isArray(req.body.retiredTerms) || typeof req.body.retiredTerms === "string") S(t).retiredTerms = normalizeRetiredTerms(req.body.retiredTerms);
   if (req.body.autoDelayMin != null && isFinite(Number(req.body.autoDelayMin))) S(t).autoDelayMin = Math.min(60, Math.max(0, Math.round(Number(req.body.autoDelayMin))));
   if (["claude", "gpt", "gemini"].includes(req.body.engine)) S(t).engine = req.body.engine;
   if (req.body.aiRoutes && typeof req.body.aiRoutes === "object") S(t).aiRoutes = normalizeAiRoutes(req.body.aiRoutes, configuredExtraOpenAiModels());
@@ -3681,6 +3698,31 @@ app.post("/api/settings", guard, oneMutationAtATime("settings"), async (req, res
 app.post("/api/done", guard, (req, res) => { const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" }); cancelAutoReply(t, c.id); c.status = "done"; c.flag = false; c.bookingSuggestion = null; dbSave(t, c); res.json({ ok: true }); });
 app.post("/api/done-all", guard, oneMutationAtATime("done-all"), (req, res) => { const t = req.tenant; let count = 0; Object.values(t.store).forEach(c => { if (c.status !== "done" || c.flag) { cancelAutoReply(t, c.id); c.status = "done"; c.flag = false; c.bookingSuggestion = null; dbSave(t, c); count++; } }); res.json({ ok: true, count }); });
 app.post("/api/tag", guard, (req, res) => { const t = req.tenant; const c = t.store[req.body.id]; if (!c) return res.status(404).json({ error: "no" }); c.flag = !c.flag; if (c.flag) { c.order = Math.max(0, ...Object.values(t.store).filter(x => x.flag).map(x => x.order || 0)) + 1; c.status = "todo"; } dbSave(t, c); res.json({ ok: true, flag: c.flag }); });
+
+// ===== 返信テンプレート（スタッフが手で返信するときの定型文。法人ごとに設定へ保存） =====
+function templatesPayload(t) {
+  return { ok: true, templates: normalizeTemplates(S(t).templates), bookingPageUrl: normalizeBookingPageUrl(S(t).bookingPageUrl) || "", clinicName: String(t.name || "") };
+}
+async function applyTemplateChange(t, res, result) {
+  if (!result.ok) return res.status(result.error === "not_found" ? 404 : 400).json({ ok: false, error: result.error });
+  const before = S(t).templates;
+  S(t).templates = result.templates;
+  try { await saveTenantConfig(t); }
+  catch (e) { S(t).templates = before; return res.status(500).json({ ok: false, error: "save" }); }
+  res.json(Object.assign(templatesPayload(t), result.template ? { template: result.template } : {}));
+}
+app.get("/api/templates", guard, (req, res) => res.json(templatesPayload(req.tenant)));
+app.post("/api/template-save", guard, oneMutationAtATime("templates"), async (req, res) => {
+  const b = req.body || {};
+  await applyTemplateChange(req.tenant, res, saveTemplate(S(req.tenant).templates, { id: b.id, title: b.title, category: b.category, body: b.body }, Date.now()));
+});
+app.post("/api/template-delete", guard, oneMutationAtATime("templates"), async (req, res) => {
+  await applyTemplateChange(req.tenant, res, deleteTemplate(S(req.tenant).templates, (req.body || {}).id));
+});
+app.post("/api/template-move", guard, oneMutationAtATime("templates"), async (req, res) => {
+  const b = req.body || {};
+  await applyTemplateChange(req.tenant, res, moveTemplate(S(req.tenant).templates, b.id, b.direction));
+});
 
 // ルール蒸留トーストの「取り消す」用。学習直後のルールを1件削除する。
 app.post("/api/rule-undo", guard, async (req, res) => {
@@ -4087,6 +4129,8 @@ app.post("/api/ai-regen", guard, async (req, res) => {
     + "本日は" + today + "です。キャンセル料など日付が関わる案内では、本日の日付と予約日の差から判断すること（例: 予約日の前日にあたる連絡なら前日扱い、当日なら当日扱い、それより前なら通常はキャンセル料は不要）。憶測で日付を決めない。"
     + "お客様が複数の質問・依頼をしている場合は、その全てにもれなく答えること。1つも取りこぼさない。"
     + "お客様への敬意と心配りが自然に伝わる表現を選び、ご不便にはお詫びや労いの一言を添える。誤った二重敬語は避け、読みやすさも保つ。絵文字は使わない。断定や医療判断は避ける。" + sig
+    + "\n" + ANSWER_FIRST_POLICY
+    + (bookingFactsOf(t) ? "\n" + bookingFactsOf(t) : "")
     + (rulesTxt ? "\n【店舗ルール（従うこと）】\n" + rulesTxt : "")
     + (replyToneInstruction(S(t).tone, 1000) ? "\n\n" + replyToneInstruction(S(t).tone, 1000) : "")
     + (c && notesBlock(c) ? "\n【このお客様への対応でスタッフが以前出した指示メモ（引き続き守る）】\n" + notesBlock(c) : "")
@@ -4190,7 +4234,9 @@ async function draftChatPrep(t, body) {
     + "\n\n【会話の仕方】ChatGPTのような自然な会話相手として振る舞う。スタッフが指示ではなく質問・相談をしてきた場合（例:「キャンセル料っていくらだっけ？」「どっちの言い方がいいと思う？」）は、店舗ルールと会話文脈を踏まえて返事で普通に答え、下書きは変えなくてよい。指示が曖昧なら、解釈した上で作りつつ、返事で一言確認する。"
     + "\n\n" + STAFF_DRAFT_POLICY
     + (replyToneInstruction(S(t).tone, 1000) ? "\n\n" + replyToneInstruction(S(t).tone, 1000) : "")
+    + "\n\n" + ANSWER_FIRST_POLICY
     + (prefsBlock(t) ? "\n\n【スタッフが記憶させた指示（全返信で必ず守る）】\n" + prefsBlock(t) : "")
+    + (bookingFactsOf(t) ? "\n\n" + bookingFactsOf(t) : "")
     + (rulesTxt ? "\n\n【通常の店舗ルール（ルールブック全文。スタッフが今回の例外を明示した項目以外の基準。推測で補わない。同じ内容が食い違う場合は更新日が新しいルールを使う）】\n" + rulesTxt : "")
     // ---- ここから下は会話・指示ごとに変わる ----
     + (examplesTxt ? "\n\n【今回に近い、スタッフ確認済みの過去対応（右腕くんの学習）】\n同じ状況ならスタッフが確定した結論・案内順序・必要な確認事項を引き継ぐ。優先順位は、今回のスタッフ指示 > 最新の店舗ルール > 本人確認済みシステムデータ > 再利用できる確定例 > 参考例。個別患者の予約日時・体調・例外対応は引き継がない。\n" + examplesTxt : "")
@@ -6032,6 +6078,37 @@ const PAGE = `<!DOCTYPE html>
   #aiLabel .patientModeNote{font-size:10px;color:#64748b;}
   #draftRow{display:flex;gap:8px;align-items:flex-end;}
   #attach{flex-shrink:0;width:38px;height:38px;border:1px solid var(--line);border-radius:9px;background:#fff;cursor:pointer;font-size:18px;}
+  #draftTools{display:flex;flex-direction:column;gap:6px;flex-shrink:0;}
+  #tplBtn{flex-shrink:0;width:38px;height:38px;border:1px solid var(--line);border-radius:9px;background:#fff;cursor:pointer;font-size:17px;}
+  #tplBtn[aria-expanded="true"]{border-color:#16a34a;background:#f0fdf4;}
+  #composer{position:relative;}
+  #tplPop{display:none;position:absolute;left:12px;bottom:calc(100% + 6px);width:min(360px,calc(100vw - 24px));max-height:min(60vh,420px);background:#fff;border:1px solid #d1d5db;border-radius:12px;box-shadow:0 12px 32px rgba(0,0,0,.16);z-index:40;flex-direction:column;overflow:hidden;}
+  #tplPop.open{display:flex;}
+  .tplHead{display:flex;gap:6px;align-items:center;padding:10px 10px 6px;}
+  .tplHead input{flex:1;min-width:0;border:1px solid #d1d5db;border-radius:8px;padding:7px 9px;font-size:13px;}
+  .tplCats{display:flex;gap:4px;flex-wrap:wrap;padding:0 10px 8px;}
+  .tplCat{border:1px solid #d1d5db;background:#fff;border-radius:999px;padding:3px 10px;font-size:11px;cursor:pointer;}
+  .tplCat[aria-pressed="true"]{background:#dcfce7;border-color:#16a34a;color:#166534;}
+  .tplList{overflow:auto;border-top:1px solid #e5e7eb;}
+  .tplItem{display:block;width:100%;text-align:left;background:#fff;border:0;border-bottom:1px solid #f3f4f6;padding:8px 10px;cursor:pointer;font-family:inherit;}
+  .tplItem:hover,.tplItem:focus{background:#f0fdf4;outline:none;}
+  .tplItemTitle{font-size:13px;font-weight:600;color:#111827;}
+  .tplItemBody{font-size:11px;color:#6b7280;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .tplEmpty{padding:14px 10px;font-size:12px;color:#6b7280;line-height:1.6;}
+  .tplFoot{font-size:11px;color:#6b7280;padding:6px 10px;border-top:1px solid #e5e7eb;}
+  #tplManagePop{position:fixed;inset:0;display:none;align-items:center;justify-content:center;z-index:79;background:rgba(0,0,0,.44);}
+  .tplManageGrid{display:grid;grid-template-columns:minmax(0,240px) minmax(0,1fr);gap:12px;padding:12px 14px;overflow:auto;}
+  .tplMList{border:1px solid #e5e7eb;border-radius:10px;overflow:auto;max-height:60vh;}
+  .tplMCat{font-size:11px;color:#6b7280;padding:6px 10px 2px;}
+  .tplMItem{display:block;width:100%;text-align:left;border:0;background:#fff;padding:7px 10px;font-size:13px;cursor:pointer;font-family:inherit;}
+  .tplMItem[aria-current="true"]{background:#dcfce7;color:#166534;font-weight:600;}
+  .tplForm label{display:block;font-size:12px;color:#6b7280;margin:0 0 3px;}
+  .tplForm input,.tplForm textarea{width:100%;box-sizing:border-box;border:1px solid #d1d5db;border-radius:8px;padding:8px;font-size:13px;font-family:inherit;}
+  .tplForm textarea{min-height:180px;line-height:1.6;}
+  .tplVars{display:flex;gap:4px;flex-wrap:wrap;margin-top:5px;align-items:center;}
+  .tplVar{border:1px dashed #9ca3af;background:#fff;border-radius:6px;padding:2px 7px;font-size:11px;cursor:pointer;font-family:inherit;}
+  .tplActions{display:flex;gap:6px;justify-content:flex-end;align-items:center;margin-top:10px;flex-wrap:wrap;}
+  @media (max-width:700px){.tplManageGrid{grid-template-columns:1fr;}.tplMList{max-height:30vh;}}
   #draft{flex:1;min-height:110px;max-height:300px;border:1px solid #d1d5db;border-radius:10px;padding:9px 11px;font-size:13px;line-height:1.5;font-family:inherit;resize:vertical;transition:min-height .15s ease;}
   #pendingAttachments{display:flex;gap:7px;overflow-x:auto;margin:0 0 7px;padding-bottom:2px;}
   .pendingAttachment{position:relative;display:flex;align-items:center;gap:7px;min-width:0;max-width:220px;padding:6px 28px 6px 7px;border:1px solid #bbf7d0;border-radius:9px;background:#f0fdf4;font-size:11px;color:#166534;}
@@ -6381,6 +6458,20 @@ const PAGE = `<!DOCTYPE html>
     <div style="font-size:11px;color:#6b7280;margin-top:2px;">ここに書いた指示は、AI下書き・自動返信・AIで作り直す返信の全文へ必須条件として反映し、生成後にもトーンを確認します。空欄なら標準のトーンです。</div>
   </div>
   <div class="settingsSection">
+    <label for="setBookingPageUrl" style="display:block;font-size:13px;margin-bottom:4px;">🔗 予約ページのURL</label>
+    <input id="setBookingPageUrl" type="url" inputmode="url" placeholder="https://app.uketsuke-run.online/booking/..." style="width:100%;box-sizing:border-box;border:1px solid #d1d5db;border-radius:8px;padding:8px;font-size:13px;">
+    <label for="setRetiredTerms" style="display:block;font-size:13px;margin:10px 0 4px;">🚫 使わなくなった予約サイト・URL・語句（1行に1つ）</label>
+    <textarea id="setRetiredTerms" placeholder="例：kalonade&#10;カロネード" style="width:100%;box-sizing:border-box;min-height:56px;border:1px solid #d1d5db;border-radius:8px;padding:8px;font-size:13px;font-family:inherit;"></textarea>
+    <div style="font-size:11px;color:#6b7280;margin-top:2px;line-height:1.55;">AI下書き・自動返信・右腕くんへの相談では、予約の案内先を上の予約ページに統一します。下の語句を含む過去の学習例・書き方の見本は使わず、患者へも案内しません。テンプレートの {予約ページ} にもこのURLが入ります。</div>
+  </div>
+  <div class="settingsSection">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+      <div style="font-size:13px;font-weight:600;">📋 返信テンプレート</div>
+      <button type="button" class="cbtn" onclick="openTplManage()">確認・編集</button>
+    </div>
+    <div style="font-size:11px;color:#6b7280;margin-top:5px;line-height:1.55;">スタッフが返信するとき、返信欄の 📋 から選んで差し込める定型文です。<span id="tplCountSummary"></span></div>
+  </div>
+  <div class="settingsSection">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
       <div style="font-size:13px;font-weight:600;">🧠 学習データ管理</div>
       <button type="button" class="cbtn" onclick="openLearning()">確認・編集</button>
@@ -6478,6 +6569,34 @@ const PAGE = `<!DOCTYPE html>
     </div>
   </div>
   <div class="rmFooter"><span id="rmStatus">読み込み前</span><div style="display:flex;gap:7px;flex-wrap:wrap;"><button type="button" id="rmUnpublishBtn" class="cbtn" style="display:none;color:#b91c1c;" onclick="busyUnpublishRichMenu()">公開停止</button><button type="button" id="rmSaveBtn" class="cbtn" onclick="busySaveRichMenu(false)">下書き保存</button><button type="button" id="rmPublishBtn" class="cbtn send" onclick="busySaveRichMenu(true)">LINEへ公開</button></div></div>
+</div></div>
+<div id="tplManagePop" role="dialog" aria-modal="true" aria-labelledby="tplManageTitle"><div class="learningCard">
+  <div class="learningHeader">
+    <div class="learningHeaderRow"><h3 id="tplManageTitle">📋 返信テンプレート</h3><button type="button" class="cbtn" onclick="closeTplManage()">閉じる</button></div>
+    <div style="font-size:11px;color:#6b7280;line-height:1.6;margin-top:6px;">返信欄の 📋 から選ぶと、カーソルの位置に差し込まれます。{お名前} はうけつけるんと連携済みの患者名、{予約ページ} は設定の予約ページURL、{医院名} は医院名に置き換わります（分からない場合は「（お名前）」のように残ります）。</div>
+  </div>
+  <div class="tplManageGrid">
+    <div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;"><span style="font-size:13px;font-weight:600;">一覧 <span id="tplMCount" style="font-weight:400;color:#6b7280;"></span></span><button type="button" class="cbtn" onclick="tplNew()">＋ 追加</button></div>
+      <div id="tplMList" class="tplMList"></div>
+    </div>
+    <div class="tplForm">
+      <label for="tplTitle">名前</label>
+      <input id="tplTitle" maxlength="60" placeholder="例：予約ページの案内">
+      <label for="tplCategory" style="margin-top:8px;">分類（同じ分類でまとめて表示）</label>
+      <input id="tplCategory" maxlength="30" list="tplCategoryList" placeholder="例：予約">
+      <datalist id="tplCategoryList"></datalist>
+      <label for="tplBody" style="margin-top:8px;">本文</label>
+      <textarea id="tplBody" maxlength="2000" placeholder="{お名前}様&#10;ご予約は下記の予約ページよりお手続きいただけます。&#10;{予約ページ}"></textarea>
+      <div class="tplVars"><button type="button" class="tplVar" onclick="tplInsertVar('{お名前}')">{お名前}</button><button type="button" class="tplVar" onclick="tplInsertVar('{予約ページ}')">{予約ページ}</button><button type="button" class="tplVar" onclick="tplInsertVar('{医院名}')">{医院名}</button><span style="font-size:11px;color:#9ca3af;">押すと本文に入ります</span></div>
+      <div class="tplActions">
+        <button type="button" id="tplDeleteBtn" class="cbtn" style="margin-right:auto;color:#b91c1c;border-color:#fecaca;" onclick="tplDelete()">削除</button>
+        <button type="button" id="tplUpBtn" class="cbtn" onclick="tplMove(-1)" aria-label="上へ">↑</button>
+        <button type="button" id="tplDownBtn" class="cbtn" onclick="tplMove(1)" aria-label="下へ">↓</button>
+        <button type="button" id="tplSaveBtn" class="cbtn" style="background:#16a34a;color:#fff;border-color:#16a34a;" onclick="tplSave()">保存</button>
+      </div>
+    </div>
+  </div>
 </div></div>
 <div id="learnManagePop"><div class="learningCard">
   <div class="learningHeader">
@@ -6668,7 +6787,7 @@ function openChat(id,keep){if((window.__dBusy||window.__voiceBusy)&&current&&cur
     '<div id="custTab" class="custTab" style="display:none;" onclick="cpExpand()">うけつけるん情報を表示 ⌄</div>'+
     '<div id="custPanel" class="custPanel">読み込み中…</div>'+
     '<div id="msgs">'+bubbles+'</div>'+
-    '<div id="composer"><div id="aiLabel"><span class="patientModeTitle">🟢 患者への返信を編集中</span><span class="patientModeNote">この入力欄の内容は患者へ送信されます</span></div><div id="groundingUsed" style="display:'+(groundingText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:'+(r.grounding&&r.grounding.autoSendAllowed&&r.validation&&r.validation.pass?'#047857':'#b45309')+';margin:2px 0 5px;">'+esc(groundingText(r))+'</div><div id="topicChips" style="display:none;"></div><div id="scheduledList"></div><div id="bookingSuggest"></div><div id="pendingAttachments"></div><div id="draftRow"><button id="attach" onclick="attach()" title="画像・ファイルを追加">📎</button><textarea id="draft" oninput="draftEdited()" onpaste="handleDraftPaste(event)" placeholder="患者へのメッセージ。画像やファイルもここへ貼り付けできます">'+esc(r.draft||"")+'</textarea></div><div class="enterHint">Enter＝改行　送信はボタンのみ</div>'+
+    '<div id="composer"><div id="aiLabel"><span class="patientModeTitle">🟢 患者への返信を編集中</span><span class="patientModeNote">この入力欄の内容は患者へ送信されます</span></div><div id="groundingUsed" style="display:'+(groundingText(r)?"block":"none")+';font-size:10px;line-height:1.45;color:'+(r.grounding&&r.grounding.autoSendAllowed&&r.validation&&r.validation.pass?'#047857':'#b45309')+';margin:2px 0 5px;">'+esc(groundingText(r))+'</div><div id="topicChips" style="display:none;"></div><div id="scheduledList"></div><div id="bookingSuggest"></div><div id="pendingAttachments"></div><div id="tplPop" role="dialog" aria-label="テンプレートを選ぶ"></div><div id="draftRow"><div id="draftTools"><button id="attach" type="button" onclick="attach()" title="画像・ファイルを追加">📎</button><button id="tplBtn" type="button" onclick="toggleTplPicker()" title="テンプレートを差し込む" aria-label="テンプレートを差し込む" aria-haspopup="dialog" aria-expanded="false">📋</button></div><textarea id="draft" oninput="draftEdited()" onpaste="handleDraftPaste(event)" placeholder="患者へのメッセージ。画像やファイルもここへ貼り付けできます">'+esc(r.draft||"")+'</textarea></div><div class="enterHint">Enter＝改行　送信はボタンのみ</div>'+
     '<div id="cbtns"><div class="composerSecondary"><button class="cbtn flagb" id="flagBtn" onclick="toggleFlag()">'+(r.flag?"⚑ 要対応を外す":"⚑ 要対応")+'</button><button class="cbtn ai" onclick="openDraftChat()">✨ 右腕くんに相談</button>'+staffReviewButton+'<button id="markDoneBtn" class="cbtn done" onclick="markDone()">対応済み</button></div><div class="composerPrimary"><button class="cbtn schedule" onclick="openScheduledMessage()">🕒 予約送信</button><button class="cbtn send" onclick="sendMsg()">患者へ送信</button></div></div></div>';
   const m=document.getElementById("msgs");if(m){m.setAttribute("data-count",String(r.msgs.length));m.setAttribute("data-day",messageDayKey());m.scrollTop=m.scrollHeight;} selTopics=null; renderTopicChips(r);renderPendingAttachments();renderScheduledMessages(r);renderBookingSuggestion(r); loadCustomer(id); if(!keep)renderList(); showReadyLearningFor(id);
 }
@@ -7604,6 +7723,50 @@ async function reloadLearning(){
 }
 function openLearning(){document.getElementById("learnManagePop").style.display="flex";reloadLearning();}
 function closeLearning(){document.getElementById("learnManagePop").style.display="none";}
+// ===== 返信テンプレート（返信欄の📋から差し込み／設定から管理） =====
+var tplCache=null,tplMeta={bookingPageUrl:"",clinicName:""},tplCat="",tplEditing="",tplBusy=false;
+function tplSetCache(list){if(Array.isArray(list))tplCache=list;var el=document.getElementById("tplCountSummary");if(el)el.textContent=tplCache?"（登録 "+tplCache.length+"件）":"";}
+async function tplLoad(){var r=await fetch("/api/templates");var j=await r.json().catch(function(){return {};});if(!r.ok||!j.ok)throw new Error(j.error||"load");tplMeta={bookingPageUrl:j.bookingPageUrl||"",clinicName:j.clinicName||""};tplSetCache(j.templates||[]);return tplCache;}
+function tplPatientName(){try{var cc=current&&custCache[current];if(cc&&cc.found&&cc.patient&&cc.patient.name)return String(cc.patient.name).trim();}catch(e){}return "";}
+function tplFill(body){var m={"{お名前}":tplPatientName()||"（お名前）","{予約ページ}":tplMeta.bookingPageUrl||"（予約ページURL）","{医院名}":tplMeta.clinicName||"（医院名）"};var out=String(body||"");Object.keys(m).forEach(function(k){out=out.split(k).join(m[k]);});return out;}
+function tplCategories(list){var seen={},out=[];(list||[]).forEach(function(t){var c=t.category||"その他";if(!seen[c]){seen[c]=1;out.push(c);}});return out;}
+function tplMatches(t,q){if(!q)return true;q=q.toLowerCase();return (t.title+"\\n"+(t.category||"")+"\\n"+t.body).toLowerCase().indexOf(q)>=0;}
+function renderTplPicker(){var pop=document.getElementById("tplPop");if(!pop)return;var qEl=document.getElementById("tplSearch");var q=qEl?qEl.value.trim():"";var list=tplCache||[];var cats=tplCategories(list);if(tplCat&&cats.indexOf(tplCat)<0)tplCat="";
+  var items=list.filter(function(t){return (!tplCat||(t.category||"その他")===tplCat)&&tplMatches(t,q);});
+  var catHtml='<button type="button" class="tplCat" aria-pressed="'+(tplCat?"false":"true")+'" data-cat="">すべて</button>'+cats.map(function(c){return '<button type="button" class="tplCat" aria-pressed="'+(tplCat===c?"true":"false")+'" data-cat="'+esc(c)+'">'+esc(c)+'</button>';}).join("");
+  var listHtml=!list.length?'<div class="tplEmpty">テンプレートはまだありません。「管理」から追加できます。</div>':(!items.length?'<div class="tplEmpty">見つかりませんでした。</div>':items.map(function(t){return '<button type="button" class="tplItem" data-tpl="'+esc(t.id)+'"><div class="tplItemTitle">'+esc(t.title)+'</div><div class="tplItemBody">'+esc(t.body.replace(/\\s+/g," "))+'</div></button>';}).join(""));
+  var catsEl=document.getElementById("tplCats"),listEl=document.getElementById("tplList");if(catsEl)catsEl.innerHTML=cats.length?catHtml:"";if(listEl)listEl.innerHTML=listHtml;}
+function tplPickerShell(){var pop=document.getElementById("tplPop");if(!pop||pop.getAttribute("data-ready"))return;pop.setAttribute("data-ready","1");pop.innerHTML='<div class="tplHead"><input id="tplSearch" type="search" placeholder="テンプレートを検索" aria-label="テンプレートを検索" autocomplete="off"><button type="button" class="cbtn" onclick="closeTplPicker();openTplManage()">管理</button></div><div id="tplCats" class="tplCats"></div><div id="tplList" class="tplList"><div class="tplEmpty">読み込み中…</div></div><div class="tplFoot">押すとカーソルの位置に入ります。差し込んだ後に内容を確認してから送信してください。</div>';
+  document.getElementById("tplSearch").addEventListener("input",renderTplPicker);
+  document.getElementById("tplSearch").addEventListener("keydown",function(e){if(e.key==="Escape"){e.preventDefault();closeTplPicker();}else if(e.key==="Enter"){e.preventDefault();var first=pop.querySelector(".tplItem");if(first)first.click();}});
+  pop.addEventListener("click",function(e){var c=e.target.closest("[data-cat]");if(c){tplCat=c.getAttribute("data-cat")||"";renderTplPicker();return;}var it=e.target.closest("[data-tpl]");if(it)insertTemplate(it.getAttribute("data-tpl"));});}
+async function toggleTplPicker(){var pop=document.getElementById("tplPop");if(!pop)return;if(pop.classList.contains("open")){closeTplPicker();return;}
+  var d=document.getElementById("draft");if(d){window.__tplSel=[d.selectionStart,d.selectionEnd];}
+  tplPickerShell();pop.classList.add("open");var b=document.getElementById("tplBtn");if(b)b.setAttribute("aria-expanded","true");
+  var s=document.getElementById("tplSearch");if(s){s.value="";s.focus();}if(tplCache)renderTplPicker();
+  try{await tplLoad();if(pop.classList.contains("open"))renderTplPicker();}catch(e){var l=document.getElementById("tplList");if(l&&!tplCache)l.innerHTML='<div class="tplEmpty">テンプレートを読み込めませんでした。</div>';}}
+function closeTplPicker(){var pop=document.getElementById("tplPop");if(pop)pop.classList.remove("open");var b=document.getElementById("tplBtn");if(b)b.setAttribute("aria-expanded","false");}
+document.addEventListener("mousedown",function(e){var pop=document.getElementById("tplPop");if(!pop||!pop.classList.contains("open"))return;if(e.target.closest("#tplPop")||e.target.closest("#tplBtn"))return;closeTplPicker();});
+function insertTemplate(id){var t=(tplCache||[]).find(function(x){return x.id===id;});var d=document.getElementById("draft");if(!t||!d)return;
+  var text=tplFill(t.body),v=d.value,sel=window.__tplSel||[v.length,v.length];var a=Math.max(0,Math.min(Number(sel[0])||0,v.length)),b=Math.max(a,Math.min(Number(sel[1])||a,v.length));
+  var before=v.slice(0,a),after=v.slice(b);if(before&&!/\\n$/.test(before))text="\\n"+text;if(after&&!/^\\n/.test(after))text=text+"\\n";
+  d.value=before+text+after;var pos=(before+text).length;closeTplPicker();d.focus();try{d.setSelectionRange(pos,pos);}catch(e){}window.__tplSel=null;draftEdited();
+  if(text.indexOf("（お名前）")>=0||text.indexOf("（予約ページURL）")>=0||text.indexOf("（医院名）")>=0)uiAlert("差し込めなかった項目が「（お名前）」のように残っています。送信前に書き換えてください。");}
+async function openTplManage(){document.getElementById("tplManagePop").style.display="flex";try{await tplLoad();}catch(e){uiAlert("テンプレートを読み込めませんでした");}var first=(tplCache||[])[0];tplOpen(first?first.id:"");}
+function closeTplManage(){document.getElementById("tplManagePop").style.display="none";}
+function renderTplManage(){var list=tplCache||[],el=document.getElementById("tplMList");if(!el)return;var cnt=document.getElementById("tplMCount");if(cnt)cnt.textContent="("+list.length+")";
+  var cats=tplCategories(list);el.innerHTML=!list.length?'<div class="tplEmpty">まだありません。「＋ 追加」から作成してください。</div>':cats.map(function(c){return '<div class="tplMCat">'+esc(c)+'</div>'+list.filter(function(t){return (t.category||"その他")===c;}).map(function(t){return '<button type="button" class="tplMItem" data-tplm="'+esc(t.id)+'" aria-current="'+(t.id===tplEditing?"true":"false")+'">'+esc(t.title)+'</button>';}).join("");}).join("");
+  el.onclick=function(e){var b=e.target.closest("[data-tplm]");if(b)tplOpen(b.getAttribute("data-tplm"));};
+  var dl=document.getElementById("tplCategoryList");if(dl)dl.innerHTML=cats.filter(function(c){return c!=="その他";}).map(function(c){return '<option value="'+esc(c)+'"></option>';}).join("");
+  var idx=list.findIndex(function(t){return t.id===tplEditing;});document.getElementById("tplDeleteBtn").style.visibility=tplEditing?"visible":"hidden";document.getElementById("tplUpBtn").disabled=tplBusy||idx<=0;document.getElementById("tplDownBtn").disabled=tplBusy||idx<0||idx>=list.length-1;document.getElementById("tplSaveBtn").disabled=tplBusy;document.getElementById("tplDeleteBtn").disabled=tplBusy;}
+function tplOpen(id){var t=(tplCache||[]).find(function(x){return x.id===id;});tplEditing=t?t.id:"";document.getElementById("tplTitle").value=t?t.title:"";document.getElementById("tplCategory").value=t?(t.category||""):"";document.getElementById("tplBody").value=t?t.body:"";renderTplManage();}
+function tplNew(){tplOpen("");document.getElementById("tplTitle").focus();}
+function tplInsertVar(v){var b=document.getElementById("tplBody");var a=b.selectionStart==null?b.value.length:b.selectionStart,e=b.selectionEnd==null?a:b.selectionEnd;b.value=b.value.slice(0,a)+v+b.value.slice(e);b.focus();try{b.setSelectionRange(a+v.length,a+v.length);}catch(x){}}
+async function tplRequest(path,body){if(tplBusy)return null;tplBusy=true;renderTplManage();try{var r=await api(path,body);var j=await r.json().catch(function(){return {};});if(!r.ok||!j.ok)throw new Error(j.error||"save");tplSetCache(j.templates||[]);return j;}finally{tplBusy=false;renderTplManage();}}
+async function tplSave(){var title=document.getElementById("tplTitle").value.trim(),category=document.getElementById("tplCategory").value.trim(),body=document.getElementById("tplBody").value;if(!title||!body.trim()){uiAlert("名前と本文を入力してください");return;}
+  try{var j=await tplRequest("/api/template-save",{id:tplEditing||null,title:title,category:category,body:body});if(!j)return;tplOpen(j.template?j.template.id:tplEditing);uiAlert("テンプレートを保存しました");}catch(e){uiAlert(e.message==="too_many"?"テンプレートは300件までです":e.message==="not_found"?"このテンプレートは削除されています。一覧を開き直してください":"保存できませんでした");}}
+async function tplDelete(){if(!tplEditing)return;if(!(await uiConfirm("このテンプレートを削除しますか？")))return;try{var j=await tplRequest("/api/template-delete",{id:tplEditing});if(!j)return;var first=(tplCache||[])[0];tplOpen(first?first.id:"");uiAlert("削除しました");}catch(e){uiAlert("削除できませんでした");}}
+async function tplMove(dir){if(!tplEditing)return;try{await tplRequest("/api/template-move",{id:tplEditing,direction:dir});}catch(e){uiAlert("並び替えできませんでした");}}
 function setLearningTab(tab){learnTab=tab;document.getElementById("learnSearch").value="";renderLearning();}
 function learningMatches(item,query){if(!query)return true;return Object.values(item||{}).some(v=>String(v||"").toLowerCase().includes(query));}
 function renderLearning(){
@@ -7731,7 +7894,7 @@ const AI_ROUTE_LABELS={draft:"下書き・自動返信",finalize:"文体の最�
 function renderAiRouteFields(settings){const box=document.getElementById("aiRouteFields");if(!box)return;const routes=settings.aiRoutes||{},catalog=Array.isArray(settings.aiModelCatalog)?settings.aiModelCatalog:[];box.innerHTML=Object.keys(AI_ROUTE_LABELS).map(task=>{const current=routes[task]&&routes[task].model||"";return '<label style="font-size:10.5px;color:#475569;">'+AI_ROUTE_LABELS[task]+'<select data-ai-route="'+task+'" style="width:100%;padding:7px;border:1px solid #d1d5db;border-radius:7px;font-size:11px;margin-top:2px;">'+catalog.map(m=>'<option value="'+esc(m.id)+'"'+(m.id===current?' selected':'')+'>'+esc(m.label)+'</option>').join("")+'</select></label>';}).join("");}
 function collectAiRoutes(){const out={};document.querySelectorAll("[data-ai-route]").forEach(el=>{out[el.getAttribute("data-ai-route")]={model:el.value};});return out;}
 async function openSet(){try{const ar=await fetch("/api/account");const a=await ar.json();document.getElementById("accountLoginId").textContent="ログインID: "+(a.loginId||"");document.getElementById("setAccountEmail").value=a.accountEmail||"";document.getElementById("accountEmailStat").textContent=(a.accountEmail?"再設定メールアドレス登録済み":"再設定メールアドレス未登録")+(a.resetEmailReady?"・メール送信可能":"・送信メール設定が必要");}catch(e){}
-  try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setBookingActions").checked=!!s.bookingActions;document.getElementById("setStaffBookingSuggest").checked=s.staffBookingSuggest!==false;document.getElementById("setInboxOrder").value=s.inboxOrder||"unanswered_first";document.getElementById("setStaffLineEnabled").checked=!!s.staffLineEnabled;document.getElementById("setStaffLineReplyMode").value=s.staffLineReplyMode||"exceptions";document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setEngine").value=s.engine||"gpt";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);renderAiRouteFields(s);window.__rules=s.rules||null;renderRuleGauge();renderPrefs(s.prefs||[]);const lcs=document.getElementById("learningConflictSummary");if(lcs)lcs.textContent=s.learningConflictsPending?" ⚠ 学習確認待ち "+s.learningConflictsPending+"件":"";const las=document.getElementById("learningAutomationSummary"),la=s.learningAutomation||{};if(las)las.textContent=la.ready?" ✅ 自動対応候補 "+la.ready+"種類":" 学習実績を蓄積中";
+  try{const r=await fetch("/api/settings");const s=await r.json();document.getElementById("setAuto").checked=!!s.autoReply;document.getElementById("setBookingActions").checked=!!s.bookingActions;document.getElementById("setStaffBookingSuggest").checked=s.staffBookingSuggest!==false;document.getElementById("setInboxOrder").value=s.inboxOrder||"unanswered_first";document.getElementById("setStaffLineEnabled").checked=!!s.staffLineEnabled;document.getElementById("setStaffLineReplyMode").value=s.staffLineReplyMode||"exceptions";document.getElementById("setLevel").value=s.level||"high";document.getElementById("setTone").value=s.tone||"";document.getElementById("setBookingPageUrl").value=s.bookingPageUrl||"";document.getElementById("setRetiredTerms").value=(Array.isArray(s.retiredTerms)?s.retiredTerms:[]).join("\\n");tplSetCache(s.templates);document.getElementById("setEngine").value=s.engine||"gpt";document.getElementById("setDelay").value=(s.autoDelayMin!=null?s.autoDelayMin:0);renderAiRouteFields(s);window.__rules=s.rules||null;renderRuleGauge();renderPrefs(s.prefs||[]);const lcs=document.getElementById("learningConflictSummary");if(lcs)lcs.textContent=s.learningConflictsPending?" ⚠ 学習確認待ち "+s.learningConflictsPending+"件":"";const las=document.getElementById("learningAutomationSummary"),la=s.learningAutomation||{};if(las)las.textContent=la.ready?" ✅ 自動対応候補 "+la.ready+"種類":" 学習実績を蓄積中";
   if(s.engines){const n=document.getElementById("engineNote");const active=({gpt:"GPT",gemini:"Gemini",claude:"Claude"})[s.activeEngine]||"なし";n.textContent="設定状況: GPT"+(s.engines.gpt?"✓設定済み":"⚠キー未設定")+"・Gemini"+(s.engines.gemini?"✓設定済み":"⚠キー未設定")+"・Claude"+(s.engines.claude?"✓設定済み":"⚠キー未設定")+"。優先エンジン: "+active+"（✓はキーの登録を示します。実際の有効性は下の文章品質テストで確認してください。失敗時は次の設定済みAIへ自動切替します）。";}}catch(e){}
   refreshModelAlert();
   try{const cr=await fetch("/api/conn");const c=await cr.json();document.getElementById("connStat").textContent=(c.lineConfigured?"LINE✓ ":"LINE未 ")+(c.mailConfigured?"メール✓":"メール未");document.getElementById("cSmtpHost").value=c.smtpHost||"";document.getElementById("cSmtpPort").value=c.smtpPort||"";document.getElementById("cSmtpUser").value=c.smtpUser||"";document.getElementById("cImapHost").value=c.imapHost||"";document.getElementById("cImapPort").value=c.imapPort||"";document.getElementById("cImapUser").value=c.imapUser||"";document.getElementById("cEmailInternal").checked=!!c.emailInternal;renderAccts(c);}catch(e){}
@@ -7800,7 +7963,7 @@ async function deleteStaffLineStaff(id,btn){if(!await uiConfirm("このスタッ
 async function runQualityPreview(){const input=document.getElementById("qualityPreviewInput"),out=document.getElementById("qualityPreviewResult"),btn=document.getElementById("qualityPreviewBtn"),inquiry=input.value.trim();if(!inquiry){uiAlert("テストする問い合わせ文を入力してください");return;}btn.disabled=true;btn.textContent="生成中…";out.style.display="block";out.textContent="返信案を生成しています…";try{const r=await api("/api/quality-preview",{inquiry,channel:document.getElementById("qualityPreviewChannel").value}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"failed");const label=({gpt:"GPT",gemini:"Gemini",claude:"Claude"})[j.engine]||j.engine;const refs=Array.isArray(j.learningRefs)?j.learningRefs:[];const g=j.grounding||{},v=j.validation||{};const audit=g.autoSendAllowed&&v.pass?" / 根拠監査OK":" / スタッフ確認: "+((g.reasons&&g.reasons[0])||v.reason||"根拠不足");out.textContent=j.draft+"\\n\\n―― "+label+" / 確信率 "+(j.confidence||"不明")+(j.toneApplied?" / 設定トーン確認済み":j.qualityIssues&&j.qualityIssues.length?" / 自動校正済み":"")+(refs.length?" / 過去対応 "+refs.length+"件参照":" / 過去対応の該当なし")+audit;}catch(e){out.textContent=e.message==="no_ai_key"?"AIキーが未設定のため生成できません。運営にAI接続設定を依頼してください。":e.message==="policy_review_failed"?"登録ルールに沿った返信か確認できなかったため、案を採用しませんでした。患者やLINEには送信されていません。":e.message==="ai_failed"?"登録済みのAIキーを確認できませんでした。キーの失効・利用上限・モデル権限を運営側で確認してください。患者やLINEには送信されていません。":"生成できませんでした。時間をおいて再度お試しください。";}finally{btn.disabled=false;btn.textContent="返信案をテスト生成";}}
 async function runShadowPreview(){const inquiry=document.getElementById("qualityPreviewInput").value.trim(),out=document.getElementById("qualityPreviewResult"),btn=document.getElementById("shadowPreviewBtn"),routes=collectAiRoutes();if(!inquiry){uiAlert("テストする問い合わせ文を入力してください");return;}btn.disabled=true;btn.textContent="2つのモデルを比較中…";out.style.display="block";out.textContent="本番回答には使わず、並行テストしています…";try{const r=await api("/api/model-shadow-preview",{inquiry,channel:document.getElementById("qualityPreviewChannel").value,candidate:routes.draft}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"failed");out.textContent="【現在のモデル "+j.active.route.model+"】\\n"+j.active.draft+"\\n\\n【候補モデル "+j.candidate.route.model+"】\\n"+j.candidate.draft+"\\n\\n※患者への送信・会話保存・学習は行っていません。";}catch(e){out.textContent=e.message==="no_openai_key"?"OpenAI APIが未接続です。":"並行テストを実行できませんでした。";}finally{btn.disabled=false;btn.textContent="候補モデルを並行テスト（回答には使用しない）";}}
 let settingsSaveBusy=false;
-async function saveSet(){if(settingsSaveBusy)return;const btn=document.getElementById("saveSettingsBtn");settingsSaveBusy=true;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>保存中…';}const autoReply=document.getElementById("setAuto").checked;const bookingActions=document.getElementById("setBookingActions").checked;const staffBookingSuggest=document.getElementById("setStaffBookingSuggest").checked;const inboxOrder=document.getElementById("setInboxOrder").value;const staffLineEnabled=document.getElementById("setStaffLineEnabled").checked;const staffLineReplyMode=document.getElementById("setStaffLineReplyMode").value;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const engine=document.getElementById("setEngine").value;const aiRoutes=collectAiRoutes();const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{const r=await api("/api/settings",{autoReply,bookingActions,staffBookingSuggest,inboxOrder,staffLineEnabled,staffLineReplyMode,level,tone,engine,aiRoutes,autoDelayMin});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");await load();uiAlert("設定を保存しました");closeSet();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"先に法人専用スタッフLINEと通知グループを接続してください":e.message==="no_ai_key"?"AIキーが未設定のため自動返信を有効にできません。運営へ接続設定を依頼してください":"保存に失敗しました");}finally{settingsSaveBusy=false;if(btn){btn.disabled=false;btn.removeAttribute("aria-busy");btn.textContent="設定を保存";}}}
+async function saveSet(){if(settingsSaveBusy)return;const btn=document.getElementById("saveSettingsBtn");settingsSaveBusy=true;if(btn){btn.disabled=true;btn.setAttribute("aria-busy","true");btn.innerHTML='<span class="spin" aria-hidden="true"></span>保存中…';}const autoReply=document.getElementById("setAuto").checked;const bookingActions=document.getElementById("setBookingActions").checked;const staffBookingSuggest=document.getElementById("setStaffBookingSuggest").checked;const inboxOrder=document.getElementById("setInboxOrder").value;const staffLineEnabled=document.getElementById("setStaffLineEnabled").checked;const staffLineReplyMode=document.getElementById("setStaffLineReplyMode").value;const level=document.getElementById("setLevel").value;const tone=document.getElementById("setTone").value;const bookingPageUrl=document.getElementById("setBookingPageUrl").value.trim();const retiredTerms=document.getElementById("setRetiredTerms").value;const engine=document.getElementById("setEngine").value;const aiRoutes=collectAiRoutes();const autoDelayMin=Math.min(60,Math.max(0,Math.round(Number(document.getElementById("setDelay").value)||0)));try{const r=await api("/api/settings",{autoReply,bookingActions,staffBookingSuggest,inboxOrder,staffLineEnabled,staffLineReplyMode,level,tone,bookingPageUrl,retiredTerms,engine,aiRoutes,autoDelayMin});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"save");await load();uiAlert("設定を保存しました");closeSet();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"先に法人専用スタッフLINEと通知グループを接続してください":e.message==="booking_page_url_invalid"?"予約ページのURLは https:// から始まる正しいURLを入力してください":e.message==="no_ai_key"?"AIキーが未設定のため自動返信を有効にできません。運営へ接続設定を依頼してください":"保存に失敗しました");}finally{settingsSaveBusy=false;if(btn){btn.disabled=false;btn.removeAttribute("aria-busy");btn.textContent="設定を保存";}}}
 async function changeLoginId(){
   const next=await uiPrompt("新しいログインID（半角英数字3〜30文字。スタッフ全員のログインに使います）");if(!next)return;
   const btn=document.getElementById("changeLoginIdBtn");await withBusy("change-login-id",btn,"変更中…",async()=>{try{const r=await api("/api/change-loginid",{next:next.trim()});const j=await r.json();

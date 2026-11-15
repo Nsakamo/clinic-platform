@@ -15,5 +15,7 @@ module.exports = function promptStubs() {
     rulesList: () => [],
     examplesRanked: () => [],
     baContextCached: () => Promise.resolve(null),
+    ANSWER_FIRST_POLICY: require("../../lib/booking-facts").ANSWER_FIRST_POLICY,
+    bookingFactsOf: () => "",
   };
 };
