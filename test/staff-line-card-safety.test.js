@@ -11,7 +11,7 @@ const sha = text => crypto.createHash("sha256").update(text).digest("hex");
 function harness({ replyOk = true, pushOk = true, onRevise = () => {} } = {}) {
   const deliveries = [], saved = [];
   const context = {
-    sha, dbSave: (_t, c) => saved.push(c.draft),
+    sha, hasUnreviewedMailAttachment: () => false, dbSave: (_t, c) => saved.push(c.draft),
     staffLineReviseDraft: async (_t, c) => { onRevise(c); return "テスト：修正済みの案"; },
     staffLineReply: async (_t, token, messages) => { deliveries.push({ kind: "reply", token, messages }); return { ok: replyOk }; },
     staffLinePush: async (_t, group, messages) => { deliveries.push({ kind: "push", group, messages }); return { ok: pushOk }; },

@@ -18,5 +18,8 @@ module.exports = function promptStubs() {
     ANSWER_FIRST_POLICY: require("../../lib/booking-facts").ANSWER_FIRST_POLICY,
     bookingFactsOf: () => "",
     applyRetiredTermGate: () => false,
+    ATTACHMENT_UNSEEN_POLICY: require("../../lib/mail-attachments").ATTACHMENT_UNSEEN_POLICY,
+    hasUnreviewedMailAttachment: () => false,
+    collapseMailAttachmentMessages: (list) => (list || []).slice(),
   };
 };
