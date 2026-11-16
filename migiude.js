@@ -229,6 +229,8 @@ async function dbInit() {
   // 患者からのメールの添付（画像・動画・ファイル）。公開URLの files とは分け、ログイン中の同じ法人のスタッフだけが見られる。
   await pool.query("CREATE TABLE IF NOT EXISTS inbound_files (id text primary key, tenant text not null, conversation_id text not null default '', name text not null, mime text not null, size integer not null, data bytea not null, ts bigint not null)");
   await pool.query("CREATE INDEX IF NOT EXISTS inbound_files_tenant_idx ON inbound_files(tenant,ts DESC)");
+  // 写真・動画は圧縮が効かず、範囲読み出し（substring）を速くするため圧縮なしで保存する
+  await pool.query("ALTER TABLE inbound_files ALTER COLUMN data SET STORAGE EXTERNAL");
   await pool.query("CREATE TABLE IF NOT EXISTS push_subs (tenant text, endpoint text primary key, sub jsonb)");
   await pool.query("CREATE TABLE IF NOT EXISTS kv (k text primary key, v jsonb)");
   await pool.query("CREATE TABLE IF NOT EXISTS line_webhook_events (event_id text not null, tenant text not null, account_key text not null, destination text not null default '', payload jsonb not null, status text not null default 'pending', attempts int not null default 0, available_at bigint not null, created_at bigint not null, updated_at bigint not null, last_error text, PRIMARY KEY(tenant,event_id))");
@@ -2655,10 +2657,35 @@ async function inboundFileBytes(t, id, start, length) {
   const r = await pool.query("SELECT substring(data from $3 for $4) AS part FROM inbound_files WHERE id=$1 AND tenant=$2", [id, t.slug, start + 1, length]);
   return r.rows[0] ? Buffer.from(r.rows[0].part || []) : null;
 }
+// 法人ごとの添付の保存容量の上限（既定5GB）。共有DBが満杯になって会話保存など全体が止まるのを防ぐ。
+const INBOUND_FILES_TENANT_MAX_BYTES = (() => { const n = Number(process.env.INBOUND_FILES_TENANT_MAX_BYTES); return Number.isFinite(n) && n > 0 ? Math.floor(n) : 5 * 1024 * 1024 * 1024; })();
+async function inboundFilesUsedBytes(t) {
+  if (!pool) return Object.values(INBOUND_FILES).filter(row => row.tenant === t.slug).reduce((sum, row) => sum + row.size, 0);
+  const r = await pool.query("SELECT COALESCE(SUM(size),0)::bigint AS used FROM inbound_files WHERE tenant=$1", [t.slug]);
+  return Number(r.rows[0] && r.rows[0].used) || 0;
+}
 async function pushInboundMailAttachments(t, c, opts, recvAt) {
   if (opts.channel !== "mail") return 0;
-  const keep = Array.isArray(opts.attachments) ? opts.attachments : [];
-  const skipped = Array.isArray(opts.skippedAttachments) ? opts.skippedAttachments : [];
+  let keep = Array.isArray(opts.attachments) ? opts.attachments : [];
+  const skipped = (Array.isArray(opts.skippedAttachments) ? opts.skippedAttachments : []).slice();
+  if (keep.length) {
+    let used = 0;
+    try { used = await inboundFilesUsedBytes(t); } catch (e) { used = Infinity; console.error("mail attachment usage check failed"); }
+    const allowed = [];
+    for (const file of keep) {
+      if (used + file.data.length > INBOUND_FILES_TENANT_MAX_BYTES) { skipped.push({ name: file.name, mime: file.mime, size: file.data.length, reason: "storage_full" }); continue; }
+      used += file.data.length;
+      allowed.push(file);
+    }
+    if (allowed.length < keep.length) {
+      const day = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Tokyo" });
+      if (t._inboundStorageAlertDay !== day) {
+        t._inboundStorageAlertDay = day;
+        try { await alertAdd(t, "システム", "メール添付の保存容量の上限に達したため、新しい添付を右腕くんに保存できませんでした。運営へご連絡ください（メールソフトでは確認できます）。", ""); } catch (_) {}
+      }
+    }
+    keep = allowed;
+  }
   let count = 0;
   const times = inboundMessageTimes(opts.sentAt, recvAt, opts.sentAtSource);
   for (const file of keep) {
@@ -2685,8 +2712,8 @@ app.get("/api/inbound-file/:id", guard, async (req, res) => {
   if (!f) return res.status(404).end();
   const headers = inboundFileHeaders(f);
   Object.keys(headers).forEach(k => res.set(k, headers[k]));
-  const range = req.headers.range ? parseRange(req.headers.range, f.size) : null;
-  if (req.headers.range && !range) { res.set("Content-Range", "bytes */" + f.size); return res.status(416).end(); }
+  const range = req.headers.range ? parseRange(req.headers.range, f.size) : null; // 解釈できない・複数範囲の指定は無視して全体を返す
+  if (range && range.unsatisfiable) { res.set("Content-Range", "bytes */" + f.size); return res.status(416).end(); }
   const start = range ? range.start : 0, length = range ? range.end - range.start + 1 : f.size;
   if (range) res.status(206).set("Content-Range", "bytes " + range.start + "-" + range.end + "/" + f.size);
   res.set("Content-Length", String(length));
@@ -2809,6 +2836,9 @@ async function handleInboundCore(t, opts) {
   const exceptionNeedsReview = S(t).autoReply && S(t).staffLineEnabled && S(t).staffLineReplyMode === "exceptions" && !baDone && c.draft && c.draft.trim() && (!confOkForStaffLine || !safeForStaffLine);
   if (staffLineReviewAll(t) && !baDone && c.draft && c.draft.trim() && c.bookingSuggestion && c.bookingSuggestion.status !== "executed") {
     staffLineEscalate(t, c, "予約操作の提案があります。右腕くんの画面で予約を確認・実行してから返信してください").catch(() => {});
+  } else if (mailAttachmentCount && !baDone && (staffLineReviewAll(t) || exceptionNeedsReview)) {
+    // 添付はスタッフLINEでは見られないため、LINEの承認だけでは送れないようにし、画面での確認へ誘導する
+    staffLineEscalate(t, c, "メールに添付ファイルがあります。右腕くんの画面で添付を確認してから返信してください").catch(() => {});
   } else if (staffLineReviewAll(t) && !baDone && c.draft && c.draft.trim()) {
     staffLineRequestApproval(t, c, "毎回確認モードのため、送信前に承認が必要です").catch(() => {});
   } else if (exceptionNeedsReview || String(needsHuman) === "true" || String(urgent) === "true" || c.flag) {

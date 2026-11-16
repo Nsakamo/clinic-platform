@@ -77,10 +77,14 @@ test("動画の分割取得（Range）を正しく解釈し、不正な範囲は
   assert.deepEqual(M.parseRange("bytes=900-", 1000), { start: 900, end: 999 });
   assert.deepEqual(M.parseRange("bytes=-100", 1000), { start: 900, end: 999 });
   assert.deepEqual(M.parseRange("bytes=0-5000", 1000), { start: 0, end: 999 });
-  assert.equal(M.parseRange("bytes=1000-", 1000), null);
-  assert.equal(M.parseRange("bytes=5-1", 1000), null);
+  assert.deepEqual(M.parseRange("bytes=1000-", 1000), { unsatisfiable: true }, "ファイルの外は416");
+  assert.equal(M.parseRange("bytes=5-1", 1000), null, "無効な指定は無視して全体を返す");
+  assert.equal(M.parseRange("bytes=0-1,5-9", 1000), null, "複数範囲は無視して全体を返す");
   assert.equal(M.parseRange("items=0-1", 1000), null);
   assert.equal(M.parseRange("bytes=-", 1000), null);
+  // 終わりの無い指定（動画の preload が送る bytes=0-）は区切って返す
+  assert.deepEqual(M.parseRange("bytes=0-", 10 * 1024 * 1024), { start: 0, end: M.RANGE_OPEN_END_MAX_BYTES - 1 });
+  assert.match(M.skippedLabel({ name: "テスト.jpg", reason: "storage_full" }), /保存容量の上限に達したため/);
 });
 
 test("IMAPの受信で添付を取り出し、添付つきメールは自動送信しない", () => {
@@ -100,6 +104,13 @@ test("IMAPの受信で添付を取り出し、添付つきメールは自動送�
   assert.match(source, /if \(!med && !mailAttachmentCount && typeof opts\.draft !== "string" && baEnabled\(t\) && PARTNER_KEY\)/);
   assert.match(source, /if \(g && !mailAttachmentCount && !g\.replyRequiresStaff && !staffLineReviewAll\(t\) && baEnabled\(t\)/);
   assert.match(source, /mailAttachmentCount \? "メールに添付ファイルがあり、AIでは中身を確認できないため確認が必要です"/);
+  // スタッフLINEは添付を見られないため、毎回確認・例外確認のどちらでもLINEの承認ボタンを出さず画面へ誘導する
+  const lineIdx = source.indexOf("} else if (mailAttachmentCount && !baDone && (staffLineReviewAll(t) || exceptionNeedsReview)) {");
+  assert.ok(lineIdx > 0 && lineIdx < source.indexOf('staffLineRequestApproval(t, c, "毎回確認モードのため、送信前に承認が必要です")', lineIdx));
+  assert.match(source.slice(lineIdx, lineIdx + 400), /staffLineEscalate\(t, c, "メールに添付ファイルがあります。右腕くんの画面で添付を確認してから返信してください"\)/);
+  // 圧縮なしで保存し、法人ごとの容量上限を確かめてから保存する
+  assert.match(source, /ALTER TABLE inbound_files ALTER COLUMN data SET STORAGE EXTERNAL/);
+  assert.match(source, /SELECT COALESCE\(SUM\(size\),0\)::bigint AS used FROM inbound_files WHERE tenant=\$1/);
   // 法人の削除（解約）で添付も消す
   assert.match(source, /DELETE FROM inbound_files WHERE tenant=\$1/);
   // テスト用の受信経路は本番・staging の実行環境では登録しない
@@ -113,7 +124,7 @@ const PARTNER_KEY = "mail-attachment-partner-key";
 test("実HTTP: 添付つきメールを受信すると会話に表示でき、ログインと同じ法人の確認・Range・自動送信なしが効く", { timeout: 20000 }, async () => {
   const child = spawn(process.execPath, ["migiude.js"], {
     cwd: root,
-    env: Object.assign({}, process.env, { NODE_ENV: "test", PORT: String(PORT), DATABASE_URL: "", CRED_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", PUBLIC_BASE_URL: BASE, PLATFORM_SECRET: PARTNER_KEY, ANTHROPIC_API_KEY: "", OPENAI_API_KEY: "", RAILWAY_ENVIRONMENT: "", RAILWAY_PROJECT_ID: "" }),
+    env: Object.assign({}, process.env, { NODE_ENV: "test", PORT: String(PORT), DATABASE_URL: "", CRED_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", PUBLIC_BASE_URL: BASE, PLATFORM_SECRET: PARTNER_KEY, ANTHROPIC_API_KEY: "", OPENAI_API_KEY: "", RAILWAY_ENVIRONMENT: "", RAILWAY_PROJECT_ID: "", INBOUND_FILES_TENANT_MAX_BYTES: "60000" }),
     stdio: ["ignore", "pipe", "pipe"],
   });
   let output = "";
@@ -186,8 +197,15 @@ test("実HTTP: 添付つきメールを受信すると会話に表示でき、�
     assert.equal(only.r.status, 200);
     const convs2 = await call("/api/conversations", { headers: { Cookie: cookieA } });
     const onlyConv = convs2.body.find(c => c.id === "mail:only@example.test");
-    assert.deepEqual(onlyConv.msgs.map(m => m.media || "text"), ["image"], "本文の無いメールで空の吹き出しを作らない");
-    assert.equal(onlyConv.last, "［画像］写真");
+    // 法人の容量上限（テストでは60KB）を超えた添付は保存せず、理由つきで表示する。本文の無いメールで空の吹き出しは作らない
+    assert.deepEqual(onlyConv.msgs.map(m => [m.media || "text", !!m.url]), [["file", false]]);
+    assert.match(onlyConv.msgs[0].fileName, /😀写真\.jpg（保存容量の上限に達したため右腕くんでは表示できません/);
+    const alerts = await call("/api/alerts", { headers: { Cookie: cookieA } });
+    assert.ok(JSON.stringify(alerts.body).includes("メール添付の保存容量の上限に達した"), "容量上限の通知が出る");
+    const openEnded = await fetch(BASE + msgs[1].url, { headers: { Cookie: cookieA, Range: "bytes=0-" } });
+    assert.equal(openEnded.status, 206);
+    const multi = await fetch(BASE + msgs[1].url, { headers: { Cookie: cookieA, Range: "bytes=0-1,5-9" } });
+    assert.equal(multi.status, 200, "複数範囲は無視して全体");
     const bogus = await fetch(BASE + "/api/inbound-file/not-a-real-id", { headers: { Cookie: cookieA } });
     assert.equal(bogus.status, 404);
     assert.doesNotMatch(output, /IMG_0001|patient@example\.test/, "ファイル名・メールアドレスをログに出さない");
@@ -201,7 +219,7 @@ test("DBからは必要な範囲だけ読む（動画のRangeで本体を毎回�
   const start = source.indexOf("// 形式・サイズだけを読む");
   const end = source.indexOf("async function pushInboundMailAttachments(");
   const queries = [];
-  const ctx = { INBOUND_FILES: {}, Buffer, pool: { query: async (sql, params) => { queries.push({ sql, params }); return { rows: [/substring/.test(sql) ? { part: Buffer.from("テスト") } : { name: "a.mp4", mime: "video/mp4", size: "5000" }] }; } } };
+  const ctx = { INBOUND_FILES: {}, Buffer, process, pool: { query: async (sql, params) => { queries.push({ sql, params }); return { rows: [/substring/.test(sql) ? { part: Buffer.from("テスト") } : { name: "a.mp4", mime: "video/mp4", size: "5000" }] }; } } };
   vm.createContext(ctx);
   vm.runInContext(source.slice(start, end), ctx);
   const t = { slug: "テスト" };
@@ -224,4 +242,24 @@ test("連続するメールの添付はスタッフLINE向けの要約で1行に
   const msgs = [{ from: "us", text: "テスト前の返信" }].concat(Array.from({ length: 10 }, (_, i) => ({ from: "them", media: "image", mailAttachment: true, fileName: "p" + i + ".jpg" }))).concat([{ from: "them", text: "テスト本文" }]);
   const text = ctx.staffLineHistoryText({ msgs });
   assert.equal(text, "スタッフ: テスト前の返信\n患者: ［添付ファイル 10件］\n患者: テスト本文");
+});
+
+test("画面: 添付のファイル名はエスケープし、保存できなかった添付はリンクなしで表示する", () => {
+  const vm = require("node:vm");
+  const start = source.indexOf("const PAGE = `");
+  const end = source.indexOf("</html>`;", start);
+  const ctx0 = {}; vm.runInNewContext("PAGE=" + source.slice(start + "const PAGE = ".length, end + "</html>`".length), ctx0);
+  const script = [...ctx0.PAGE.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]).join("\n");
+  const pick = (a, b) => script.slice(script.indexOf(a), script.indexOf(b, script.indexOf(a)));
+  const ctx = { location: { origin: "https://example.test" }, URL };
+  vm.createContext(ctx);
+  vm.runInContext(pick("function esc(", "\n") + "\n" + pick("function safeMediaUrl(", "\n") + "\n" + pick("function mediaHtml(", "\n"), ctx);
+  const evil = '"><img src=x onerror=alert(1)>`';
+  for (const media of ["image", "video", "file", "audio"]) {
+    const html = ctx.mediaHtml({ from: "them", media, url: "/api/inbound-file/0123456789abcdef0123456789abcdef", fileName: evil, mailAttachment: true });
+    assert.doesNotMatch(html, /<img src=x/, media);
+  }
+  const failed = ctx.mediaHtml({ from: "them", media: "file", fileName: "テスト.jpg（保存できませんでした）", mailAttachment: true });
+  assert.match(failed, /📎 テスト\.jpg（保存できませんでした）/);
+  assert.doesNotMatch(failed, /<a /, "保存できなかった添付はリンクにしない");
 });
