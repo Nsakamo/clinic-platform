@@ -26,6 +26,7 @@ const { REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery,
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { ANSWER_FIRST_POLICY, bookingFactsBlock, learningUsesRetiredTerms, normalizeBookingPageUrl, normalizeRetiredTerms, retiredTermsExcludingUrl, textMentionsRetiredTerm } = require("./lib/booking-facts");
 const { normalizeTemplates, saveTemplate, deleteTemplate, moveTemplate } = require("./lib/reply-templates");
+const { ATTACHMENT_UNSEEN_POLICY, inboundFileHeaders, parseRange, selectMailAttachments, skippedLabel } = require("./lib/mail-attachments");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
 const { AiUsageSpool, resolveAiUsageSpoolPath } = require("./lib/ai-usage-spool");
 const app = express();
@@ -225,6 +226,12 @@ async function dbInit() {
   await pool.query("CREATE INDEX IF NOT EXISTS ai_usage_events_tenant_created_idx ON ai_usage_events(tenant,created_at DESC)");
   await pool.query("CREATE TABLE IF NOT EXISTS alerts (id serial primary key, tenant text, type text, summary text, name text, ts bigint, done boolean default false)");
   await pool.query("CREATE TABLE IF NOT EXISTS files (id text primary key, tenant text, name text, mime text, data bytea, ts bigint)");
+  // 患者からのメールの添付（画像・動画・ファイル）。公開URLの files とは分け、ログイン中の同じ法人のスタッフだけが見られる。
+  await pool.query("CREATE TABLE IF NOT EXISTS inbound_files (id text primary key, tenant text not null, conversation_id text not null default '', name text not null, mime text not null, size integer not null, data bytea not null, ts bigint not null)");
+  await pool.query("CREATE INDEX IF NOT EXISTS inbound_files_tenant_idx ON inbound_files(tenant,ts DESC)");
+  // 写真・動画は圧縮が効かず、範囲読み出し（substring）を速くするため圧縮なしで保存する
+  const storage = await pool.query("SELECT attstorage FROM pg_attribute WHERE attrelid='inbound_files'::regclass AND attname='data'");
+  if (storage.rows[0] && storage.rows[0].attstorage !== "e") await pool.query("ALTER TABLE inbound_files ALTER COLUMN data SET STORAGE EXTERNAL"); // 起動のたびに排他ロックを取らない
   await pool.query("CREATE TABLE IF NOT EXISTS push_subs (tenant text, endpoint text primary key, sub jsonb)");
   await pool.query("CREATE TABLE IF NOT EXISTS kv (k text primary key, v jsonb)");
   await pool.query("CREATE TABLE IF NOT EXISTS line_webhook_events (event_id text not null, tenant text not null, account_key text not null, destination text not null default '', payload jsonb not null, status text not null default 'pending', attempts int not null default 0, available_at bigint not null, created_at bigint not null, updated_at bigint not null, last_error text, PRIMARY KEY(tenant,event_id))");
@@ -416,8 +423,21 @@ function staffLineUpsertStaff(t, userId, name, role) {
   else { s.name = String(name || s.name || "LINEスタッフ").slice(0, 80); s.active = true; if (role) s.role = role; }
   return s;
 }
+// 連続するメールの添付を1件にまとめる（AIには中身が見えないことも書き添える。ファイル名は渡さない）
+function collapseMailAttachmentMessages(list) {
+  const msgs = [];
+  for (const m of (list || [])) {
+    const prev = msgs[msgs.length - 1];
+    if (m && m.mailAttachment && prev && prev.mailAttachment && prev.from === m.from) { prev.attachmentCount = (prev.attachmentCount || 1) + 1; prev.text = "［添付ファイル " + prev.attachmentCount + "件（中身は確認できません）］"; continue; }
+    // まとめた複製には元のメッセージ（_src）を持たせ、元の会話での位置を探せるようにする
+    msgs.push(m && m.mailAttachment ? Object.assign({}, m, { text: "［添付ファイル 1件（中身は確認できません）］", attachmentCount: 1, _src: m }) : m);
+  }
+  return msgs;
+}
 function staffLineHistoryText(c) {
-  return (c.msgs || []).slice(-10).map(m => (m.from === "them" ? "患者" : "スタッフ") + ": " + String(m.text || (m.media ? "［" + m.media + "］" : "")).slice(0, 500)).join("\n");
+  // 連続するメールの添付は1行にまとめる（添付が多いと前の会話が要約から押し出されるため）
+  const msgs = collapseMailAttachmentMessages(c.msgs || []);
+  return msgs.slice(-10).map(m => (m.from === "them" ? "患者" : "スタッフ") + ": " + String(m.text || (m.media ? "［" + m.media + "］" : "")).slice(0, 500)).join("\n");
 }
 async function staffLineSummary(t, c) {
   const history = staffLineHistoryText(c);
@@ -487,8 +507,22 @@ function staffLineApprovalById(t, id) {
   }
   return null;
 }
+// 最後のスタッフ返信より後に、患者からのメールの添付が届いているか（スタッフLINEでは添付を見られない）
+function hasUnreviewedMailAttachment(c) {
+  const msgs = (c && c.msgs) || [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (!m) continue;
+    // 送信予約（添付が届く前に作られたもの）と自動送信は、スタッフが添付を見たことにはならないので確認済みにしない
+    if (m.from !== "them") { if (m.scheduled || m.auto) continue; return false; }
+    if (m.mailAttachment) return true;
+  }
+  return false;
+}
 async function staffLineRequestApproval(t, c, reason, opts) {
   opts = opts || {};
+  // 添付つきメールは送信ボタン付きのカードを出さず、画面での確認を促す通知だけにする（どの経路から呼ばれても）
+  if (hasUnreviewedMailAttachment(c)) return staffLineEscalate(t, c, "メールに添付ファイルがあります。右腕くんの画面で添付を確認してから返信してください");
   const draft = String(c && c.draft || "").trim(), groupId = String(t.config.conn.staffLineGroupId || "");
   if (!S(t).staffLineEnabled || !staffLineReady(t) || !draft || !groupId) return false;
   if (c.bookingSuggestion && c.bookingSuggestion.status !== "executed") return false; // 予約操作は右腕くん画面の提案カードで実行してから送る
@@ -517,6 +551,7 @@ async function staffLineReplyOrPush(t, replyToken, groupId, messages) {
 async function staffLineApplyRevision(t, c, approval, instruction, userId, replyToken) {
   const beforeHash = approval.draftHash;
   if (c.bookingSuggestion && c.bookingSuggestion.status !== "executed") return false; // 未実行の予約操作の提案がある間は送信ボタン付きカードを出し直さない
+  if (hasUnreviewedMailAttachment(c)) return false; // 未確認のメール添付がある間も、送信ボタン付きカードを出し直さない
   const revised = await staffLineReviseDraft(t, c, instruction);
   if (!revised || c.staffLineApproval !== approval || approval.status !== "pending" || approval.expiresAt < Date.now()
       || approval.assignedUserId !== userId || !staffLineCardMatches(c, approval, beforeHash)) return false;
@@ -540,7 +575,7 @@ const staffLineInFlight = new Set();
 async function staffLineEscalate(t, c, reason) {
   if (!S(t).staffLineEnabled || !staffLineReady(t) || !c) return false;
   // 未実行の予約操作の提案がある時は承認カード（送信ボタン付き）を出さず、通知だけにする
-  if (String(c.draft || "").trim() && !(c.bookingSuggestion && c.bookingSuggestion.status !== "executed")) return staffLineRequestApproval(t, c, reason);
+  if (String(c.draft || "").trim() && !(c.bookingSuggestion && c.bookingSuggestion.status !== "executed") && !hasUnreviewedMailAttachment(c)) return staffLineRequestApproval(t, c, reason);
   const incoming = (c.msgs || []).slice().reverse().find(m => m && m.from === "them") || {};
   const eventKey = sha([t.slug, c.id, incoming.time || "", incoming.text || "", incoming.media || ""].join("|"));
   if (c.staffLineLastEventKey === eventKey || staffLineInFlight.has(eventKey)) return false;
@@ -1130,7 +1165,7 @@ async function distillRules(t, c, opts) {
 
 function recentCustomerQuestion(c) {
   return activeConversationMessages(c)
-    .filter((message) => message && message.from === "them")
+    .filter((message) => message && message.from === "them" && String(message.text || "").trim()) // 本文の無い添付は質問文に数えない
     .slice(-3)
     .map((message) => String(message.text || "").trim())
     .filter(Boolean)
@@ -2359,6 +2394,7 @@ function scheduleAutoReply(t, c, draftText, recvAt, delayMin) {
       if (!(cur.grounding && cur.grounding.autoSendAllowed && cur.validation && cur.validation.pass)) return; // 生成時の根拠監査を通っていない下書きは送らない
       if (!cur.draft || cur.draft.trim() !== draftText) return; // 下書きが変わった/消えた
       if (textMentionsRetiredTerm(cur.draft, retiredTermsOf(t))) return; // 待機中に「使わなくなった語句」が登録された場合も送らない（スタッフ確認のまま）
+      if (hasUnreviewedMailAttachment(cur)) return; // スタッフが確認していないメールの添付がある会話は自動で送らない
       const lastMsg = cur.msgs[cur.msgs.length - 1];
       if (!lastMsg || lastMsg.from !== "them") return; // 待機中に誰かが返信した
       const r = await deliverText(t, cur, draftText);
@@ -2380,7 +2416,7 @@ async function genDraft(t, c, opts) {
   const channel = c.channel;
   const activeMsgs = activeConversationMessages(c);
   // 検索キーは直近3件のお客様メッセージ（最後の一言だけだと文脈語が拾えないため）
-  const recentQuestions = activeMsgs.filter(m => m.from === "them").slice(-3).map(m => m.text || "").filter(Boolean);
+  const recentQuestions = activeMsgs.filter(m => m.from === "them" && String(m.text || "").trim()).slice(-3).map(m => m.text || "").filter(Boolean); // 本文の無い添付で質問文が押し出されないように
   const latestQ = recentQuestions[recentQuestions.length - 1] || "";
   const lastQ = recentQuestions.join(" ");
   const rankedRules = rulesRankedWithScores(t, replyRuleQuery(lastQ.slice(0, 1500)));
@@ -2400,12 +2436,13 @@ async function genDraft(t, c, opts) {
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = channel === "mail" ? "メールなので返信本文の最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
   // 今回の話題より前の直近のやり取り（対応済みにした後・時間が空いた後の短い返事の意味を読むための参考）
-  const precedingMsgs = precedingReference(c, activeMsgs.slice(-16), { max: 10 });
+  const contextMsgs = collapseMailAttachmentMessages(activeMsgs).slice(-16); // 添付が多くても前の会話が押し出されないよう、連続する添付は1件にまとめる
+  const precedingMsgs = precedingReference(c, contextMsgs.map(m => (m && m._src) || m), { max: 10 }); // 位置は元のメッセージで探す
   const precedingTxt = precedingMsgs.length
     ? formatDraftContext(precedingMsgs, m => (m.from === "them" ? "患者" : "医院") + ": " + replyMessageText(m), 4000)
     : "";
   const msgsArr = []; let cur = null;
-  activeMsgs.slice(-16).forEach(m => {
+  contextMsgs.forEach(m => {
     const role = m.from === "them" ? "user" : "assistant";
     const tx = replyMessageText(m);
     if (!tx) return;
@@ -2450,6 +2487,7 @@ async function genDraft(t, c, opts) {
     + "医療判断・診断はしない。「絶対」「完治」など断定的表現は使わない。絵文字は使わない。" + sig
     + "\n\n【事実の安全ルール】料金・金額・割引・期限・規定・営業日・対応可否は店舗ルールに明記された内容だけを答える。予約日時・空き枠・患者固有情報・手続き完了は、本人確認済みのシステム照会結果だけを答える。痛み・症状・薬・安全性は診断や『大丈夫』という断定をせず、スタッフ確認へ回す。根拠が無い部分は推測で埋めず、下の【保留にしない答え方】に従う（答えられる部分は答え、患者側の情報が足りなければ具体的に尋ね、医院側の確認が要る部分だけ何を確認するかを書いて『確認してご案内します』とする）。医院側の確認が要る部分が残る場合は needs_human:true、confidence:low にする。"
     + "\n\n" + ANSWER_FIRST_POLICY
+    + "\n\n" + ATTACHMENT_UNSEEN_POLICY
     + "\n\n" + JP_QUALITY
     + "\n\n出力は必ず次のJSONのみ（前後に説明や```やかぎ括弧を付けない）: {\"draft\":\"お客様への返信文\",\"confidence\":\"high|medium|low\",\"is_urgent\":true|false,\"needs_human\":true|false,\"site_alert\":\"遅刻|当日キャンセル|緊急来院|none\",\"site_summary\":\"現場向け一行要約。site_alertがnoneなら空文字\",\"topics\":[{\"q\":\"短い質問ラベル\",\"need\":true}]"
     + (baTxt ? ",\"action\":{\"type\":\"none|cancel|reschedule|slots|link|verify\",\"appointmentId\":\"\",\"newDateTime\":\"\",\"dates\":[\"YYYY-MM-DD\"],\"phone\":\"\",\"email\":\"\"},\"after_action_draft\":\"\"" : "")
@@ -2619,6 +2657,120 @@ async function enrichStaffLineBookingPreview(t, c, generated) {
 }
 
 // ===== shared inbound handler (LINE webhook / email poller / ingest all funnel here) =====
+// ===== 患者からのメールの添付（画像・動画・ファイル） =====
+const INBOUND_FILES = {}; // DBが無いとき（テスト・ローカル）だけ使うメモリ置き場
+async function saveInboundFile(t, conversationId, file) {
+  if (TEN[t.slug] !== t || t._deleting) throw new Error("tenant_gone"); // 巡回中に法人が削除された（削除中の）場合は保存しない
+  const id = crypto.randomBytes(16).toString("hex");
+  const row = { tenant: t.slug, conversationId: String(conversationId || ""), name: file.name, mime: file.mime, size: file.data.length, data: file.data, ts: Date.now() };
+  if (pool) {
+    // 削除と同時に保存されても消した法人の行が残らないよう、法人が存在するときだけ保存する
+    const r = await pool.query("INSERT INTO inbound_files (id,tenant,conversation_id,name,mime,size,data,ts) SELECT $1,$2,$3,$4,$5,$6,$7,$8 WHERE EXISTS (SELECT 1 FROM tenants WHERE slug=$2)", [id, row.tenant, row.conversationId, row.name, row.mime, row.size, row.data, row.ts]);
+    if (!r.rowCount) throw new Error("tenant_gone");
+  } else {
+    INBOUND_FILES[id] = row;
+  }
+  return id;
+}
+const INBOUND_FILE_CHUNK_BYTES = 1024 * 1024;
+// 書き込みの待ち: drain か切断のどちらかで必ず終わり、待ち受けは毎回両方外す（切断時に処理が止まったまま残らない）
+function waitForDrainOrClose(res) {
+  return new Promise(resolve => {
+    if (res.destroyed || res.writableEnded) return resolve();
+    const done = () => { res.off("drain", done); res.off("close", done); res.off("error", done); resolve(); };
+    res.on("drain", done); res.on("close", done); res.on("error", done);
+  });
+}
+// 形式・サイズだけを読む（動画のRange要求やHEADで、本体を毎回まるごと読まないため）
+async function inboundFileMeta(t, id) {
+  if (!/^[0-9a-f]{32}$/.test(String(id || ""))) return null;
+  if (!pool) { const row = INBOUND_FILES[id]; return row && row.tenant === t.slug ? { name: row.name, mime: row.mime, size: row.size } : null; }
+  const r = await pool.query("SELECT name,mime,size FROM inbound_files WHERE id=$1 AND tenant=$2", [id, t.slug]);
+  return r.rows[0] ? { name: r.rows[0].name, mime: r.rows[0].mime, size: Number(r.rows[0].size) || 0 } : null;
+}
+// 本体の必要な範囲だけを読む（start は0始まり、length バイト）
+async function inboundFileBytes(t, id, start, length) {
+  if (!pool) { const row = INBOUND_FILES[id]; return row && row.tenant === t.slug ? row.data.subarray(start, start + length) : null; }
+  const r = await pool.query("SELECT substring(data from $3 for $4) AS part FROM inbound_files WHERE id=$1 AND tenant=$2", [id, t.slug, start + 1, length]);
+  return r.rows[0] ? Buffer.from(r.rows[0].part || []) : null;
+}
+// 法人ごとの添付の保存容量の上限（既定5GB）。共有DBが満杯になって会話保存など全体が止まるのを防ぐ。
+const INBOUND_FILES_TENANT_MAX_BYTES = (() => { const n = Number(process.env.INBOUND_FILES_TENANT_MAX_BYTES); return Number.isFinite(n) && n > 0 ? Math.floor(n) : 5 * 1024 * 1024 * 1024; })();
+async function inboundFilesUsedBytes(t) {
+  if (!pool) return Object.values(INBOUND_FILES).filter(row => row.tenant === t.slug).reduce((sum, row) => sum + row.size, 0);
+  const r = await pool.query("SELECT COALESCE(SUM(size),0)::bigint AS used FROM inbound_files WHERE tenant=$1", [t.slug]);
+  return Number(r.rows[0] && r.rows[0].used) || 0;
+}
+async function pushInboundMailAttachments(t, c, opts, recvAt) {
+  if (opts.channel !== "mail") return 0;
+  let keep = Array.isArray(opts.attachments) ? opts.attachments : [];
+  const skipped = (Array.isArray(opts.skippedAttachments) ? opts.skippedAttachments : []).slice();
+  if (keep.length) {
+    let used = 0;
+    let usageFailed = false;
+    try { used = await inboundFilesUsedBytes(t); } catch (e) { usageFailed = true; console.error("mail attachment usage check failed"); }
+    const allowed = [];
+    for (const file of keep) {
+      if (usageFailed) { skipped.push({ name: file.name, mime: file.mime, size: file.data.length, reason: "save_failed" }); continue; }
+      if (used + file.data.length > INBOUND_FILES_TENANT_MAX_BYTES) { skipped.push({ name: file.name, mime: file.mime, size: file.data.length, reason: "storage_full" }); continue; }
+      used += file.data.length;
+      allowed.push(file);
+    }
+    if (!usageFailed && allowed.length < keep.length) {
+      const day = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Tokyo" });
+      if (t._inboundStorageAlertDay !== day) {
+        t._inboundStorageAlertDay = day;
+        try { await alertAdd(t, "システム", "メール添付の保存容量の上限に達したため、新しい添付を右腕くんに保存できませんでした。運営へご連絡ください（メールソフトでは確認できます）。", ""); } catch (_) {}
+      }
+    }
+    keep = allowed;
+  }
+  let count = 0;
+  const times = inboundMessageTimes(opts.sentAt, recvAt, opts.sentAtSource);
+  for (const file of keep) {
+    count++;
+    try {
+      const fid = await saveInboundFile(t, c.id, file);
+      c.msgs.push({ from: "them", text: "", media: file.kind, url: "/api/inbound-file/" + fid, fileName: file.name, mailAttachment: true, time: nowt(), ...times });
+    } catch (e) {
+      console.error("mail attachment save failed"); // 患者情報（ファイル名等）はログに出さない
+      c.msgs.push({ from: "them", text: "", media: "file", fileName: file.name + "（保存できませんでした。メールソフトで確認してください）", mailAttachment: true, time: nowt(), ...times });
+    }
+  }
+  for (const item of skipped) {
+    count++;
+    c.msgs.push({ from: "them", text: "", media: "file", fileName: skippedLabel(item), mailAttachment: true, time: nowt(), ...times });
+  }
+  return count;
+}
+// 添付の表示・再生（ログイン必須・同じ法人だけ。動画のために Range にも対応）
+app.get("/api/inbound-file/:id", guard, async (req, res) => {
+  const id = String(req.params.id || "");
+  let f = null;
+  try { f = await inboundFileMeta(req.tenant, id); } catch (e) { return res.status(500).end(); }
+  if (!f) return res.status(404).end();
+  const headers = inboundFileHeaders(f);
+  Object.keys(headers).forEach(k => res.set(k, headers[k]));
+  const range = req.headers.range ? parseRange(req.headers.range, f.size) : null; // 解釈できない・複数範囲の指定は無視して全体を返す
+  if (range && range.unsatisfiable) { res.set("Content-Range", "bytes */" + f.size); return res.status(416).end(); }
+  const start = range ? range.start : 0, length = range ? range.end - range.start + 1 : f.size;
+  const sendHead = () => { if (range) res.status(206).set("Content-Range", "bytes " + range.start + "-" + range.end + "/" + f.size); res.set("Content-Length", String(length)); };
+  if (req.method === "HEAD") { sendHead(); return res.end(); }
+  // 本体は1MBずつ読んで書き出す（大きな画像・動画を丸ごとメモリに載せない。受け手が遅ければ待つ）
+  let pos = start, remaining = length, chunk = null;
+  try { chunk = await inboundFileBytes(req.tenant, id, pos, Math.min(INBOUND_FILE_CHUNK_BYTES, remaining)); } catch (e) { return res.status(500).end(); }
+  if (!chunk || (remaining > 0 && !chunk.length)) return res.status(404).end(); // 最初の読み出しに成功してからヘッダーを送る
+  sendHead();
+  while (true) {
+    pos += chunk.length; remaining -= chunk.length;
+    if (res.destroyed || res.writableEnded) return; // 閲覧側が切断した（動画のシーク・会話の切り替えなど）
+    if (!res.write(chunk)) await waitForDrainOrClose(res);
+    if (remaining <= 0 || res.destroyed || res.writableEnded) break;
+    try { chunk = await inboundFileBytes(req.tenant, id, pos, Math.min(INBOUND_FILE_CHUNK_BYTES, remaining)); } catch (e) { chunk = null; }
+    if (!chunk || !chunk.length) { res.destroy(); return; } // 途中で読めなくなったら接続を切る（宣言した長さと食い違う応答を返さない）
+  }
+  if (!res.destroyed) res.end();
+});
 async function handleInbound(t, opts) {
   return aiUsageContext.run({ entries: [] }, () => handleInboundCore(t, opts));
 }
@@ -2637,7 +2789,11 @@ async function handleInboundCore(t, opts) {
   if (opts.acct) c.acct = opts.acct; // どの連携アカウント（LINEチャネル/メールアドレス）経由か
   const med = ["image", "video", "file", "audio"].includes(opts.media) ? opts.media : null;
   preserveTopicBoundary(c);
-  c.msgs.push({ from: "them", text: opts.text || "", media: med, mediaId: med ? (opts.mediaId || null) : null, fileName: med === "file" ? (opts.fileName || "ファイル") : undefined, time: nowt(), ...inboundMessageTimes(opts.sentAt, recvAt, opts.sentAtSource) });
+  // メールの添付は本文より先に並べる（AIへ渡す「最新の患者の文」が本文になるように）
+  const mailAttachmentCount = await pushInboundMailAttachments(t, c, opts, recvAt);
+  // 今回のメールの添付だけでなく、スタッフがまだ返信していない前のメールの添付も含めて判定する（後から本文だけのメールが来ても自動で処理しない）
+  const attachmentUnreviewed = mailAttachmentCount > 0 || hasUnreviewedMailAttachment(c);
+  if (!(mailAttachmentCount && !String(opts.text || "").trim())) c.msgs.push({ from: "them", text: opts.text || "", media: med, mediaId: med ? (opts.mediaId || null) : null, fileName: med === "file" ? (opts.fileName || "ファイル") : undefined, time: nowt(), ...inboundMessageTimes(opts.sentAt, recvAt, opts.sentAtSource) });
   statBump(t, "in");
   if (opts.subject) c.subject = String(opts.subject).slice(0, 300);
   c.status = "todo"; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
@@ -2646,7 +2802,7 @@ async function handleInboundCore(t, opts) {
 
   // ===== 予約自動受付: 確認待ちへの「はい/いいえ」を最優先で処理（明確な返答のときだけ実行） =====
   let baDone = false;
-  if (!med && typeof opts.draft !== "string" && baEnabled(t) && PARTNER_KEY) {
+  if (!med && !attachmentUnreviewed && typeof opts.draft !== "string" && baEnabled(t) && PARTNER_KEY) { // 添付つきメールは中身を誰も見ないまま予約操作しない
     try { baDone = await baHandlePending(t, c); } catch (e) { console.error("ba pending:", e && e.message); }
   }
 
@@ -2671,7 +2827,7 @@ async function handleInboundCore(t, opts) {
     // 下書き生成中にスタッフが提案を実行した場合は、その「実行済み」表示（実行後の案内文）を残す
     const executedDuringDraft = !!(c.bookingSuggestion && c.bookingSuggestion !== suggestionBefore && c.bookingSuggestion.status === "executed");
     if (!executedDuringDraft) c.bookingSuggestion = null;
-    const autoBooking = !!(g && !g.replyRequiresStaff && !staffLineReviewAll(t) && baEnabled(t));
+    const autoBooking = !!(g && !attachmentUnreviewed && !g.replyRequiresStaff && !staffLineReviewAll(t) && baEnabled(t)); // 未確認の添付があれば自動実行せず、提案カードでスタッフに確認してもらう
     const bookingOp = !!(g && g.action && typeof g.action === "object" && ["cancel", "reschedule"].includes(String(g.action.type)));
     if (g && bookingOp && !autoBooking) {
       // 自動で実行しないキャンセル・日時変更の依頼は、提案が作れたかに関係なくスタッフ確認へ回す（自動送信しない）
@@ -2683,7 +2839,7 @@ async function handleInboundCore(t, opts) {
       }
     }
     // ===== 予約自動受付: AIが操作依頼(action)を出したら、確認文の送信までを自動処理 =====
-    if (g && !g.replyRequiresStaff && !staffLineReviewAll(t) && baEnabled(t) && PARTNER_KEY && g.action && typeof g.action === "object" && g.action.type && g.action.type !== "none") {
+    if (g && !attachmentUnreviewed && !g.replyRequiresStaff && !staffLineReviewAll(t) && baEnabled(t) && PARTNER_KEY && g.action && typeof g.action === "object" && g.action.type && g.action.type !== "none") {
       try { baDone = await baAction(t, c, g.action, g.baCtx); } catch (e) { console.error("ba action:", e && e.message); }
       if (baDone) { c.draft = ""; c.draft0 = ""; c.learningRefs = []; }
       else if (String(needsHuman) !== "true" && String(urgent) !== "true") {
@@ -2708,7 +2864,7 @@ async function handleInboundCore(t, opts) {
     const conf = String(confidence || "").toLowerCase();
     const confOk = conf === "high" || (S(t).level === "medium" && conf === "medium");
     const grounded = !!(c.grounding && c.grounding.autoSendAllowed && c.validation && c.validation.pass);
-    const safe = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med && grounded;
+    const safe = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med && !attachmentUnreviewed && grounded; // 添付つきメールはAIが中身を見られないため自動送信しない
     if (!baDone && S(t).autoReply && !staffLineReviewAll(t) && confOk && safe && c.draft && c.draft.trim()) {
       const draftText = c.draft.trim();
       const delayMin = Number(S(t).autoDelayMin || 0);
@@ -2726,15 +2882,18 @@ async function handleInboundCore(t, opts) {
   const confForStaffLine = String(confidence || "").toLowerCase();
   const confOkForStaffLine = confForStaffLine === "high" || (S(t).level === "medium" && confForStaffLine === "medium");
   const groundedForStaffLine = !!(c.grounding && c.grounding.autoSendAllowed && c.validation && c.validation.pass);
-  const safeForStaffLine = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med && groundedForStaffLine;
+  const safeForStaffLine = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med && !attachmentUnreviewed && groundedForStaffLine;
   const exceptionNeedsReview = S(t).autoReply && S(t).staffLineEnabled && S(t).staffLineReplyMode === "exceptions" && !baDone && c.draft && c.draft.trim() && (!confOkForStaffLine || !safeForStaffLine);
   if (staffLineReviewAll(t) && !baDone && c.draft && c.draft.trim() && c.bookingSuggestion && c.bookingSuggestion.status !== "executed") {
     staffLineEscalate(t, c, "予約操作の提案があります。右腕くんの画面で予約を確認・実行してから返信してください").catch(() => {});
+  } else if (attachmentUnreviewed && !baDone && (staffLineReviewAll(t) || exceptionNeedsReview)) {
+    // 添付はスタッフLINEでは見られないため、LINEの承認だけでは送れないようにし、画面での確認へ誘導する
+    staffLineEscalate(t, c, "メールに添付ファイルがあります。右腕くんの画面で添付を確認してから返信してください").catch(() => {});
   } else if (staffLineReviewAll(t) && !baDone && c.draft && c.draft.trim()) {
     staffLineRequestApproval(t, c, "毎回確認モードのため、送信前に承認が必要です").catch(() => {});
   } else if (exceptionNeedsReview || String(needsHuman) === "true" || String(urgent) === "true" || c.flag) {
     const groundingReason = c.grounding && Array.isArray(c.grounding.reasons) && c.grounding.reasons[0];
-    const reason = String(urgent) === "true" ? "緊急性のある問い合わせとAIが判定しました" : (c.flag ? "要対応フラグが付いています" : (!groundedForStaffLine ? (groundingReason || "送信前の根拠監査を通らなかったため確認が必要です") : (!confOkForStaffLine ? "自動送信に必要な確信率を満たさないため確認が必要です" : "AIが人による判断を必要と判定しました")));
+    const reason = String(urgent) === "true" ? "緊急性のある問い合わせとAIが判定しました" : (c.flag ? "要対応フラグが付いています" : (!groundedForStaffLine ? (groundingReason || "送信前の根拠監査を通らなかったため確認が必要です") : (!confOkForStaffLine ? "自動送信に必要な確信率を満たさないため確認が必要です" : (attachmentUnreviewed ? "メールに添付ファイルがあり、AIでは中身を確認できないため確認が必要です" : "AIが人による判断を必要と判定しました"))));
     // 未実行の予約操作の提案がある返信は、スタッフLINEの承認だけで送れないようにする（予約操作は画面の確認カードで実行）
     const pendingBookingSuggestion = !!(c.bookingSuggestion && c.bookingSuggestion.status !== "executed");
     if (!pendingBookingSuggestion && c.draft && c.draft.trim() && S(t).staffLineEnabled && S(t).staffLineReplyMode === "exceptions" && staffLineReady(t)) staffLineRequestApproval(t, c, reason).catch(() => {});
@@ -3046,6 +3205,8 @@ app.post("/webhook/staff-line", async (req, res) => {
       }
       if (action === "send" && found.c.bookingSuggestion && found.c.bookingSuggestion.status !== "executed") { await staffLineReply(t, ev.replyToken, [staffLineText("この会話には未実行の予約操作（キャンセル・日時変更）の提案があります。右腕くんの画面で予約を確認・実行してから送信してください。")]); continue; }
       // 使わなくなった予約サイト・語句が残る返信案は、LINEの承認だけでは送らない（右腕くんかLINEの修正で書き換えてもらう）
+      // 添付つきメールへの返信は、LINEの承認だけでは送らない（以前に出たカードを押された場合も）
+      if (action === "send" && hasUnreviewedMailAttachment(found.c)) { await staffLineReply(t, ev.replyToken, [staffLineText("患者からのメールに添付ファイルがあるため、LINEからは送信できません。右腕くんの画面で添付を確認してから返信してください。")]); continue; }
       if (action === "send" && textMentionsRetiredTerm(found.approval.draft != null ? found.approval.draft : found.c.draft, retiredTermsOf(t))) { await staffLineReply(t, ev.replyToken, [staffLineText("この返信案には使わなくなった予約サイト・語句が含まれているため送信できません。「修正」から予約ページの案内に直すか、右腕くんで書き換えてください。")]); continue; }
       if (action !== "send" || !staffLineCardMatches(found.c, found.approval, q.get("h"))) { await staffLineReply(t, ev.replyToken, [staffLineText("返信案が更新されています。最新の承認依頼を確認してください。")]); continue; }
       const lockKey = t.slug + "::" + found.c.id;
@@ -3077,6 +3238,9 @@ app.post("/webhook/staff-line", async (req, res) => {
 
 // ===== Email inbound via IMAP（全テナント横断ポーリング。provider-agnostic: Gmail/Outlook/独自ドメイン） =====
 let emailPolling = false;
+const MAIL_RAW_MAX_BYTES = 60 * 1024 * 1024;   // これより大きいメールは添付を取り込まない（添付の上限50MB＋本文の余裕）
+const MAIL_RAW_HEAD_BYTES = 2 * 1024 * 1024;   // 大きすぎるメールは先頭2MBだけ読んで本文を取り出す
+const mailFailures = new Map();                // 処理に失敗したメールのやり直し回数（法人:UID）
 async function pollAll() {
   if (emailPolling) return; emailPolling = true;
   let ImapFlow, simpleParser;
@@ -3104,27 +3268,43 @@ async function pollAll() {
         const lock = await client.getMailboxLock("INBOX");
         try {
           // 注意: fetchループの最中に他のIMAPコマンド（既読化など）を実行してはいけない（無効になる）
+          // 先にUIDと大きさだけを集め、本体は1通ずつ取得して処理する（添付つきの大きなメールを全件まとめてメモリに載せない）
           const items = [];
-          for await (const msg of client.fetch({ seen: false, since: new Date(Date.now() - 2 * 86400000) }, { source: true })) {
-            items.push({ uid: msg.uid, source: msg.source });
+          for await (const msg of client.fetch({ seen: false, since: new Date(Date.now() - 2 * 86400000) }, { uid: true, size: true })) {
+            items.push({ uid: msg.uid, size: Number(msg.size) || 0 });
           }
           const markUids = [];
           for (const it of items) {
+            let mid = "";
+            if (client.usable === false) break; // 接続が切れたら残りは次の巡回へ（試していないメールを失敗に数えない）
             try {
-              const parsed = await simpleParser(it.source);
+              const tooLarge = it.size > MAIL_RAW_MAX_BYTES;
+              // 大きすぎるメールは先頭だけ取得して本文を読み、添付は取り込まない（理由つきで表示する）
+              const fetched = await client.fetchOne(String(it.uid), { source: tooLarge ? { start: 0, maxLength: MAIL_RAW_HEAD_BYTES } : true }, { uid: true });
+              if (!fetched || !fetched.source) continue;
+              const parsed = await simpleParser(fetched.source);
               const mdate = parsed.date ? new Date(parsed.date).getTime() : Date.now();
               if (mdate < cutoff) continue; // 有効化前のメールは未読のまま放置
-              const mid = String(parsed.messageId || "").trim();
-              markUids.push(it.uid);
-              if (mid && seenIds.has(mid)) continue; // 既に処理済み
-              if (mid) seenIds.add(mid);
+              mid = String(parsed.messageId || "").trim();
+              if (mid && seenIds.has(mid)) { markUids.push(it.uid); continue; } // 既に処理済み
               const fromV = (parsed.from && parsed.from.value && parsed.from.value[0]) || {};
               const email = String(fromV.address || "").toLowerCase();
-              if (!email || ownAddrs.includes(email)) continue;
-              if (/no-?reply|mailer-daemon|postmaster/i.test(email)) continue;
+              if (!email || ownAddrs.includes(email) || /no-?reply|mailer-daemon|postmaster/i.test(email)) { markUids.push(it.uid); if (mid) seenIds.add(mid); continue; }
               const text = String(parsed.text || parsed.subject || "").replace(/\r/g, "").slice(0, 8000);
-              await handleInbound(t, { channel: "mail", uid: email, name: fromV.name || email, text, subject: parsed.subject || "", sentAt: parsed.date ? mdate : undefined, sentAtSource: "mail_header", acct: { type: "mail", key: acc.smtpUser, name: acc.name } });
-            } catch (e) { console.error("mail parse:", e.message); }
+              const mailFiles = tooLarge ? { keep: [], skipped: [{ name: "このメールの添付", reason: "mail_too_large" }] } : selectMailAttachments(parsed.attachments);
+              if (mid) seenIds.add(mid);
+              await handleInbound(t, { channel: "mail", uid: email, name: fromV.name || email, text, subject: parsed.subject || "", attachments: mailFiles.keep, skippedAttachments: mailFiles.skipped, sentAt: parsed.date ? mdate : undefined, sentAtSource: "mail_header", acct: { type: "mail", key: acc.smtpUser, name: acc.name } });
+              markUids.push(it.uid);
+              mailFailures.delete(slug + ":" + acc.smtpUser + ":" + it.uid);
+            } catch (e) {
+              // 処理に失敗したメールは既読にせず次の巡回でやり直す（3回失敗したら既読にして止める）。患者情報はログに出さない
+              console.error("mail process failed");
+              if (mid) seenIds.delete(mid);
+              const key = slug + ":" + acc.smtpUser + ":" + it.uid, n = (mailFailures.get(key) || 0) + 1;
+              mailFailures.set(key, n);
+              if (n >= 3) { markUids.push(it.uid); mailFailures.delete(key); if (mid) seenIds.add(mid); }
+              if (mailFailures.size > 2000) mailFailures.delete(mailFailures.keys().next().value); // 記録が増え続けないよう古いものから消す
+            }
           }
           // フェッチ完了後にまとめて既読化（ループ中は効かないため）
           if (markUids.length) {
@@ -3674,6 +3854,7 @@ app.post("/api/staff-line/resend-approval", guard, oneMutationAtATime("staff-lin
   // 未実行の予約操作の提案がある返信は、スタッフLINEの承認だけで送れないようにする（画面の提案カードで実行してから）
   if (c.bookingSuggestion && c.bookingSuggestion.status !== "executed") return res.status(409).json({ ok: false, error: "booking_suggestion_pending" });
   if (!S(t).staffLineEnabled || !staffLineReady(t)) return res.status(400).json({ ok: false, error: "staff_line_not_ready" });
+  if (hasUnreviewedMailAttachment(c)) return res.status(409).json({ ok: false, error: "mail_attachment_unreviewed" }); // 添付は画面で確認してから返信する
   try {
     const ok = await staffLineRequestApproval(t, c, "右腕くん画面から承認依頼を再送しました", { force: true });
     if (!ok) return res.status(502).json({ ok: false, error: "line_send_failed" });
@@ -4176,6 +4357,7 @@ app.post("/api/ai-regen", guard, async (req, res) => {
     + "お客様が複数の質問・依頼をしている場合は、その全てにもれなく答えること。1つも取りこぼさない。"
     + "お客様への敬意と心配りが自然に伝わる表現を選び、ご不便にはお詫びや労いの一言を添える。誤った二重敬語は避け、読みやすさも保つ。絵文字は使わない。断定や医療判断は避ける。" + sig
     + "\n" + ANSWER_FIRST_POLICY
+    + "\n" + ATTACHMENT_UNSEEN_POLICY
     + (bookingFactsOf(t) ? "\n" + bookingFactsOf(t) : "")
     + (rulesTxt ? "\n【店舗ルール（従うこと）】\n" + rulesTxt : "")
     + (replyToneInstruction(S(t).tone, 1000) ? "\n\n" + replyToneInstruction(S(t).tone, 1000) : "")
@@ -4281,6 +4463,7 @@ async function draftChatPrep(t, body) {
     + "\n\n" + STAFF_DRAFT_POLICY
     + (replyToneInstruction(S(t).tone, 1000) ? "\n\n" + replyToneInstruction(S(t).tone, 1000) : "")
     + "\n\n" + ANSWER_FIRST_POLICY
+    + "\n\n" + ATTACHMENT_UNSEEN_POLICY
     + (prefsBlock(t) ? "\n\n【スタッフが記憶させた指示（全返信で必ず守る）】\n" + prefsBlock(t) : "")
     + (bookingFactsOf(t) ? "\n\n" + bookingFactsOf(t) : "")
     + (rulesTxt ? "\n\n【通常の店舗ルール（ルールブック全文。スタッフが今回の例外を明示した項目以外の基準。推測で補わない。同じ内容が食い違う場合は更新日が新しいルールを使う）】\n" + rulesTxt : "")
@@ -5480,18 +5663,22 @@ app.put("/api/partner/account", pGuard, async (req,res)=>{
 // テナント完全削除（解約時）
 app.delete("/api/partner/tenants/:slug", pGuard, async (req,res)=>{
   const slug = String(req.params.slug||""); const t = TEN[slug]; if(!t) return res.status(404).json({ok:false});
+  t._deleting = true; // 削除中に届いたメールの添付を保存させない
   try{
     if(pool){
       await pool.query("DELETE FROM convos WHERE tenant=$1",[slug]);
       await pool.query("DELETE FROM rules WHERE tenant=$1",[slug]);
       await pool.query("DELETE FROM alerts WHERE tenant=$1",[slug]);
       await pool.query("DELETE FROM files WHERE tenant=$1",[slug]);
+      await pool.query("DELETE FROM inbound_files WHERE tenant=$1",[slug]); // 患者からのメールの添付も法人と一緒に消す
       await pool.query("DELETE FROM push_subs WHERE tenant=$1",[slug]);
       await pool.query("DELETE FROM tenants WHERE slug=$1",[slug]);
+      await pool.query("DELETE FROM inbound_files WHERE tenant=$1",[slug]); // 削除中に確定した添付の保存が残らないよう、法人の削除後にもう一度消す
     }
+    for (const fid of Object.keys(INBOUND_FILES)) if (INBOUND_FILES[fid].tenant === slug) delete INBOUND_FILES[fid]; // DBなし（テスト・ローカル）の置き場
     delete TEN[slug];
     res.json({ok:true});
-  }catch(e){ res.status(500).json({ok:false,error:String(e.message||e).slice(0,80)}); }
+  }catch(e){ t._deleting = false; res.status(500).json({ok:false,error:String(e.message||e).slice(0,80)}); }
 });
 // LINE設定（受付くん運営画面から。トークン検証＋botId自動取得）
 app.put("/api/partner/line-config", pGuard, async (req,res)=>{
@@ -5820,6 +6007,16 @@ app.get("/signup", (req, res) => res.redirect("/")); // 申込みは営業契約
 app.get("/board", (req, res) => { res.set("Content-Type", "text/html; charset=utf-8"); res.set("Cache-Control", "no-store"); res.send(pageWithEnvironmentBanner(req, tenantFromReq(req) ? BOARD_PAGE : emailLoginPage(LOGIN_PAGE, requestPublicBase(req)))); });
 if (process.env.NODE_ENV === "test") {
   app.get("/__test/async-error", async () => { throw new Error("private-test-stack-marker"); });
+}
+// テスト専用: IMAPを使わずに「添付つきメールの受信」を再現する（Railwayなどの本番・staging実行環境では登録しない）
+if (process.env.NODE_ENV === "test" && !isManagedRuntime()) {
+  app.post("/__test/mail-inbound", guard, async (req, res) => {
+    const b = req.body || {};
+    const raw = (Array.isArray(b.attachments) ? b.attachments : []).map(a => ({ filename: a.filename, contentType: a.contentType, related: !!a.related, content: Buffer.from(String(a.base64 || ""), "base64") }));
+    const files = selectMailAttachments(raw);
+    const r = await handleInbound(req.tenant, { channel: "mail", uid: String(b.email || "test@example.test").toLowerCase(), name: b.name || "テスト患者", text: String(b.text || ""), subject: String(b.subject || ""), attachments: files.keep, skippedAttachments: files.skipped });
+    res.json({ ok: true, ...r, kept: files.keep.length, skipped: files.skipped.length });
+  });
 }
 app.use((err, req, res, next) => {
   console.error("request failed:", req.method, req.path, err && err.message ? err.message : "unknown");
@@ -6158,6 +6355,8 @@ const PAGE = `<!DOCTYPE html>
   #draft{flex:1;min-height:110px;max-height:300px;border:1px solid #d1d5db;border-radius:10px;padding:9px 11px;font-size:13px;line-height:1.5;font-family:inherit;resize:vertical;transition:min-height .15s ease;}
   #pendingAttachments{display:flex;gap:7px;overflow-x:auto;margin:0 0 7px;padding-bottom:2px;}
   .pendingAttachment{position:relative;display:flex;align-items:center;gap:7px;min-width:0;max-width:220px;padding:6px 28px 6px 7px;border:1px solid #bbf7d0;border-radius:9px;background:#f0fdf4;font-size:11px;color:#166534;}
+  .mailAttachName{font-size:11px;color:#6b7280;margin-top:3px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .mailAttachName a{color:inherit;}
   .pendingAttachment img{width:34px;height:34px;object-fit:cover;border-radius:6px;background:#fff;}
   .pendingAttachment .pendingFileIcon{width:34px;height:34px;display:flex;align-items:center;justify-content:center;border-radius:6px;background:#fff;font-size:18px;}
   .pendingAttachment .pendingName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
@@ -6806,7 +7005,9 @@ function renderList(){
   });
 }
 function esc(s){return String(s||"").replace(/[<>&"']/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;",'"':"&quot;","'":"&#39;"}[c])).replace(/\x60/g,"&#96;");}
-function mediaHtml(m){ var cls='b '+(m.from==="them"?"them":"us"); var raw=m.mediaId?('/api/line-media/'+String(m.mediaId).replace(/[^0-9a-zA-Z_-]/g,"")):(m.url||"https://placehold.co/300x220/e5e7eb/6b7280?text=%F0%9F%93%B7"),src=esc(safeMediaUrl(raw)); if(!src)return ''; if(m.media==="image")return '<div class="'+cls+' media"><a href="'+src+'" target="_blank" rel="noopener noreferrer"><img class="ph" src="'+src+'"></a></div>'; if(m.media==="video")return (m.mediaId||m.url)?('<div class="'+cls+' media"><video class="ph" style="max-width:220px;border-radius:10px;" controls preload="metadata" src="'+src+'"></video></div>'):('<div class="'+cls+' media"><div class="vid">▶<span>動画</span></div></div>'); if(m.media==="file")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">📄 '+esc(m.fileName||"ファイル")+'</a></div>'; if(m.media==="audio")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">🎤 音声メッセージ</a></div>'; return ''; }
+function mediaHtml(m){ var cls='b '+(m.from==="them"?"them":"us"); if(m.mailAttachment&&!m.url)return '<div class="'+cls+'"><span style="color:#6b7280;">📎 '+esc(m.fileName||"添付ファイル")+'</span></div>'; var raw=m.mediaId?('/api/line-media/'+String(m.mediaId).replace(/[^0-9a-zA-Z_-]/g,"")):(m.url||"https://placehold.co/300x220/e5e7eb/6b7280?text=%F0%9F%93%B7"),src=esc(safeMediaUrl(raw)); if(!src)return ''; if(m.media==="image")return '<div class="'+cls+' media"><a href="'+src+'" target="_blank" rel="noopener noreferrer"><img class="ph" src="'+src+'" alt="'+esc(m.fileName||"画像")+'" loading="lazy" decoding="async" onerror="mediaImgFallback(this)"></a>'+(m.mailAttachment?'<div class="mailAttachName">📎 '+esc(m.fileName||"画像")+'</div>':'')+'</div>'; if(m.mailAttachment&&m.media==="video")return '<div class="'+cls+' media"><video class="ph" style="max-width:260px;border-radius:10px;" controls preload="metadata" src="'+src+'"></video><div class="mailAttachName"><a href="'+src+'" target="_blank" rel="noopener noreferrer">📎 '+esc(m.fileName||"動画")+'</a></div></div>'; if(m.media==="video")return (m.mediaId||m.url)?('<div class="'+cls+' media"><video class="ph" style="max-width:220px;border-radius:10px;" controls preload="metadata" src="'+src+'"></video></div>'):('<div class="'+cls+' media"><div class="vid">▶<span>動画</span></div></div>'); if(m.media==="file")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">📄 '+esc(m.fileName||"ファイル")+'</a></div>'; if(m.media==="audio")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">🎤 '+(m.mailAttachment?esc(m.fileName||"音声ファイル"):'音声メッセージ')+'</a></div>'; return ''; }
+// iPhoneのHEICなど、ブラウザで表示できない画像は「開く」リンクに置き換える
+function mediaImgFallback(img){try{var a=img.parentNode;if(!a||a.getAttribute("data-fallback"))return;a.setAttribute("data-fallback","1");img.remove();var span=document.createElement("span");span.textContent="📷 画像を開く（ここではプレビューできません）";span.style.cssText="display:inline-block;padding:10px 12px;font-size:13px;";a.appendChild(span);}catch(e){}}
 // 会話本文の日時は日本時間で統一。会話全体の更新時刻から古いメッセージの日付を推測しない。
 const messageDateFormatter=new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Tokyo",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hourCycle:"h23"});
 function messageDateParts(timestamp){const parts={};messageDateFormatter.formatToParts(new Date(timestamp)).forEach(p=>{parts[p.type]=p.value;});return parts;}
@@ -7512,7 +7713,7 @@ function renderScheduledMessages(conversation){
 }
 async function cancelScheduledMessage(scheduleId,button){if(!await uiConfirm("この送信予約を取り消しますか？"))return;await withBusy("scheduled-cancel-"+scheduleId,button,"取消中…",async()=>{try{const response=await api("/api/scheduled-message-cancel",{scheduleId}),json=await response.json();if(!response.ok||!json.ok)throw new Error(json.error||"cancel");await load();}catch(e){uiAlert(e.message==="sending"?"現在送信処理中のため取り消せません":"送信予約を取り消せませんでした");}});}
 async function retryScheduledMessage(scheduleId,button){if(!await uiConfirm("患者側の履歴を確認しましたか？\\n同じ内容が届いていないことを確認したうえで再送してください。"))return;await withBusy("scheduled-retry-"+scheduleId,button,"再送中…",async()=>{try{const response=await api("/api/scheduled-message-retry",{scheduleId}),json=await response.json();if(!response.ok||!json.ok)throw new Error(json.error||"retry");await load();uiAlert("再送を開始しました");}catch(e){uiAlert("再送を開始できませんでした");}});}
-async function resendStaffApproval(){if(!current)return;const b=document.getElementById("staffReviewResend"),draft=String(document.getElementById("draft")&&document.getElementById("draft").value||"").trim();if(!draft){uiAlert("先に患者様へ送る返信案を入力してください");return;}if(b){b.disabled=true;b.textContent="送信中…";}try{const r=await api("/api/staff-line/resend-approval",{id:current,draft}),j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error(j.error||"resend");uiAlert("スタッフLINEへ承認依頼を送りました");await load();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"スタッフLINE連携を設定・有効化してください":e.message==="booking_suggestion_pending"?"予約操作の提案がまだ実行されていません。提案カードで実行するか、提案を消してから承認依頼を送ってください":"承認依頼を送れませんでした");}finally{if(b){b.disabled=false;b.textContent="📲 スタッフLINEで確認";}}}
+async function resendStaffApproval(){if(!current)return;const b=document.getElementById("staffReviewResend"),draft=String(document.getElementById("draft")&&document.getElementById("draft").value||"").trim();if(!draft){uiAlert("先に患者様へ送る返信案を入力してください");return;}if(b){b.disabled=true;b.textContent="送信中…";}try{const r=await api("/api/staff-line/resend-approval",{id:current,draft}),j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error(j.error||"resend");uiAlert("スタッフLINEへ承認依頼を送りました");await load();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"スタッフLINE連携を設定・有効化してください":e.message==="booking_suggestion_pending"?"予約操作の提案がまだ実行されていません。提案カードで実行するか、提案を消してから承認依頼を送ってください":e.message==="mail_attachment_unreviewed"?"患者からのメールに添付ファイルがあります。この画面で添付を確認してから、ここから返信してください（LINEの承認だけでは送れません）":"承認依頼を送れませんでした");}finally{if(b){b.disabled=false;b.textContent="📲 スタッフLINEで確認";}}}
 async function shareClinic(){const note=await uiPrompt("現場に伝える内容を入力してください（空欄のままOKを押すと、お客様の直近メッセージをそのまま共有します）","");if(note===null)return;const btn=document.getElementById("shareClinicBtn"),id=current;await withBusy("share-"+id,btn,"共有中…",async()=>{try{const r=await api("/api/share",{id,note:note||""});const j=await r.json();if(j.ok)uiAlert("現場ボードに共有しました");else uiAlert("共有に失敗しました");}catch(e){uiAlert("共有に失敗しました");}});}
 async function toggleFlag(){if(!current)return;const id=current,b=document.getElementById("flagBtn");let next=null;await withBusy("flag-"+id,b,"変更中…",async()=>{try{const r=await api("/api/tag",{id});const j=await r.json();next=!!j.flag;const cd=DATA.find(x=>x.id===id);if(cd)cd.flag=next;renderList();}catch(e){uiAlert("変更に失敗しました");}});if(b&&next!==null)b.textContent=next?"⚑ 要対応を外す":"⚑ 要対応";}
 // ---- AIで作り直す（会話型・下書きを会話で磨く。会話ごとにセッションを保持し再開可能）----
