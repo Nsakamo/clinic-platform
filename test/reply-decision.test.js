@@ -74,7 +74,8 @@ test("旧返信に送信日時がなくても話題だけを区切り、仮の�
   c.msgs.push({ from: "them", text: "テスト：営業時間について", sentAt: before + 86400000 });
   c.ts = before + 86400000;
   assert.deepEqual(selectConversationContext(c).current.map(m => m.text), ["テスト：営業時間について"]);
-  assert.match(source, /preserveTopicBoundary\(c\);\s*c\.msgs\.push/);
+  // メールの添付（あれば）を先に並べてから本文を追加する。話題の区切りはその前に確定する
+  assert.match(source, /preserveTopicBoundary\(c\);\s*(?:\/\/[^\n]*\n\s*)?const mailAttachmentCount = await pushInboundMailAttachments\(t, c, opts, recvAt\);\s*(?:\/\/[^\n]*\n\s*)?const attachmentUnreviewed = mailAttachmentCount > 0 \|\| hasUnreviewedMailAttachment\(c\);\s*if \(!\(mailAttachmentCount && !String\(opts\.text \|\| ""\)\.trim\(\)\)\) c\.msgs\.push/);
 });
 
 test("日付を跨ぐ遅延処理でも送信日時を保存し、欠落・未来日時や旧履歴の日時を捏造しない", async () => {
@@ -344,7 +345,7 @@ test("感染症のスタッフ確認ゲートを予約の自動提案も迂回�
     let proposed = 0, delivered = 0;
     const context = {
       ...decision, cancelAutoReply: () => {}, colorFor: () => "", nowt: () => "テスト", statBump: () => {}, lastText: () => "テスト", dbSave: () => {},
-      preserveTopicBoundary,
+      preserveTopicBoundary, pushInboundMailAttachments: async () => 0, hasUnreviewedMailAttachment: () => false,
       baEnabled: () => true, PARTNER_KEY: "テスト", baHandlePending: async () => false, staffLineReviewAll: () => false, staffBookingSuggestEnabled: () => false,
       genDraft: async () => ({ draft: "テスト：証明書はスタッフが確認します。", confidence: "high", needs_human: blocked, replyRequiresStaff: blocked,
         grounding: { autoSendAllowed: false, reasons: [] }, validation: { pass: false }, action: { type: "cancel", appointmentId: "テスト将来予約" } }),
