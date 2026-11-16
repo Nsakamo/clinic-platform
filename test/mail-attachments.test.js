@@ -442,3 +442,33 @@ test("P3: 法人削除では法人の行を消した後にも受信添付を消�
   const a = del.indexOf("DELETE FROM tenants"), b = del.indexOf("DELETE FROM inbound_files WHERE tenant=$1", a);
   assert.ok(a > 0 && b > a);
 });
+
+test("r7 P2: 添付つきメールで始まる話題でも、自動下書きへ直前のやり取りを渡す", () => {
+  const vm = require("node:vm");
+  const { precedingReference } = require("../lib/conversation-context");
+  const fn = source.slice(source.indexOf("function collapseMailAttachmentMessages("), source.indexOf("function staffLineHistoryText("));
+  const ctx = {}; vm.createContext(ctx); vm.runInContext(fn, ctx);
+  const now = Date.now();
+  const msgs = [
+    { from: "them", text: "テスト予約したいです", time: now - 3000 },
+    { from: "us", text: "テスト14日10時か15日11時が空いております", time: now - 2000 },
+    { from: "them", media: "image", mailAttachment: true, time: now - 1000 },
+    { from: "them", text: "テスト前者で", time: now },
+  ];
+  const c = { msgs };
+  const active = msgs.slice(2);
+  const contextMsgs = ctx.collapseMailAttachmentMessages(active).slice(-16);
+  const before = precedingReference(c, active, { max: 10 });
+  const after = precedingReference(c, contextMsgs.map(m => (m && m._src) || m), { max: 10 });
+  assert.equal(before.length, 2);
+  assert.equal(after.length, 2, "まとめた後も直前の2件が残る");
+  const gen = source.slice(source.indexOf("async function genDraft("), source.indexOf("async function enrichStaffLineBookingPreview("));
+  assert.match(gen, /precedingReference\(c, contextMsgs\.map\(m => \(m && m\._src\) \|\| m\), \{ max: 10 \}\)/);
+});
+
+test("r7 P3: IMAPのやり直し回数はアカウント別に数え、接続が切れたら残りを数えない", () => {
+  const poll = source.slice(source.indexOf("async function pollAll("), source.indexOf("emailPolling = false;\n}", source.indexOf("async function pollAll(")));
+  assert.match(poll, /const key = slug \+ ":" \+ acc\.smtpUser \+ ":" \+ it\.uid/);
+  assert.match(poll, /if \(client\.usable === false\) break;/);
+  assert.match(poll, /if \(mailFailures\.size > 2000\)/);
+});

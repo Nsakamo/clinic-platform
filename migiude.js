@@ -429,7 +429,8 @@ function collapseMailAttachmentMessages(list) {
   for (const m of (list || [])) {
     const prev = msgs[msgs.length - 1];
     if (m && m.mailAttachment && prev && prev.mailAttachment && prev.from === m.from) { prev.attachmentCount = (prev.attachmentCount || 1) + 1; prev.text = "［添付ファイル " + prev.attachmentCount + "件（中身は確認できません）］"; continue; }
-    msgs.push(m && m.mailAttachment ? Object.assign({}, m, { text: "［添付ファイル 1件（中身は確認できません）］", attachmentCount: 1 }) : m);
+    // まとめた複製には元のメッセージ（_src）を持たせ、元の会話での位置を探せるようにする
+    msgs.push(m && m.mailAttachment ? Object.assign({}, m, { text: "［添付ファイル 1件（中身は確認できません）］", attachmentCount: 1, _src: m }) : m);
   }
   return msgs;
 }
@@ -2436,7 +2437,7 @@ async function genDraft(t, c, opts) {
   const sig = channel === "mail" ? "メールなので返信本文の最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
   // 今回の話題より前の直近のやり取り（対応済みにした後・時間が空いた後の短い返事の意味を読むための参考）
   const contextMsgs = collapseMailAttachmentMessages(activeMsgs).slice(-16); // 添付が多くても前の会話が押し出されないよう、連続する添付は1件にまとめる
-  const precedingMsgs = precedingReference(c, contextMsgs, { max: 10 });
+  const precedingMsgs = precedingReference(c, contextMsgs.map(m => (m && m._src) || m), { max: 10 }); // 位置は元のメッセージで探す
   const precedingTxt = precedingMsgs.length
     ? formatDraftContext(precedingMsgs, m => (m.from === "them" ? "患者" : "医院") + ": " + replyMessageText(m), 4000)
     : "";
@@ -3275,6 +3276,7 @@ async function pollAll() {
           const markUids = [];
           for (const it of items) {
             let mid = "";
+            if (client.usable === false) break; // 接続が切れたら残りは次の巡回へ（試していないメールを失敗に数えない）
             try {
               const tooLarge = it.size > MAIL_RAW_MAX_BYTES;
               // 大きすぎるメールは先頭だけ取得して本文を読み、添付は取り込まない（理由つきで表示する）
@@ -3293,14 +3295,15 @@ async function pollAll() {
               if (mid) seenIds.add(mid);
               await handleInbound(t, { channel: "mail", uid: email, name: fromV.name || email, text, subject: parsed.subject || "", attachments: mailFiles.keep, skippedAttachments: mailFiles.skipped, sentAt: parsed.date ? mdate : undefined, sentAtSource: "mail_header", acct: { type: "mail", key: acc.smtpUser, name: acc.name } });
               markUids.push(it.uid);
-              mailFailures.delete(slug + ":" + it.uid);
+              mailFailures.delete(slug + ":" + acc.smtpUser + ":" + it.uid);
             } catch (e) {
               // 処理に失敗したメールは既読にせず次の巡回でやり直す（3回失敗したら既読にして止める）。患者情報はログに出さない
               console.error("mail process failed");
               if (mid) seenIds.delete(mid);
-              const key = slug + ":" + it.uid, n = (mailFailures.get(key) || 0) + 1;
+              const key = slug + ":" + acc.smtpUser + ":" + it.uid, n = (mailFailures.get(key) || 0) + 1;
               mailFailures.set(key, n);
               if (n >= 3) { markUids.push(it.uid); mailFailures.delete(key); if (mid) seenIds.add(mid); }
+              if (mailFailures.size > 2000) mailFailures.delete(mailFailures.keys().next().value); // 記録が増え続けないよう古いものから消す
             }
           }
           // フェッチ完了後にまとめて既読化（ループ中は効かないため）
