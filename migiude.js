@@ -26,7 +26,7 @@ const { REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery,
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { ANSWER_FIRST_POLICY, bookingFactsBlock, learningUsesRetiredTerms, normalizeBookingPageUrl, normalizeRetiredTerms, retiredTermsExcludingUrl, textMentionsRetiredTerm } = require("./lib/booking-facts");
 const { normalizeTemplates, saveTemplate, deleteTemplate, moveTemplate } = require("./lib/reply-templates");
-const { inboundFileHeaders, parseRange, selectMailAttachments, skippedLabel } = require("./lib/mail-attachments");
+const { ATTACHMENT_UNSEEN_POLICY, inboundFileHeaders, parseRange, selectMailAttachments, skippedLabel } = require("./lib/mail-attachments");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
 const { AiUsageSpool, resolveAiUsageSpoolPath } = require("./lib/ai-usage-spool");
 const app = express();
@@ -423,14 +423,19 @@ function staffLineUpsertStaff(t, userId, name, role) {
   else { s.name = String(name || s.name || "LINEスタッフ").slice(0, 80); s.active = true; if (role) s.role = role; }
   return s;
 }
+// 連続するメールの添付を1件にまとめる（AIには中身が見えないことも書き添える。ファイル名は渡さない）
+function collapseMailAttachmentMessages(list) {
+  const msgs = [];
+  for (const m of (list || [])) {
+    const prev = msgs[msgs.length - 1];
+    if (m && m.mailAttachment && prev && prev.mailAttachment && prev.from === m.from) { prev.attachmentCount = (prev.attachmentCount || 1) + 1; prev.text = "［添付ファイル " + prev.attachmentCount + "件（中身は確認できません）］"; continue; }
+    msgs.push(m && m.mailAttachment ? Object.assign({}, m, { text: "［添付ファイル 1件（中身は確認できません）］", attachmentCount: 1 }) : m);
+  }
+  return msgs;
+}
 function staffLineHistoryText(c) {
   // 連続するメールの添付は1行にまとめる（添付が多いと前の会話が要約から押し出されるため）
-  const msgs = [];
-  for (const m of (c.msgs || [])) {
-    const prev = msgs[msgs.length - 1];
-    if (m && m.mailAttachment && prev && prev.mailAttachment && prev.from === m.from) { prev.attachmentCount = (prev.attachmentCount || 1) + 1; prev.text = "［添付ファイル " + prev.attachmentCount + "件］"; continue; }
-    msgs.push(m && m.mailAttachment ? Object.assign({}, m, { text: "［添付ファイル 1件］", attachmentCount: 1 }) : m);
-  }
+  const msgs = collapseMailAttachmentMessages(c.msgs || []);
   return msgs.slice(-10).map(m => (m.from === "them" ? "患者" : "スタッフ") + ": " + String(m.text || (m.media ? "［" + m.media + "］" : "")).slice(0, 500)).join("\n");
 }
 async function staffLineSummary(t, c) {
@@ -507,7 +512,8 @@ function hasUnreviewedMailAttachment(c) {
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i];
     if (!m) continue;
-    if (m.from !== "them") return false;
+    // 送信予約（添付が届く前に作られたもの）と自動送信は、スタッフが添付を見たことにはならないので確認済みにしない
+    if (m.from !== "them") { if (m.scheduled || m.auto) continue; return false; }
     if (m.mailAttachment) return true;
   }
   return false;
@@ -544,6 +550,7 @@ async function staffLineReplyOrPush(t, replyToken, groupId, messages) {
 async function staffLineApplyRevision(t, c, approval, instruction, userId, replyToken) {
   const beforeHash = approval.draftHash;
   if (c.bookingSuggestion && c.bookingSuggestion.status !== "executed") return false; // 未実行の予約操作の提案がある間は送信ボタン付きカードを出し直さない
+  if (hasUnreviewedMailAttachment(c)) return false; // 未確認のメール添付がある間も、送信ボタン付きカードを出し直さない
   const revised = await staffLineReviseDraft(t, c, instruction);
   if (!revised || c.staffLineApproval !== approval || approval.status !== "pending" || approval.expiresAt < Date.now()
       || approval.assignedUserId !== userId || !staffLineCardMatches(c, approval, beforeHash)) return false;
@@ -1157,7 +1164,7 @@ async function distillRules(t, c, opts) {
 
 function recentCustomerQuestion(c) {
   return activeConversationMessages(c)
-    .filter((message) => message && message.from === "them")
+    .filter((message) => message && message.from === "them" && String(message.text || "").trim()) // 本文の無い添付は質問文に数えない
     .slice(-3)
     .map((message) => String(message.text || "").trim())
     .filter(Boolean)
@@ -2408,7 +2415,7 @@ async function genDraft(t, c, opts) {
   const channel = c.channel;
   const activeMsgs = activeConversationMessages(c);
   // 検索キーは直近3件のお客様メッセージ（最後の一言だけだと文脈語が拾えないため）
-  const recentQuestions = activeMsgs.filter(m => m.from === "them").slice(-3).map(m => m.text || "").filter(Boolean);
+  const recentQuestions = activeMsgs.filter(m => m.from === "them" && String(m.text || "").trim()).slice(-3).map(m => m.text || "").filter(Boolean); // 本文の無い添付で質問文が押し出されないように
   const latestQ = recentQuestions[recentQuestions.length - 1] || "";
   const lastQ = recentQuestions.join(" ");
   const rankedRules = rulesRankedWithScores(t, replyRuleQuery(lastQ.slice(0, 1500)));
@@ -2428,12 +2435,13 @@ async function genDraft(t, c, opts) {
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sig = channel === "mail" ? "メールなので返信本文の最後に改行して「" + (t.name || "クリニック") + " サポート」と署名を付ける。" : "LINEなので署名は付けない。";
   // 今回の話題より前の直近のやり取り（対応済みにした後・時間が空いた後の短い返事の意味を読むための参考）
-  const precedingMsgs = precedingReference(c, activeMsgs.slice(-16), { max: 10 });
+  const contextMsgs = collapseMailAttachmentMessages(activeMsgs).slice(-16); // 添付が多くても前の会話が押し出されないよう、連続する添付は1件にまとめる
+  const precedingMsgs = precedingReference(c, contextMsgs, { max: 10 });
   const precedingTxt = precedingMsgs.length
     ? formatDraftContext(precedingMsgs, m => (m.from === "them" ? "患者" : "医院") + ": " + replyMessageText(m), 4000)
     : "";
   const msgsArr = []; let cur = null;
-  activeMsgs.slice(-16).forEach(m => {
+  contextMsgs.forEach(m => {
     const role = m.from === "them" ? "user" : "assistant";
     const tx = replyMessageText(m);
     if (!tx) return;
@@ -2478,6 +2486,7 @@ async function genDraft(t, c, opts) {
     + "医療判断・診断はしない。「絶対」「完治」など断定的表現は使わない。絵文字は使わない。" + sig
     + "\n\n【事実の安全ルール】料金・金額・割引・期限・規定・営業日・対応可否は店舗ルールに明記された内容だけを答える。予約日時・空き枠・患者固有情報・手続き完了は、本人確認済みのシステム照会結果だけを答える。痛み・症状・薬・安全性は診断や『大丈夫』という断定をせず、スタッフ確認へ回す。根拠が無い部分は推測で埋めず、下の【保留にしない答え方】に従う（答えられる部分は答え、患者側の情報が足りなければ具体的に尋ね、医院側の確認が要る部分だけ何を確認するかを書いて『確認してご案内します』とする）。医院側の確認が要る部分が残る場合は needs_human:true、confidence:low にする。"
     + "\n\n" + ANSWER_FIRST_POLICY
+    + "\n\n" + ATTACHMENT_UNSEEN_POLICY
     + "\n\n" + JP_QUALITY
     + "\n\n出力は必ず次のJSONのみ（前後に説明や```やかぎ括弧を付けない）: {\"draft\":\"お客様への返信文\",\"confidence\":\"high|medium|low\",\"is_urgent\":true|false,\"needs_human\":true|false,\"site_alert\":\"遅刻|当日キャンセル|緊急来院|none\",\"site_summary\":\"現場向け一行要約。site_alertがnoneなら空文字\",\"topics\":[{\"q\":\"短い質問ラベル\",\"need\":true}]"
     + (baTxt ? ",\"action\":{\"type\":\"none|cancel|reschedule|slots|link|verify\",\"appointmentId\":\"\",\"newDateTime\":\"\",\"dates\":[\"YYYY-MM-DD\"],\"phone\":\"\",\"email\":\"\"},\"after_action_draft\":\"\"" : "")
@@ -2663,6 +2672,14 @@ async function saveInboundFile(t, conversationId, file) {
   return id;
 }
 const INBOUND_FILE_CHUNK_BYTES = 1024 * 1024;
+// 書き込みの待ち: drain か切断のどちらかで必ず終わり、待ち受けは毎回両方外す（切断時に処理が止まったまま残らない）
+function waitForDrainOrClose(res) {
+  return new Promise(resolve => {
+    if (res.destroyed || res.writableEnded) return resolve();
+    const done = () => { res.off("drain", done); res.off("close", done); res.off("error", done); resolve(); };
+    res.on("drain", done); res.on("close", done); res.on("error", done);
+  });
+}
 // 形式・サイズだけを読む（動画のRange要求やHEADで、本体を毎回まるごと読まないため）
 async function inboundFileMeta(t, id) {
   if (!/^[0-9a-f]{32}$/.test(String(id || ""))) return null;
@@ -2745,7 +2762,8 @@ app.get("/api/inbound-file/:id", guard, async (req, res) => {
   sendHead();
   while (true) {
     pos += chunk.length; remaining -= chunk.length;
-    if (!res.write(chunk)) await new Promise(resolve => { res.once("drain", resolve); res.once("close", resolve); });
+    if (res.destroyed || res.writableEnded) return; // 閲覧側が切断した（動画のシーク・会話の切り替えなど）
+    if (!res.write(chunk)) await waitForDrainOrClose(res);
     if (remaining <= 0 || res.destroyed || res.writableEnded) break;
     try { chunk = await inboundFileBytes(req.tenant, id, pos, Math.min(INBOUND_FILE_CHUNK_BYTES, remaining)); } catch (e) { chunk = null; }
     if (!chunk || !chunk.length) { res.destroy(); return; } // 途中で読めなくなったら接続を切る（宣言した長さと食い違う応答を返さない）
@@ -3219,6 +3237,9 @@ app.post("/webhook/staff-line", async (req, res) => {
 
 // ===== Email inbound via IMAP（全テナント横断ポーリング。provider-agnostic: Gmail/Outlook/独自ドメイン） =====
 let emailPolling = false;
+const MAIL_RAW_MAX_BYTES = 60 * 1024 * 1024;   // これより大きいメールは添付を取り込まない（添付の上限50MB＋本文の余裕）
+const MAIL_RAW_HEAD_BYTES = 2 * 1024 * 1024;   // 大きすぎるメールは先頭2MBだけ読んで本文を取り出す
+const mailFailures = new Map();                // 処理に失敗したメールのやり直し回数（法人:UID）
 async function pollAll() {
   if (emailPolling) return; emailPolling = true;
   let ImapFlow, simpleParser;
@@ -3246,28 +3267,41 @@ async function pollAll() {
         const lock = await client.getMailboxLock("INBOX");
         try {
           // 注意: fetchループの最中に他のIMAPコマンド（既読化など）を実行してはいけない（無効になる）
+          // 先にUIDと大きさだけを集め、本体は1通ずつ取得して処理する（添付つきの大きなメールを全件まとめてメモリに載せない）
           const items = [];
-          for await (const msg of client.fetch({ seen: false, since: new Date(Date.now() - 2 * 86400000) }, { source: true })) {
-            items.push({ uid: msg.uid, source: msg.source });
+          for await (const msg of client.fetch({ seen: false, since: new Date(Date.now() - 2 * 86400000) }, { uid: true, size: true })) {
+            items.push({ uid: msg.uid, size: Number(msg.size) || 0 });
           }
           const markUids = [];
           for (const it of items) {
+            let mid = "";
             try {
-              const parsed = await simpleParser(it.source);
+              const tooLarge = it.size > MAIL_RAW_MAX_BYTES;
+              // 大きすぎるメールは先頭だけ取得して本文を読み、添付は取り込まない（理由つきで表示する）
+              const fetched = await client.fetchOne(String(it.uid), { source: tooLarge ? { start: 0, maxLength: MAIL_RAW_HEAD_BYTES } : true }, { uid: true });
+              if (!fetched || !fetched.source) continue;
+              const parsed = await simpleParser(fetched.source);
               const mdate = parsed.date ? new Date(parsed.date).getTime() : Date.now();
               if (mdate < cutoff) continue; // 有効化前のメールは未読のまま放置
-              const mid = String(parsed.messageId || "").trim();
-              markUids.push(it.uid);
-              if (mid && seenIds.has(mid)) continue; // 既に処理済み
-              if (mid) seenIds.add(mid);
+              mid = String(parsed.messageId || "").trim();
+              if (mid && seenIds.has(mid)) { markUids.push(it.uid); continue; } // 既に処理済み
               const fromV = (parsed.from && parsed.from.value && parsed.from.value[0]) || {};
               const email = String(fromV.address || "").toLowerCase();
-              if (!email || ownAddrs.includes(email)) continue;
-              if (/no-?reply|mailer-daemon|postmaster/i.test(email)) continue;
+              if (!email || ownAddrs.includes(email) || /no-?reply|mailer-daemon|postmaster/i.test(email)) { markUids.push(it.uid); if (mid) seenIds.add(mid); continue; }
               const text = String(parsed.text || parsed.subject || "").replace(/\r/g, "").slice(0, 8000);
-              const mailFiles = selectMailAttachments(parsed.attachments);
+              const mailFiles = tooLarge ? { keep: [], skipped: [{ name: "このメールの添付", reason: "mail_too_large" }] } : selectMailAttachments(parsed.attachments);
+              if (mid) seenIds.add(mid);
               await handleInbound(t, { channel: "mail", uid: email, name: fromV.name || email, text, subject: parsed.subject || "", attachments: mailFiles.keep, skippedAttachments: mailFiles.skipped, sentAt: parsed.date ? mdate : undefined, sentAtSource: "mail_header", acct: { type: "mail", key: acc.smtpUser, name: acc.name } });
-            } catch (e) { console.error("mail parse:", e.message); }
+              markUids.push(it.uid);
+              mailFailures.delete(slug + ":" + it.uid);
+            } catch (e) {
+              // 処理に失敗したメールは既読にせず次の巡回でやり直す（3回失敗したら既読にして止める）。患者情報はログに出さない
+              console.error("mail process failed");
+              if (mid) seenIds.delete(mid);
+              const key = slug + ":" + it.uid, n = (mailFailures.get(key) || 0) + 1;
+              mailFailures.set(key, n);
+              if (n >= 3) { markUids.push(it.uid); mailFailures.delete(key); if (mid) seenIds.add(mid); }
+            }
           }
           // フェッチ完了後にまとめて既読化（ループ中は効かないため）
           if (markUids.length) {
@@ -4320,6 +4354,7 @@ app.post("/api/ai-regen", guard, async (req, res) => {
     + "お客様が複数の質問・依頼をしている場合は、その全てにもれなく答えること。1つも取りこぼさない。"
     + "お客様への敬意と心配りが自然に伝わる表現を選び、ご不便にはお詫びや労いの一言を添える。誤った二重敬語は避け、読みやすさも保つ。絵文字は使わない。断定や医療判断は避ける。" + sig
     + "\n" + ANSWER_FIRST_POLICY
+    + "\n" + ATTACHMENT_UNSEEN_POLICY
     + (bookingFactsOf(t) ? "\n" + bookingFactsOf(t) : "")
     + (rulesTxt ? "\n【店舗ルール（従うこと）】\n" + rulesTxt : "")
     + (replyToneInstruction(S(t).tone, 1000) ? "\n\n" + replyToneInstruction(S(t).tone, 1000) : "")
@@ -4425,6 +4460,7 @@ async function draftChatPrep(t, body) {
     + "\n\n" + STAFF_DRAFT_POLICY
     + (replyToneInstruction(S(t).tone, 1000) ? "\n\n" + replyToneInstruction(S(t).tone, 1000) : "")
     + "\n\n" + ANSWER_FIRST_POLICY
+    + "\n\n" + ATTACHMENT_UNSEEN_POLICY
     + (prefsBlock(t) ? "\n\n【スタッフが記憶させた指示（全返信で必ず守る）】\n" + prefsBlock(t) : "")
     + (bookingFactsOf(t) ? "\n\n" + bookingFactsOf(t) : "")
     + (rulesTxt ? "\n\n【通常の店舗ルール（ルールブック全文。スタッフが今回の例外を明示した項目以外の基準。推測で補わない。同じ内容が食い違う場合は更新日が新しいルールを使う）】\n" + rulesTxt : "")
@@ -5634,7 +5670,9 @@ app.delete("/api/partner/tenants/:slug", pGuard, async (req,res)=>{
       await pool.query("DELETE FROM inbound_files WHERE tenant=$1",[slug]); // 患者からのメールの添付も法人と一緒に消す
       await pool.query("DELETE FROM push_subs WHERE tenant=$1",[slug]);
       await pool.query("DELETE FROM tenants WHERE slug=$1",[slug]);
+      await pool.query("DELETE FROM inbound_files WHERE tenant=$1",[slug]); // 削除中に確定した添付の保存が残らないよう、法人の削除後にもう一度消す
     }
+    for (const fid of Object.keys(INBOUND_FILES)) if (INBOUND_FILES[fid].tenant === slug) delete INBOUND_FILES[fid]; // DBなし（テスト・ローカル）の置き場
     delete TEN[slug];
     res.json({ok:true});
   }catch(e){ t._deleting = false; res.status(500).json({ok:false,error:String(e.message||e).slice(0,80)}); }

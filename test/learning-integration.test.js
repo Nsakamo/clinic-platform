@@ -46,7 +46,7 @@ test("スタッフLINEで送信しないを選ぶと次の問い合わせへ文�
   assert.match(source, /found\.c\.draft = ""; found\.c\.draft0 = ""; found\.c\.topics = \[\]; found\.c\.learningRefs = \[\]/);
   assert.match(source, /found\.c\.status = "done"; found\.c\.flag = false/);
   assert.match(source, /const activeMsgs = activeConversationMessages\(c\)/);
-  assert.match(source, /activeMsgs\.slice\(-16\)\.forEach/);
+  assert.match(source, /contextMsgs\.forEach/);
 });
 
 test("AIのconfidenceだけでなく根拠監査を通過した返信だけ自動送信する", () => {
