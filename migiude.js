@@ -2386,6 +2386,7 @@ function scheduleAutoReply(t, c, draftText, recvAt, delayMin) {
       if (!(cur.grounding && cur.grounding.autoSendAllowed && cur.validation && cur.validation.pass)) return; // 生成時の根拠監査を通っていない下書きは送らない
       if (!cur.draft || cur.draft.trim() !== draftText) return; // 下書きが変わった/消えた
       if (textMentionsRetiredTerm(cur.draft, retiredTermsOf(t))) return; // 待機中に「使わなくなった語句」が登録された場合も送らない（スタッフ確認のまま）
+      if (hasUnreviewedMailAttachment(cur)) return; // スタッフが確認していないメールの添付がある会話は自動で送らない
       const lastMsg = cur.msgs[cur.msgs.length - 1];
       if (!lastMsg || lastMsg.from !== "them") return; // 待機中に誰かが返信した
       const r = await deliverText(t, cur, draftText);
@@ -2649,7 +2650,7 @@ async function enrichStaffLineBookingPreview(t, c, generated) {
 // ===== 患者からのメールの添付（画像・動画・ファイル） =====
 const INBOUND_FILES = {}; // DBが無いとき（テスト・ローカル）だけ使うメモリ置き場
 async function saveInboundFile(t, conversationId, file) {
-  if (TEN[t.slug] !== t) throw new Error("tenant_gone"); // 巡回中に法人が削除された場合は保存しない
+  if (TEN[t.slug] !== t || t._deleting) throw new Error("tenant_gone"); // 巡回中に法人が削除された（削除中の）場合は保存しない
   const id = crypto.randomBytes(16).toString("hex");
   const row = { tenant: t.slug, conversationId: String(conversationId || ""), name: file.name, mime: file.mime, size: file.data.length, data: file.data, ts: Date.now() };
   if (pool) {
@@ -2760,6 +2761,8 @@ async function handleInboundCore(t, opts) {
   preserveTopicBoundary(c);
   // メールの添付は本文より先に並べる（AIへ渡す「最新の患者の文」が本文になるように）
   const mailAttachmentCount = await pushInboundMailAttachments(t, c, opts, recvAt);
+  // 今回のメールの添付だけでなく、スタッフがまだ返信していない前のメールの添付も含めて判定する（後から本文だけのメールが来ても自動で処理しない）
+  const attachmentUnreviewed = mailAttachmentCount > 0 || hasUnreviewedMailAttachment(c);
   if (!(mailAttachmentCount && !String(opts.text || "").trim())) c.msgs.push({ from: "them", text: opts.text || "", media: med, mediaId: med ? (opts.mediaId || null) : null, fileName: med === "file" ? (opts.fileName || "ファイル") : undefined, time: nowt(), ...inboundMessageTimes(opts.sentAt, recvAt, opts.sentAtSource) });
   statBump(t, "in");
   if (opts.subject) c.subject = String(opts.subject).slice(0, 300);
@@ -2769,7 +2772,7 @@ async function handleInboundCore(t, opts) {
 
   // ===== 予約自動受付: 確認待ちへの「はい/いいえ」を最優先で処理（明確な返答のときだけ実行） =====
   let baDone = false;
-  if (!med && !mailAttachmentCount && typeof opts.draft !== "string" && baEnabled(t) && PARTNER_KEY) { // 添付つきメールは中身を誰も見ないまま予約操作しない
+  if (!med && !attachmentUnreviewed && typeof opts.draft !== "string" && baEnabled(t) && PARTNER_KEY) { // 添付つきメールは中身を誰も見ないまま予約操作しない
     try { baDone = await baHandlePending(t, c); } catch (e) { console.error("ba pending:", e && e.message); }
   }
 
@@ -2806,7 +2809,7 @@ async function handleInboundCore(t, opts) {
       }
     }
     // ===== 予約自動受付: AIが操作依頼(action)を出したら、確認文の送信までを自動処理 =====
-    if (g && !mailAttachmentCount && !g.replyRequiresStaff && !staffLineReviewAll(t) && baEnabled(t) && PARTNER_KEY && g.action && typeof g.action === "object" && g.action.type && g.action.type !== "none") {
+    if (g && !attachmentUnreviewed && !g.replyRequiresStaff && !staffLineReviewAll(t) && baEnabled(t) && PARTNER_KEY && g.action && typeof g.action === "object" && g.action.type && g.action.type !== "none") {
       try { baDone = await baAction(t, c, g.action, g.baCtx); } catch (e) { console.error("ba action:", e && e.message); }
       if (baDone) { c.draft = ""; c.draft0 = ""; c.learningRefs = []; }
       else if (String(needsHuman) !== "true" && String(urgent) !== "true") {
@@ -2831,7 +2834,7 @@ async function handleInboundCore(t, opts) {
     const conf = String(confidence || "").toLowerCase();
     const confOk = conf === "high" || (S(t).level === "medium" && conf === "medium");
     const grounded = !!(c.grounding && c.grounding.autoSendAllowed && c.validation && c.validation.pass);
-    const safe = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med && !mailAttachmentCount && grounded; // 添付つきメールはAIが中身を見られないため自動送信しない
+    const safe = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med && !attachmentUnreviewed && grounded; // 添付つきメールはAIが中身を見られないため自動送信しない
     if (!baDone && S(t).autoReply && !staffLineReviewAll(t) && confOk && safe && c.draft && c.draft.trim()) {
       const draftText = c.draft.trim();
       const delayMin = Number(S(t).autoDelayMin || 0);
@@ -2849,18 +2852,18 @@ async function handleInboundCore(t, opts) {
   const confForStaffLine = String(confidence || "").toLowerCase();
   const confOkForStaffLine = confForStaffLine === "high" || (S(t).level === "medium" && confForStaffLine === "medium");
   const groundedForStaffLine = !!(c.grounding && c.grounding.autoSendAllowed && c.validation && c.validation.pass);
-  const safeForStaffLine = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med && !mailAttachmentCount && groundedForStaffLine;
+  const safeForStaffLine = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med && !attachmentUnreviewed && groundedForStaffLine;
   const exceptionNeedsReview = S(t).autoReply && S(t).staffLineEnabled && S(t).staffLineReplyMode === "exceptions" && !baDone && c.draft && c.draft.trim() && (!confOkForStaffLine || !safeForStaffLine);
   if (staffLineReviewAll(t) && !baDone && c.draft && c.draft.trim() && c.bookingSuggestion && c.bookingSuggestion.status !== "executed") {
     staffLineEscalate(t, c, "予約操作の提案があります。右腕くんの画面で予約を確認・実行してから返信してください").catch(() => {});
-  } else if (mailAttachmentCount && !baDone && (staffLineReviewAll(t) || exceptionNeedsReview)) {
+  } else if (attachmentUnreviewed && !baDone && (staffLineReviewAll(t) || exceptionNeedsReview)) {
     // 添付はスタッフLINEでは見られないため、LINEの承認だけでは送れないようにし、画面での確認へ誘導する
     staffLineEscalate(t, c, "メールに添付ファイルがあります。右腕くんの画面で添付を確認してから返信してください").catch(() => {});
   } else if (staffLineReviewAll(t) && !baDone && c.draft && c.draft.trim()) {
     staffLineRequestApproval(t, c, "毎回確認モードのため、送信前に承認が必要です").catch(() => {});
   } else if (exceptionNeedsReview || String(needsHuman) === "true" || String(urgent) === "true" || c.flag) {
     const groundingReason = c.grounding && Array.isArray(c.grounding.reasons) && c.grounding.reasons[0];
-    const reason = String(urgent) === "true" ? "緊急性のある問い合わせとAIが判定しました" : (c.flag ? "要対応フラグが付いています" : (!groundedForStaffLine ? (groundingReason || "送信前の根拠監査を通らなかったため確認が必要です") : (!confOkForStaffLine ? "自動送信に必要な確信率を満たさないため確認が必要です" : (mailAttachmentCount ? "メールに添付ファイルがあり、AIでは中身を確認できないため確認が必要です" : "AIが人による判断を必要と判定しました"))));
+    const reason = String(urgent) === "true" ? "緊急性のある問い合わせとAIが判定しました" : (c.flag ? "要対応フラグが付いています" : (!groundedForStaffLine ? (groundingReason || "送信前の根拠監査を通らなかったため確認が必要です") : (!confOkForStaffLine ? "自動送信に必要な確信率を満たさないため確認が必要です" : (attachmentUnreviewed ? "メールに添付ファイルがあり、AIでは中身を確認できないため確認が必要です" : "AIが人による判断を必要と判定しました"))));
     // 未実行の予約操作の提案がある返信は、スタッフLINEの承認だけで送れないようにする（予約操作は画面の確認カードで実行）
     const pendingBookingSuggestion = !!(c.bookingSuggestion && c.bookingSuggestion.status !== "executed");
     if (!pendingBookingSuggestion && c.draft && c.draft.trim() && S(t).staffLineEnabled && S(t).staffLineReplyMode === "exceptions" && staffLineReady(t)) staffLineRequestApproval(t, c, reason).catch(() => {});
@@ -3803,6 +3806,7 @@ app.post("/api/staff-line/resend-approval", guard, oneMutationAtATime("staff-lin
   // 未実行の予約操作の提案がある返信は、スタッフLINEの承認だけで送れないようにする（画面の提案カードで実行してから）
   if (c.bookingSuggestion && c.bookingSuggestion.status !== "executed") return res.status(409).json({ ok: false, error: "booking_suggestion_pending" });
   if (!S(t).staffLineEnabled || !staffLineReady(t)) return res.status(400).json({ ok: false, error: "staff_line_not_ready" });
+  if (hasUnreviewedMailAttachment(c)) return res.status(409).json({ ok: false, error: "mail_attachment_unreviewed" }); // 添付は画面で確認してから返信する
   try {
     const ok = await staffLineRequestApproval(t, c, "右腕くん画面から承認依頼を再送しました", { force: true });
     if (!ok) return res.status(502).json({ ok: false, error: "line_send_failed" });
@@ -5609,6 +5613,7 @@ app.put("/api/partner/account", pGuard, async (req,res)=>{
 // テナント完全削除（解約時）
 app.delete("/api/partner/tenants/:slug", pGuard, async (req,res)=>{
   const slug = String(req.params.slug||""); const t = TEN[slug]; if(!t) return res.status(404).json({ok:false});
+  t._deleting = true; // 削除中に届いたメールの添付を保存させない
   try{
     if(pool){
       await pool.query("DELETE FROM convos WHERE tenant=$1",[slug]);
@@ -5621,7 +5626,7 @@ app.delete("/api/partner/tenants/:slug", pGuard, async (req,res)=>{
     }
     delete TEN[slug];
     res.json({ok:true});
-  }catch(e){ res.status(500).json({ok:false,error:String(e.message||e).slice(0,80)}); }
+  }catch(e){ t._deleting = false; res.status(500).json({ok:false,error:String(e.message||e).slice(0,80)}); }
 });
 // LINE設定（受付くん運営画面から。トークン検証＋botId自動取得）
 app.put("/api/partner/line-config", pGuard, async (req,res)=>{
@@ -7656,7 +7661,7 @@ function renderScheduledMessages(conversation){
 }
 async function cancelScheduledMessage(scheduleId,button){if(!await uiConfirm("この送信予約を取り消しますか？"))return;await withBusy("scheduled-cancel-"+scheduleId,button,"取消中…",async()=>{try{const response=await api("/api/scheduled-message-cancel",{scheduleId}),json=await response.json();if(!response.ok||!json.ok)throw new Error(json.error||"cancel");await load();}catch(e){uiAlert(e.message==="sending"?"現在送信処理中のため取り消せません":"送信予約を取り消せませんでした");}});}
 async function retryScheduledMessage(scheduleId,button){if(!await uiConfirm("患者側の履歴を確認しましたか？\\n同じ内容が届いていないことを確認したうえで再送してください。"))return;await withBusy("scheduled-retry-"+scheduleId,button,"再送中…",async()=>{try{const response=await api("/api/scheduled-message-retry",{scheduleId}),json=await response.json();if(!response.ok||!json.ok)throw new Error(json.error||"retry");await load();uiAlert("再送を開始しました");}catch(e){uiAlert("再送を開始できませんでした");}});}
-async function resendStaffApproval(){if(!current)return;const b=document.getElementById("staffReviewResend"),draft=String(document.getElementById("draft")&&document.getElementById("draft").value||"").trim();if(!draft){uiAlert("先に患者様へ送る返信案を入力してください");return;}if(b){b.disabled=true;b.textContent="送信中…";}try{const r=await api("/api/staff-line/resend-approval",{id:current,draft}),j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error(j.error||"resend");uiAlert("スタッフLINEへ承認依頼を送りました");await load();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"スタッフLINE連携を設定・有効化してください":e.message==="booking_suggestion_pending"?"予約操作の提案がまだ実行されていません。提案カードで実行するか、提案を消してから承認依頼を送ってください":"承認依頼を送れませんでした");}finally{if(b){b.disabled=false;b.textContent="📲 スタッフLINEで確認";}}}
+async function resendStaffApproval(){if(!current)return;const b=document.getElementById("staffReviewResend"),draft=String(document.getElementById("draft")&&document.getElementById("draft").value||"").trim();if(!draft){uiAlert("先に患者様へ送る返信案を入力してください");return;}if(b){b.disabled=true;b.textContent="送信中…";}try{const r=await api("/api/staff-line/resend-approval",{id:current,draft}),j=await r.json().catch(()=>({}));if(!r.ok||!j.ok)throw new Error(j.error||"resend");uiAlert("スタッフLINEへ承認依頼を送りました");await load();}catch(e){uiAlert(e.message==="staff_line_not_ready"?"スタッフLINE連携を設定・有効化してください":e.message==="booking_suggestion_pending"?"予約操作の提案がまだ実行されていません。提案カードで実行するか、提案を消してから承認依頼を送ってください":e.message==="mail_attachment_unreviewed"?"患者からのメールに添付ファイルがあります。この画面で添付を確認してから、ここから返信してください（LINEの承認だけでは送れません）":"承認依頼を送れませんでした");}finally{if(b){b.disabled=false;b.textContent="📲 スタッフLINEで確認";}}}
 async function shareClinic(){const note=await uiPrompt("現場に伝える内容を入力してください（空欄のままOKを押すと、お客様の直近メッセージをそのまま共有します）","");if(note===null)return;const btn=document.getElementById("shareClinicBtn"),id=current;await withBusy("share-"+id,btn,"共有中…",async()=>{try{const r=await api("/api/share",{id,note:note||""});const j=await r.json();if(j.ok)uiAlert("現場ボードに共有しました");else uiAlert("共有に失敗しました");}catch(e){uiAlert("共有に失敗しました");}});}
 async function toggleFlag(){if(!current)return;const id=current,b=document.getElementById("flagBtn");let next=null;await withBusy("flag-"+id,b,"変更中…",async()=>{try{const r=await api("/api/tag",{id});const j=await r.json();next=!!j.flag;const cd=DATA.find(x=>x.id===id);if(cd)cd.flag=next;renderList();}catch(e){uiAlert("変更に失敗しました");}});if(b&&next!==null)b.textContent=next?"⚑ 要対応を外す":"⚑ 要対応";}
 // ---- AIで作り直す（会話型・下書きを会話で磨く。会話ごとにセッションを保持し再開可能）----

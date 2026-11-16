@@ -90,8 +90,8 @@ test("動画の分割取得（Range）を正しく解釈し、不正な範囲は
 test("IMAPの受信で添付を取り出し、添付つきメールは自動送信しない", () => {
   assert.match(source, /const mailFiles = selectMailAttachments\(parsed\.attachments\);/);
   assert.match(source, /attachments: mailFiles\.keep, skippedAttachments: mailFiles\.skipped,/);
-  assert.match(source, /!med && !mailAttachmentCount && grounded;/);
-  assert.match(source, /!med && !mailAttachmentCount && groundedForStaffLine;/);
+  assert.match(source, /!med && !attachmentUnreviewed && grounded;/);
+  assert.match(source, /!med && !attachmentUnreviewed && groundedForStaffLine;/);
   // 添付は本文より先に並べ、AIへ渡す最新の患者の文が本文になるようにする
   const core = source.slice(source.indexOf("async function handleInboundCore("), source.indexOf("statBump(t, \"in\");", source.indexOf("async function handleInboundCore(")));
   assert.ok(core.indexOf("pushInboundMailAttachments(") < core.indexOf('c.msgs.push({ from: "them", text: opts.text'));
@@ -101,9 +101,9 @@ test("IMAPの受信で添付を取り出し、添付つきメールは自動送�
   assert.match(source, /SELECT name,mime,size FROM inbound_files WHERE id=\$1 AND tenant=\$2/);
   assert.match(source, /SELECT substring\(data from \$3 for \$4\) AS part FROM inbound_files WHERE id=\$1 AND tenant=\$2/);
   // 予約自動受付（はい/いいえの確定・AIの操作依頼・うまくいかなかったときの即時送信）にも添付つきメールは入れない
-  assert.match(source, /if \(!med && !mailAttachmentCount && typeof opts\.draft !== "string" && baEnabled\(t\) && PARTNER_KEY\)/);
-  assert.match(source, /if \(g && !mailAttachmentCount && !g\.replyRequiresStaff && !staffLineReviewAll\(t\) && baEnabled\(t\)/);
-  assert.match(source, /mailAttachmentCount \? "メールに添付ファイルがあり、AIでは中身を確認できないため確認が必要です"/);
+  assert.match(source, /if \(!med && !attachmentUnreviewed && typeof opts\.draft !== "string" && baEnabled\(t\) && PARTNER_KEY\)/);
+  assert.match(source, /if \(g && !attachmentUnreviewed && !g\.replyRequiresStaff && !staffLineReviewAll\(t\) && baEnabled\(t\)/);
+  assert.match(source, /attachmentUnreviewed \? "メールに添付ファイルがあり、AIでは中身を確認できないため確認が必要です"/);
   // 圧縮なしで保存し、法人ごとの容量上限を確かめてから保存する
   assert.match(source, /ALTER TABLE inbound_files ALTER COLUMN data SET STORAGE EXTERNAL/);
   assert.match(source, /SELECT COALESCE\(SUM\(size\),0\)::bigint AS used FROM inbound_files WHERE tenant=\$1/);
@@ -299,6 +299,43 @@ test("容量の集計に失敗したときは上限扱いにせず「一時的�
   const push = source.slice(source.indexOf("async function pushInboundMailAttachments("), source.indexOf('app.get("/api/inbound-file/:id"'));
   assert.match(push, /if \(usageFailed\) \{ skipped\.push\(\{[^}]*reason: "save_failed" \}\); continue; \}/);
   assert.match(push, /if \(!usageFailed && allowed\.length < keep\.length\)/);
-  assert.match(source, /if \(TEN\[t\.slug\] !== t\) throw new Error\("tenant_gone"\);/);
+  assert.match(source, /if \(TEN\[t\.slug\] !== t \|\| t\._deleting\) throw new Error\("tenant_gone"\);/);
   assert.match(source, /if \(storage\.rows\[0\] && storage\.rows\[0\]\.attstorage !== "e"\) await pool\.query\("ALTER TABLE inbound_files ALTER COLUMN data SET STORAGE EXTERNAL"\)/);
+});
+
+test("添付つきメールの後に本文だけのメールが来ても、スタッフが確認するまで自動送信・予約自動受付をしない（実動作）", async () => {
+  const vm = require("node:vm");
+  const decision = require("../lib/reply-decision.js");
+  const { preserveTopicBoundary } = require("../lib/conversation-context.js");
+  const cut = (a, b) => source.slice(source.indexOf(a), source.indexOf(b, source.indexOf(a)));
+  const start = source.indexOf("async function handleInboundCore("), end = source.indexOf("// ===== 複数アカウント対応", start);
+  const helperSrc = cut("function hasUnreviewedMailAttachment(", "async function staffLineRequestApproval(");
+  for (const prior of [true, false]) {
+    let delivered = 0, scheduled = 0, baCalls = 0;
+    const context = {
+      ...decision, preserveTopicBoundary, pushInboundMailAttachments: async () => 0, cancelAutoReply: () => {}, colorFor: () => "", nowt: () => "テスト", statBump: () => {}, lastText: () => "テスト", dbSave: () => {},
+      baEnabled: () => true, staffLineReviewAll: () => false, staffBookingSuggestEnabled: () => false, PARTNER_KEY: "テスト",
+      baHandlePending: async () => { baCalls++; return false; }, enrichStaffLineBookingPreview: async (_t, _c, g) => g,
+      genDraft: async () => ({ draft: "テスト：ご連絡ありがとうございます。", confidence: "high", needs_human: false, replyRequiresStaff: false,
+        grounding: { autoSendAllowed: true, reasons: [] }, validation: { pass: true }, action: { type: "cancel", appointmentId: "a1" }, baCtx: { ok: true, verified: true } }),
+      startLearningUsageTrace: async () => {}, baAction: async () => { baCalls++; return true; }, S: () => ({ autoReply: true, level: "high", autoDelayMin: 0, staffLineEnabled: false }),
+      deliverText: async () => { delivered++; return { sent: true }; }, notifyAll: () => {}, staffLineEscalate: async () => false, staffLineRequestApproval: async () => false,
+      staffLineReady: () => false, scheduleAutoReply: () => { scheduled++; }, aiUsageContext: { getStore: () => ({ entries: [] }) }, forwardToPartner: async () => {},
+      baDeliverOrEscalate: async () => { delivered++; return true; }, inboundMessageTimes: () => ({}),
+    };
+    vm.runInNewContext(helperSrc + "\n" + source.slice(start, end), context);
+    const t = { slug: "テスト", store: {}, config: { conn: {} } };
+    if (prior) t.store["mail:テスト"] = { id: "mail:テスト", userId: "テスト", channel: "mail", status: "todo", msgs: [{ from: "them", text: "テスト写真です" }, { from: "them", media: "image", mailAttachment: true, url: "/api/inbound-file/x" }], draft: "" };
+    await context.handleInboundCore(t, { channel: "mail", uid: "テスト", text: "テスト：届いていますか？明日はキャンセルでお願いします" });
+    if (prior) {
+      assert.equal(delivered + scheduled, 0, "未確認の添付がある会話は自動送信しない");
+      assert.equal(baCalls, 0, "予約自動受付もしない");
+    } else {
+      assert.ok(delivered + scheduled + baCalls > 0, "添付の無い会話は従来どおり自動処理に進む（テストが空振りしていない確認）");
+    }
+  }
+  // 待ち時間つき送信も、送る直前に未確認の添付を確かめる
+  assert.match(cut("function scheduleAutoReply(", "cur.lastAuto = true;"), /if \(hasUnreviewedMailAttachment\(cur\)\) return;/);
+  // 画面からの再送も、未確認の添付があれば専用のエラーで断る
+  assert.match(source, /if \(hasUnreviewedMailAttachment\(c\)\) return res\.status\(409\)\.json\(\{ ok: false, error: "mail_attachment_unreviewed" \}\);/);
 });
