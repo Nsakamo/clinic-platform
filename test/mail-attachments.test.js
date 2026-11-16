@@ -104,10 +104,6 @@ test("IMAPの受信で添付を取り出し、添付つきメールは自動送�
   assert.match(source, /if \(!med && !mailAttachmentCount && typeof opts\.draft !== "string" && baEnabled\(t\) && PARTNER_KEY\)/);
   assert.match(source, /if \(g && !mailAttachmentCount && !g\.replyRequiresStaff && !staffLineReviewAll\(t\) && baEnabled\(t\)/);
   assert.match(source, /mailAttachmentCount \? "メールに添付ファイルがあり、AIでは中身を確認できないため確認が必要です"/);
-  // スタッフLINEは添付を見られないため、毎回確認・例外確認のどちらでもLINEの承認ボタンを出さず画面へ誘導する
-  const lineIdx = source.indexOf("} else if (mailAttachmentCount && !baDone && (staffLineReviewAll(t) || exceptionNeedsReview)) {");
-  assert.ok(lineIdx > 0 && lineIdx < source.indexOf('staffLineRequestApproval(t, c, "毎回確認モードのため、送信前に承認が必要です")', lineIdx));
-  assert.match(source.slice(lineIdx, lineIdx + 400), /staffLineEscalate\(t, c, "メールに添付ファイルがあります。右腕くんの画面で添付を確認してから返信してください"\)/);
   // 圧縮なしで保存し、法人ごとの容量上限を確かめてから保存する
   assert.match(source, /ALTER TABLE inbound_files ALTER COLUMN data SET STORAGE EXTERNAL/);
   assert.match(source, /SELECT COALESCE\(SUM\(size\),0\)::bigint AS used FROM inbound_files WHERE tenant=\$1/);
@@ -262,4 +258,47 @@ test("画面: 添付のファイル名はエスケープし、保存できなか
   const failed = ctx.mediaHtml({ from: "them", media: "file", fileName: "テスト.jpg（保存できませんでした）", mailAttachment: true });
   assert.match(failed, /📎 テスト\.jpg（保存できませんでした）/);
   assert.doesNotMatch(failed, /<a /, "保存できなかった添付はリンクにしない");
+});
+
+test("スタッフLINE: 添付つきメールには、どの経路からでも送信ボタン付きのカードを出さず、LINEからの送信も断る", async () => {
+  const vm = require("node:vm");
+  const cut = (a, b) => source.slice(source.indexOf(a), source.indexOf(b, source.indexOf(a)));
+  const escalateSrc = cut("const staffLineInFlight", "// ---------- auth");
+  const helperSrc = cut("function hasUnreviewedMailAttachment(", "async function staffLineRequestApproval(");
+  // 承認カードの入口の判定までを実物で動かし、その先（カード作成）に進んだら数える
+  const approvalSrc = source.slice(source.indexOf("async function staffLineRequestApproval("), source.indexOf("\n", source.indexOf("予約操作は右腕くん画面の提案カードで実行してから送る")))
+    + "\n  approvalCount(); return true;\n}\n";
+  let approvals = 0; const pushed = [];
+  const ctx = {
+    S: () => ({ staffLineEnabled: true }), staffLineReady: () => true, sha: x => x, publicConversationUrl: () => "", staffLineText: x => x,
+    staffLinePush: async (_t, _g, messages) => { pushed.push(messages); return { ok: true }; }, dbSave: () => {}, approvalCount: () => { approvals++; },
+  };
+  vm.createContext(ctx);
+  vm.runInContext(escalateSrc + "\n" + helperSrc + "\n" + approvalSrc, ctx);
+  const t = { slug: "テスト", name: "テスト医院", config: { conn: { staffLineGroupId: "テストG" } } };
+  const withAttachment = () => ({ id: "mail:テスト", name: "テスト", draft: "テストの返信案", msgs: [
+    { from: "us", text: "テスト前回" }, { from: "them", media: "image", mailAttachment: true, url: "/api/inbound-file/x" }, { from: "them", text: "テスト本文", time: "1" } ] });
+  // 直接の承認依頼（毎回確認モード・例外確認・AIの要対応判定など、どの経路からでもここを通る）
+  await ctx.staffLineRequestApproval(t, withAttachment(), "毎回確認モードのため、送信前に承認が必要です");
+  await ctx.staffLineEscalate(t, withAttachment(), "AIが人による判断を必要と判定しました");
+  assert.equal(approvals, 0, "送信ボタン付きのカードは出ない");
+  assert.ok(pushed.length >= 1);
+  assert.ok(pushed.every(m => /右腕くんでスタッフ対応が必要です/.test(String(m[0])) && /添付ファイルがあります|右腕くん/.test(String(m[0]))));
+  // スタッフが返信した後の新しいメール（添付なし）なら、通常どおり承認カードを出せる
+  const answered = { id: "mail:テスト2", name: "テスト", draft: "テストの返信案", msgs: [ { from: "them", media: "image", mailAttachment: true }, { from: "us", text: "テスト返信" }, { from: "them", text: "テスト追加の質問", time: "2" } ] };
+  await ctx.staffLineRequestApproval(t, answered, "テスト");
+  assert.equal(approvals, 1);
+  // 以前に出たカードの送信ボタンが押されても、添付が未確認なら送らない（送信ロックより前に断る）
+  const handler = cut('const action = q.get("migiude"), found = staffLineApprovalById(t, q.get("id"));', "sendLocks.add(lockKey)");
+  assert.ok(handler.indexOf('action === "send" && hasUnreviewedMailAttachment(found.c)') > 0);
+  assert.ok(handler.indexOf("hasUnreviewedMailAttachment(found.c)") < handler.indexOf("const lockKey"));
+});
+
+test("容量の集計に失敗したときは上限扱いにせず「一時的に保存できなかった」と表示し、上限の通知を出さない", () => {
+  assert.match(M.skippedLabel({ name: "テスト.jpg", reason: "save_failed" }), /一時的に保存できなかったため/);
+  const push = source.slice(source.indexOf("async function pushInboundMailAttachments("), source.indexOf('app.get("/api/inbound-file/:id"'));
+  assert.match(push, /if \(usageFailed\) \{ skipped\.push\(\{[^}]*reason: "save_failed" \}\); continue; \}/);
+  assert.match(push, /if \(!usageFailed && allowed\.length < keep\.length\)/);
+  assert.match(source, /if \(TEN\[t\.slug\] !== t\) throw new Error\("tenant_gone"\);/);
+  assert.match(source, /if \(storage\.rows\[0\] && storage\.rows\[0\]\.attstorage !== "e"\) await pool\.query\("ALTER TABLE inbound_files ALTER COLUMN data SET STORAGE EXTERNAL"\)/);
 });

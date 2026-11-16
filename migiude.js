@@ -230,7 +230,8 @@ async function dbInit() {
   await pool.query("CREATE TABLE IF NOT EXISTS inbound_files (id text primary key, tenant text not null, conversation_id text not null default '', name text not null, mime text not null, size integer not null, data bytea not null, ts bigint not null)");
   await pool.query("CREATE INDEX IF NOT EXISTS inbound_files_tenant_idx ON inbound_files(tenant,ts DESC)");
   // 写真・動画は圧縮が効かず、範囲読み出し（substring）を速くするため圧縮なしで保存する
-  await pool.query("ALTER TABLE inbound_files ALTER COLUMN data SET STORAGE EXTERNAL");
+  const storage = await pool.query("SELECT attstorage FROM pg_attribute WHERE attrelid='inbound_files'::regclass AND attname='data'");
+  if (storage.rows[0] && storage.rows[0].attstorage !== "e") await pool.query("ALTER TABLE inbound_files ALTER COLUMN data SET STORAGE EXTERNAL"); // 起動のたびに排他ロックを取らない
   await pool.query("CREATE TABLE IF NOT EXISTS push_subs (tenant text, endpoint text primary key, sub jsonb)");
   await pool.query("CREATE TABLE IF NOT EXISTS kv (k text primary key, v jsonb)");
   await pool.query("CREATE TABLE IF NOT EXISTS line_webhook_events (event_id text not null, tenant text not null, account_key text not null, destination text not null default '', payload jsonb not null, status text not null default 'pending', attempts int not null default 0, available_at bigint not null, created_at bigint not null, updated_at bigint not null, last_error text, PRIMARY KEY(tenant,event_id))");
@@ -500,8 +501,21 @@ function staffLineApprovalById(t, id) {
   }
   return null;
 }
+// 最後のスタッフ返信より後に、患者からのメールの添付が届いているか（スタッフLINEでは添付を見られない）
+function hasUnreviewedMailAttachment(c) {
+  const msgs = (c && c.msgs) || [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (!m) continue;
+    if (m.from !== "them") return false;
+    if (m.mailAttachment) return true;
+  }
+  return false;
+}
 async function staffLineRequestApproval(t, c, reason, opts) {
   opts = opts || {};
+  // 添付つきメールは送信ボタン付きのカードを出さず、画面での確認を促す通知だけにする（どの経路から呼ばれても）
+  if (hasUnreviewedMailAttachment(c)) return staffLineEscalate(t, c, "メールに添付ファイルがあります。右腕くんの画面で添付を確認してから返信してください");
   const draft = String(c && c.draft || "").trim(), groupId = String(t.config.conn.staffLineGroupId || "");
   if (!S(t).staffLineEnabled || !staffLineReady(t) || !draft || !groupId) return false;
   if (c.bookingSuggestion && c.bookingSuggestion.status !== "executed") return false; // 予約操作は右腕くん画面の提案カードで実行してから送る
@@ -553,7 +567,7 @@ const staffLineInFlight = new Set();
 async function staffLineEscalate(t, c, reason) {
   if (!S(t).staffLineEnabled || !staffLineReady(t) || !c) return false;
   // 未実行の予約操作の提案がある時は承認カード（送信ボタン付き）を出さず、通知だけにする
-  if (String(c.draft || "").trim() && !(c.bookingSuggestion && c.bookingSuggestion.status !== "executed")) return staffLineRequestApproval(t, c, reason);
+  if (String(c.draft || "").trim() && !(c.bookingSuggestion && c.bookingSuggestion.status !== "executed") && !hasUnreviewedMailAttachment(c)) return staffLineRequestApproval(t, c, reason);
   const incoming = (c.msgs || []).slice().reverse().find(m => m && m.from === "them") || {};
   const eventKey = sha([t.slug, c.id, incoming.time || "", incoming.text || "", incoming.media || ""].join("|"));
   if (c.staffLineLastEventKey === eventKey || staffLineInFlight.has(eventKey)) return false;
@@ -2635,6 +2649,7 @@ async function enrichStaffLineBookingPreview(t, c, generated) {
 // ===== 患者からのメールの添付（画像・動画・ファイル） =====
 const INBOUND_FILES = {}; // DBが無いとき（テスト・ローカル）だけ使うメモリ置き場
 async function saveInboundFile(t, conversationId, file) {
+  if (TEN[t.slug] !== t) throw new Error("tenant_gone"); // 巡回中に法人が削除された場合は保存しない
   const id = crypto.randomBytes(16).toString("hex");
   const row = { tenant: t.slug, conversationId: String(conversationId || ""), name: file.name, mime: file.mime, size: file.data.length, data: file.data, ts: Date.now() };
   if (pool) {
@@ -2670,14 +2685,16 @@ async function pushInboundMailAttachments(t, c, opts, recvAt) {
   const skipped = (Array.isArray(opts.skippedAttachments) ? opts.skippedAttachments : []).slice();
   if (keep.length) {
     let used = 0;
-    try { used = await inboundFilesUsedBytes(t); } catch (e) { used = Infinity; console.error("mail attachment usage check failed"); }
+    let usageFailed = false;
+    try { used = await inboundFilesUsedBytes(t); } catch (e) { usageFailed = true; console.error("mail attachment usage check failed"); }
     const allowed = [];
     for (const file of keep) {
+      if (usageFailed) { skipped.push({ name: file.name, mime: file.mime, size: file.data.length, reason: "save_failed" }); continue; }
       if (used + file.data.length > INBOUND_FILES_TENANT_MAX_BYTES) { skipped.push({ name: file.name, mime: file.mime, size: file.data.length, reason: "storage_full" }); continue; }
       used += file.data.length;
       allowed.push(file);
     }
-    if (allowed.length < keep.length) {
+    if (!usageFailed && allowed.length < keep.length) {
       const day = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Tokyo" });
       if (t._inboundStorageAlertDay !== day) {
         t._inboundStorageAlertDay = day;
@@ -3155,6 +3172,8 @@ app.post("/webhook/staff-line", async (req, res) => {
       }
       if (action === "send" && found.c.bookingSuggestion && found.c.bookingSuggestion.status !== "executed") { await staffLineReply(t, ev.replyToken, [staffLineText("この会話には未実行の予約操作（キャンセル・日時変更）の提案があります。右腕くんの画面で予約を確認・実行してから送信してください。")]); continue; }
       // 使わなくなった予約サイト・語句が残る返信案は、LINEの承認だけでは送らない（右腕くんかLINEの修正で書き換えてもらう）
+      // 添付つきメールへの返信は、LINEの承認だけでは送らない（以前に出たカードを押された場合も）
+      if (action === "send" && hasUnreviewedMailAttachment(found.c)) { await staffLineReply(t, ev.replyToken, [staffLineText("患者からのメールに添付ファイルがあるため、LINEからは送信できません。右腕くんの画面で添付を確認してから返信してください。")]); continue; }
       if (action === "send" && textMentionsRetiredTerm(found.approval.draft != null ? found.approval.draft : found.c.draft, retiredTermsOf(t))) { await staffLineReply(t, ev.replyToken, [staffLineText("この返信案には使わなくなった予約サイト・語句が含まれているため送信できません。「修正」から予約ページの案内に直すか、右腕くんで書き換えてください。")]); continue; }
       if (action !== "send" || !staffLineCardMatches(found.c, found.approval, q.get("h"))) { await staffLineReply(t, ev.replyToken, [staffLineText("返信案が更新されています。最新の承認依頼を確認してください。")]); continue; }
       const lockKey = t.slug + "::" + found.c.id;

@@ -119,7 +119,8 @@ test("テスト：自動で実行しないキャンセル・変更は、提案�
     { mode: "off", appt: "a2", suggestion: false }, // 受付期限外: 提案は作れないが、自動送信もしない
   ];
   // スタッフLINEは実際の staffLineEscalate と、staffLineRequestApproval の入口の判定（送信ボタン付きカードを出す前の確認）を使う
-  const escalateSrc = slice("const staffLineInFlight", "// ---------- auth", source);
+  const escalateSrc = slice("const staffLineInFlight", "// ---------- auth", source)
+    + "\n" + slice("function hasUnreviewedMailAttachment(", "async function staffLineRequestApproval(", source);
   const approvalSrc = source.slice(source.indexOf("async function staffLineRequestApproval("), source.indexOf("\n", source.indexOf("予約操作は右腕くん画面の提案カードで実行してから送る")))
     + "\n  approvalCount(); return true;\n}\n";
   for (const k of cases) {
