@@ -88,7 +88,7 @@ test("動画の分割取得（Range）を正しく解釈し、不正な範囲は
 });
 
 test("IMAPの受信で添付を取り出し、添付つきメールは自動送信しない", () => {
-  assert.match(source, /const mailFiles = selectMailAttachments\(parsed\.attachments\);/);
+  assert.match(source, /const mailFiles = tooLarge \? \{ keep: \[\], skipped: \[\{ name: "このメールの添付", reason: "mail_too_large" \}\] \} : selectMailAttachments\(parsed\.attachments\);/);
   assert.match(source, /attachments: mailFiles\.keep, skippedAttachments: mailFiles\.skipped,/);
   assert.match(source, /!med && !attachmentUnreviewed && grounded;/);
   assert.match(source, /!med && !attachmentUnreviewed && groundedForStaffLine;/);
@@ -238,11 +238,11 @@ test("DBからは必要な範囲だけ読む（動画のRangeで本体を毎回�
 
 test("連続するメールの添付はスタッフLINE向けの要約で1行にまとめる", () => {
   const vm = require("node:vm");
-  const fn = source.slice(source.indexOf("function staffLineHistoryText("), source.indexOf("async function staffLineSummary("));
+  const fn = source.slice(source.indexOf("function collapseMailAttachmentMessages("), source.indexOf("async function staffLineSummary("));
   const ctx = {}; vm.createContext(ctx); vm.runInContext(fn, ctx);
   const msgs = [{ from: "us", text: "テスト前の返信" }].concat(Array.from({ length: 10 }, (_, i) => ({ from: "them", media: "image", mailAttachment: true, fileName: "p" + i + ".jpg" }))).concat([{ from: "them", text: "テスト本文" }]);
   const text = ctx.staffLineHistoryText({ msgs });
-  assert.equal(text, "スタッフ: テスト前の返信\n患者: ［添付ファイル 10件］\n患者: テスト本文");
+  assert.equal(text, "スタッフ: テスト前の返信\n患者: ［添付ファイル 10件（中身は確認できません）］\n患者: テスト本文");
 });
 
 test("画面: 添付のファイル名はエスケープし、保存できなかった添付はリンクなしで表示する", () => {
@@ -373,4 +373,102 @@ test("実HTTP: 1MBを超える添付も分割して読み出し、全体・境�
     assert.equal(part.status, 206);
     assert.ok(Buffer.from(await part.arrayBuffer()).equals(big.subarray(from, to + 1)), "チャンクの境界をまたぐ範囲も一致");
   } finally { child.kill(); }
+});
+
+test("P3: 送信予約・自動送信の返信は添付を確認済みにせず、スタッフの返信だけが確認済みにする", () => {
+  const vm = require("node:vm");
+  const fn = source.slice(source.indexOf("function hasUnreviewedMailAttachment("), source.indexOf("\n}\n", source.indexOf("function hasUnreviewedMailAttachment(")) + 3);
+  const ctx = {}; vm.createContext(ctx); vm.runInContext(fn, ctx);
+  const att = { from: "them", media: "image", mailAttachment: true };
+  assert.equal(ctx.hasUnreviewedMailAttachment({ msgs: [att, { from: "us", text: "テスト予約送信", scheduled: true }] }), true);
+  assert.equal(ctx.hasUnreviewedMailAttachment({ msgs: [att, { from: "us", text: "テスト自動", auto: true }] }), true);
+  assert.equal(ctx.hasUnreviewedMailAttachment({ msgs: [att, { from: "us", text: "テストスタッフ返信" }] }), false);
+  assert.equal(ctx.hasUnreviewedMailAttachment({ msgs: [{ from: "them", text: "テスト本文" }] }), false);
+});
+
+test("P3: 自動下書き・相談・作り直しのAIへ『添付の中身は見えない』と伝え、連続する添付は1件にまとめる", () => {
+  const { ATTACHMENT_UNSEEN_POLICY } = require("../lib/mail-attachments");
+  assert.match(ATTACHMENT_UNSEEN_POLICY, /AIには中身が見えない/);
+  assert.match(ATTACHMENT_UNSEEN_POLICY, /スタッフが確認/);
+  assert.equal((source.match(/\+ "(?:\\n){1,2}" \+ ATTACHMENT_UNSEEN_POLICY/g) || []).length, 3);
+  const gen = source.slice(source.indexOf("async function genDraft("), source.indexOf("async function enrichStaffLineBookingPreview("));
+  assert.match(gen, /ATTACHMENT_UNSEEN_POLICY/);
+  assert.match(gen, /const contextMsgs = collapseMailAttachmentMessages\(activeMsgs\)\.slice\(-16\)/);
+  const vm = require("node:vm");
+  const fn = source.slice(source.indexOf("function collapseMailAttachmentMessages("), source.indexOf("function staffLineHistoryText("));
+  const ctx = {}; vm.createContext(ctx); vm.runInContext(fn, ctx);
+  const list = [{ from: "them", mailAttachment: true }, { from: "them", mailAttachment: true }, { from: "them", text: "テスト本文" }, { from: "them", mailAttachment: true }];
+  const out = ctx.collapseMailAttachmentMessages(list);
+  assert.equal(out.length, 3);
+  assert.equal(out[0].text, "［添付ファイル 2件（中身は確認できません）］");
+  assert.equal(out[2].text, "［添付ファイル 1件（中身は確認できません）］");
+  assert.equal(list[0].text, undefined, "元の会話は書き換えない");
+});
+
+test("P3: 未確認の添付があるときはスタッフLINEからの修正でも送信カードを作り直さない", () => {
+  const fn = source.slice(source.indexOf("async function staffLineApplyRevision("), source.indexOf("\n}\n", source.indexOf("async function staffLineApplyRevision(")));
+  assert.match(fn, /if \(hasUnreviewedMailAttachment\(c\)\) return false;/);
+});
+
+test("P3: 添付の配信は接続が切れたら書き込みを止め、待ち受けの登録を毎回外す", async () => {
+  const vm = require("node:vm");
+  const { EventEmitter } = require("node:events");
+  const fn = source.slice(source.indexOf("function waitForDrainOrClose("), source.indexOf("\n}\n", source.indexOf("function waitForDrainOrClose(")) + 3);
+  const ctx = {}; vm.createContext(ctx); vm.runInContext(fn, ctx);
+  const res = new EventEmitter();
+  for (let i = 0; i < 20; i++) { const p = ctx.waitForDrainOrClose(res); res.emit("drain"); await p; }
+  assert.equal(res.listenerCount("drain") + res.listenerCount("close") + res.listenerCount("error"), 0);
+  const p = ctx.waitForDrainOrClose(res); res.emit("close"); await p;
+  await ctx.waitForDrainOrClose(Object.assign(new EventEmitter(), { destroyed: true }));
+  const route = source.slice(source.indexOf('app.get("/api/inbound-file/:id", guard,'), source.indexOf("\n});\n", source.indexOf('app.get("/api/inbound-file/:id", guard,')));
+  assert.match(route, /if \(res\.destroyed \|\| res\.writableEnded\) return;/);
+});
+
+test("P3: IMAPは大きさを先に見て1通ずつ取得し、処理に失敗したメールは既読にせずやり直す", () => {
+  const poll = source.slice(source.indexOf("async function pollAll("), source.indexOf("emailPolling = false;\n}", source.indexOf("async function pollAll(")));
+  assert.ok(poll.includes("2 * 86400000) }, { uid: true, size: true })"), "先にUIDと大きさだけを取得する");
+  assert.doesNotMatch(poll, /\{ source: true \}\)\)/, "全件の本文をまとめて取得しない");
+  assert.match(poll, /client\.fetchOne\(String\(it\.uid\), \{ source: tooLarge \? \{ start: 0, maxLength: MAIL_RAW_HEAD_BYTES \} : true \}, \{ uid: true \}\)/);
+  const okIdx = poll.indexOf("await handleInbound(t,");
+  assert.ok(okIdx > 0 && poll.indexOf("markUids.push(it.uid);", okIdx) > okIdx, "処理が終わってから既読にする");
+  assert.match(poll, /if \(mid\) seenIds\.delete\(mid\);/);
+  assert.match(poll, /if \(n >= 3\) \{ markUids\.push\(it\.uid\);/);
+  const { skippedLabel } = require("../lib/mail-attachments");
+  assert.match(String(skippedLabel({ name: "テスト", reason: "mail_too_large" })), /大きすぎる/);
+});
+
+test("P3: 法人削除では法人の行を消した後にも受信添付を消し直し、メモリ上の添付も消す", () => {
+  const del = source.slice(source.indexOf("t._deleting = true"), source.indexOf("t._deleting = true") + 3000);
+  const a = del.indexOf("DELETE FROM tenants"), b = del.indexOf("DELETE FROM inbound_files WHERE tenant=$1", a);
+  assert.ok(a > 0 && b > a);
+});
+
+test("r7 P2: 添付つきメールで始まる話題でも、自動下書きへ直前のやり取りを渡す", () => {
+  const vm = require("node:vm");
+  const { precedingReference } = require("../lib/conversation-context");
+  const fn = source.slice(source.indexOf("function collapseMailAttachmentMessages("), source.indexOf("function staffLineHistoryText("));
+  const ctx = {}; vm.createContext(ctx); vm.runInContext(fn, ctx);
+  const now = Date.now();
+  const msgs = [
+    { from: "them", text: "テスト予約したいです", time: now - 3000 },
+    { from: "us", text: "テスト14日10時か15日11時が空いております", time: now - 2000 },
+    { from: "them", media: "image", mailAttachment: true, time: now - 1000 },
+    { from: "them", text: "テスト前者で", time: now },
+  ];
+  const c = { msgs };
+  const active = msgs.slice(2);
+  const contextMsgs = ctx.collapseMailAttachmentMessages(active).slice(-16);
+  const before = precedingReference(c, active, { max: 10 });
+  const after = precedingReference(c, contextMsgs.map(m => (m && m._src) || m), { max: 10 });
+  assert.equal(before.length, 2);
+  assert.equal(after.length, 2, "まとめた後も直前の2件が残る");
+  const gen = source.slice(source.indexOf("async function genDraft("), source.indexOf("async function enrichStaffLineBookingPreview("));
+  assert.match(gen, /precedingReference\(c, contextMsgs\.map\(m => \(m && m\._src\) \|\| m\), \{ max: 10 \}\)/);
+});
+
+test("r7 P3: IMAPのやり直し回数はアカウント別に数え、接続が切れたら残りを数えない", () => {
+  const poll = source.slice(source.indexOf("async function pollAll("), source.indexOf("emailPolling = false;\n}", source.indexOf("async function pollAll(")));
+  assert.match(poll, /const key = slug \+ ":" \+ acc\.smtpUser \+ ":" \+ it\.uid/);
+  assert.match(poll, /if \(client\.usable === false\) break;/);
+  assert.match(poll, /if \(mailFailures\.size > 2000\)/);
 });
