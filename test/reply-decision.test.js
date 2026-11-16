@@ -75,7 +75,7 @@ test("旧返信に送信日時がなくても話題だけを区切り、仮の�
   c.ts = before + 86400000;
   assert.deepEqual(selectConversationContext(c).current.map(m => m.text), ["テスト：営業時間について"]);
   // メールの添付（あれば）を先に並べてから本文を追加する。話題の区切りはその前に確定する
-  assert.match(source, /preserveTopicBoundary\(c\);\s*(?:\/\/[^\n]*\n\s*)?const mailAttachmentCount = await pushInboundMailAttachments\(t, c, opts, recvAt\);\s*c\.msgs\.push/);
+  assert.match(source, /preserveTopicBoundary\(c\);\s*(?:\/\/[^\n]*\n\s*)?const mailAttachmentCount = await pushInboundMailAttachments\(t, c, opts, recvAt\);\s*if \(!\(mailAttachmentCount && !String\(opts\.text \|\| ""\)\.trim\(\)\)\) c\.msgs\.push/);
 });
 
 test("日付を跨ぐ遅延処理でも送信日時を保存し、欠落・未来日時や旧履歴の日時を捏造しない", async () => {

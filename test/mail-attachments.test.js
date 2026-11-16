@@ -44,7 +44,12 @@ test("メール添付の取り込み: 大きすぎる・多すぎる添付は取
   assert.equal(total.skipped[0].reason, "total_too_large");
 });
 
-test("ファイル名の制御文字・パス区切りは取り除く", () => {
+test("ファイル名の制御文字・パス区切りは取り除き、絵文字を途中で切らない", () => {
+  const emoji = "😀".repeat(130);
+  const cut = M.cleanFileName(emoji);
+  assert.equal(Array.from(cut).length, 120);
+  assert.doesNotThrow(() => encodeURIComponent(cut));
+  assert.doesNotThrow(() => M.inboundFileHeaders({ mime: "image/jpeg", name: "a".repeat(119) + "😀😀" }));
   assert.equal(M.cleanFileName("../\u0000evil\\name\n.jpg"), ".. evil name .jpg");
   assert.equal(M.cleanFileName(""), "添付ファイル");
 });
@@ -89,7 +94,14 @@ test("IMAPの受信で添付を取り出し、添付つきメールは自動送�
   // 公開URLの files とは別の表に保存し、ログイン必須の経路だけで配信する
   assert.match(source, /CREATE TABLE IF NOT EXISTS inbound_files/);
   assert.match(source, /app\.get\("\/api\/inbound-file\/:id", guard,/);
-  assert.match(source, /SELECT name,mime,size,data FROM inbound_files WHERE id=\$1 AND tenant=\$2/);
+  assert.match(source, /SELECT name,mime,size FROM inbound_files WHERE id=\$1 AND tenant=\$2/);
+  assert.match(source, /SELECT substring\(data from \$3 for \$4\) AS part FROM inbound_files WHERE id=\$1 AND tenant=\$2/);
+  // 予約自動受付（はい/いいえの確定・AIの操作依頼・うまくいかなかったときの即時送信）にも添付つきメールは入れない
+  assert.match(source, /if \(!med && !mailAttachmentCount && typeof opts\.draft !== "string" && baEnabled\(t\) && PARTNER_KEY\)/);
+  assert.match(source, /if \(g && !mailAttachmentCount && !g\.replyRequiresStaff && !staffLineReviewAll\(t\) && baEnabled\(t\)/);
+  assert.match(source, /mailAttachmentCount \? "メールに添付ファイルがあり、AIでは中身を確認できないため確認が必要です"/);
+  // 法人の削除（解約）で添付も消す
+  assert.match(source, /DELETE FROM inbound_files WHERE tenant=\$1/);
   // テスト用の受信経路は本番・staging の実行環境では登録しない
   assert.match(source, /if \(process\.env\.NODE_ENV === "test" && !isManagedRuntime\(\)\) \{\n  app\.post\("\/__test\/mail-inbound"/);
 });
@@ -167,10 +179,49 @@ test("実HTTP: 添付つきメールを受信すると会話に表示でき、�
     assert.equal(html.headers.get("content-type"), "application/octet-stream");
     assert.match(html.headers.get("content-disposition"), /^attachment;/);
     assert.match(html.headers.get("content-security-policy"), /sandbox/);
+    const head = await fetch(BASE + msgs[1].url, { method: "HEAD", headers: { Cookie: cookieA } });
+    assert.equal(head.status, 200);
+    assert.equal(head.headers.get("content-length"), "5000");
+    const only = await call("/__test/mail-inbound", { method: "POST", headers: { "Content-Type": "application/json", Cookie: cookieA, Origin: BASE }, body: JSON.stringify({ email: "only@example.test", text: "", subject: "", attachments: [{ filename: "😀写真.jpg", contentType: "image/jpeg", base64: jpeg.toString("base64") }] }) });
+    assert.equal(only.r.status, 200);
+    const convs2 = await call("/api/conversations", { headers: { Cookie: cookieA } });
+    const onlyConv = convs2.body.find(c => c.id === "mail:only@example.test");
+    assert.deepEqual(onlyConv.msgs.map(m => m.media || "text"), ["image"], "本文の無いメールで空の吹き出しを作らない");
+    assert.equal(onlyConv.last, "［画像］写真");
     const bogus = await fetch(BASE + "/api/inbound-file/not-a-real-id", { headers: { Cookie: cookieA } });
     assert.equal(bogus.status, 404);
     assert.doesNotMatch(output, /IMG_0001|patient@example\.test/, "ファイル名・メールアドレスをログに出さない");
   } finally {
     child.kill();
   }
+});
+
+test("DBからは必要な範囲だけ読む（動画のRangeで本体を毎回まるごと読まない）", async () => {
+  const vm = require("node:vm");
+  const start = source.indexOf("// 形式・サイズだけを読む");
+  const end = source.indexOf("async function pushInboundMailAttachments(");
+  const queries = [];
+  const ctx = { INBOUND_FILES: {}, Buffer, pool: { query: async (sql, params) => { queries.push({ sql, params }); return { rows: [/substring/.test(sql) ? { part: Buffer.from("テスト") } : { name: "a.mp4", mime: "video/mp4", size: "5000" }] }; } } };
+  vm.createContext(ctx);
+  vm.runInContext(source.slice(start, end), ctx);
+  const t = { slug: "テスト" };
+  const id = "0123456789abcdef0123456789abcdef";
+  const meta = await ctx.inboundFileMeta(t, id);
+  assert.equal(meta.size, 5000);
+  assert.doesNotMatch(queries[0].sql, /\bdata\b/, "形式・サイズの取得では本体を読まない");
+  await ctx.inboundFileBytes(t, id, 100, 50);
+  assert.match(queries[1].sql, /substring\(data from \$3 for \$4\)/);
+  assert.equal(JSON.stringify(queries[1].params), JSON.stringify([id, "テスト", 101, 50]), "PostgreSQLのsubstringは1始まり");
+  assert.equal(await ctx.inboundFileMeta(t, "../etc"), null);
+  const route = source.slice(source.indexOf('app.get("/api/inbound-file/:id"'), source.indexOf("async function handleInbound(t, opts)"));
+  assert.ok(route.indexOf('if (req.method === "HEAD") return res.end();') < route.indexOf("inboundFileBytes("), "HEADでは本体を読まない");
+});
+
+test("連続するメールの添付はスタッフLINE向けの要約で1行にまとめる", () => {
+  const vm = require("node:vm");
+  const fn = source.slice(source.indexOf("function staffLineHistoryText("), source.indexOf("async function staffLineSummary("));
+  const ctx = {}; vm.createContext(ctx); vm.runInContext(fn, ctx);
+  const msgs = [{ from: "us", text: "テスト前の返信" }].concat(Array.from({ length: 10 }, (_, i) => ({ from: "them", media: "image", mailAttachment: true, fileName: "p" + i + ".jpg" }))).concat([{ from: "them", text: "テスト本文" }]);
+  const text = ctx.staffLineHistoryText({ msgs });
+  assert.equal(text, "スタッフ: テスト前の返信\n患者: ［添付ファイル 10件］\n患者: テスト本文");
 });

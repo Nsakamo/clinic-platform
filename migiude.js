@@ -421,7 +421,14 @@ function staffLineUpsertStaff(t, userId, name, role) {
   return s;
 }
 function staffLineHistoryText(c) {
-  return (c.msgs || []).slice(-10).map(m => (m.from === "them" ? "患者" : "スタッフ") + ": " + String(m.text || (m.media ? "［" + m.media + "］" : "")).slice(0, 500)).join("\n");
+  // 連続するメールの添付は1行にまとめる（添付が多いと前の会話が要約から押し出されるため）
+  const msgs = [];
+  for (const m of (c.msgs || [])) {
+    const prev = msgs[msgs.length - 1];
+    if (m && m.mailAttachment && prev && prev.mailAttachment && prev.from === m.from) { prev.attachmentCount = (prev.attachmentCount || 1) + 1; prev.text = "［添付ファイル " + prev.attachmentCount + "件］"; continue; }
+    msgs.push(m && m.mailAttachment ? Object.assign({}, m, { text: "［添付ファイル 1件］", attachmentCount: 1 }) : m);
+  }
+  return msgs.slice(-10).map(m => (m.from === "them" ? "患者" : "スタッフ") + ": " + String(m.text || (m.media ? "［" + m.media + "］" : "")).slice(0, 500)).join("\n");
 }
 async function staffLineSummary(t, c) {
   const history = staffLineHistoryText(c);
@@ -2635,11 +2642,18 @@ async function saveInboundFile(t, conversationId, file) {
   }
   return id;
 }
-async function loadInboundFile(t, id) {
+// 形式・サイズだけを読む（動画のRange要求やHEADで、本体を毎回まるごと読まないため）
+async function inboundFileMeta(t, id) {
   if (!/^[0-9a-f]{32}$/.test(String(id || ""))) return null;
-  if (!pool) { const row = INBOUND_FILES[id]; return row && row.tenant === t.slug ? row : null; }
-  const r = await pool.query("SELECT name,mime,size,data FROM inbound_files WHERE id=$1 AND tenant=$2", [id, t.slug]);
-  return r.rows[0] || null;
+  if (!pool) { const row = INBOUND_FILES[id]; return row && row.tenant === t.slug ? { name: row.name, mime: row.mime, size: row.size } : null; }
+  const r = await pool.query("SELECT name,mime,size FROM inbound_files WHERE id=$1 AND tenant=$2", [id, t.slug]);
+  return r.rows[0] ? { name: r.rows[0].name, mime: r.rows[0].mime, size: Number(r.rows[0].size) || 0 } : null;
+}
+// 本体の必要な範囲だけを読む（start は0始まり、length バイト）
+async function inboundFileBytes(t, id, start, length) {
+  if (!pool) { const row = INBOUND_FILES[id]; return row && row.tenant === t.slug ? row.data.subarray(start, start + length) : null; }
+  const r = await pool.query("SELECT substring(data from $3 for $4) AS part FROM inbound_files WHERE id=$1 AND tenant=$2", [id, t.slug, start + 1, length]);
+  return r.rows[0] ? Buffer.from(r.rows[0].part || []) : null;
 }
 async function pushInboundMailAttachments(t, c, opts, recvAt) {
   if (opts.channel !== "mail") return 0;
@@ -2665,19 +2679,22 @@ async function pushInboundMailAttachments(t, c, opts, recvAt) {
 }
 // 添付の表示・再生（ログイン必須・同じ法人だけ。動画のために Range にも対応）
 app.get("/api/inbound-file/:id", guard, async (req, res) => {
+  const id = String(req.params.id || "");
   let f = null;
-  try { f = await loadInboundFile(req.tenant, String(req.params.id || "")); } catch (e) { return res.status(500).end(); }
+  try { f = await inboundFileMeta(req.tenant, id); } catch (e) { return res.status(500).end(); }
   if (!f) return res.status(404).end();
-  const data = Buffer.isBuffer(f.data) ? f.data : Buffer.from(f.data || []);
   const headers = inboundFileHeaders(f);
   Object.keys(headers).forEach(k => res.set(k, headers[k]));
-  const range = req.headers.range ? parseRange(req.headers.range, data.length) : null;
-  if (req.headers.range && !range) { res.set("Content-Range", "bytes */" + data.length); return res.status(416).end(); }
-  if (range) {
-    res.status(206).set("Content-Range", "bytes " + range.start + "-" + range.end + "/" + data.length);
-    return res.send(data.subarray(range.start, range.end + 1));
-  }
-  res.send(data);
+  const range = req.headers.range ? parseRange(req.headers.range, f.size) : null;
+  if (req.headers.range && !range) { res.set("Content-Range", "bytes */" + f.size); return res.status(416).end(); }
+  const start = range ? range.start : 0, length = range ? range.end - range.start + 1 : f.size;
+  if (range) res.status(206).set("Content-Range", "bytes " + range.start + "-" + range.end + "/" + f.size);
+  res.set("Content-Length", String(length));
+  if (req.method === "HEAD") return res.end();
+  let data = null;
+  try { data = await inboundFileBytes(req.tenant, id, start, length); } catch (e) { return res.status(500).end(); }
+  if (!data) return res.status(404).end();
+  res.end(data);
 });
 async function handleInbound(t, opts) {
   return aiUsageContext.run({ entries: [] }, () => handleInboundCore(t, opts));
@@ -2699,7 +2716,7 @@ async function handleInboundCore(t, opts) {
   preserveTopicBoundary(c);
   // メールの添付は本文より先に並べる（AIへ渡す「最新の患者の文」が本文になるように）
   const mailAttachmentCount = await pushInboundMailAttachments(t, c, opts, recvAt);
-  c.msgs.push({ from: "them", text: opts.text || "", media: med, mediaId: med ? (opts.mediaId || null) : null, fileName: med === "file" ? (opts.fileName || "ファイル") : undefined, time: nowt(), ...inboundMessageTimes(opts.sentAt, recvAt, opts.sentAtSource) });
+  if (!(mailAttachmentCount && !String(opts.text || "").trim())) c.msgs.push({ from: "them", text: opts.text || "", media: med, mediaId: med ? (opts.mediaId || null) : null, fileName: med === "file" ? (opts.fileName || "ファイル") : undefined, time: nowt(), ...inboundMessageTimes(opts.sentAt, recvAt, opts.sentAtSource) });
   statBump(t, "in");
   if (opts.subject) c.subject = String(opts.subject).slice(0, 300);
   c.status = "todo"; c.time = nowt(); c.ts = Date.now(); c.last = lastText(c); dbSave(t, c);
@@ -2708,7 +2725,7 @@ async function handleInboundCore(t, opts) {
 
   // ===== 予約自動受付: 確認待ちへの「はい/いいえ」を最優先で処理（明確な返答のときだけ実行） =====
   let baDone = false;
-  if (!med && typeof opts.draft !== "string" && baEnabled(t) && PARTNER_KEY) {
+  if (!med && !mailAttachmentCount && typeof opts.draft !== "string" && baEnabled(t) && PARTNER_KEY) { // 添付つきメールは中身を誰も見ないまま予約操作しない
     try { baDone = await baHandlePending(t, c); } catch (e) { console.error("ba pending:", e && e.message); }
   }
 
@@ -2745,7 +2762,7 @@ async function handleInboundCore(t, opts) {
       }
     }
     // ===== 予約自動受付: AIが操作依頼(action)を出したら、確認文の送信までを自動処理 =====
-    if (g && !g.replyRequiresStaff && !staffLineReviewAll(t) && baEnabled(t) && PARTNER_KEY && g.action && typeof g.action === "object" && g.action.type && g.action.type !== "none") {
+    if (g && !mailAttachmentCount && !g.replyRequiresStaff && !staffLineReviewAll(t) && baEnabled(t) && PARTNER_KEY && g.action && typeof g.action === "object" && g.action.type && g.action.type !== "none") {
       try { baDone = await baAction(t, c, g.action, g.baCtx); } catch (e) { console.error("ba action:", e && e.message); }
       if (baDone) { c.draft = ""; c.draft0 = ""; c.learningRefs = []; }
       else if (String(needsHuman) !== "true" && String(urgent) !== "true") {
@@ -2796,7 +2813,7 @@ async function handleInboundCore(t, opts) {
     staffLineRequestApproval(t, c, "毎回確認モードのため、送信前に承認が必要です").catch(() => {});
   } else if (exceptionNeedsReview || String(needsHuman) === "true" || String(urgent) === "true" || c.flag) {
     const groundingReason = c.grounding && Array.isArray(c.grounding.reasons) && c.grounding.reasons[0];
-    const reason = String(urgent) === "true" ? "緊急性のある問い合わせとAIが判定しました" : (c.flag ? "要対応フラグが付いています" : (!groundedForStaffLine ? (groundingReason || "送信前の根拠監査を通らなかったため確認が必要です") : (!confOkForStaffLine ? "自動送信に必要な確信率を満たさないため確認が必要です" : "AIが人による判断を必要と判定しました")));
+    const reason = String(urgent) === "true" ? "緊急性のある問い合わせとAIが判定しました" : (c.flag ? "要対応フラグが付いています" : (!groundedForStaffLine ? (groundingReason || "送信前の根拠監査を通らなかったため確認が必要です") : (!confOkForStaffLine ? "自動送信に必要な確信率を満たさないため確認が必要です" : (mailAttachmentCount ? "メールに添付ファイルがあり、AIでは中身を確認できないため確認が必要です" : "AIが人による判断を必要と判定しました"))));
     // 未実行の予約操作の提案がある返信は、スタッフLINEの承認だけで送れないようにする（予約操作は画面の確認カードで実行）
     const pendingBookingSuggestion = !!(c.bookingSuggestion && c.bookingSuggestion.status !== "executed");
     if (!pendingBookingSuggestion && c.draft && c.draft.trim() && S(t).staffLineEnabled && S(t).staffLineReplyMode === "exceptions" && staffLineReady(t)) staffLineRequestApproval(t, c, reason).catch(() => {});
@@ -5549,6 +5566,7 @@ app.delete("/api/partner/tenants/:slug", pGuard, async (req,res)=>{
       await pool.query("DELETE FROM rules WHERE tenant=$1",[slug]);
       await pool.query("DELETE FROM alerts WHERE tenant=$1",[slug]);
       await pool.query("DELETE FROM files WHERE tenant=$1",[slug]);
+      await pool.query("DELETE FROM inbound_files WHERE tenant=$1",[slug]); // 患者からのメールの添付も法人と一緒に消す
       await pool.query("DELETE FROM push_subs WHERE tenant=$1",[slug]);
       await pool.query("DELETE FROM tenants WHERE slug=$1",[slug]);
     }
@@ -6881,9 +6899,9 @@ function renderList(){
   });
 }
 function esc(s){return String(s||"").replace(/[<>&"']/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;",'"':"&quot;","'":"&#39;"}[c])).replace(/\x60/g,"&#96;");}
-function mediaHtml(m){ var cls='b '+(m.from==="them"?"them":"us"); if(m.mailAttachment&&!m.url)return '<div class="'+cls+'"><span style="color:#6b7280;">📎 '+esc(m.fileName||"添付ファイル")+'</span></div>'; var raw=m.mediaId?('/api/line-media/'+String(m.mediaId).replace(/[^0-9a-zA-Z_-]/g,"")):(m.url||"https://placehold.co/300x220/e5e7eb/6b7280?text=%F0%9F%93%B7"),src=esc(safeMediaUrl(raw)); if(!src)return ''; if(m.media==="image")return '<div class="'+cls+' media"><a href="'+src+'" target="_blank" rel="noopener noreferrer"><img class="ph" src="'+src+'" alt="'+esc(m.fileName||"画像")+'" onerror="mediaImgFallback(this)"></a>'+(m.mailAttachment?'<div class="mailAttachName">📎 '+esc(m.fileName||"画像")+'</div>':'')+'</div>'; if(m.mailAttachment&&m.media==="video")return '<div class="'+cls+' media"><video class="ph" style="max-width:260px;border-radius:10px;" controls preload="metadata" src="'+src+'"></video><div class="mailAttachName"><a href="'+src+'" target="_blank" rel="noopener noreferrer">📎 '+esc(m.fileName||"動画")+'</a></div></div>'; if(m.media==="video")return (m.mediaId||m.url)?('<div class="'+cls+' media"><video class="ph" style="max-width:220px;border-radius:10px;" controls preload="metadata" src="'+src+'"></video></div>'):('<div class="'+cls+' media"><div class="vid">▶<span>動画</span></div></div>'); if(m.media==="file")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">📄 '+esc(m.fileName||"ファイル")+'</a></div>'; if(m.media==="audio")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">🎤 音声メッセージ</a></div>'; return ''; }
+function mediaHtml(m){ var cls='b '+(m.from==="them"?"them":"us"); if(m.mailAttachment&&!m.url)return '<div class="'+cls+'"><span style="color:#6b7280;">📎 '+esc(m.fileName||"添付ファイル")+'</span></div>'; var raw=m.mediaId?('/api/line-media/'+String(m.mediaId).replace(/[^0-9a-zA-Z_-]/g,"")):(m.url||"https://placehold.co/300x220/e5e7eb/6b7280?text=%F0%9F%93%B7"),src=esc(safeMediaUrl(raw)); if(!src)return ''; if(m.media==="image")return '<div class="'+cls+' media"><a href="'+src+'" target="_blank" rel="noopener noreferrer"><img class="ph" src="'+src+'" alt="'+esc(m.fileName||"画像")+'" onerror="mediaImgFallback(this)"></a>'+(m.mailAttachment?'<div class="mailAttachName">📎 '+esc(m.fileName||"画像")+'</div>':'')+'</div>'; if(m.mailAttachment&&m.media==="video")return '<div class="'+cls+' media"><video class="ph" style="max-width:260px;border-radius:10px;" controls preload="metadata" src="'+src+'"></video><div class="mailAttachName"><a href="'+src+'" target="_blank" rel="noopener noreferrer">📎 '+esc(m.fileName||"動画")+'</a></div></div>'; if(m.media==="video")return (m.mediaId||m.url)?('<div class="'+cls+' media"><video class="ph" style="max-width:220px;border-radius:10px;" controls preload="metadata" src="'+src+'"></video></div>'):('<div class="'+cls+' media"><div class="vid">▶<span>動画</span></div></div>'); if(m.media==="file")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">📄 '+esc(m.fileName||"ファイル")+'</a></div>'; if(m.media==="audio")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">🎤 '+(m.mailAttachment?esc(m.fileName||"音声ファイル"):'音声メッセージ')+'</a></div>'; return ''; }
 // iPhoneのHEICなど、ブラウザで表示できない画像は「開く」リンクに置き換える
-function mediaImgFallback(img){try{var a=img.parentNode;if(!a||a.getAttribute("data-fallback"))return;a.setAttribute("data-fallback","1");img.remove();var span=document.createElement("span");span.textContent="📷 画像を開く（この形式はプレビューできません）";span.style.cssText="display:inline-block;padding:10px 12px;font-size:13px;";a.appendChild(span);}catch(e){}}
+function mediaImgFallback(img){try{var a=img.parentNode;if(!a||a.getAttribute("data-fallback"))return;a.setAttribute("data-fallback","1");img.remove();var span=document.createElement("span");span.textContent="📷 画像を開く（ここではプレビューできません）";span.style.cssText="display:inline-block;padding:10px 12px;font-size:13px;";a.appendChild(span);}catch(e){}}
 // 会話本文の日時は日本時間で統一。会話全体の更新時刻から古いメッセージの日付を推測しない。
 const messageDateFormatter=new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Tokyo",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hourCycle:"h23"});
 function messageDateParts(timestamp){const parts={};messageDateFormatter.formatToParts(new Date(timestamp)).forEach(p=>{parts[p.type]=p.value;});return parts;}
