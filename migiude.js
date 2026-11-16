@@ -2654,12 +2654,15 @@ async function saveInboundFile(t, conversationId, file) {
   const id = crypto.randomBytes(16).toString("hex");
   const row = { tenant: t.slug, conversationId: String(conversationId || ""), name: file.name, mime: file.mime, size: file.data.length, data: file.data, ts: Date.now() };
   if (pool) {
-    await pool.query("INSERT INTO inbound_files (id,tenant,conversation_id,name,mime,size,data,ts) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)", [id, row.tenant, row.conversationId, row.name, row.mime, row.size, row.data, row.ts]);
+    // 削除と同時に保存されても消した法人の行が残らないよう、法人が存在するときだけ保存する
+    const r = await pool.query("INSERT INTO inbound_files (id,tenant,conversation_id,name,mime,size,data,ts) SELECT $1,$2,$3,$4,$5,$6,$7,$8 WHERE EXISTS (SELECT 1 FROM tenants WHERE slug=$2)", [id, row.tenant, row.conversationId, row.name, row.mime, row.size, row.data, row.ts]);
+    if (!r.rowCount) throw new Error("tenant_gone");
   } else {
     INBOUND_FILES[id] = row;
   }
   return id;
 }
+const INBOUND_FILE_CHUNK_BYTES = 1024 * 1024;
 // 形式・サイズだけを読む（動画のRange要求やHEADで、本体を毎回まるごと読まないため）
 async function inboundFileMeta(t, id) {
   if (!/^[0-9a-f]{32}$/.test(String(id || ""))) return null;
@@ -2733,13 +2736,21 @@ app.get("/api/inbound-file/:id", guard, async (req, res) => {
   const range = req.headers.range ? parseRange(req.headers.range, f.size) : null; // 解釈できない・複数範囲の指定は無視して全体を返す
   if (range && range.unsatisfiable) { res.set("Content-Range", "bytes */" + f.size); return res.status(416).end(); }
   const start = range ? range.start : 0, length = range ? range.end - range.start + 1 : f.size;
-  if (range) res.status(206).set("Content-Range", "bytes " + range.start + "-" + range.end + "/" + f.size);
-  res.set("Content-Length", String(length));
-  if (req.method === "HEAD") return res.end();
-  let data = null;
-  try { data = await inboundFileBytes(req.tenant, id, start, length); } catch (e) { return res.status(500).end(); }
-  if (!data) return res.status(404).end();
-  res.end(data);
+  const sendHead = () => { if (range) res.status(206).set("Content-Range", "bytes " + range.start + "-" + range.end + "/" + f.size); res.set("Content-Length", String(length)); };
+  if (req.method === "HEAD") { sendHead(); return res.end(); }
+  // 本体は1MBずつ読んで書き出す（大きな画像・動画を丸ごとメモリに載せない。受け手が遅ければ待つ）
+  let pos = start, remaining = length, chunk = null;
+  try { chunk = await inboundFileBytes(req.tenant, id, pos, Math.min(INBOUND_FILE_CHUNK_BYTES, remaining)); } catch (e) { return res.status(500).end(); }
+  if (!chunk || (remaining > 0 && !chunk.length)) return res.status(404).end(); // 最初の読み出しに成功してからヘッダーを送る
+  sendHead();
+  while (true) {
+    pos += chunk.length; remaining -= chunk.length;
+    if (!res.write(chunk)) await new Promise(resolve => { res.once("drain", resolve); res.once("close", resolve); });
+    if (remaining <= 0 || res.destroyed || res.writableEnded) break;
+    try { chunk = await inboundFileBytes(req.tenant, id, pos, Math.min(INBOUND_FILE_CHUNK_BYTES, remaining)); } catch (e) { chunk = null; }
+    if (!chunk || !chunk.length) { res.destroy(); return; } // 途中で読めなくなったら接続を切る（宣言した長さと食い違う応答を返さない）
+  }
+  if (!res.destroyed) res.end();
 });
 async function handleInbound(t, opts) {
   return aiUsageContext.run({ entries: [] }, () => handleInboundCore(t, opts));
@@ -2797,7 +2808,7 @@ async function handleInboundCore(t, opts) {
     // 下書き生成中にスタッフが提案を実行した場合は、その「実行済み」表示（実行後の案内文）を残す
     const executedDuringDraft = !!(c.bookingSuggestion && c.bookingSuggestion !== suggestionBefore && c.bookingSuggestion.status === "executed");
     if (!executedDuringDraft) c.bookingSuggestion = null;
-    const autoBooking = !!(g && !g.replyRequiresStaff && !staffLineReviewAll(t) && baEnabled(t));
+    const autoBooking = !!(g && !attachmentUnreviewed && !g.replyRequiresStaff && !staffLineReviewAll(t) && baEnabled(t)); // 未確認の添付があれば自動実行せず、提案カードでスタッフに確認してもらう
     const bookingOp = !!(g && g.action && typeof g.action === "object" && ["cancel", "reschedule"].includes(String(g.action.type)));
     if (g && bookingOp && !autoBooking) {
       // 自動で実行しないキャンセル・日時変更の依頼は、提案が作れたかに関係なくスタッフ確認へ回す（自動送信しない）
@@ -6953,7 +6964,7 @@ function renderList(){
   });
 }
 function esc(s){return String(s||"").replace(/[<>&"']/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;",'"':"&quot;","'":"&#39;"}[c])).replace(/\x60/g,"&#96;");}
-function mediaHtml(m){ var cls='b '+(m.from==="them"?"them":"us"); if(m.mailAttachment&&!m.url)return '<div class="'+cls+'"><span style="color:#6b7280;">📎 '+esc(m.fileName||"添付ファイル")+'</span></div>'; var raw=m.mediaId?('/api/line-media/'+String(m.mediaId).replace(/[^0-9a-zA-Z_-]/g,"")):(m.url||"https://placehold.co/300x220/e5e7eb/6b7280?text=%F0%9F%93%B7"),src=esc(safeMediaUrl(raw)); if(!src)return ''; if(m.media==="image")return '<div class="'+cls+' media"><a href="'+src+'" target="_blank" rel="noopener noreferrer"><img class="ph" src="'+src+'" alt="'+esc(m.fileName||"画像")+'" onerror="mediaImgFallback(this)"></a>'+(m.mailAttachment?'<div class="mailAttachName">📎 '+esc(m.fileName||"画像")+'</div>':'')+'</div>'; if(m.mailAttachment&&m.media==="video")return '<div class="'+cls+' media"><video class="ph" style="max-width:260px;border-radius:10px;" controls preload="metadata" src="'+src+'"></video><div class="mailAttachName"><a href="'+src+'" target="_blank" rel="noopener noreferrer">📎 '+esc(m.fileName||"動画")+'</a></div></div>'; if(m.media==="video")return (m.mediaId||m.url)?('<div class="'+cls+' media"><video class="ph" style="max-width:220px;border-radius:10px;" controls preload="metadata" src="'+src+'"></video></div>'):('<div class="'+cls+' media"><div class="vid">▶<span>動画</span></div></div>'); if(m.media==="file")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">📄 '+esc(m.fileName||"ファイル")+'</a></div>'; if(m.media==="audio")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">🎤 '+(m.mailAttachment?esc(m.fileName||"音声ファイル"):'音声メッセージ')+'</a></div>'; return ''; }
+function mediaHtml(m){ var cls='b '+(m.from==="them"?"them":"us"); if(m.mailAttachment&&!m.url)return '<div class="'+cls+'"><span style="color:#6b7280;">📎 '+esc(m.fileName||"添付ファイル")+'</span></div>'; var raw=m.mediaId?('/api/line-media/'+String(m.mediaId).replace(/[^0-9a-zA-Z_-]/g,"")):(m.url||"https://placehold.co/300x220/e5e7eb/6b7280?text=%F0%9F%93%B7"),src=esc(safeMediaUrl(raw)); if(!src)return ''; if(m.media==="image")return '<div class="'+cls+' media"><a href="'+src+'" target="_blank" rel="noopener noreferrer"><img class="ph" src="'+src+'" alt="'+esc(m.fileName||"画像")+'" loading="lazy" decoding="async" onerror="mediaImgFallback(this)"></a>'+(m.mailAttachment?'<div class="mailAttachName">📎 '+esc(m.fileName||"画像")+'</div>':'')+'</div>'; if(m.mailAttachment&&m.media==="video")return '<div class="'+cls+' media"><video class="ph" style="max-width:260px;border-radius:10px;" controls preload="metadata" src="'+src+'"></video><div class="mailAttachName"><a href="'+src+'" target="_blank" rel="noopener noreferrer">📎 '+esc(m.fileName||"動画")+'</a></div></div>'; if(m.media==="video")return (m.mediaId||m.url)?('<div class="'+cls+' media"><video class="ph" style="max-width:220px;border-radius:10px;" controls preload="metadata" src="'+src+'"></video></div>'):('<div class="'+cls+' media"><div class="vid">▶<span>動画</span></div></div>'); if(m.media==="file")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">📄 '+esc(m.fileName||"ファイル")+'</a></div>'; if(m.media==="audio")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">🎤 '+(m.mailAttachment?esc(m.fileName||"音声ファイル"):'音声メッセージ')+'</a></div>'; return ''; }
 // iPhoneのHEICなど、ブラウザで表示できない画像は「開く」リンクに置き換える
 function mediaImgFallback(img){try{var a=img.parentNode;if(!a||a.getAttribute("data-fallback"))return;a.setAttribute("data-fallback","1");img.remove();var span=document.createElement("span");span.textContent="📷 画像を開く（ここではプレビューできません）";span.style.cssText="display:inline-block;padding:10px 12px;font-size:13px;";a.appendChild(span);}catch(e){}}
 // 会話本文の日時は日本時間で統一。会話全体の更新時刻から古いメッセージの日付を推測しない。

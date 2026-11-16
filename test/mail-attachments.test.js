@@ -228,7 +228,12 @@ test("DBからは必要な範囲だけ読む（動画のRangeで本体を毎回�
   assert.equal(JSON.stringify(queries[1].params), JSON.stringify([id, "テスト", 101, 50]), "PostgreSQLのsubstringは1始まり");
   assert.equal(await ctx.inboundFileMeta(t, "../etc"), null);
   const route = source.slice(source.indexOf('app.get("/api/inbound-file/:id"'), source.indexOf("async function handleInbound(t, opts)"));
-  assert.ok(route.indexOf('if (req.method === "HEAD") return res.end();') < route.indexOf("inboundFileBytes("), "HEADでは本体を読まない");
+  const headIdx = route.indexOf('if (req.method === "HEAD") { sendHead(); return res.end(); }');
+  assert.ok(headIdx > 0 && headIdx < route.indexOf("inboundFileBytes("), "HEADでは本体を読まない");
+  assert.match(route, /Math\.min\(INBOUND_FILE_CHUNK_BYTES, remaining\)/, "本体は1MBずつ読む");
+  assert.match(source, /SELECT \$1,\$2,\$3,\$4,\$5,\$6,\$7,\$8 WHERE EXISTS \(SELECT 1 FROM tenants WHERE slug=\$2\)/, "法人が存在するときだけ保存");
+  assert.match(source, /const autoBooking = !!\(g && !attachmentUnreviewed && /, "未確認の添付があれば予約は提案カードへ");
+  assert.match(source, /loading="lazy" decoding="async" onerror="mediaImgFallback\(this\)"/);
 });
 
 test("連続するメールの添付はスタッフLINE向けの要約で1行にまとめる", () => {
@@ -338,4 +343,34 @@ test("添付つきメールの後に本文だけのメールが来ても、ス�
   assert.match(cut("function scheduleAutoReply(", "cur.lastAuto = true;"), /if \(hasUnreviewedMailAttachment\(cur\)\) return;/);
   // 画面からの再送も、未確認の添付があれば専用のエラーで断る
   assert.match(source, /if \(hasUnreviewedMailAttachment\(c\)\) return res\.status\(409\)\.json\(\{ ok: false, error: "mail_attachment_unreviewed" \}\);/);
+});
+
+test("実HTTP: 1MBを超える添付も分割して読み出し、全体・境界をまたぐ範囲とも元のファイルと一致する", { timeout: 20000 }, async () => {
+  const port = 43843, base = "http://127.0.0.1:" + port;
+  const child = spawn(process.execPath, ["migiude.js"], {
+    cwd: root,
+    env: Object.assign({}, process.env, { NODE_ENV: "test", PORT: String(port), DATABASE_URL: "", CRED_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", PUBLIC_BASE_URL: base, PLATFORM_SECRET: PARTNER_KEY, ANTHROPIC_API_KEY: "", OPENAI_API_KEY: "", RAILWAY_ENVIRONMENT: "", RAILWAY_PROJECT_ID: "" }),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let output = ""; child.stdout.on("data", d => { output += d; }); child.stderr.on("data", d => { output += d; });
+  try {
+    for (let i = 0; i < 80 && !output.includes("listening on"); i++) await new Promise(r => setTimeout(r, 100));
+    const created = await fetch(base + "/api/partner/tenants", { method: "POST", headers: { "Content-Type": "application/json", "x-partner-key": PARTNER_KEY }, body: JSON.stringify({ slug: "mail-big", name: "mail-big", accountEmail: "mail-big@example.test", password: "password-Test-123" }) });
+    assert.equal(created.status, 201);
+    const lr = await fetch(base + "/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ loginId: "mail-big", password: "password-Test-123" }) });
+    const cookie = String(lr.headers.get("set-cookie") || "").split(";")[0];
+    const big = require("node:crypto").randomBytes(2.5 * 1024 * 1024);
+    const r = await fetch(base + "/__test/mail-inbound", { method: "POST", headers: { "Content-Type": "application/json", Cookie: cookie, Origin: base }, body: JSON.stringify({ email: "big@example.test", text: "テスト大きい写真", attachments: [{ filename: "big.jpg", contentType: "image/jpeg", base64: big.toString("base64") }] }) });
+    assert.equal(r.status, 200);
+    const convs = await (await fetch(base + "/api/conversations", { headers: { Cookie: cookie } })).json();
+    const url = convs.find(c => c.id === "mail:big@example.test").msgs[0].url;
+    const full = await fetch(base + url, { headers: { Cookie: cookie } });
+    assert.equal(full.status, 200);
+    assert.equal(full.headers.get("content-length"), String(big.length));
+    assert.ok(Buffer.from(await full.arrayBuffer()).equals(big), "全体が一致");
+    const from = 1024 * 1024 - 10, to = 2 * 1024 * 1024 + 9;
+    const part = await fetch(base + url, { headers: { Cookie: cookie, Range: "bytes=" + from + "-" + to } });
+    assert.equal(part.status, 206);
+    assert.ok(Buffer.from(await part.arrayBuffer()).equals(big.subarray(from, to + 1)), "チャンクの境界をまたぐ範囲も一致");
+  } finally { child.kill(); }
 });
