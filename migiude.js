@@ -26,6 +26,7 @@ const { REPLY_DECISION, isCancellationInquiry, isIllnessInquiry, replyRuleQuery,
 const { deliverPartnerEvent } = require("./lib/partner-delivery");
 const { ANSWER_FIRST_POLICY, bookingFactsBlock, learningUsesRetiredTerms, normalizeBookingPageUrl, normalizeRetiredTerms, retiredTermsExcludingUrl, textMentionsRetiredTerm } = require("./lib/booking-facts");
 const { normalizeTemplates, saveTemplate, deleteTemplate, moveTemplate } = require("./lib/reply-templates");
+const { inboundFileHeaders, parseRange, selectMailAttachments, skippedLabel } = require("./lib/mail-attachments");
 const { uketsukeLoginUrl, emailLoginPage } = require("./lib/uketsuke-login");
 const { AiUsageSpool, resolveAiUsageSpoolPath } = require("./lib/ai-usage-spool");
 const app = express();
@@ -225,6 +226,9 @@ async function dbInit() {
   await pool.query("CREATE INDEX IF NOT EXISTS ai_usage_events_tenant_created_idx ON ai_usage_events(tenant,created_at DESC)");
   await pool.query("CREATE TABLE IF NOT EXISTS alerts (id serial primary key, tenant text, type text, summary text, name text, ts bigint, done boolean default false)");
   await pool.query("CREATE TABLE IF NOT EXISTS files (id text primary key, tenant text, name text, mime text, data bytea, ts bigint)");
+  // 患者からのメールの添付（画像・動画・ファイル）。公開URLの files とは分け、ログイン中の同じ法人のスタッフだけが見られる。
+  await pool.query("CREATE TABLE IF NOT EXISTS inbound_files (id text primary key, tenant text not null, conversation_id text not null default '', name text not null, mime text not null, size integer not null, data bytea not null, ts bigint not null)");
+  await pool.query("CREATE INDEX IF NOT EXISTS inbound_files_tenant_idx ON inbound_files(tenant,ts DESC)");
   await pool.query("CREATE TABLE IF NOT EXISTS push_subs (tenant text, endpoint text primary key, sub jsonb)");
   await pool.query("CREATE TABLE IF NOT EXISTS kv (k text primary key, v jsonb)");
   await pool.query("CREATE TABLE IF NOT EXISTS line_webhook_events (event_id text not null, tenant text not null, account_key text not null, destination text not null default '', payload jsonb not null, status text not null default 'pending', attempts int not null default 0, available_at bigint not null, created_at bigint not null, updated_at bigint not null, last_error text, PRIMARY KEY(tenant,event_id))");
@@ -2619,6 +2623,62 @@ async function enrichStaffLineBookingPreview(t, c, generated) {
 }
 
 // ===== shared inbound handler (LINE webhook / email poller / ingest all funnel here) =====
+// ===== 患者からのメールの添付（画像・動画・ファイル） =====
+const INBOUND_FILES = {}; // DBが無いとき（テスト・ローカル）だけ使うメモリ置き場
+async function saveInboundFile(t, conversationId, file) {
+  const id = crypto.randomBytes(16).toString("hex");
+  const row = { tenant: t.slug, conversationId: String(conversationId || ""), name: file.name, mime: file.mime, size: file.data.length, data: file.data, ts: Date.now() };
+  if (pool) {
+    await pool.query("INSERT INTO inbound_files (id,tenant,conversation_id,name,mime,size,data,ts) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)", [id, row.tenant, row.conversationId, row.name, row.mime, row.size, row.data, row.ts]);
+  } else {
+    INBOUND_FILES[id] = row;
+  }
+  return id;
+}
+async function loadInboundFile(t, id) {
+  if (!/^[0-9a-f]{32}$/.test(String(id || ""))) return null;
+  if (!pool) { const row = INBOUND_FILES[id]; return row && row.tenant === t.slug ? row : null; }
+  const r = await pool.query("SELECT name,mime,size,data FROM inbound_files WHERE id=$1 AND tenant=$2", [id, t.slug]);
+  return r.rows[0] || null;
+}
+async function pushInboundMailAttachments(t, c, opts, recvAt) {
+  if (opts.channel !== "mail") return 0;
+  const keep = Array.isArray(opts.attachments) ? opts.attachments : [];
+  const skipped = Array.isArray(opts.skippedAttachments) ? opts.skippedAttachments : [];
+  let count = 0;
+  const times = inboundMessageTimes(opts.sentAt, recvAt, opts.sentAtSource);
+  for (const file of keep) {
+    count++;
+    try {
+      const fid = await saveInboundFile(t, c.id, file);
+      c.msgs.push({ from: "them", text: "", media: file.kind, url: "/api/inbound-file/" + fid, fileName: file.name, mailAttachment: true, time: nowt(), ...times });
+    } catch (e) {
+      console.error("mail attachment save failed"); // 患者情報（ファイル名等）はログに出さない
+      c.msgs.push({ from: "them", text: "", media: "file", fileName: file.name + "（保存できませんでした。メールソフトで確認してください）", mailAttachment: true, time: nowt(), ...times });
+    }
+  }
+  for (const item of skipped) {
+    count++;
+    c.msgs.push({ from: "them", text: "", media: "file", fileName: skippedLabel(item), mailAttachment: true, time: nowt(), ...times });
+  }
+  return count;
+}
+// 添付の表示・再生（ログイン必須・同じ法人だけ。動画のために Range にも対応）
+app.get("/api/inbound-file/:id", guard, async (req, res) => {
+  let f = null;
+  try { f = await loadInboundFile(req.tenant, String(req.params.id || "")); } catch (e) { return res.status(500).end(); }
+  if (!f) return res.status(404).end();
+  const data = Buffer.isBuffer(f.data) ? f.data : Buffer.from(f.data || []);
+  const headers = inboundFileHeaders(f);
+  Object.keys(headers).forEach(k => res.set(k, headers[k]));
+  const range = req.headers.range ? parseRange(req.headers.range, data.length) : null;
+  if (req.headers.range && !range) { res.set("Content-Range", "bytes */" + data.length); return res.status(416).end(); }
+  if (range) {
+    res.status(206).set("Content-Range", "bytes " + range.start + "-" + range.end + "/" + data.length);
+    return res.send(data.subarray(range.start, range.end + 1));
+  }
+  res.send(data);
+});
 async function handleInbound(t, opts) {
   return aiUsageContext.run({ entries: [] }, () => handleInboundCore(t, opts));
 }
@@ -2637,6 +2697,8 @@ async function handleInboundCore(t, opts) {
   if (opts.acct) c.acct = opts.acct; // どの連携アカウント（LINEチャネル/メールアドレス）経由か
   const med = ["image", "video", "file", "audio"].includes(opts.media) ? opts.media : null;
   preserveTopicBoundary(c);
+  // メールの添付は本文より先に並べる（AIへ渡す「最新の患者の文」が本文になるように）
+  const mailAttachmentCount = await pushInboundMailAttachments(t, c, opts, recvAt);
   c.msgs.push({ from: "them", text: opts.text || "", media: med, mediaId: med ? (opts.mediaId || null) : null, fileName: med === "file" ? (opts.fileName || "ファイル") : undefined, time: nowt(), ...inboundMessageTimes(opts.sentAt, recvAt, opts.sentAtSource) });
   statBump(t, "in");
   if (opts.subject) c.subject = String(opts.subject).slice(0, 300);
@@ -2708,7 +2770,7 @@ async function handleInboundCore(t, opts) {
     const conf = String(confidence || "").toLowerCase();
     const confOk = conf === "high" || (S(t).level === "medium" && conf === "medium");
     const grounded = !!(c.grounding && c.grounding.autoSendAllowed && c.validation && c.validation.pass);
-    const safe = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med && grounded;
+    const safe = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med && !mailAttachmentCount && grounded; // 添付つきメールはAIが中身を見られないため自動送信しない
     if (!baDone && S(t).autoReply && !staffLineReviewAll(t) && confOk && safe && c.draft && c.draft.trim()) {
       const draftText = c.draft.trim();
       const delayMin = Number(S(t).autoDelayMin || 0);
@@ -2726,7 +2788,7 @@ async function handleInboundCore(t, opts) {
   const confForStaffLine = String(confidence || "").toLowerCase();
   const confOkForStaffLine = confForStaffLine === "high" || (S(t).level === "medium" && confForStaffLine === "medium");
   const groundedForStaffLine = !!(c.grounding && c.grounding.autoSendAllowed && c.validation && c.validation.pass);
-  const safeForStaffLine = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med && groundedForStaffLine;
+  const safeForStaffLine = String(needsHuman) !== "true" && String(urgent) !== "true" && !c.flag && !med && !mailAttachmentCount && groundedForStaffLine;
   const exceptionNeedsReview = S(t).autoReply && S(t).staffLineEnabled && S(t).staffLineReplyMode === "exceptions" && !baDone && c.draft && c.draft.trim() && (!confOkForStaffLine || !safeForStaffLine);
   if (staffLineReviewAll(t) && !baDone && c.draft && c.draft.trim() && c.bookingSuggestion && c.bookingSuggestion.status !== "executed") {
     staffLineEscalate(t, c, "予約操作の提案があります。右腕くんの画面で予約を確認・実行してから返信してください").catch(() => {});
@@ -3123,7 +3185,8 @@ async function pollAll() {
               if (!email || ownAddrs.includes(email)) continue;
               if (/no-?reply|mailer-daemon|postmaster/i.test(email)) continue;
               const text = String(parsed.text || parsed.subject || "").replace(/\r/g, "").slice(0, 8000);
-              await handleInbound(t, { channel: "mail", uid: email, name: fromV.name || email, text, subject: parsed.subject || "", sentAt: parsed.date ? mdate : undefined, sentAtSource: "mail_header", acct: { type: "mail", key: acc.smtpUser, name: acc.name } });
+              const mailFiles = selectMailAttachments(parsed.attachments);
+              await handleInbound(t, { channel: "mail", uid: email, name: fromV.name || email, text, subject: parsed.subject || "", attachments: mailFiles.keep, skippedAttachments: mailFiles.skipped, sentAt: parsed.date ? mdate : undefined, sentAtSource: "mail_header", acct: { type: "mail", key: acc.smtpUser, name: acc.name } });
             } catch (e) { console.error("mail parse:", e.message); }
           }
           // フェッチ完了後にまとめて既読化（ループ中は効かないため）
@@ -5821,6 +5884,16 @@ app.get("/board", (req, res) => { res.set("Content-Type", "text/html; charset=ut
 if (process.env.NODE_ENV === "test") {
   app.get("/__test/async-error", async () => { throw new Error("private-test-stack-marker"); });
 }
+// テスト専用: IMAPを使わずに「添付つきメールの受信」を再現する（Railwayなどの本番・staging実行環境では登録しない）
+if (process.env.NODE_ENV === "test" && !isManagedRuntime()) {
+  app.post("/__test/mail-inbound", guard, async (req, res) => {
+    const b = req.body || {};
+    const raw = (Array.isArray(b.attachments) ? b.attachments : []).map(a => ({ filename: a.filename, contentType: a.contentType, related: !!a.related, content: Buffer.from(String(a.base64 || ""), "base64") }));
+    const files = selectMailAttachments(raw);
+    const r = await handleInbound(req.tenant, { channel: "mail", uid: String(b.email || "test@example.test").toLowerCase(), name: b.name || "テスト患者", text: String(b.text || ""), subject: String(b.subject || ""), attachments: files.keep, skippedAttachments: files.skipped });
+    res.json({ ok: true, ...r, kept: files.keep.length, skipped: files.skipped.length });
+  });
+}
 app.use((err, req, res, next) => {
   console.error("request failed:", req.method, req.path, err && err.message ? err.message : "unknown");
   if (res.headersSent) return next(err);
@@ -6158,6 +6231,8 @@ const PAGE = `<!DOCTYPE html>
   #draft{flex:1;min-height:110px;max-height:300px;border:1px solid #d1d5db;border-radius:10px;padding:9px 11px;font-size:13px;line-height:1.5;font-family:inherit;resize:vertical;transition:min-height .15s ease;}
   #pendingAttachments{display:flex;gap:7px;overflow-x:auto;margin:0 0 7px;padding-bottom:2px;}
   .pendingAttachment{position:relative;display:flex;align-items:center;gap:7px;min-width:0;max-width:220px;padding:6px 28px 6px 7px;border:1px solid #bbf7d0;border-radius:9px;background:#f0fdf4;font-size:11px;color:#166534;}
+  .mailAttachName{font-size:11px;color:#6b7280;margin-top:3px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .mailAttachName a{color:inherit;}
   .pendingAttachment img{width:34px;height:34px;object-fit:cover;border-radius:6px;background:#fff;}
   .pendingAttachment .pendingFileIcon{width:34px;height:34px;display:flex;align-items:center;justify-content:center;border-radius:6px;background:#fff;font-size:18px;}
   .pendingAttachment .pendingName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
@@ -6806,7 +6881,9 @@ function renderList(){
   });
 }
 function esc(s){return String(s||"").replace(/[<>&"']/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;",'"':"&quot;","'":"&#39;"}[c])).replace(/\x60/g,"&#96;");}
-function mediaHtml(m){ var cls='b '+(m.from==="them"?"them":"us"); var raw=m.mediaId?('/api/line-media/'+String(m.mediaId).replace(/[^0-9a-zA-Z_-]/g,"")):(m.url||"https://placehold.co/300x220/e5e7eb/6b7280?text=%F0%9F%93%B7"),src=esc(safeMediaUrl(raw)); if(!src)return ''; if(m.media==="image")return '<div class="'+cls+' media"><a href="'+src+'" target="_blank" rel="noopener noreferrer"><img class="ph" src="'+src+'"></a></div>'; if(m.media==="video")return (m.mediaId||m.url)?('<div class="'+cls+' media"><video class="ph" style="max-width:220px;border-radius:10px;" controls preload="metadata" src="'+src+'"></video></div>'):('<div class="'+cls+' media"><div class="vid">▶<span>動画</span></div></div>'); if(m.media==="file")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">📄 '+esc(m.fileName||"ファイル")+'</a></div>'; if(m.media==="audio")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">🎤 音声メッセージ</a></div>'; return ''; }
+function mediaHtml(m){ var cls='b '+(m.from==="them"?"them":"us"); if(m.mailAttachment&&!m.url)return '<div class="'+cls+'"><span style="color:#6b7280;">📎 '+esc(m.fileName||"添付ファイル")+'</span></div>'; var raw=m.mediaId?('/api/line-media/'+String(m.mediaId).replace(/[^0-9a-zA-Z_-]/g,"")):(m.url||"https://placehold.co/300x220/e5e7eb/6b7280?text=%F0%9F%93%B7"),src=esc(safeMediaUrl(raw)); if(!src)return ''; if(m.media==="image")return '<div class="'+cls+' media"><a href="'+src+'" target="_blank" rel="noopener noreferrer"><img class="ph" src="'+src+'" alt="'+esc(m.fileName||"画像")+'" onerror="mediaImgFallback(this)"></a>'+(m.mailAttachment?'<div class="mailAttachName">📎 '+esc(m.fileName||"画像")+'</div>':'')+'</div>'; if(m.mailAttachment&&m.media==="video")return '<div class="'+cls+' media"><video class="ph" style="max-width:260px;border-radius:10px;" controls preload="metadata" src="'+src+'"></video><div class="mailAttachName"><a href="'+src+'" target="_blank" rel="noopener noreferrer">📎 '+esc(m.fileName||"動画")+'</a></div></div>'; if(m.media==="video")return (m.mediaId||m.url)?('<div class="'+cls+' media"><video class="ph" style="max-width:220px;border-radius:10px;" controls preload="metadata" src="'+src+'"></video></div>'):('<div class="'+cls+' media"><div class="vid">▶<span>動画</span></div></div>'); if(m.media==="file")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">📄 '+esc(m.fileName||"ファイル")+'</a></div>'; if(m.media==="audio")return '<div class="'+cls+'"><a href="'+src+'" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">🎤 音声メッセージ</a></div>'; return ''; }
+// iPhoneのHEICなど、ブラウザで表示できない画像は「開く」リンクに置き換える
+function mediaImgFallback(img){try{var a=img.parentNode;if(!a||a.getAttribute("data-fallback"))return;a.setAttribute("data-fallback","1");img.remove();var span=document.createElement("span");span.textContent="📷 画像を開く（この形式はプレビューできません）";span.style.cssText="display:inline-block;padding:10px 12px;font-size:13px;";a.appendChild(span);}catch(e){}}
 // 会話本文の日時は日本時間で統一。会話全体の更新時刻から古いメッセージの日付を推測しない。
 const messageDateFormatter=new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Tokyo",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hourCycle:"h23"});
 function messageDateParts(timestamp){const parts={};messageDateFormatter.formatToParts(new Date(timestamp)).forEach(p=>{parts[p.type]=p.value;});return parts;}

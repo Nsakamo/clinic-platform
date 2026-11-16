@@ -125,7 +125,7 @@ test("テスト：自動で実行しないキャンセル・変更は、提案�
   for (const k of cases) {
     let executed = 0, delivered = 0, approvals = 0, notices = 0;
     const context = {
-      ...decision, preserveTopicBoundary, cancelAutoReply: () => {}, colorFor: () => "", nowt: () => "テスト", statBump: () => {}, lastText: () => "テスト", dbSave: () => {},
+      ...decision, preserveTopicBoundary, pushInboundMailAttachments: async () => 0, cancelAutoReply: () => {}, colorFor: () => "", nowt: () => "テスト", statBump: () => {}, lastText: () => "テスト", dbSave: () => {},
       normalizeStaffBookingAction: helpers.normalizeStaffBookingAction, bookingSuggestionFromDraft: helpers.bookingSuggestionFromDraft,
       baEnabled: () => k.mode !== "off", staffLineReviewAll: () => k.mode === "staffReview", staffBookingSuggestEnabled: () => true,
       PARTNER_KEY: "テスト", baHandlePending: async () => false, enrichStaffLineBookingPreview: async (_t, _c, g) => g,
