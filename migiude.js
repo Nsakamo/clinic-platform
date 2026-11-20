@@ -4239,7 +4239,14 @@ app.post("/api/customer-karte", guard, oneMutationAtATime("customer-karte", req 
   if (!c) return res.json({ ok: false, error: "no" });
   const action = req.body.action;
   let r;
-  if (action === "add") r = await partnerPost("/karte", { slug: t.slug, patientId: req.body.patientId, body: req.body.body });
+  if (action === "add") {
+    // kind: note=顧客備考（省略時・従来どおり）/ treatment=施術記録。それ以外は送らない。
+    const kind = req.body.kind == null ? "note" : String(req.body.kind);
+    if (kind !== "note" && kind !== "treatment") return res.status(400).json({ ok: false, error: "bad_kind" });
+    r = await partnerPost("/karte", { slug: t.slug, patientId: req.body.patientId, body: req.body.body, kind });
+    // 旧版のうけつけるんは kind を無視して顧客備考で保存するため、返り値の kind で確かめる（施術記録のつもりが備考になるのを防ぐ）
+    if (kind === "treatment" && r.json && r.json.ok && r.json.kind !== "treatment") return res.json({ ok: false, error: "kind_unsupported", kind_unsupported: true, savedAs: "note", id: r.json.id });
+  }
   else if (action === "edit") r = await partnerReq("PUT", "/karte", { slug: t.slug, recordId: req.body.recordId, body: req.body.body });
   else return res.json({ ok: false, error: "bad_action" });
   if (!r.json) return res.json({ ok: false });
@@ -6308,6 +6315,10 @@ const PAGE = `<!DOCTYPE html>
   .snipRow{display:flex;gap:6px;overflow-x:auto;padding:2px 0 6px;-webkit-overflow-scrolling:touch;}
   .snipChip{flex:0 0 auto;white-space:nowrap;border:1px solid #d1d5db;background:#f9fafb;color:#374151;border-radius:999px;padding:3px 10px;font-size:11px;cursor:pointer;}
   .snipChip:hover{background:#f3f4f6;}
+  .kKindRow{display:flex;align-items:center;gap:6px;padding:0 0 6px;font-size:12px;color:#4b5563;}
+  .kKind{border:1px solid #d1d5db;background:#fff;color:#374151;border-radius:999px;padding:4px 14px;font-size:12px;cursor:pointer;min-height:36px;}
+  .kKind[aria-pressed="true"]{background:#e6f5f1;border-color:#0f766e;color:#0f766e;font-weight:600;}
+  .kKind.kKindNote[aria-pressed="true"]{background:#f5f0fb;border-color:#6b21a8;color:#6b21a8;}
   @media(min-width:900px){ .karteCard{left:50%;right:auto;transform:translateX(-50%);width:700px;max-width:92%;} }
   #msgs{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px;}
   .b{max-width:74%;padding:9px 12px;border-radius:14px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word;}
@@ -7041,7 +7052,7 @@ function openChat(id,keep){if((window.__dBusy||window.__voiceBusy)&&current&&cur
 }
 function closeChat(){hideDraftChatForConversationSwitch();appEl.classList.remove("chatopen");current=null;renderList();}
 // ===== うけつけるん 顧客情報パネル =====
-var custPid=null; var karteEntries={};
+var custPid=null; var karteEntries={}; var karteKind="note"; var karteKindConv=null; // クイック追加の種類（note=顧客備考 / treatment=施術記録）と、その種類を選んだ会話
 var custCache={}; var karteCache={}; // 会話ごとのコンテキスト/カルテのメモリキャッシュ（体感1秒以下）
 function kIsPC(){ return window.matchMedia("(min-width: 900px)").matches; }
 function copyText(s){ try{ navigator.clipboard.writeText(s); }catch(e){} }
@@ -7294,6 +7305,8 @@ function openKarte(){
     ov.onclick=function(e){ if(e.target===ov){ closeKarte(); return; } karteClick(e); }; }
   ov.style.display="block";
   var convId=current;
+  // 別の会話（患者）を開いたら、追加する記録の種類は既定（顧客備考）に戻す（取り違え防止）
+  if(karteKindConv!==convId){ karteKind="note"; karteKindConv=convId; }
   var cached=karteCache[convId];
   if(cached){ ov.innerHTML=karteHtml(cached,kIsPC()); } // キャッシュあり=即描画
   else { ov.innerHTML=karteLoadingCard("読み込み中…"); }
@@ -7335,6 +7348,7 @@ function karteHtml(j,isPC){
   var entries=(j.entries)||[];
   var snips=(j.snippets)||[];
   window.karteSnips=snips;
+  window.karteVars=(j.vars&&typeof j.vars==="object")?j.vars:{}; // 定型文の差し込み値（うけつけるんが返す。連携できない値は空）
   var body='';
   if(!j.found){ body='<span class="cpMuted">カルテを取得できませんでした</span>'; }
   else if(!entries.length){ body='<span class="cpMuted">記録がありません</span>'; }
@@ -7356,7 +7370,26 @@ function karteHtml(j,isPC){
   }
   return '<div class="karteCard"><div class="karteHd">🗂 カルテクイック — '+name+'<button class="kClose" data-cp="karteclose">✕</button></div>'+
     '<div class="karteBody">'+body+'</div>'+
-    '<div class="karteFoot">'+snipRowHtml(snips,"add")+'<textarea id="karteAddText" placeholder="クイック追加（カルテにメモを追加）"></textarea><div class="cpBtnRow"><button class="cpBtn cpKarte" data-cp="karteadd">カルテに保存</button></div></div></div>';
+    '<div class="karteFoot">'+karteKindRowHtml()+snipRowHtml(snips,"add")+'<textarea id="karteAddText" placeholder="'+karteAddPlaceholder()+'"></textarea><div class="cpBtnRow"><button class="cpBtn cpKarte" data-cp="karteadd">'+karteAddLabel()+'</button></div></div></div>';
+}
+function karteKindRowHtml(){
+  return '<div class="kKindRow" role="group" aria-label="追加する記録の種類">追加する記録：'+
+    '<button type="button" class="kKind kKindNote" data-cp="kartekind" data-val="note" aria-pressed="'+(karteKind==="note"?"true":"false")+'">顧客備考</button>'+
+    '<button type="button" class="kKind kKindTreat" data-cp="kartekind" data-val="treatment" aria-pressed="'+(karteKind==="treatment"?"true":"false")+'">施術記録</button></div>';
+}
+function karteAddPlaceholder(){ return karteKind==="treatment"?"施術記録を追加（予約に紐づけない下書きとして保存）":"顧客備考を追加（来院以外のメモ・注意事項など）"; }
+function karteAddLabel(){ return karteKind==="treatment"?"施術記録として保存":"顧客備考として保存"; }
+function karteSetKind(kind,btn){
+  karteKind=(kind==="treatment")?"treatment":"note";
+  var row=btn&&btn.closest?btn.closest(".karteFoot"):null; if(!row)return;
+  Array.prototype.forEach.call(row.querySelectorAll(".kKind"),function(b){ b.setAttribute("aria-pressed",b.getAttribute("data-val")===karteKind?"true":"false"); });
+  var ta=document.getElementById("karteAddText"); if(ta) ta.setAttribute("placeholder",karteAddPlaceholder());
+  var save=row.querySelector('[data-cp="karteadd"]'); if(save) save.textContent=karteAddLabel();
+}
+// 定型文の {{date}} などを、うけつけるんが返した値で置き換える。連携できない値・知らない変数は空欄にしてスタッフが書き足す。
+function karteRenderVars(text){
+  var vars=window.karteVars||{};
+  return String(text||"").replace(/\\{\\{\\s*(\\w+)\\s*\\}\\}/g,function(_,k){ var v=Object.prototype.hasOwnProperty.call(vars,k)?vars[k]:null; return (v==null)?"":String(v); });
 }
 function karteEditStart(i,recordId){
   var inner=document.getElementById("kInner_"+i); if(!inner)return;
@@ -7381,7 +7414,7 @@ function snipInsert(bodyStr,tgt,btn){
   if(!ta)return;
   var cur=ta.value||"";
   if(cur&&cur.charAt(cur.length-1)!==String.fromCharCode(10)) cur=cur+String.fromCharCode(10);
-  ta.value=cur+bodyStr; ta.focus();
+  ta.value=cur+karteRenderVars(bodyStr); ta.focus();
 }
 function karteExpand(i){
   var f=document.getElementById("keFull_"+i); if(!f)return;
@@ -7410,16 +7443,19 @@ function karteClick(e){
   else if(act==="karteeditstart") karteEditStart(b.getAttribute("data-i"),val);
   else if(act==="karteeditcancel") karteEditCancel(b.getAttribute("data-i"),val);
   else if(act==="snipins") snipInsert(val,decodeURIComponent(b.getAttribute("data-tgt")||""),b);
+  else if(act==="kartekind") karteSetKind(val,b);
 }
 function closeKarte(){ var ov=document.getElementById("karteOv"); if(ov) ov.style.display="none"; }
 async function karteAdd(btn){
   var ta=document.getElementById("karteAddText"); if(!ta||!current)return;
   var body=(ta.value||"").trim(); if(!body)return;
   await withBusy("karte-add-"+current,btn,"保存中…",async()=>{try{
-    var r=await api("/api/customer-karte",{id:current,action:"add",patientId:custPid,body:body});
+    var kind=karteKind;
+    var r=await api("/api/customer-karte",{id:current,action:"add",patientId:custPid,body:body,kind:kind});
     var j=await r.json();
     if(j&&j.ok){ delete karteCache[current]; reloadKarte(); } // 保存成功→キャッシュ無効化→再取得
-    else { uiAlert("カルテの保存に失敗しました"); }
+    else if(j&&j.kind_unsupported){ delete karteCache[current]; reloadKarte(); uiAlert("うけつけるんが施術記録の追加にまだ対応していないため、顧客備考として保存されました。施術記録にする場合はうけつけるんで種類を変更してください"); }
+    else { uiAlert(kind==="treatment"?"施術記録の保存に失敗しました":"顧客備考の保存に失敗しました"); }
   }catch(e){ uiAlert("カルテの保存に失敗しました"); }});
 }
 async function karteEdit(recordId){
