@@ -6316,7 +6316,7 @@ const PAGE = `<!DOCTYPE html>
   .snipChip{flex:0 0 auto;white-space:nowrap;border:1px solid #d1d5db;background:#f9fafb;color:#374151;border-radius:999px;padding:3px 10px;font-size:11px;cursor:pointer;}
   .snipChip:hover{background:#f3f4f6;}
   .kKindRow{display:flex;align-items:center;gap:6px;padding:0 0 6px;font-size:12px;color:#4b5563;}
-  .kKind{border:1px solid #d1d5db;background:#fff;color:#374151;border-radius:999px;padding:3px 12px;font-size:12px;cursor:pointer;min-height:28px;}
+  .kKind{border:1px solid #d1d5db;background:#fff;color:#374151;border-radius:999px;padding:4px 14px;font-size:12px;cursor:pointer;min-height:36px;}
   .kKind[aria-pressed="true"]{background:#e6f5f1;border-color:#0f766e;color:#0f766e;font-weight:600;}
   .kKind.kKindNote[aria-pressed="true"]{background:#f5f0fb;border-color:#6b21a8;color:#6b21a8;}
   @media(min-width:900px){ .karteCard{left:50%;right:auto;transform:translateX(-50%);width:700px;max-width:92%;} }
@@ -7052,7 +7052,7 @@ function openChat(id,keep){if((window.__dBusy||window.__voiceBusy)&&current&&cur
 }
 function closeChat(){hideDraftChatForConversationSwitch();appEl.classList.remove("chatopen");current=null;renderList();}
 // ===== うけつけるん 顧客情報パネル =====
-var custPid=null; var karteEntries={}; var karteKind="note"; // クイック追加の種類（note=顧客備考 / treatment=施術記録）
+var custPid=null; var karteEntries={}; var karteKind="note"; var karteKindConv=null; // クイック追加の種類（note=顧客備考 / treatment=施術記録）と、その種類を選んだ会話
 var custCache={}; var karteCache={}; // 会話ごとのコンテキスト/カルテのメモリキャッシュ（体感1秒以下）
 function kIsPC(){ return window.matchMedia("(min-width: 900px)").matches; }
 function copyText(s){ try{ navigator.clipboard.writeText(s); }catch(e){} }
@@ -7305,6 +7305,8 @@ function openKarte(){
     ov.onclick=function(e){ if(e.target===ov){ closeKarte(); return; } karteClick(e); }; }
   ov.style.display="block";
   var convId=current;
+  // 別の会話（患者）を開いたら、追加する記録の種類は既定（顧客備考）に戻す（取り違え防止）
+  if(karteKindConv!==convId){ karteKind="note"; karteKindConv=convId; }
   var cached=karteCache[convId];
   if(cached){ ov.innerHTML=karteHtml(cached,kIsPC()); } // キャッシュあり=即描画
   else { ov.innerHTML=karteLoadingCard("読み込み中…"); }
@@ -7387,7 +7389,7 @@ function karteSetKind(kind,btn){
 // 定型文の {{date}} などを、うけつけるんが返した値で置き換える。連携できない値・知らない変数は空欄にしてスタッフが書き足す。
 function karteRenderVars(text){
   var vars=window.karteVars||{};
-  return String(text||"").replace(/\\{\\{\\s*(\\w+)\\s*\\}\\}/g,function(_,k){ var v=vars[k]; return (v==null)?"":String(v); });
+  return String(text||"").replace(/\\{\\{\\s*(\\w+)\\s*\\}\\}/g,function(_,k){ var v=Object.prototype.hasOwnProperty.call(vars,k)?vars[k]:null; return (v==null)?"":String(v); });
 }
 function karteEditStart(i,recordId){
   var inner=document.getElementById("kInner_"+i); if(!inner)return;
