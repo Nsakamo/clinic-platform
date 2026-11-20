@@ -34,6 +34,7 @@ test("テスト：定型文の変数は値で置き換え、スタッフ名な�
   ctx.window.karteVars = {}; // 旧版のうけつけるん（vars なし）でも {{…}} は残さない
   assert.equal(ctx.karteRenderVars("{{date}}：メモ"), "：メモ");
   assert.equal(ctx.karteRenderVars("{date} と $1 はそのまま"), "{date} と $1 はそのまま");
+  assert.equal(ctx.karteRenderVars("{{constructor}}{{toString}}{{__proto__}}"), ""); // 組み込みの名前も空欄
 });
 
 test("テスト：定型文を押すと、変数を置き換えた本文が入力欄に入る（追加・編集どちらも）", () => {
@@ -122,4 +123,18 @@ test("テスト：施術記録のつもりで旧版のうけつけるんが顧�
   assert.deepEqual(out, { ok: false, error: "kind_unsupported", kind_unsupported: true, savedAs: "note", id: "r9" });
   const noteOld = karteRoute({ json: { ok: true, id: "r10" } });
   assert.deepEqual((await noteOld.run({ kind: "note" })).out, { ok: true, id: "r10" }); // 顧客備考なら従来どおり成功
+});
+
+test("テスト：別の会話（患者）でカルテクイックを開くと、追加する記録の種類は顧客備考に戻る", () => {
+  const ov = { style: {}, innerHTML: "" };
+  const ctx = karteContext({ document: { getElementById: id => (id === "chat" ? {} : id === "karteOv" ? ov : null) }, karteCache: {}, kIsPC: () => true, karteLoad() {}, karteLoadingCard: () => "" });
+  vm.runInContext("var karteKindConv=null; var current='c1'; var karteCache={};", ctx);
+  vm.runInContext(slice("function openKarte(", "function reloadKarte("), ctx);
+  ctx.openKarte();
+  vm.runInContext("karteKind='treatment';", ctx);
+  ctx.openKarte(); // 同じ会話では選んだまま
+  assert.equal(vm.runInContext("karteKind", ctx), "treatment");
+  vm.runInContext("current='c2';", ctx);
+  ctx.openKarte();
+  assert.equal(vm.runInContext("karteKind", ctx), "note");
 });
