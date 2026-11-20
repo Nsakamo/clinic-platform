@@ -45,6 +45,10 @@ API を変える／足すときは、まず正本を更新し、右腕くん（`
 - `POST /api/partner/appointment-cancel` … 顧客情報パネルからのスタッフ取消。画面で最終確認後、
   `channel + userId (+ mail時phone) + confirmed:true` を渡し、うけつけるん側で会話相手と予約患者を再照合する。
 
+- `GET/POST/PUT /api/partner/karte` … カルテクイック。GETの `vars`（日付・患者名・カナ・患者番号・当日予約のメニュー名、スタッフ名は常に空）で
+  定型文の `{{…}}` を挿入時に置き換え、値の無い変数は空欄にする。POSTは `kind`（`note`=顧客備考・省略時／`treatment`=施術記録）を送り、
+  旧版のうけつけるんが `kind` を返さず顧客備考で保存した場合はスタッフへその旨を知らせる（2026-11-20）。
+
 詳細な各リクエスト/レスポンス形は正本（うけつけるん `docs/19`）を参照。
 
 stagingのうけつけるんがVercel Deployment Protection下にある場合は、Railway stagingだけに
