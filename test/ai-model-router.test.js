@@ -92,3 +92,8 @@ test("GPT-6.1 Sol snapshot IDs registered for rollout also avoid the unsupported
   assert.equal(routes.draft.reasoningEffort, "low");
   assert.equal(normalizeAiRoutes({ draft: { model: "gpt-6.1-solar", reasoningEffort: "none" } }, ["gpt-6.1-solar"]).draft.reasoningEffort, "none");
 });
+
+test("GPT-6.2 Sol のスナップショットIDも none を受け付けない制約を受け、プロトタイプの名前は既定値に戻る", () => {
+  assert.equal(normalizeAiRoutes({ draft: { model: "gpt-6.2-sol-2026-11-17", reasoningEffort: "none" } }, ["gpt-6.2-sol-2026-11-17"]).draft.reasoningEffort, "low");
+  for (const name of ["constructor", "__proto__", "toString"]) assert.equal(normalizeAiRoutes({ draft: { model: name } }).draft.model, "gpt-6-luna");
+});

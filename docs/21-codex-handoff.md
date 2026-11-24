@@ -1,5 +1,13 @@
 # Codex → Claude 引き継ぎ（右腕くん）
 
+## Claude追加: GPT-6.1 Sol を GPT-6.2 Sol へ置き換え（2026-11-24）
+
+- ユーザー指示: 「右腕くんのAI、今GPT-6.1だと思うから6.2のSolに変えておいて」。
+- `lib/ai-model-router.js`: MODEL_CATALOG の `gpt-6.1-sol` を `gpt-6.2-sol` に置き換え。保存済みの aiRoutes にある `gpt-6.1-sol` は役割・推論の強さを保って `gpt-6.2-sol` へ移す（REPLACED_MODELS、冪等）。6.2 Sol も OpenAI 公式で reasoning_effort `none` を拒否するため `low` に寄せる（スナップショットIDも同様）。既定値（TASK_DEFAULTS）は変えない（学習・監査・予約は GPT-6 Sol、分類等は Luna のまま）。
+- `OPENAI_EXTRA_MODELS` に `gpt-6.1-sol` が入っていると移行されない。本番反映前に Railway の値を確認すること。コードを b6b085b 以前へ戻す場合は、先に `OPENAI_EXTRA_MODELS` に `gpt-6.2-sol` を入れる（入れないと6.2を選んだ役割が Luna に落ちて保存される）。
+- テスト338→339件、構文・差分・check-source 合格。
+- 独立Claude Opus 5.5監査 r1（e194217）: PASS（P0/P1/P2=0・P3 5）。P3対応: 引き継ぎ記録、プロトタイプの名前を引かない判定、6.2のスナップショットIDのテスト、コメントの用途の書き直し。残P3: checkNewerModel・/api/model-shadow-preview の6.2回帰テスト。設定画面で保存すると推論の強さが既定へ戻るのは以前からの挙動。
+
 ## Claude追加: カルテクイックの定型文の変数と、顧客備考／施術記録の選択（2026-11-20）
 
 - ユーザー依頼: カルテクイックの定型文を入れると `{{date}}` などの変数のまま入る。連携できない部分（スタッフ名など）は空白にして入力できるようにしたい。患者備考を作りたくても選択肢が無い。テストもしっかり。
