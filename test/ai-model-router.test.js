@@ -52,19 +52,38 @@ test("booking keeps critical reasoning while style review uses low effort by def
   assert.equal(resolveAiRoute({ aiRoutes: { finalize: { model: "gpt-6-luna", reasoningEffort: "low" } } }, "finalize").model, "gpt-6-luna");
 });
 
-test("GPT-6.1 Sol can be chosen per role and never receives an unsupported reasoning effort", () => {
-  const routes = normalizeAiRoutes({ draft: { model: "gpt-6.1-sol", reasoningEffort: "medium" }, chat: { model: "gpt-6.1-sol", reasoningEffort: "none" }, critical: { model: "gpt-6.1-sol", reasoningEffort: "high" } });
-  assert.equal(routes.draft.model, "gpt-6.1-sol");
+test("GPT-6.2 Sol can be chosen per role and never receives an unsupported reasoning effort", () => {
+  const routes = normalizeAiRoutes({ draft: { model: "gpt-6.2-sol", reasoningEffort: "medium" }, chat: { model: "gpt-6.2-sol", reasoningEffort: "none" }, critical: { model: "gpt-6.2-sol", reasoningEffort: "high" } });
+  assert.equal(routes.draft.model, "gpt-6.2-sol");
   assert.equal(routes.draft.reasoningEffort, "medium");
-  assert.equal(routes.chat.model, "gpt-6.1-sol");
+  assert.equal(routes.chat.model, "gpt-6.2-sol");
   assert.equal(routes.chat.reasoningEffort, "low");
   assert.equal(routes.critical.reasoningEffort, "high");
   assert.equal(routes.classify.model, "gpt-6-luna");
-  assert.equal(resolveAiRoute({}, "draft", { override: { model: "gpt-6.1-sol", reasoningEffort: "none" } }).reasoningEffort, "low");
+  assert.equal(resolveAiRoute({}, "draft", { override: { model: "gpt-6.2-sol", reasoningEffort: "none" } }).reasoningEffort, "low");
   assert.equal(normalizeAiRoutes({ draft: { model: "gpt-6-sol", reasoningEffort: "none" } }).draft.reasoningEffort, "none");
   const catalog = publicModelCatalog();
-  assert.ok(catalog.some(item => item.id === "gpt-6.1-sol" && item.label === "GPT-6.1 Sol"));
-  assert.equal(publicModelCatalog(["gpt-6.1-sol"]).filter(item => item.id === "gpt-6.1-sol").length, 1);
+  assert.ok(catalog.some(item => item.id === "gpt-6.2-sol" && item.label === "GPT-6.2 Sol"));
+  assert.ok(!catalog.some(item => item.id === "gpt-6.1-sol"));
+  assert.equal(publicModelCatalog(["gpt-6.2-sol"]).filter(item => item.id === "gpt-6.2-sol").length, 1);
+});
+
+test("保存済みの GPT-6.1 Sol は役割・推論の強さを保ったまま GPT-6.2 Sol へ移る", () => {
+  const routes = normalizeAiRoutes({ draft: { model: "gpt-6.1-sol", reasoningEffort: "medium" }, chat: { model: "gpt-6.1-sol", reasoningEffort: "none" }, finalize: { model: "gpt-6.1-sol", reasoningEffort: "low" }, classify: { model: "gpt-6-luna", reasoningEffort: "low" } });
+  assert.equal(routes.draft.model, "gpt-6.2-sol");
+  assert.equal(routes.draft.reasoningEffort, "medium");
+  assert.equal(routes.chat.model, "gpt-6.2-sol");
+  assert.equal(routes.chat.reasoningEffort, "low");
+  assert.equal(routes.finalize.model, "gpt-6.2-sol");
+  assert.equal(routes.classify.model, "gpt-6-luna");
+  assert.equal(routes.learning.model, "gpt-6-sol");
+  // 旧設定で下書きだけ 6.1 Sol を選んでいた法人は、文体校正の引き継ぎも 6.2 Sol になる。
+  assert.equal(normalizeAiRoutes({ draft: { model: "gpt-6.1-sol" } }).finalize.model, "gpt-6.2-sol");
+  // 移行は保存済みの値を読むたびに冪等。
+  assert.deepEqual(normalizeAiRoutes(routes), routes);
+  // 運営が OPENAI_EXTRA_MODELS で 6.1 Sol を明示登録している間は、そのまま使える（切り戻し用）。
+  assert.equal(normalizeAiRoutes({ draft: { model: "gpt-6.1-sol", reasoningEffort: "none" } }, ["gpt-6.1-sol"]).draft.model, "gpt-6.1-sol");
+  assert.equal(normalizeAiRoutes({ draft: { model: "gpt-6.1-sol", reasoningEffort: "none" } }, ["gpt-6.1-sol"]).draft.reasoningEffort, "low");
 });
 
 test("GPT-6.1 Sol snapshot IDs registered for rollout also avoid the unsupported effort", () => {
@@ -72,4 +91,9 @@ test("GPT-6.1 Sol snapshot IDs registered for rollout also avoid the unsupported
   assert.equal(routes.draft.model, "GPT-6.1-sol-2026-10-01");
   assert.equal(routes.draft.reasoningEffort, "low");
   assert.equal(normalizeAiRoutes({ draft: { model: "gpt-6.1-solar", reasoningEffort: "none" } }, ["gpt-6.1-solar"]).draft.reasoningEffort, "none");
+});
+
+test("GPT-6.2 Sol のスナップショットIDも none を受け付けない制約を受け、プロトタイプの名前は既定値に戻る", () => {
+  assert.equal(normalizeAiRoutes({ draft: { model: "gpt-6.2-sol-2026-11-17", reasoningEffort: "none" } }, ["gpt-6.2-sol-2026-11-17"]).draft.reasoningEffort, "low");
+  for (const name of ["constructor", "__proto__", "toString"]) assert.equal(normalizeAiRoutes({ draft: { model: name } }).draft.model, "gpt-6-luna");
 });
