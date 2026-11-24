@@ -7,6 +7,7 @@
 - `OPENAI_EXTRA_MODELS` に `gpt-6.1-sol` が入っていると移行されない。本番反映前に Railway の値を確認すること。コードを b6b085b 以前へ戻す場合は、先に `OPENAI_EXTRA_MODELS` に `gpt-6.2-sol` を入れる（入れないと6.2を選んだ役割が Luna に落ちて保存される）。
 - テスト338→339件、構文・差分・check-source 合格。
 - 独立Claude Opus 5.5監査 r1（e194217）: PASS（P0/P1/P2=0・P3 5）。P3対応: 引き継ぎ記録、プロトタイプの名前を引かない判定、6.2のスナップショットIDのテスト、コメントの用途の書き直し。残P3: checkNewerModel・/api/model-shadow-preview の6.2回帰テスト。設定画面で保存すると推論の強さが既定へ戻るのは以前からの挙動。
+- 本番反映（2026-11-24、ユーザー指示「全部最後までやっておいて、許可するから本番への反映」）: staging #114 → main #116（release/gpt-6.2-sol-20261124、staging と同じ3ファイル。staging→main の #115 はマージ履歴の衝突で閉じた）。反映前に本番で読み取り確認: OpenAIキーで gpt-6.2-sol が一覧に出る（/api/model-check）、選択肢3件＝OPENAI_EXTRA_MODELS に 6.1 なし。反映後: health 200、HB CLINIC の下書き・相談が gpt-6.2-sol（推論 medium のまま）、選択肢に6.1なし、保存しない並行テスト（/api/model-shadow-preview）で6.2の下書き生成を確認（persisted:false・sent:false）。隔離stagingの実画面確認は Railway にログインできず未実施。
 
 ## Claude追加: カルテクイックの定型文の変数と、顧客備考／施術記録の選択（2026-11-20）
 
