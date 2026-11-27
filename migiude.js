@@ -4612,7 +4612,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
   // 相談チャットの照合・修正: スタッフが明示した対応は店舗ルールと違っても正しいものとして扱う（「ルールはこうだから」で指示を戻さない）
   const STAFF_FIRST_AUDIT = "【スタッフ指示を最優先する照合】スタッフが最新指示・相談で明示した対応（料金・免除・案内する内容・条件や規定を書かないこと・書き方）は、店舗ルールや通常の条件と違っていても正しいものとして扱う。『ルールの条件・料金・提出物が欠けている』『ルールと違う』という理由だけでpass:falseにしない。"
   + "pass:falseにするのは、(1)最新指示や未撤回の決定が反映されていない・逆の内容になっている、(2)日時・医院・金額などの取り違えや、指示にも根拠資料にもない新しい事実の追加（受診・救急・119番・悪化時の条件付き案内を、上の受診・救急の方針の（ア）〜（ウ）に当たらないのに加えることを含む。この時は \"escalation\":true も付ける）、(3)スタッフの指示にも店舗ルールにもない診断・治療判断をAIが独自に書く、上の受診・救急の方針の（ウ）に当たる（患者様の連絡に命に関わる緊急の症状がある）のに救急の案内が無い（この時は \"emergency_missing\":true も付ける）、本人確認・個人情報、未実施の予約操作を完了と書く、のいずれかだけ。スタッフが指示した症状の説明・経過の見込み・対処・安心していただく言葉は医院としての案内であり、(3)に当たらず、そのまま書かれていることを理由に不合格にしない（（ウ）に当たるのに救急の案内が無い時を除く。指示にない受診・救急の案内が加わっていれば(2)で不合格にする）。JSON には必ず \"safety\" を付け、(3)に当たる時は true、それ以外は false にする。";
-  const STAFF_FIRST_REPAIR = "照合の指摘のうち、最新指示の未反映・事実の取り違え・安全上の問題だけを直す。受診・救急の案内は、受診・救急の方針の（ア）〜（ウ）に当たらないものだけを削除し、当たるものは残す。スタッフが指示で外した条件・料金・規定や確認事項を戻さない。新しい推測は加えない。";
+  const STAFF_FIRST_REPAIR = "照合の指摘のうち、最新指示の未反映・事実の取り違え・安全上の問題だけを直す。受診・救急の案内は、受診・救急の方針の（ア）〜（ウ）に当たらないものだけを削除し、当たるものは残す。（ウ）に当たるのに救急の案内が無いと指摘された時は、スタッフの外す指示より優先して、スタッフの説明を保ったまま救急の案内を添える。スタッフが指示で外した条件・料金・規定や確認事項を戻さない。新しい推測は加えない。";
   if (p.consultation) return { text: "", error: "" };
   const instruction = String(p.latestInstruction || "").slice(0, 4000);
   const acknowledgementOnly = p.acknowledgementOnly === true || isAcknowledgementOnlyRequest(instruction);
@@ -4663,13 +4663,20 @@ async function reviewDraftChatCandidate(t, p, raw) {
       const result = JSON.parse(match ? match[0] : rawAudit);
       const casual = hasConversationalTone(candidate);
       // 受診・救急の手がかりを示した照合では escalation の真偽値が必須。無ければ照合済みとして扱わない（最初の案を採用しない）
+      const isTrue = v => v === true || v === "true";
       const hinted = !!escalationHint(candidate);
-      const flagged = result.safety === true || result.escalation === true || result.emergency_missing === true;
+      const reasonText = String(result.reason || "");
       const escalationUnchecked = hinted && typeof result.escalation !== "boolean";
-      return { pass: result.pass === true && !flagged && !escalationUnchecked && !mismatch && !casual, audited: typeof result.safety === "boolean" && !escalationUnchecked, mismatch: !!mismatch, safety: result.safety === true || result.emergency_missing === true, emergencyMissing: result.emergency_missing === true,
-        // escalation の真偽値が無い不合格で、理由が受診・救急に触れている時は escalation とみなす（最初の案を使わない安全側）
-        escalation: result.escalation === true || (typeof result.escalation !== "boolean" && result.pass !== true && /受診|救急|119|医療機関|病院/.test(String(result.reason || ""))), escalationCleared: hinted && result.escalation === false,
-        reason: mismatch || (casual ? "患者様向けの敬語になっていません" : escalationUnchecked ? "受診・救急の案内の確認結果を読み取れませんでした" : String(result.reason || "").slice(0, 200)) };
+      // 真偽値の無い不合格は、受診・救急らしい文がある案に限り理由から判断する（証明書・提出物の話は除く。「救急の案内が無い」は欠落として扱う）
+      const inferable = typeof result.escalation !== "boolean" && !isTrue(result.pass) && (hinted || escalationSentences(candidate).length > 0)
+        && !/証明|書類|免除|キャンセル料|診断書|受診日/.test(reasonText);
+      const inferredMissing = inferable && /(?:救急|119)[^。]{0,12}(?:無|な(?:い|く|し)|欠|足り)/.test(reasonText);
+      const emergencyMissing = isTrue(result.emergency_missing) || inferredMissing;
+      const escalation = isTrue(result.escalation) || (inferable && !inferredMissing && /受診|救急|119|医療機関|病院/.test(reasonText));
+      const flagged = isTrue(result.safety) || escalation || emergencyMissing;
+      return { pass: isTrue(result.pass) && !flagged && !escalationUnchecked && !mismatch && !casual, audited: typeof result.safety === "boolean" && !escalationUnchecked, mismatch: !!mismatch,
+        safety: isTrue(result.safety) || emergencyMissing, emergencyMissing, escalation, escalationCleared: hinted && result.escalation === false, unverified: escalationUnchecked,
+        reason: mismatch || (casual ? "患者様向けの敬語になっていません" : escalationUnchecked ? "受診・救急の案内の確認結果を読み取れませんでした" : reasonText.slice(0, 200)) };
     } catch (e) { return { pass: false, reason: "編集指示の照合結果を読み取れませんでした" }; }
   }
   let checked = await audit(text);
@@ -4701,8 +4708,10 @@ async function reviewDraftChatCandidate(t, p, raw) {
     // ただし最初の案が安全面・受診や救急の扱いで不合格、または照合自体ができなかった場合は、最初の案は返さない
     const firstUsable = String(firstText || "").trim() && !/@@\s*(?:REPLY|DRAFT|MEMORY|RULE|ACTION|META)\s*@@/.test(firstText)
       && !draftQualityIssues(firstText).some(issue => issue === "empty" || issue === "meta_text") && !hasConversationalTone(firstText);
-    const useFirst = staffFirst && firstUsable && firstChecked.audited === true && !firstChecked.safety && !firstChecked.mismatch && !firstChecked.escalation && !firstChecked.emergencyMissing;
-    // 最終の照合が、指示にない受診・救急の案内または安全面（医療判断・（ウ）の救急案内の欠落など）で不合格の案も表示しない
+    const useFirst = staffFirst && firstUsable && firstChecked.audited === true && !firstChecked.safety && !firstChecked.mismatch && !firstChecked.escalation && !firstChecked.emergencyMissing
+      // 最終の照合で（ウ）の欠落や指示にない受診・救急の案内が見つかった時は、最初の案にも同じ問題があり得るため使わない
+      && !checked.emergencyMissing && !(checked.escalation && escalationSentences(firstText).length > 0)
+      && !(p.escalationCheck === true && escalationSentences(firstText).length > 0 && !firstChecked.escalationCleared);
     // 受診・救急の扱い（指示にない案内・（ウ）の救急案内の欠落）で不合格の案は表示しない。他の safety は従来どおり確認ポイント付きで表示する
     const unsafeFirstUnchanged = (firstChecked.escalation || firstChecked.emergencyMissing) && String(text || "").trim() === String(firstText || "").trim();
     // 受診・救急らしい文が残る案は、照合AIが例外に当たると確認できた時（escalation:false）だけ表示する
@@ -4710,7 +4719,8 @@ async function reviewDraftChatCandidate(t, p, raw) {
     if (!useFirst && (checked.escalation || checked.emergencyMissing || unsafeFirstUnchanged || escalationUnverified)) {
       // 理由は固定の文にする（照合AIの理由文に患者名や内部記号が入ることがあるため）
       const missing = checked.emergencyMissing || (unsafeFirstUnchanged && firstChecked.emergencyMissing && !checked.escalation && !escalationUnverified);
-      const why = missing ? "患者様の連絡に命に関わる症状があるのに、救急の案内がありません" : "スタッフの指示にない受診・救急の案内が残りました";
+      const why = missing ? "患者様の連絡に命に関わる症状があるのに、救急の案内がありません"
+        : checked.escalation || unsafeFirstUnchanged ? "スタッフの指示にない受診・救急の案内が残りました" : "受診・救急の案内が残っていますが、指示どおりか確認できませんでした";
       return { text: "", error: "編集指示を正確に反映できませんでした（理由：" + why + "）。内容を短く言い換えて、もう一度お試しください。" };
     }
     const shown = useFirst ? firstText : text;
