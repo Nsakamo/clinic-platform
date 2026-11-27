@@ -84,9 +84,9 @@ test("テスト：最初の案が指示にない受診・救急の案内で不�
   const r2 = await h2.review({}, consult(), ADDED);
   assert.equal(r2.text, "");
   assert.match(r2.error, /編集指示を正確に反映できませんでした/);
-  // 理由の文に「受診・救急の案内」とあるだけでは escalation 扱いにしない（指示どおりの最初の案を使える）
-  const h3 = reviewer(['{"pass":false,"safety":false,"escalation":false,"reason":"受診・救急の案内は適切。お詫びが弱い"}', "テスト：別の案です。", '{"pass":false,"safety":false,"reason":"指示から離れた"}']);
-  assert.equal((await h3.review({}, consult(), ADDED)).text, ADDED);
+  // 理由が受診・救急に触れる不合格では、肯定の言い方でも最初の案は使わず、修正案を表示する（理由文の言い回しは解釈しない）
+  const h3 = reviewer(['{"pass":false,"safety":false,"escalation":false,"emergency_missing":false,"reason":"受診・救急の案内は適切。お詫びが弱い"}', "テスト：別の案です。", '{"pass":false,"safety":false,"escalation":false,"emergency_missing":false,"reason":"指示から離れた"}']);
+  assert.equal((await h3.review({}, consult(), ADDED)).text, "テスト：別の案です。");
 });
 
 test("テスト：受診・救急を足さない文には、店舗ルールの明記と命に関わる症状の例外を必ず付ける", () => {
@@ -148,7 +148,7 @@ test("テスト：修正後の案も指示にない受診・救急の案内や�
   const h11 = reviewer(['{"pass":false,"safety":true,"reason":"息苦しさがあるのに救急の案内が無い"}', null]);
   const r11 = await h11.review({}, consult({ lastQ: "テスト：息苦しいです" }), "テスト：一時的な炎症で大丈夫です。");
   assert.equal(r11.text, "");
-  assert.match(r11.error, /救急の案内がありません/);
+  assert.match(r11.error, /受診・救急の案内の扱いを確認できませんでした/); // 理由文の言い回しは解釈せず、中立の理由で止める
   // 理由が受診に触れる不合格で修正AIが応答しない時も、最初の案を表示しない
   const h12 = reviewer(['{"pass":false,"safety":false,"reason":"指示にない受診案内がある"}', null]);
   const r12 = await h12.review({}, consult(), "テスト：一時的な炎症です。様子を見ても治らなければ、ご相談を。");
@@ -160,31 +160,32 @@ test("テスト：修正後の案も指示にない受診・救急の案内や�
   const hA = reviewer(['{"pass":false,"safety":false,"escalation":true,"emergency_missing":false,"reason":"119番の案内はスタッフ指示になく不要"}', ADDED, '{"pass":false,"safety":false,"escalation":true,"emergency_missing":false,"reason":"119番の案内はスタッフ指示になく不要"}']);
   const rA = await hA.review({}, consult(), ADDED);
   assert.match(rA.error, /スタッフの指示にない受診・救急の案内が残りました/);
-  // B: 受診案内の無い正しい案で「救急の案内は不要なので問題ないが、お詫びが弱い」→ 確認ポイント付きで表示
+  // B: 真偽値がそろっていれば止めない（理由が救急に触れるので最初の案ではなく修正案を確認ポイント付きで表示）
   const okDraft = "テスト：一時的な炎症で、数日〜2週間ほどで落ち着いてまいります。";
   const hB = reviewer(['{"pass":false,"safety":false,"escalation":false,"emergency_missing":false,"reason":"救急の案内は不要なので問題ないが、お詫びが弱い"}', "テスト：別の案です。", '{"pass":false,"safety":false,"escalation":false,"emergency_missing":false,"reason":"指示から離れた"}']);
   const rB = await hB.review({}, consult(), okDraft);
-  assert.equal(rB.text, okDraft);
+  assert.equal(rB.text, "テスト：別の案です。");
+  assert.equal(rB.error, "");
   // 文字列の "false" も false として読む
   const hC = reviewer(['{"pass":false,"safety":"false","escalation":"false","emergency_missing":"false","reason":"お詫びが弱い"}', "テスト：別の案です。", '{"pass":false,"safety":false,"escalation":false,"reason":"指示から離れた"}']);
   assert.equal((await hC.review({}, consult(), ADDED)).text, ADDED);
-  // スタッフ指示優先の照合で safety:true・理由が救急案内の欠落なら、emergency_missing:false の明示があっても表示しない
+  // 照合AIが emergency_missing:false と明示しつつ理由で欠落を述べる矛盾した結果は、言い回しを解釈せず、理由を確認ポイントに出して表示する（送信はスタッフが押すまで行われない）
   const hM = reviewer(['{"pass":false,"safety":true,"escalation":false,"emergency_missing":false,"reason":"息苦しさがあるのに救急の案内が無い"}', null]);
-  assert.equal((await hM.review({}, consult({ lastQ: "テスト：息苦しいです" }), "テスト：一時的な炎症で大丈夫です。")).text, "");
+  const rM = await hM.review({}, consult({ lastQ: "テスト：息苦しいです" }), "テスト：一時的な炎症で大丈夫です。");
+  assert.match(rM.warning, /救急の案内が無い/);
   // 「命に関わる症状ではないため救急の案内がないのは適切」は欠落ではない（別の safety の理由で確認ポイント付き表示）
   const okDraft2 = "テスト：一時的な炎症で、数日〜2週間ほどで落ち着いてまいります。";
   const hP = reviewer(['{"pass":false,"safety":true,"escalation":false,"emergency_missing":false,"reason":"命に関わる症状ではないため救急の案内がないのは適切ですが、店舗ルールに無い診断名が加わっています"}', okDraft2, '{"pass":false,"safety":true,"escalation":false,"emergency_missing":false,"reason":"命に関わる症状ではないため救急の案内がないのは適切ですが、店舗ルールに無い診断名が加わっています"}']);
   const rP = await hP.review({}, consult(), okDraft2);
   assert.equal(rP.text, okDraft2);
   assert.match(rP.warning, /診断名/);
+  // 真偽値が欠けた不合格で理由が救急に触れる時は、言い回しを解釈せず中立の理由で止める（逆の誘導をしない）
   const hQ = reviewer(['{"pass":false,"safety":false,"reason":"119番の案内がないのは適切ですが、お詫びが不足"}', null]);
-  assert.equal((await hQ.review({}, consult(), okDraft2)).error, "");
+  assert.match((await hQ.review({}, consult(), okDraft2)).error, /受診・救急の案内の扱いを確認できませんでした/);
   // escalation:false の明示があっても、理由が「指示にない受診案内」なら最初の案は使わない（修正案を表示する）
   const hR = reviewer(['{"pass":false,"safety":false,"escalation":false,"emergency_missing":false,"reason":"指示にない医療機関への相談の案内"}', "テスト：修正した案です。", '{"pass":false,"safety":false,"escalation":false,"reason":"お詫びが弱い"}']);
   assert.equal((await hR.review({}, consult(), ADDED)).text, "テスト：修正した案です。");
-  // 否定の形（適切ではない・不要な受診案内・当たらないのに）は肯定とみなさない
-  const hS = reviewer(['{"pass":false,"safety":true,"escalation":false,"emergency_missing":false,"reason":"救急の案内が無いのは適切ではない"}', null]);
-  assert.equal((await hS.review({}, consult({ lastQ: "テスト：息苦しいです" }), "テスト：一時的な炎症で大丈夫です。")).text, "");
+  // 真偽値が欠けた不合格で理由が受診・救急に触れる時は、肯定・否定どちらの言い回しでも表示しない
   const hT = reviewer(['{"pass":false,"safety":false,"reason":"救急の案内が無いのは適切ではありません"}', null]);
   assert.equal((await hT.review({}, consult({ lastQ: "テスト：息苦しいです" }), "テスト：一時的な炎症で大丈夫です。")).text, "");
   for (const reason of ["不要な受診案内が追加されています", "受診の案内は不要なのに追加", "命に関わる症状に当たらないのに受診の案内"]) {

@@ -4465,7 +4465,7 @@ async function draftChatPrep(t, body) {
   const base = "あなたは「" + (t.name || "クリニック") + "」の受付スタッフの返信作成アシスタントです。"
     + "スタッフと会話しながら、お客様への返信下書きを一緒に磨き上げます。あなたと会話しているのはスタッフで、下書きを送る相手はお客様です。"
     + REPLY_DECISION
-    + "AIが独自に医療判断・診断はしない。断定的表現や絵文字は使わない。" + sig
+    + "AIが独自に医療判断・診断はしない。AIの判断での断定的表現や絵文字は使わない（スタッフが指示した説明・結論は弱めずに書く）。" + sig
     + "\n\n" + JP_QUALITY
     + "\n\nスタッフの指示がどんなに短くても（「あってる」「もっと短く」「優しく」等）、お客様との会話の文脈に当てはめて意味を解釈すること。"
     + "\n\n" + STAFF_TONE_PRIORITY
@@ -4669,34 +4669,16 @@ async function reviewDraftChatCandidate(t, p, raw) {
       const hinted = !!escalationHint(candidate);
       const reasonText = String(result.reason || "");
       const escalationUnchecked = hinted && typeof result.escalation !== "boolean";
-      // 真偽値の無い不合格は、受診・救急らしい文がある案に限り理由から判断する（証明書・提出物の話は除く。「救急の案内が無い」は欠落として扱う）
-      const inferable = typeof result.escalation !== "boolean" && !isTrue(result.pass) && (hinted || escalationSentences(candidate).length > 0)
-        && !/証明|書類|免除|キャンセル料|診断書|受診日/.test(reasonText);
-      // 節が「適切・問題ない・不要」など受診・救急の扱いを肯定する言い方か（「不適切」「適切ではない」「不要な受診案内」「当たらないのに」などの否定の形は肯定にしない）
-      const affirmativeClause = c => !/不適切|適切(?:では|で)?(?:ない|なく|ありません)|妥当(?:では|で)?(?:ない|なく|ありません)|不要な(?!ので|ため)|(?:当たら|該当し)ないのに|(?:当たら|該当し)ない(?:受診|救急|119|案内|文)/.test(c)
-        && /適切|妥当|問題(?:は|も)?(?:ない|無い|ありません|ございません)|当たらない|該当しない|不要|必要(?:は|も)?(?:ない|無い|ありません)|なくて(?:も)?(?:よい|良い|いい|問題)/.test(c);
-      // 理由文を節に分け、「救急の案内が無い」を欠落として述べる節があるか（「無いのは適切」「指示にない」「不要」の節は除く）
-      const reasonSaysEmergencyMissing = text => String(text || "").split(/[。、,]|ですが|ですけど|だが|けれど|が、/).some(c =>
-        /(?:救急|119)[^。]{0,10}(?:案内|誘導|連絡先)(?:の記載)?(?:が|は)?(?:無い|ない|無く|なく|なし|ありません|欠け|足りな|含まれ(?:てい)?(?:ない|ません)|抜け)/.test(c)
-        && !affirmativeClause(c) && !/指示に(?:な|無)/.test(c));
       const submissionReason = /証明|書類|免除|キャンセル料|診断書|受診日/.test(reasonText);
-      // 「救急の案内が無い」は欠落として扱う（emergency_missing を付け忘れた時と、escalation:true でない時だけ。「指示にない」「不要」は欠落ではない）
-      const inferredMissing = !isTrue(result.pass) && !submissionReason && !isTrue(result.escalation) && !isFalse(result.emergency_missing) && typeof result.emergency_missing !== "boolean"
-        && reasonSaysEmergencyMissing(reasonText);
-      // 理由が受診・救急に触れる不合格（escalation:false の明示が無いもの）は、最初の案を使う判断から外す
-      // 理由文の節のうち、受診・救急に触れ、「適切・問題ない・不要」などの肯定でない節があるか
-      const touchesClause = !isTrue(result.pass) && !submissionReason && String(reasonText).split(/[。、,]|ですが|ですけど|だが|けれど|が、/).some(c =>
-        /受診|救急|119|医療機関|病院/.test(c) && !affirmativeClause(c));
-      const reasonMentionsEscalation = result.escalation !== false && touchesClause;
-      // 最初の案を使うかの判断だけは、escalation:false の明示があっても理由が受診・救急に触れていれば使わない（表示を止める範囲は広げない）
-      const reasonTouchesEscalation = touchesClause;
-      // スタッフ指示優先の照合で safety:true かつ理由文が救急案内の欠落を述べる時は、emergency_missing:false の明示があっても欠落として扱う
-      const safetyMissing = staffFirst && isTrue(result.safety) && !isTrue(result.escalation) && !submissionReason
-        && reasonSaysEmergencyMissing(reasonText);
-      const emergencyMissing = isTrue(result.emergency_missing) || inferredMissing || safetyMissing;
-      const escalation = isTrue(result.escalation) || (inferable && !inferredMissing && touchesClause);
+      // 理由文は言い回しで判断しない（肯定・否定の読み違いを避ける）。真偽値の明示だけで判定し、
+      // 受診・救急に触れる不合格なのに escalation／emergency_missing の真偽値が欠けている時は「確認できない」として表示しない。
+      const reasonTouchesEscalation = !isTrue(result.pass) && !submissionReason && /受診|救急|119|医療機関|病院/.test(reasonText);
+      const boolsMissing = typeof result.escalation !== "boolean" || typeof result.emergency_missing !== "boolean";
+      const reasonMentionsEscalation = p.escalationCheck === true && reasonTouchesEscalation && boolsMissing;
+      const emergencyMissing = isTrue(result.emergency_missing);
+      const escalation = isTrue(result.escalation);
       // safety を合否に使うのは、safety の意味を詳しく指示しているスタッフ指示優先の照合だけ（他の経路で「安全＝true」と読まれても止めない）
-      const flagged = (staffFirst && isTrue(result.safety)) || escalation || emergencyMissing;
+      const flagged = (staffFirst && isTrue(result.safety)) || escalation || emergencyMissing || reasonMentionsEscalation;
       const overHintLimit = hinted && escalationSentences(candidate).length > HINT_LIMIT; // 示しきれない受診・救急の文がある案は合格にしない
       return { pass: isTrue(result.pass) && !flagged && !escalationUnchecked && !overHintLimit && !mismatch && !casual, audited: typeof result.safety === "boolean" && !escalationUnchecked, mismatch: !!mismatch,
         safety: isTrue(result.safety) || emergencyMissing, emergencyMissing, escalation, escalationCleared: hinted && result.escalation === false && escalationSentences(candidate).length <= HINT_LIMIT, unverified: escalationUnchecked, reasonMentionsEscalation, reasonTouchesEscalation,
