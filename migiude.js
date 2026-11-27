@@ -4611,7 +4611,7 @@ function draftChatNote(t, c, edits) {
 async function reviewDraftChatCandidate(t, p, raw) {
   // 相談チャットの照合・修正: スタッフが明示した対応は店舗ルールと違っても正しいものとして扱う（「ルールはこうだから」で指示を戻さない）
   const STAFF_FIRST_AUDIT = "【スタッフ指示を最優先する照合】スタッフが最新指示・相談で明示した対応（料金・免除・案内する内容・条件や規定を書かないこと・書き方）は、店舗ルールや通常の条件と違っていても正しいものとして扱う。『ルールの条件・料金・提出物が欠けている』『ルールと違う』という理由だけでpass:falseにしない。"
-  + "pass:falseにするのは、(1)最新指示や未撤回の決定が反映されていない・逆の内容になっている、(2)日時・医院・金額などの取り違えや、指示にも根拠資料にもない新しい事実の追加（受診・救急・119番・悪化時の条件付き案内を、上の受診・救急の方針の（ア）〜（ウ）に当たらないのに加えることを含む。この時は \"escalation\":true も付ける）、(3)スタッフの指示にも店舗ルールにもない診断・治療判断をAIが独自に書く、上の受診・救急の方針の（ウ）に当たる（患者様の連絡に命に関わる緊急の症状がある）のに救急の案内が無い、本人確認・個人情報、未実施の予約操作を完了と書く、のいずれかだけ。スタッフが指示した症状の説明・経過の見込み・対処・安心していただく言葉は医院としての案内であり、(3)に当たらず、そのまま書かれていれば合格とする（（ウ）に当たるのに救急の案内が無い時を除く）。JSON には必ず \"safety\" を付け、(3)に当たる時は true、それ以外は false にする。";
+  + "pass:falseにするのは、(1)最新指示や未撤回の決定が反映されていない・逆の内容になっている、(2)日時・医院・金額などの取り違えや、指示にも根拠資料にもない新しい事実の追加（受診・救急・119番・悪化時の条件付き案内を、上の受診・救急の方針の（ア）〜（ウ）に当たらないのに加えることを含む。この時は \"escalation\":true も付ける）、(3)スタッフの指示にも店舗ルールにもない診断・治療判断をAIが独自に書く、上の受診・救急の方針の（ウ）に当たる（患者様の連絡に命に関わる緊急の症状がある）のに救急の案内が無い、本人確認・個人情報、未実施の予約操作を完了と書く、のいずれかだけ。スタッフが指示した症状の説明・経過の見込み・対処・安心していただく言葉は医院としての案内であり、(3)に当たらず、そのまま書かれていることを理由に不合格にしない（（ウ）に当たるのに救急の案内が無い時を除く。指示にない受診・救急の案内が加わっていれば(2)で不合格にする）。JSON には必ず \"safety\" を付け、(3)に当たる時は true、それ以外は false にする。";
   const STAFF_FIRST_REPAIR = "照合の指摘のうち、最新指示の未反映・事実の取り違え・安全上の問題だけを直す。受診・救急の案内は、受診・救急の方針の（ア）〜（ウ）に当たらないものだけを削除し、当たるものは残す。スタッフが指示で外した条件・料金・規定や確認事項を戻さない。新しい推測は加えない。";
   if (p.consultation) return { text: "", error: "" };
   const instruction = String(p.latestInstruction || "").slice(0, 4000);
@@ -4695,8 +4695,9 @@ async function reviewDraftChatCandidate(t, p, raw) {
       && !draftQualityIssues(firstText).some(issue => issue === "empty" || issue === "meta_text") && !hasConversationalTone(firstText);
     // 最初の案が、指示にない受診・救急の案内で不合格だった時も、最初の案は返さない
     const useFirst = staffFirst && firstUsable && firstChecked.audited === true && !firstChecked.safety && !firstChecked.mismatch && !firstChecked.escalation;
-    // 指示にない受診・救急の案内で不合格になり、修正もできなかった（最初の案のまま）時は、その案を表示しない
-    if (!useFirst && firstChecked.escalation && String(text || "").trim() === String(firstText || "").trim()) {
+    // 最終の照合が、指示にない受診・救急の案内または安全面（医療判断・（ウ）の救急案内の欠落など）で不合格の案も表示しない
+    const unsafeFirstUnchanged = (firstChecked.escalation || firstChecked.safety) && String(text || "").trim() === String(firstText || "").trim();
+    if (!useFirst && (checked.escalation || checked.safety || unsafeFirstUnchanged)) {
       return { text: "", error: "編集指示を正確に反映できませんでした。内容を短く言い換えて、もう一度お試しください。" };
     }
     const shown = useFirst ? firstText : text;
