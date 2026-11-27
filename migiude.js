@@ -4362,6 +4362,7 @@ app.post("/api/ai-regen", guard, async (req, res) => {
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sys = "あなたは「" + (t.name || "クリニック") + "」の受付スタッフとして、お客様とこの会話をしてきた本人です。とても丁寧でへりくだった敬語で、温かくお客様に対応します。"
     + "会話の最後に入るスタッフの内部指示メモに沿って、会話の続きとして自然につながる返信を書いてください。"
+    + MEDICAL_GUIDANCE_POLICY + STAFF_MEDICAL_INSTRUCTION
     + "本日は" + today + "です。キャンセル料など日付が関わる案内では、本日の日付と予約日の差から判断すること（例: 予約日の前日にあたる連絡なら前日扱い、当日なら当日扱い、それより前なら通常はキャンセル料は不要）。憶測で日付を決めない。"
     + "お客様が複数の質問・依頼をしている場合は、その全てにもれなく答えること。1つも取りこぼさない。"
     + "お客様への敬意と心配りが自然に伝わる表現を選び、ご不便にはお詫びや労いの一言を添える。誤った二重敬語は避け、読みやすさも保つ。絵文字は使わない。断定や医療判断は避ける。" + sig
@@ -4610,7 +4611,7 @@ function draftChatNote(t, c, edits) {
 async function reviewDraftChatCandidate(t, p, raw) {
   // 相談チャットの照合・修正: スタッフが明示した対応は店舗ルールと違っても正しいものとして扱う（「ルールはこうだから」で指示を戻さない）
   const STAFF_FIRST_AUDIT = "【スタッフ指示を最優先する照合】スタッフが最新指示・相談で明示した対応（料金・免除・案内する内容・条件や規定を書かないこと・書き方）は、店舗ルールや通常の条件と違っていても正しいものとして扱う。『ルールの条件・料金・提出物が欠けている』『ルールと違う』という理由だけでpass:falseにしない。"
-  + "pass:falseにするのは、(1)最新指示や未撤回の決定が反映されていない・逆の内容になっている、(2)日時・医院・金額などの取り違えや、指示にも根拠資料にもない新しい事実の追加（受診・救急・119番・悪化時の条件付き案内を、上の受診・救急の方針の（ア）〜（ウ）に当たらないのに加えることを含む。この時は \"escalation\":true も付ける）、(3)スタッフの指示にも店舗ルールにもない診断・治療判断をAIが独自に書く、本人確認・個人情報、未実施の予約操作を完了と書く、のいずれかだけ。スタッフが指示した症状の説明・経過の見込み・対処・安心していただく言葉は医院としての案内であり、(3)に当たらず、そのまま書かれていれば合格とする。JSON には必ず \"safety\" を付け、(3)に当たる時は true、それ以外は false にする。";
+  + "pass:falseにするのは、(1)最新指示や未撤回の決定が反映されていない・逆の内容になっている、(2)日時・医院・金額などの取り違えや、指示にも根拠資料にもない新しい事実の追加（受診・救急・119番・悪化時の条件付き案内を、上の受診・救急の方針の（ア）〜（ウ）に当たらないのに加えることを含む。この時は \"escalation\":true も付ける）、(3)スタッフの指示にも店舗ルールにもない診断・治療判断をAIが独自に書く、上の受診・救急の方針の（ウ）に当たる（患者様の連絡に命に関わる緊急の症状がある）のに救急の案内が無い、本人確認・個人情報、未実施の予約操作を完了と書く、のいずれかだけ。スタッフが指示した症状の説明・経過の見込み・対処・安心していただく言葉は医院としての案内であり、(3)に当たらず、そのまま書かれていれば合格とする（（ウ）に当たるのに救急の案内が無い時を除く）。JSON には必ず \"safety\" を付け、(3)に当たる時は true、それ以外は false にする。";
   const STAFF_FIRST_REPAIR = "照合の指摘のうち、最新指示の未反映・事実の取り違え・安全上の問題だけを直す。受診・救急の案内は、受診・救急の方針の（ア）〜（ウ）に当たらないものだけを削除し、当たるものは残す。スタッフが指示で外した条件・料金・規定や確認事項を戻さない。新しい推測は加えない。";
   if (p.consultation) return { text: "", error: "" };
   const instruction = String(p.latestInstruction || "").slice(0, 4000);
@@ -4661,7 +4662,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
       const match = rawAudit.match(/\{[\s\S]*\}/);
       const result = JSON.parse(match ? match[0] : rawAudit);
       const casual = hasConversationalTone(candidate);
-      return { pass: result.pass === true && !mismatch && !casual, audited: typeof result.safety === "boolean", mismatch: !!mismatch, safety: result.safety === true, escalation: result.escalation === true || (result.pass !== true && /受診・救急の案内/.test(String(result.reason || ""))), reason: mismatch || (casual ? "患者様向けの敬語になっていません" : String(result.reason || "").slice(0, 200)) };
+      return { pass: result.pass === true && !mismatch && !casual, audited: typeof result.safety === "boolean", mismatch: !!mismatch, safety: result.safety === true, escalation: result.escalation === true, reason: mismatch || (casual ? "患者様向けの敬語になっていません" : String(result.reason || "").slice(0, 200)) };
     } catch (e) { return { pass: false, reason: "編集指示の照合結果を読み取れませんでした" }; }
   }
   let checked = await audit(text);
@@ -4694,6 +4695,10 @@ async function reviewDraftChatCandidate(t, p, raw) {
       && !draftQualityIssues(firstText).some(issue => issue === "empty" || issue === "meta_text") && !hasConversationalTone(firstText);
     // 最初の案が、指示にない受診・救急の案内で不合格だった時も、最初の案は返さない
     const useFirst = staffFirst && firstUsable && firstChecked.audited === true && !firstChecked.safety && !firstChecked.mismatch && !firstChecked.escalation;
+    // 指示にない受診・救急の案内で不合格になり、修正もできなかった（最初の案のまま）時は、その案を表示しない
+    if (!useFirst && firstChecked.escalation && String(text || "").trim() === String(firstText || "").trim()) {
+      return { text: "", error: "編集指示を正確に反映できませんでした。内容を短く言い換えて、もう一度お試しください。" };
+    }
     const shown = useFirst ? firstText : text;
     const reason = useFirst ? firstChecked.reason : checked.reason;
     return { text: shown, error: "", warning: String(reason || "内容をご確認ください").slice(0, 200) };
