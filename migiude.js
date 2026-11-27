@@ -4728,7 +4728,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
       // 理由は固定の文にする（照合AIの理由文に患者名や内部記号が入ることがあるため）
       const missing = !checked.escalation && (checked.emergencyMissing || (unsafeFirstUnchanged && firstChecked.emergencyMissing && !escalationUnverified));
       const why = missing ? "患者様の連絡に命に関わる症状があるのに、救急の案内がありません"
-        : checked.escalation || (unsafeFirstUnchanged && firstChecked.escalation) ? "スタッフの指示にない受診・救急の案内が残りました"
+        : checked.escalation || (unsafeFirstUnchanged && firstChecked.escalation) ? "スタッフの指示にない受診・救急の案内が残りました。患者様の連絡に命に関わる症状がある時は、救急の案内は必要です"
         : escalationUnverified ? "受診・救急の案内が残っていますが、指示どおりか確認できませんでした" : "受診・救急の案内の扱いを確認できませんでした";
       return { text: "", error: "編集指示を正確に反映できませんでした（理由：" + why + "）。内容を短く言い換えて、もう一度お試しください。" };
     }
