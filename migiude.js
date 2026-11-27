@@ -4666,7 +4666,9 @@ async function reviewDraftChatCandidate(t, p, raw) {
       const hinted = !!escalationHint(candidate);
       const flagged = result.safety === true || result.escalation === true || result.emergency_missing === true;
       const escalationUnchecked = hinted && typeof result.escalation !== "boolean";
-      return { pass: result.pass === true && !flagged && !escalationUnchecked && !mismatch && !casual, audited: typeof result.safety === "boolean" && !escalationUnchecked, mismatch: !!mismatch, safety: result.safety === true, emergencyMissing: result.emergency_missing === true, escalation: result.escalation === true, escalationCleared: hinted && result.escalation === false,
+      return { pass: result.pass === true && !flagged && !escalationUnchecked && !mismatch && !casual, audited: typeof result.safety === "boolean" && !escalationUnchecked, mismatch: !!mismatch, safety: result.safety === true || result.emergency_missing === true, emergencyMissing: result.emergency_missing === true,
+        // escalation の真偽値が無い不合格で、理由が受診・救急に触れている時は escalation とみなす（最初の案を使わない安全側）
+        escalation: result.escalation === true || (typeof result.escalation !== "boolean" && result.pass !== true && /受診|救急|119|医療機関|病院/.test(String(result.reason || ""))), escalationCleared: hinted && result.escalation === false,
         reason: mismatch || (casual ? "患者様向けの敬語になっていません" : escalationUnchecked ? "受診・救急の案内の確認結果を読み取れませんでした" : String(result.reason || "").slice(0, 200)) };
     } catch (e) { return { pass: false, reason: "編集指示の照合結果を読み取れませんでした" }; }
   }
@@ -4696,11 +4698,10 @@ async function reviewDraftChatCandidate(t, p, raw) {
   if (p.allowWarning && String(text || "").trim() && !/@@\s*(?:REPLY|DRAFT|MEMORY|RULE|ACTION|META)\s*@@/.test(text)
       && !draftQualityIssues(text).some(issue => issue === "empty" || issue === "meta_text")) {
     // スタッフ指示を最優先する相談では、修正で指示から離れた案ではなく、指示どおりに作った最初の案を返す
-    // ただし最初の案が安全面（医療判断・本人確認・未実施操作の完了表記）で不合格、または照合自体ができなかった場合は、最初の案は返さない
+    // ただし最初の案が安全面・受診や救急の扱いで不合格、または照合自体ができなかった場合は、最初の案は返さない
     const firstUsable = String(firstText || "").trim() && !/@@\s*(?:REPLY|DRAFT|MEMORY|RULE|ACTION|META)\s*@@/.test(firstText)
       && !draftQualityIssues(firstText).some(issue => issue === "empty" || issue === "meta_text") && !hasConversationalTone(firstText);
-    // 最初の案が、指示にない受診・救急の案内で不合格だった時も、最初の案は返さない
-    const useFirst = staffFirst && firstUsable && firstChecked.audited === true && !firstChecked.safety && !firstChecked.mismatch && !firstChecked.escalation;
+    const useFirst = staffFirst && firstUsable && firstChecked.audited === true && !firstChecked.safety && !firstChecked.mismatch && !firstChecked.escalation && !firstChecked.emergencyMissing;
     // 最終の照合が、指示にない受診・救急の案内または安全面（医療判断・（ウ）の救急案内の欠落など）で不合格の案も表示しない
     // 受診・救急の扱い（指示にない案内・（ウ）の救急案内の欠落）で不合格の案は表示しない。他の safety は従来どおり確認ポイント付きで表示する
     const unsafeFirstUnchanged = (firstChecked.escalation || firstChecked.emergencyMissing) && String(text || "").trim() === String(firstText || "").trim();
