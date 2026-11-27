@@ -18,7 +18,7 @@ assert.ok(start > 0 && end > start);
 function reviewer(replies) {
   const calls = [];
   const context = {
-    ...consultation,
+    ...consultation, ...require("../lib/medical-escalation"),
     finalizeGeneratedDraft: async (_t, text) => ({ text }),
     aiChat: async (_t, sys, messages, _limit, task) => { calls.push({ sys, messages, task }); return replies.shift(); },
     explicitEditMismatch,
@@ -220,7 +220,7 @@ test("相談への返事は患者向け下書きを作らず、返信だけの�
   const handlers = new Map();
   const saved = [];
   const context = {
-    ...consultation, ...draftOutput, safeDraftChatText: draftOutput.safeText,
+    ...consultation, ...require("../lib/medical-escalation"), ...draftOutput, safeDraftChatText: draftOutput.safeText,
     app: { post: (route, ...handlersForRoute) => handlers.set(route, handlersForRoute.at(-1)) },
     guard() {}, oneMutationAtATime: () => (_req, _res, next) => next(),
     ANTHROPIC_KEY: "test", process: { env: {} },
@@ -275,7 +275,7 @@ test("照合後の完成案と矛盾するスタッフ向け説明をJSONと互�
   const handlers = new Map();
   const correct = "証明書をお送りください。条件を満たさない場合は3,300円です。";
   const context = {
-    ...consultation, ...draftOutput, safeDraftChatText: draftOutput.safeText,
+    ...consultation, ...require("../lib/medical-escalation"), ...draftOutput, safeDraftChatText: draftOutput.safeText,
     app: { post: (route, ...args) => handlers.set(route, args.at(-1)) },
     guard() {}, oneMutationAtATime: () => (_req, _res, next) => next(),
     ANTHROPIC_KEY: "test", process: { env: {} },

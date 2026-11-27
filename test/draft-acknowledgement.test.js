@@ -41,7 +41,7 @@ test("この文へお礼を書く追加指示を、相手へのお礼返信と�
 function harness(outputs,rawResponse,consultation=false){
   const routes=new Map(),calls=[],saved=[];
   const p={c:{channel:"line"},latestInstruction:"これ返信返しておいて、ありがとうって。",previousDraft:"通常は3,300円です。",lastQ:"テスト：証明書を送ります。免除できますか？",staffHistory:"スタッフの指示：お礼だけに作り直して",acknowledgementOnly:true,consultation,base:"",edits:[],engLabel:"テスト",topicTs:1,baCtx:{ok:true,verified:true,appointments:[{id:"test-appointment",changeable:true}]}};
-  const ctx={...scope,...edit,...output, safeDraftChatText: output.safeText,REPLY_DECISION,PATIENT_COURTESY:"丁寧に",hasConversationalTone:()=>false,
+  const ctx={...scope,...require("../lib/medical-escalation"),...edit,...output, safeDraftChatText: output.safeText,REPLY_DECISION,PATIENT_COURTESY:"丁寧に",hasConversationalTone:()=>false,
     cleanDraftText:x=>String(x||"").trim(),sha:v=>require("node:crypto").createHash("sha256").update(v).digest("hex"),draftQualityIssues:()=>[],preservesReplyFacts:()=>true,baEnabled:()=>false,PARTNER_KEY:"",baContextCached:async()=>null,
     ANTHROPIC_KEY:"test",process:{env:{}},guard(){},oneMutationAtATime:()=>()=>{},
     app:{post:(route,...args)=>routes.set(route,args.at(-1))},draftChatPrep:async()=>p,

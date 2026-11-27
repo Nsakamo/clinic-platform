@@ -118,7 +118,7 @@ function reviewHarness(responses) {
   const start = source.indexOf("async function reviewDraftChatCandidate(");
   const end = source.indexOf('app.post("/api/draft-chat"', start);
   const context = {
-    ...decision, ...consultation, explicitEditMismatch,
+    ...decision, ...consultation, ...require("../lib/medical-escalation"), explicitEditMismatch,
     finalizeGeneratedDraft: async (_t, text) => { finalizations.push(text); return { text, issues: [] }; },
     hasConversationalTone: () => false, PATIENT_COURTESY: "丁寧に",
     aiChat: async (_t, sys, messages, _limit, task) => { calls.push({ sys, messages, task }); return responses.shift(); },
@@ -226,7 +226,7 @@ test("編集準備は関連証明書ルールと会話日時を照合資料へ�
   const end = source.indexOf('app.get("/api/draft-chat-history"', start);
   const queries = [];
   const context = {
-    ...decision, ...consultation, selectConversationContext, normalizeDraftEditHistory, isDraftChatConsultation,
+    ...decision, ...consultation, ...require("../lib/medical-escalation"), selectConversationContext, normalizeDraftEditHistory, isDraftChatConsultation,
     ...promptStubs(), rulesRankedWithScores: (_t, q) => { queries.push(q); return [{ n: 2, r: { content: rules } }]; },
     rulesBlock: rel => rel.map(r => r.content).join("\n"),
     S: () => ({ engine: "gpt", tone: "" }), notesBlock: () => "", prefsBlock: () => "", replyToneInstruction: () => "",
