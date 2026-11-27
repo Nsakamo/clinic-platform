@@ -4400,7 +4400,7 @@ function staffBookingPrompt(ctx) {
     + "\n対象予約が複数あり特定できない、日付・時刻が不足、操作不可、または患者名を別人として指定している場合はactionをnoneにし、必要な確認をスタッフへ質問する。推測でIDや日時を補わない。";
 }
 // スタッフが明示した口調・言い回しの指示は、既定の文体ルール（トーン設定、書き出しのお礼や結びのあいさつの付け方）より優先する（運用方針）。
-const STAFF_TONE_PRIORITY = "【スタッフの口調指示の優先】スタッフが口調・言い回し・温度感・長さ（例:「もっと丁寧で温かく」「もっと柔らかく」「短く」）を明示したら、その指示を既定の文体ルール（トーン設定、書き出しのお礼や結びのあいさつの付け方）より優先し、読んで違いがはっきり分かるように返信全文を書き直す。丁寧・温かくの指示では、お問い合わせへのお礼、ご連絡への感謝、お手数への気づかい、締めのあいさつなどを自然に加えてよい。ただし事実・日時・金額・可否・結論・案内先は変えず、『ご安心ください』『よくあることです』のような根拠のない安心づけ、症状や経過への言及、医療判断、受診や救急の案内、新しい約束は加えない（スタッフが指示した説明・経過・安心していただく言葉は除く）。";
+const STAFF_TONE_PRIORITY = "【スタッフの口調指示の優先】スタッフが口調・言い回し・温度感・長さ（例:「もっと丁寧で温かく」「もっと柔らかく」「短く」）を明示したら、その指示を既定の文体ルール（トーン設定、書き出しのお礼や結びのあいさつの付け方）より優先し、読んで違いがはっきり分かるように返信全文を書き直す。丁寧・温かくの指示では、お問い合わせへのお礼、ご連絡への感謝、お手数への気づかい、締めのあいさつなどを自然に加えてよい。ただし事実・日時・金額・可否・結論・案内先は変えず、『ご安心ください』『よくあることです』のような根拠のない安心づけ、症状や経過への言及、医療判断、受診や救急の案内、新しい約束は加えない（スタッフが指示した説明・経過・安心していただく言葉は除く。受診や救急の案内は、スタッフの指示、今回の症状に関する店舗ルールの明記、患者様の連絡にある命に関わる緊急の症状のいずれかがある時は加えてよい）。";
 // 共通部（会話文脈＋ルール＋方針）。出力形式はJSONで受け取り、画面向けの形はサーバーで組み立てる。
 async function draftChatPrep(t, body) {
   const c = t.store[body.id] || null;
@@ -4610,8 +4610,8 @@ function draftChatNote(t, c, edits) {
 async function reviewDraftChatCandidate(t, p, raw) {
   // 相談チャットの照合・修正: スタッフが明示した対応は店舗ルールと違っても正しいものとして扱う（「ルールはこうだから」で指示を戻さない）
   const STAFF_FIRST_AUDIT = "【スタッフ指示を最優先する照合】スタッフが最新指示・相談で明示した対応（料金・免除・案内する内容・条件や規定を書かないこと・書き方）は、店舗ルールや通常の条件と違っていても正しいものとして扱う。『ルールの条件・料金・提出物が欠けている』『ルールと違う』という理由だけでpass:falseにしない。"
-  + "pass:falseにするのは、(1)最新指示や未撤回の決定が反映されていない・逆の内容になっている、(2)日時・医院・金額などの取り違えや、指示にも根拠資料にもない新しい事実の追加（受診・救急・119番・悪化時の条件付き案内を、下の方針の(1)〜(3)に当たらないのに加えることを含む）、(3)スタッフの指示にも店舗ルールにもない診断・治療判断をAIが独自に書く、本人確認・個人情報、未実施の予約操作を完了と書く、のいずれかだけ。スタッフが指示した症状の説明・経過の見込み・対処・安心していただく言葉は医院としての案内であり、(3)に当たらず、そのまま書かれていれば合格とする。JSON には必ず \"safety\" を付け、(3)に当たる時は true、それ以外は false にする。";
-  const STAFF_FIRST_REPAIR = "照合の指摘のうち、最新指示の未反映・事実の取り違え・安全上の問題だけを直す。受診・救急の案内は、方針の(1)〜(3)に当たらないものだけを削除し、当たるものは残す。スタッフが指示で外した条件・料金・規定や確認事項を戻さない。新しい推測は加えない。";
+  + "pass:falseにするのは、(1)最新指示や未撤回の決定が反映されていない・逆の内容になっている、(2)日時・医院・金額などの取り違えや、指示にも根拠資料にもない新しい事実の追加（受診・救急・119番・悪化時の条件付き案内を、上の受診・救急の方針の（ア）〜（ウ）に当たらないのに加えることを含む。この時は \"escalation\":true も付ける）、(3)スタッフの指示にも店舗ルールにもない診断・治療判断をAIが独自に書く、本人確認・個人情報、未実施の予約操作を完了と書く、のいずれかだけ。スタッフが指示した症状の説明・経過の見込み・対処・安心していただく言葉は医院としての案内であり、(3)に当たらず、そのまま書かれていれば合格とする。JSON には必ず \"safety\" を付け、(3)に当たる時は true、それ以外は false にする。";
+  const STAFF_FIRST_REPAIR = "照合の指摘のうち、最新指示の未反映・事実の取り違え・安全上の問題だけを直す。受診・救急の案内は、受診・救急の方針の（ア）〜（ウ）に当たらないものだけを削除し、当たるものは残す。スタッフが指示で外した条件・料金・規定や確認事項を戻さない。新しい推測は加えない。";
   if (p.consultation) return { text: "", error: "" };
   const instruction = String(p.latestInstruction || "").slice(0, 4000);
   const acknowledgementOnly = p.acknowledgementOnly === true || isAcknowledgementOnlyRequest(instruction);
@@ -4661,7 +4661,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
       const match = rawAudit.match(/\{[\s\S]*\}/);
       const result = JSON.parse(match ? match[0] : rawAudit);
       const casual = hasConversationalTone(candidate);
-      return { pass: result.pass === true && !mismatch && !casual, audited: typeof result.safety === "boolean", mismatch: !!mismatch, safety: result.safety === true, reason: mismatch || (casual ? "患者様向けの敬語になっていません" : String(result.reason || "").slice(0, 200)) };
+      return { pass: result.pass === true && !mismatch && !casual, audited: typeof result.safety === "boolean", mismatch: !!mismatch, safety: result.safety === true, escalation: result.escalation === true || (result.pass !== true && /受診・救急の案内/.test(String(result.reason || ""))), reason: mismatch || (casual ? "患者様向けの敬語になっていません" : String(result.reason || "").slice(0, 200)) };
     } catch (e) { return { pass: false, reason: "編集指示の照合結果を読み取れませんでした" }; }
   }
   let checked = await audit(text);
@@ -4677,7 +4677,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
       + evidence
       + "\n【修正が必要な案】\n" + text
       + "\n【照合で見つかった問題】\n" + checked.reason;
-    const repaired = await aiChat(t, (acknowledgementOnly ? "患者様向けのお礼の返信文を編集する。直前のお礼案とスタッフの文体指示を踏まえ、自然で丁寧な完成文だけを出力する。医学的安全性・本人確認・個人情報保護を守り、未実施の操作を実施済みとは書かない。" + PATIENT_COURTESY + replyScope : staffFirst ? repairSystem + STAFF_FIRST_REPAIR + staffPolicy : repairSystem + REPLY_DECISION + "新しい推測は加えない。指摘箇所を直す際、指摘されていない正しい条件・未確定事項の説明を落とさない。関連ルールの条件・提出物・料金は、今回の依頼や選択対象でまだ案内が必要なものだけ補う。既に条件を伝え証明書を提出済みなら、お礼とスタッフ確認待ちだけでよく、条件・期限・料金や同じ提出依頼を繰り返さない。" + staffPolicy), [{ role: "user", content: repairPrompt }], 4000, "chat");
+    const repaired = await aiChat(t, (acknowledgementOnly ? "患者様向けのお礼の返信文を編集する。直前のお礼案とスタッフの文体指示を踏まえ、自然で丁寧な完成文だけを出力する。本人確認・個人情報保護を守り、未実施の操作を実施済みとは書かない。" + MEDICAL_GUIDANCE_POLICY + PATIENT_COURTESY + replyScope : staffFirst ? repairSystem + STAFF_FIRST_REPAIR + staffPolicy : repairSystem + REPLY_DECISION + "新しい推測は加えない。指摘箇所を直す際、指摘されていない正しい条件・未確定事項の説明を落とさない。関連ルールの条件・提出物・料金は、今回の依頼や選択対象でまだ案内が必要なものだけ補う。既に条件を伝え証明書を提出済みなら、お礼とスタッフ確認待ちだけでよく、条件・期限・料金や同じ提出依頼を繰り返さない。" + staffPolicy), [{ role: "user", content: repairPrompt }], 4000, "chat");
     if (repaired) {
       const candidate = await finalizeText(repaired);
       checked = await audit(candidate);
@@ -4685,7 +4685,6 @@ async function reviewDraftChatCandidate(t, p, raw) {
       if (String(candidate || "").trim()) text = candidate;
     }
   }
-  // 修正してもスタッフの指示にない受診・救急の案内が残る時は、その文だけを取り除いてもう一度照合する（モデルが安全側に足し続けるため）。
   // 患者へは「この下書きを使う」を押すまで送られない相談チャットでは、止めずに案と確認ポイントを返す。
   if (p.allowWarning && String(text || "").trim() && !/@@\s*(?:REPLY|DRAFT|MEMORY|RULE|ACTION|META)\s*@@/.test(text)
       && !draftQualityIssues(text).some(issue => issue === "empty" || issue === "meta_text")) {
@@ -4693,7 +4692,8 @@ async function reviewDraftChatCandidate(t, p, raw) {
     // ただし最初の案が安全面（医療判断・本人確認・未実施操作の完了表記）で不合格、または照合自体ができなかった場合は、最初の案は返さない
     const firstUsable = String(firstText || "").trim() && !/@@\s*(?:REPLY|DRAFT|MEMORY|RULE|ACTION|META)\s*@@/.test(firstText)
       && !draftQualityIssues(firstText).some(issue => issue === "empty" || issue === "meta_text") && !hasConversationalTone(firstText);
-    const useFirst = staffFirst && firstUsable && firstChecked.audited === true && !firstChecked.safety && !firstChecked.mismatch;
+    // 最初の案が、指示にない受診・救急の案内で不合格だった時も、最初の案は返さない
+    const useFirst = staffFirst && firstUsable && firstChecked.audited === true && !firstChecked.safety && !firstChecked.mismatch && !firstChecked.escalation;
     const shown = useFirst ? firstText : text;
     const reason = useFirst ? firstChecked.reason : checked.reason;
     return { text: shown, error: "", warning: String(reason || "内容をご確認ください").slice(0, 200) };
