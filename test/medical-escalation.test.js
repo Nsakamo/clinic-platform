@@ -153,9 +153,21 @@ test("テスト：修正後の案も指示にない受診・救急の案内や�
   const h12 = reviewer(['{"pass":false,"safety":false,"reason":"指示にない受診案内がある"}', null]);
   const r12 = await h12.review({}, consult(), "テスト：一時的な炎症です。様子を見ても治らなければ、ご相談を。");
   assert.equal(r12.text, "");
-  // emergency_missing:false と明示されても、理由文が救急の欠落なら欠落として扱う
-  const h13 = reviewer(['{"pass":false,"safety":false,"escalation":false,"emergency_missing":false,"reason":"息苦しさがあるのに救急の案内が無い"}', null]);
+  // emergency_missing を付け忘れ、理由文が救急の欠落を述べる時は欠落として扱う
+  const h13 = reviewer(['{"pass":false,"safety":false,"escalation":false,"reason":"息苦しさがあるのに救急の案内が無い"}', null]);
   assert.equal((await h13.review({}, consult({ lastQ: "テスト：息苦しいです" }), "テスト：一時的な炎症で大丈夫です。")).text, "");
+  // A: 指示にない119番で escalation:true・理由が「指示になく不要」→ 理由は「指示にない受診・救急の案内」
+  const hA = reviewer(['{"pass":false,"safety":false,"escalation":true,"emergency_missing":false,"reason":"119番の案内はスタッフ指示になく不要"}', ADDED, '{"pass":false,"safety":false,"escalation":true,"emergency_missing":false,"reason":"119番の案内はスタッフ指示になく不要"}']);
+  const rA = await hA.review({}, consult(), ADDED);
+  assert.match(rA.error, /スタッフの指示にない受診・救急の案内が残りました/);
+  // B: 受診案内の無い正しい案で「救急の案内は不要なので問題ないが、お詫びが弱い」→ 確認ポイント付きで表示
+  const okDraft = "テスト：一時的な炎症で、数日〜2週間ほどで落ち着いてまいります。";
+  const hB = reviewer(['{"pass":false,"safety":false,"escalation":false,"emergency_missing":false,"reason":"救急の案内は不要なので問題ないが、お詫びが弱い"}', "テスト：別の案です。", '{"pass":false,"safety":false,"escalation":false,"emergency_missing":false,"reason":"指示から離れた"}']);
+  const rB = await hB.review({}, consult(), okDraft);
+  assert.equal(rB.text, okDraft);
+  // 文字列の "false" も false として読む
+  const hC = reviewer(['{"pass":false,"safety":"false","escalation":"false","emergency_missing":"false","reason":"お詫びが弱い"}', "テスト：別の案です。", '{"pass":false,"safety":false,"escalation":false,"reason":"指示から離れた"}']);
+  assert.equal((await hC.review({}, consult(), ADDED)).text, ADDED);
   // 医療以外の safety（未実施の予約操作の完了表記など）は、従来どおり確認ポイント付きで表示する（最初の案は使わない）
   const h3 = reviewer(['{"pass":false,"safety":true,"escalation":false,"reason":"未実施の予約操作を完了と書いている"}', "テスト：キャンセルについて確認いたします。", '{"pass":false,"safety":true,"escalation":false,"reason":"未実施の予約操作"}']);
   const r3 = await h3.review({}, consult({ latestInstruction: "テスト：キャンセル済みと伝えて" }), "テスト：キャンセルが完了いたしました。");
