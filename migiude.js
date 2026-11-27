@@ -4672,10 +4672,13 @@ async function reviewDraftChatCandidate(t, p, raw) {
       // 真偽値の無い不合格は、受診・救急らしい文がある案に限り理由から判断する（証明書・提出物の話は除く。「救急の案内が無い」は欠落として扱う）
       const inferable = typeof result.escalation !== "boolean" && !isTrue(result.pass) && (hinted || escalationSentences(candidate).length > 0)
         && !/証明|書類|免除|キャンセル料|診断書|受診日/.test(reasonText);
+      // 節が「適切・問題ない・不要」など受診・救急の扱いを肯定する言い方か（「不適切」「適切ではない」「不要な受診案内」「当たらないのに」などの否定の形は肯定にしない）
+      const affirmativeClause = c => !/不適切|適切(?:では|で)?(?:ない|なく|ありません)|妥当(?:では|で)?(?:ない|なく|ありません)|不要な(?!ので|ため)|(?:当たら|該当し)ないのに|(?:当たら|該当し)ない(?:受診|救急|119|案内|文)/.test(c)
+        && /適切|妥当|問題(?:は|も)?(?:ない|無い|ありません|ございません)|当たらない|該当しない|不要|必要(?:は|も)?(?:ない|無い|ありません)|なくて(?:も)?(?:よい|良い|いい|問題)/.test(c);
       // 理由文を節に分け、「救急の案内が無い」を欠落として述べる節があるか（「無いのは適切」「指示にない」「不要」の節は除く）
       const reasonSaysEmergencyMissing = text => String(text || "").split(/[。、,]|ですが|ですけど|だが|けれど|が、/).some(c =>
-        /(?:救急|119)[^。]{0,10}(?:案内|誘導|連絡先)(?:の記載)?(?:が|は)?(?:無い|ない|なし|ありません|欠け|足りな|含まれ(?:てい)?(?:ない|ません)|抜け)/.test(c)
-        && !/適切|妥当|問題(?:は|も)?(?:ない|無い|ありません|ございません)|当たらない|該当しない|不要|必要(?:は|も)?(?:ない|無い|ありません)|なくて(?:も)?(?:よい|良い|いい|問題)|指示に(?:な|無)/.test(c));
+        /(?:救急|119)[^。]{0,10}(?:案内|誘導|連絡先)(?:の記載)?(?:が|は)?(?:無い|ない|無く|なく|なし|ありません|欠け|足りな|含まれ(?:てい)?(?:ない|ません)|抜け)/.test(c)
+        && !affirmativeClause(c) && !/指示に(?:な|無)/.test(c));
       const submissionReason = /証明|書類|免除|キャンセル料|診断書|受診日/.test(reasonText);
       // 「救急の案内が無い」は欠落として扱う（emergency_missing を付け忘れた時と、escalation:true でない時だけ。「指示にない」「不要」は欠落ではない）
       const inferredMissing = !isTrue(result.pass) && !submissionReason && !isTrue(result.escalation) && !isFalse(result.emergency_missing) && typeof result.emergency_missing !== "boolean"
@@ -4683,7 +4686,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
       // 理由が受診・救急に触れる不合格（escalation:false の明示が無いもの）は、最初の案を使う判断から外す
       // 理由文の節のうち、受診・救急に触れ、「適切・問題ない・不要」などの肯定でない節があるか
       const touchesClause = !isTrue(result.pass) && !submissionReason && String(reasonText).split(/[。、,]|ですが|ですけど|だが|けれど|が、/).some(c =>
-        /受診|救急|119|医療機関|病院/.test(c) && !/適切|妥当|問題(?:は|も)?(?:ない|無い|ありません|ございません)|当たらない|該当しない|不要|必要(?:は|も)?(?:ない|無い|ありません)|なくて(?:も)?(?:よい|良い|いい|問題)/.test(c));
+        /受診|救急|119|医療機関|病院/.test(c) && !affirmativeClause(c));
       const reasonMentionsEscalation = result.escalation !== false && touchesClause;
       // 最初の案を使うかの判断だけは、escalation:false の明示があっても理由が受診・救急に触れていれば使わない（表示を止める範囲は広げない）
       const reasonTouchesEscalation = touchesClause;
