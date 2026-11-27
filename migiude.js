@@ -4675,7 +4675,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
       const submissionReason = /証明|書類|免除|キャンセル料|診断書|受診日/.test(reasonText);
       // 「救急の案内が無い」は欠落として扱う（emergency_missing を付け忘れた時と、escalation:true でない時だけ。「指示にない」「不要」は欠落ではない）
       const inferredMissing = !isTrue(result.pass) && !submissionReason && !isTrue(result.escalation) && !isFalse(result.emergency_missing) && typeof result.emergency_missing !== "boolean"
-        && /(?:救急|119)[^。]{0,10}(?:案内|誘導|連絡先)(?:が|は)?(?:無い|ない|なし|ありません|欠け|足りな)/.test(reasonText) && !/指示に(?:な|無)|不要/.test(reasonText);
+        && /(?:救急|119)[^。]{0,10}(?:案内|誘導|連絡先)(?:の記載)?(?:が|は)?(?:無い|ない|なし|ありません|欠け|足りな|含まれ(?:てい)?(?:ない|ません)|抜け)/.test(reasonText) && !/指示に(?:な|無)|不要/.test(reasonText);
       // 理由が受診・救急に触れる不合格（escalation:false の明示が無いもの）は、最初の案を使う判断から外す
       const reasonMentionsEscalation = !isTrue(result.pass) && result.escalation !== false && !submissionReason && /受診|救急|119|医療機関|病院/.test(reasonText);
       const emergencyMissing = isTrue(result.emergency_missing) || inferredMissing;
