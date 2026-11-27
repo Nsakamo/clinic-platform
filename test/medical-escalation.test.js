@@ -113,7 +113,7 @@ test("テスト：修正後の案も指示にない受診・救急の案内や�
   const h = reviewer(['{"pass":false,"safety":false,"escalation":true,"reason":"指示にない受診案内"}', other, '{"pass":false,"safety":false,"escalation":true,"reason":"指示にない受診案内（皮膚科）"}']);
   const r = await h.review({}, consult(), ADDED);
   assert.equal(r.text, "");
-  assert.match(r.error, /編集指示を正確に反映できませんでした（理由：指示にない受診案内（皮膚科））/);
+  assert.match(r.error, /編集指示を正確に反映できませんでした（理由：スタッフの指示にない受診・救急の案内が残りました）/);
   // （ウ）の救急案内が欠けて safety:true、修正AIが応答しない時も、救急案内の無い最初の案を返さない
   const h2 = reviewer(['{"pass":false,"safety":true,"reason":"息苦しさがあるのに救急案内が無い"}', null]);
   const r2 = await h2.review({}, consult({ lastQ: "テスト：さっきから息が苦しいです" }), "テスト：一時的な炎症で大丈夫です。");
@@ -131,6 +131,33 @@ test("テスト：照合AIが escalation を付け忘れた・合否が矛盾し
   assert.match(med.escalationAuditHint(ADDED), /必ず "escalation":true\|false/);
 });
 
+test("テスト：手がかりを示した照合が escalation を返さない時は、合格にも表示にもしない", async () => {
+  const h = reviewer(['{"pass":true,"safety":false,"reason":"ok"}', ADDED, '{"pass":true,"safety":false,"reason":"ok"}']);
+  const r = await h.review({}, consult(), ADDED);
+  assert.equal(r.text, "");
+  assert.match(r.error, /受診・救急の案内が残りました/);
+  // 修正AIが応答しない
+  const h2 = reviewer(['{"pass":false,"safety":false,"reason":"スタッフの指示にない受診・救急の案内"}', null]);
+  assert.equal((await h2.review({}, consult(), ADDED)).text, "");
+  // 修正案に受診の文が残り、最後の照合が別の理由だけを返す
+  const keep = "テスト：一時的な炎症です。念のため皮膚科を受診してください。";
+  const h3 = reviewer(['{"pass":false,"safety":false,"escalation":true}', keep, '{"pass":false,"safety":false,"reason":"お詫びが弱い"}']);
+  assert.equal((await h3.review({}, consult(), ADDED)).text, "");
+  // 最後の照合を読み取れない
+  const h4 = reviewer(['{"pass":false,"safety":false,"escalation":true}', keep, 'not json']);
+  assert.equal((await h4.review({}, consult(), ADDED)).text, "");
+  // 照合AIが例外に当たると確認した（escalation:false）案は、別の理由の確認ポイント付きで表示できる
+  const h5 = reviewer(['{"pass":false,"safety":false,"escalation":true}', keep, '{"pass":false,"safety":false,"escalation":false,"reason":"お詫びが弱い"}']);
+  const r5 = await h5.review({}, consult(), ADDED);
+  assert.equal(r5.text, keep);
+  assert.match(r5.warning, /お詫びが弱い/);
+});
+
+test("テスト：受診案内の時期や条件だけを書いた一般的なルールは（イ）に当たらないと明記する", () => {
+  assert.match(med.MEDICAL_GUIDANCE_POLICY, /受診案内を出す時期や条件だけを書いた一般的なルール（例:『受診案内は患者から質問がある場合に記載する』）は（イ）に当たらない/);
+  assert.equal(med.isEscalationSentence("テスト：念のため医師にご相談ください。"), true);
+});
+
 test("テスト：施術部位だけの腫れ・ヒリヒリは命に関わる症状に当たらないと方針に明記する", () => {
   assert.match(med.MEDICAL_GUIDANCE_POLICY, /施術した部位（唇・歯ぐき・口元・歯）だけの腫れ・ヒリヒリ・しみる・白くなる・痛みは、（ウ）に当たらない/);
   const gen = source.slice(source.indexOf("async function genDraft("), source.indexOf("async function genDraft(") + 6000);
@@ -144,13 +171,13 @@ test("テスト：受診が不要と伝える文は、照合AIへ案内に当た
 });
 
 test("テスト：照合AIが例外に当たると判断した受診・救急の案内（スタッフ指示・命に関わる症状）は、そのまま残す", async () => {
-  const h = reviewer(['{"pass":true,"safety":false,"reason":"患者が息苦しさを訴えているため救急案内は適切"}']);
+  const h = reviewer(['{"pass":true,"safety":false,"escalation":false,"reason":"患者が息苦しさを訴えているため救急案内は適切"}']);
   const r = await h.review({}, consult({ lastQ: "テスト：さっきから息が苦しいです" }), ADDED);
   assert.equal(r.text, ADDED);
 });
 
 test("テスト：受診・救急の文がある時は、文体だけの指示でも照合を省かない", async () => {
-  const h = reviewer(['{"pass":true,"safety":false}']);
+  const h = reviewer(['{"pass":true,"safety":false,"escalation":false}']);
   const r = await h.review({}, consult({ latestInstruction: "テスト：もっと丁寧に", previousDraft: ADDED, styleFastPath: true }), ADDED);
   assert.equal(h.calls.length, 1);
   assert.equal(r.fastPath, undefined);

@@ -4665,7 +4665,9 @@ async function reviewDraftChatCandidate(t, p, raw) {
       // 受診・救急の手がかりを示した照合では escalation の真偽値が必須。無ければ照合済みとして扱わない（最初の案を採用しない）
       const hinted = !!escalationHint(candidate);
       const flagged = result.safety === true || result.escalation === true;
-      return { pass: result.pass === true && !flagged && !mismatch && !casual, audited: typeof result.safety === "boolean" && (!hinted || typeof result.escalation === "boolean"), mismatch: !!mismatch, safety: result.safety === true, escalation: result.escalation === true, reason: mismatch || (casual ? "患者様向けの敬語になっていません" : String(result.reason || "").slice(0, 200)) };
+      const escalationUnchecked = hinted && typeof result.escalation !== "boolean";
+      return { pass: result.pass === true && !flagged && !escalationUnchecked && !mismatch && !casual, audited: typeof result.safety === "boolean" && !escalationUnchecked, mismatch: !!mismatch, safety: result.safety === true, escalation: result.escalation === true, escalationCleared: hinted && result.escalation === false,
+        reason: mismatch || (casual ? "患者様向けの敬語になっていません" : escalationUnchecked ? "受診・救急の案内の確認結果を読み取れませんでした" : String(result.reason || "").slice(0, 200)) };
     } catch (e) { return { pass: false, reason: "編集指示の照合結果を読み取れませんでした" }; }
   }
   let checked = await audit(text);
@@ -4700,9 +4702,12 @@ async function reviewDraftChatCandidate(t, p, raw) {
     const useFirst = staffFirst && firstUsable && firstChecked.audited === true && !firstChecked.safety && !firstChecked.mismatch && !firstChecked.escalation;
     // 最終の照合が、指示にない受診・救急の案内または安全面（医療判断・（ウ）の救急案内の欠落など）で不合格の案も表示しない
     const unsafeFirstUnchanged = (firstChecked.escalation || firstChecked.safety) && String(text || "").trim() === String(firstText || "").trim();
-    if (!useFirst && (checked.escalation || checked.safety || unsafeFirstUnchanged)) {
-      const why = String((unsafeFirstUnchanged && !(checked.escalation || checked.safety) ? firstChecked.reason : checked.reason) || "").slice(0, 160);
-      return { text: "", error: "編集指示を正確に反映できませんでした" + (why ? "（理由：" + why + "）" : "") + "。内容を短く言い換えて、もう一度お試しください。" };
+    // 受診・救急らしい文が残る案は、照合AIが例外に当たると確認できた時（escalation:false）だけ表示する
+    const escalationUnverified = !useFirst && p.escalationCheck === true && escalationSentences(text).length > 0 && !checked.escalationCleared;
+    if (!useFirst && (checked.escalation || checked.safety || unsafeFirstUnchanged || escalationUnverified)) {
+      // 理由は固定の文にする（照合AIの理由文に患者名や内部記号が入ることがあるため）
+      const why = checked.escalation || escalationUnverified || (unsafeFirstUnchanged && firstChecked.escalation) ? "スタッフの指示にない受診・救急の案内が残りました" : "医療判断・本人確認・予約操作の書き方など、安全面の確認が必要な内容が残りました";
+      return { text: "", error: "編集指示を正確に反映できませんでした（理由：" + why + "）。内容を短く言い換えて、もう一度お試しください。" };
     }
     const shown = useFirst ? firstText : text;
     const reason = useFirst ? firstChecked.reason : checked.reason;
