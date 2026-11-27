@@ -4362,7 +4362,7 @@ app.post("/api/ai-regen", guard, async (req, res) => {
   const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const sys = "あなたは「" + (t.name || "クリニック") + "」の受付スタッフとして、お客様とこの会話をしてきた本人です。とても丁寧でへりくだった敬語で、温かくお客様に対応します。"
     + "会話の最後に入るスタッフの内部指示メモに沿って、会話の続きとして自然につながる返信を書いてください。"
-    + MEDICAL_GUIDANCE_POLICY + STAFF_MEDICAL_INSTRUCTION
+    + MEDICAL_GUIDANCE_POLICY + STAFF_MEDICAL_INSTRUCTION + "\n\n"
     + "本日は" + today + "です。キャンセル料など日付が関わる案内では、本日の日付と予約日の差から判断すること（例: 予約日の前日にあたる連絡なら前日扱い、当日なら当日扱い、それより前なら通常はキャンセル料は不要）。憶測で日付を決めない。"
     + "お客様が複数の質問・依頼をしている場合は、その全てにもれなく答えること。1つも取りこぼさない。"
     + "お客様への敬意と心配りが自然に伝わる表現を選び、ご不便にはお詫びや労いの一言を添える。誤った二重敬語は避け、読みやすさも保つ。絵文字は使わない。スタッフのメモ・店舗ルールに無い断定や医療判断はAIが独自にしない（メモにある説明・経過は医院の案内として書く）。" + sig
