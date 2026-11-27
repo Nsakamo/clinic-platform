@@ -2485,7 +2485,7 @@ async function genDraft(t, c, opts) {
   // 同じ先頭部分はOpenAI側で再利用（プロンプトキャッシュ）され、返信作成が速くなる。
   const sys = "あなたはクリニック・店舗「" + (t.name || "クリニック") + "」の受付スタッフです。お客様とこの会話をしてきた本人として、最新のメッセージへ、とても丁寧でへりくだった敬語で、温かく返信します。"
     + REPLY_DECISION
-    + "医療判断・診断はしない。「絶対」「完治」など断定的表現は使わない。絵文字は使わない。" + sig
+    + "スタッフの指示・店舗ルールに無い医療判断・診断はAIが独自にしない。「絶対」「完治」など断定的表現は使わない。絵文字は使わない。" + sig
     + "\n\n【事実の安全ルール】料金・金額・割引・期限・規定・営業日・対応可否は店舗ルールに明記された内容だけを答える。予約日時・空き枠・患者固有情報・手続き完了は、本人確認済みのシステム照会結果だけを答える。痛み・症状・薬・安全性は、スタッフの指示や店舗ルールに無い診断や『大丈夫』という断定をせず、スタッフ確認へ回す。根拠が無い部分は推測で埋めず、下の【保留にしない答え方】に従う（答えられる部分は答え、患者側の情報が足りなければ具体的に尋ね、医院側の確認が要る部分だけ何を確認するかを書いて『確認してご案内します』とする）。医院側の確認が要る部分が残る場合は needs_human:true、confidence:low にする。"
     + "\n\n" + MEDICAL_GUIDANCE_POLICY
     + "\n\n" + ANSWER_FIRST_POLICY
@@ -4365,7 +4365,7 @@ app.post("/api/ai-regen", guard, async (req, res) => {
     + MEDICAL_GUIDANCE_POLICY + STAFF_MEDICAL_INSTRUCTION
     + "本日は" + today + "です。キャンセル料など日付が関わる案内では、本日の日付と予約日の差から判断すること（例: 予約日の前日にあたる連絡なら前日扱い、当日なら当日扱い、それより前なら通常はキャンセル料は不要）。憶測で日付を決めない。"
     + "お客様が複数の質問・依頼をしている場合は、その全てにもれなく答えること。1つも取りこぼさない。"
-    + "お客様への敬意と心配りが自然に伝わる表現を選び、ご不便にはお詫びや労いの一言を添える。誤った二重敬語は避け、読みやすさも保つ。絵文字は使わない。断定や医療判断は避ける。" + sig
+    + "お客様への敬意と心配りが自然に伝わる表現を選び、ご不便にはお詫びや労いの一言を添える。誤った二重敬語は避け、読みやすさも保つ。絵文字は使わない。スタッフのメモ・店舗ルールに無い断定や医療判断はAIが独自にしない（メモにある説明・経過は医院の案内として書く）。" + sig
     + "\n" + ANSWER_FIRST_POLICY
     + "\n" + ATTACHMENT_UNSEEN_POLICY
     + (bookingFactsOf(t) ? "\n" + bookingFactsOf(t) : "")
@@ -4662,7 +4662,10 @@ async function reviewDraftChatCandidate(t, p, raw) {
       const match = rawAudit.match(/\{[\s\S]*\}/);
       const result = JSON.parse(match ? match[0] : rawAudit);
       const casual = hasConversationalTone(candidate);
-      return { pass: result.pass === true && !mismatch && !casual, audited: typeof result.safety === "boolean", mismatch: !!mismatch, safety: result.safety === true, escalation: result.escalation === true, reason: mismatch || (casual ? "患者様向けの敬語になっていません" : String(result.reason || "").slice(0, 200)) };
+      // 受診・救急の手がかりを示した照合では escalation の真偽値が必須。無ければ照合済みとして扱わない（最初の案を採用しない）
+      const hinted = !!escalationHint(candidate);
+      const flagged = result.safety === true || result.escalation === true;
+      return { pass: result.pass === true && !flagged && !mismatch && !casual, audited: typeof result.safety === "boolean" && (!hinted || typeof result.escalation === "boolean"), mismatch: !!mismatch, safety: result.safety === true, escalation: result.escalation === true, reason: mismatch || (casual ? "患者様向けの敬語になっていません" : String(result.reason || "").slice(0, 200)) };
     } catch (e) { return { pass: false, reason: "編集指示の照合結果を読み取れませんでした" }; }
   }
   let checked = await audit(text);
@@ -4698,7 +4701,8 @@ async function reviewDraftChatCandidate(t, p, raw) {
     // 最終の照合が、指示にない受診・救急の案内または安全面（医療判断・（ウ）の救急案内の欠落など）で不合格の案も表示しない
     const unsafeFirstUnchanged = (firstChecked.escalation || firstChecked.safety) && String(text || "").trim() === String(firstText || "").trim();
     if (!useFirst && (checked.escalation || checked.safety || unsafeFirstUnchanged)) {
-      return { text: "", error: "編集指示を正確に反映できませんでした。内容を短く言い換えて、もう一度お試しください。" };
+      const why = String((unsafeFirstUnchanged && !(checked.escalation || checked.safety) ? firstChecked.reason : checked.reason) || "").slice(0, 160);
+      return { text: "", error: "編集指示を正確に反映できませんでした" + (why ? "（理由：" + why + "）" : "") + "。内容を短く言い換えて、もう一度お試しください。" };
     }
     const shown = useFirst ? firstText : text;
     const reason = useFirst ? firstChecked.reason : checked.reason;

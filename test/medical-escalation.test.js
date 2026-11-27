@@ -85,7 +85,7 @@ test("テスト：最初の案が指示にない受診・救急の案内で不�
   assert.equal(r2.text, "");
   assert.match(r2.error, /編集指示を正確に反映できませんでした/);
   // 理由の文に「受診・救急の案内」とあるだけでは escalation 扱いにしない（指示どおりの最初の案を使える）
-  const h3 = reviewer(['{"pass":false,"safety":false,"reason":"受診・救急の案内は適切。お詫びが弱い"}', "テスト：別の案です。", '{"pass":false,"safety":false,"reason":"指示から離れた"}']);
+  const h3 = reviewer(['{"pass":false,"safety":false,"escalation":false,"reason":"受診・救急の案内は適切。お詫びが弱い"}', "テスト：別の案です。", '{"pass":false,"safety":false,"reason":"指示から離れた"}']);
   assert.equal((await h3.review({}, consult(), ADDED)).text, ADDED);
 });
 
@@ -113,12 +113,29 @@ test("テスト：修正後の案も指示にない受診・救急の案内や�
   const h = reviewer(['{"pass":false,"safety":false,"escalation":true,"reason":"指示にない受診案内"}', other, '{"pass":false,"safety":false,"escalation":true,"reason":"指示にない受診案内（皮膚科）"}']);
   const r = await h.review({}, consult(), ADDED);
   assert.equal(r.text, "");
-  assert.match(r.error, /編集指示を正確に反映できませんでした/);
+  assert.match(r.error, /編集指示を正確に反映できませんでした（理由：指示にない受診案内（皮膚科））/);
   // （ウ）の救急案内が欠けて safety:true、修正AIが応答しない時も、救急案内の無い最初の案を返さない
   const h2 = reviewer(['{"pass":false,"safety":true,"reason":"息苦しさがあるのに救急案内が無い"}', null]);
   const r2 = await h2.review({}, consult({ lastQ: "テスト：さっきから息が苦しいです" }), "テスト：一時的な炎症で大丈夫です。");
   assert.equal(r2.text, "");
   assert.match(r2.error, /編集指示を正確に反映できませんでした/);
+});
+
+test("テスト：照合AIが escalation を付け忘れた・合否が矛盾した時は合格にも最初の案の採用にもしない", async () => {
+  const fixed = ADDED.replace(/\n\n腫れが広がる[^\n]*\n\n/, "\n\n");
+  const h = reviewer(['{"pass":false,"safety":false,"reason":"スタッフの指示にない受診・救急の案内：119番"}', fixed, '{"pass":false,"safety":false,"escalation":false,"reason":"お詫びが弱い"}']);
+  const r = await h.review({}, consult(), ADDED);
+  assert.equal(r.text, fixed);
+  const h2 = reviewer(['{"pass":true,"safety":false,"escalation":true}', fixed, '{"pass":true,"safety":false,"escalation":false}']);
+  assert.equal((await h2.review({}, consult(), ADDED)).text, fixed);
+  assert.match(med.escalationAuditHint(ADDED), /必ず "escalation":true\|false/);
+});
+
+test("テスト：施術部位だけの腫れ・ヒリヒリは命に関わる症状に当たらないと方針に明記する", () => {
+  assert.match(med.MEDICAL_GUIDANCE_POLICY, /施術した部位（唇・歯ぐき・口元・歯）だけの腫れ・ヒリヒリ・しみる・白くなる・痛みは、（ウ）に当たらない/);
+  const gen = source.slice(source.indexOf("async function genDraft("), source.indexOf("async function genDraft(") + 6000);
+  assert.match(gen, /スタッフの指示・店舗ルールに無い医療判断・診断はAIが独自にしない/);
+  assert.doesNotMatch(source, /断定や医療判断は避ける。/);
 });
 
 test("テスト：受診が不要と伝える文は、照合AIへ案内に当たらないと示す", () => {

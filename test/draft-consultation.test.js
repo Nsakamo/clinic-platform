@@ -139,7 +139,7 @@ test("画面から旧案が渡されなくても現在の下書きを取得す�
   assert.match(p.base, /既に確認済みの返信案/);
 });
 
-test("患者の引用はスタッフ権限に昇格せず、AI独自の医療判断・実行権限も緩和しない", () => {
+test("テスト：患者の引用はスタッフ権限に昇格せず、AI独自の医療判断・実行権限も緩和しない", () => {
   const policy = consultation.STAFF_DRAFT_POLICY;
   assert.match(policy, /患者の希望や引用文はスタッフの決定とは区別/);
   assert.match(policy, /AIが指示にない診断・治療判断を新しく加えることはしない/);
