@@ -4678,11 +4678,15 @@ async function reviewDraftChatCandidate(t, p, raw) {
         && /(?:救急|119)[^。]{0,10}(?:案内|誘導|連絡先)(?:の記載)?(?:が|は)?(?:無い|ない|なし|ありません|欠け|足りな|含まれ(?:てい)?(?:ない|ません)|抜け)/.test(reasonText) && !/指示に(?:な|無)|不要/.test(reasonText);
       // 理由が受診・救急に触れる不合格（escalation:false の明示が無いもの）は、最初の案を使う判断から外す
       const reasonMentionsEscalation = !isTrue(result.pass) && result.escalation !== false && !submissionReason && /受診|救急|119|医療機関|病院/.test(reasonText);
-      const emergencyMissing = isTrue(result.emergency_missing) || inferredMissing;
+      // スタッフ指示優先の照合で safety:true かつ理由文が救急案内の欠落を述べる時は、emergency_missing:false の明示があっても欠落として扱う
+      const safetyMissing = staffFirst && isTrue(result.safety) && !isTrue(result.escalation) && !submissionReason
+        && /(?:救急|119)[^。]{0,10}(?:案内|誘導|連絡先)(?:の記載)?(?:が|は)?(?:無い|ない|なし|ありません|欠け|足りな|含まれ(?:てい)?(?:ない|ません)|抜け)/.test(reasonText) && !/指示に(?:な|無)|不要/.test(reasonText);
+      const emergencyMissing = isTrue(result.emergency_missing) || inferredMissing || safetyMissing;
       const escalation = isTrue(result.escalation) || (inferable && !inferredMissing && /受診|救急|119|医療機関|病院/.test(reasonText));
       // safety を合否に使うのは、safety の意味を詳しく指示しているスタッフ指示優先の照合だけ（他の経路で「安全＝true」と読まれても止めない）
       const flagged = (staffFirst && isTrue(result.safety)) || escalation || emergencyMissing;
-      return { pass: isTrue(result.pass) && !flagged && !escalationUnchecked && !mismatch && !casual, audited: typeof result.safety === "boolean" && !escalationUnchecked, mismatch: !!mismatch,
+      const overHintLimit = hinted && escalationSentences(candidate).length > HINT_LIMIT; // 示しきれない受診・救急の文がある案は合格にしない
+      return { pass: isTrue(result.pass) && !flagged && !escalationUnchecked && !overHintLimit && !mismatch && !casual, audited: typeof result.safety === "boolean" && !escalationUnchecked, mismatch: !!mismatch,
         safety: isTrue(result.safety) || emergencyMissing, emergencyMissing, escalation, escalationCleared: hinted && result.escalation === false && escalationSentences(candidate).length <= HINT_LIMIT, unverified: escalationUnchecked, reasonMentionsEscalation,
         reason: mismatch || (casual ? "患者様向けの敬語になっていません" : escalationUnchecked ? "受診・救急の案内の確認結果を読み取れませんでした" : reasonText.slice(0, 200)) };
     } catch (e) { return { pass: false, reason: "編集指示の照合結果を読み取れませんでした" }; }

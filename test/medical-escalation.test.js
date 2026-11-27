@@ -168,6 +168,9 @@ test("テスト：修正後の案も指示にない受診・救急の案内や�
   // 文字列の "false" も false として読む
   const hC = reviewer(['{"pass":false,"safety":"false","escalation":"false","emergency_missing":"false","reason":"お詫びが弱い"}', "テスト：別の案です。", '{"pass":false,"safety":false,"escalation":false,"reason":"指示から離れた"}']);
   assert.equal((await hC.review({}, consult(), ADDED)).text, ADDED);
+  // スタッフ指示優先の照合で safety:true・理由が救急案内の欠落なら、emergency_missing:false の明示があっても表示しない
+  const hM = reviewer(['{"pass":false,"safety":true,"escalation":false,"emergency_missing":false,"reason":"息苦しさがあるのに救急の案内が無い"}', null]);
+  assert.equal((await hM.review({}, consult({ lastQ: "テスト：息苦しいです" }), "テスト：一時的な炎症で大丈夫です。")).text, "");
   // 医療以外の safety（未実施の予約操作の完了表記など）は、従来どおり確認ポイント付きで表示する（最初の案は使わない）
   const h3 = reviewer(['{"pass":false,"safety":true,"escalation":false,"reason":"未実施の予約操作を完了と書いている"}', "テスト：キャンセルについて確認いたします。", '{"pass":false,"safety":true,"escalation":false,"reason":"未実施の予約操作"}']);
   const r3 = await h3.review({}, consult({ latestInstruction: "テスト：キャンセル済みと伝えて" }), "テスト：キャンセルが完了いたしました。");
@@ -226,6 +229,9 @@ test("テスト：手がかりの上限を超える受診・救急の文があ�
   const h = reviewer(['{"pass":false,"safety":false,"escalation":false,"reason":"お詫びが無い"}', null]);
   const r = await h.review({}, consult(), many);
   assert.equal(r.text, "");
+  // 合格でも、手がかりの上限を超える案は確認済みにしない
+  const h2 = reviewer(['{"pass":true,"safety":false,"escalation":false,"emergency_missing":false}', null]);
+  assert.equal((await h2.review({}, consult(), many)).text, "");
   assert.match(source, /"safety\\":true\|false,\\"escalation\\":true\|false,\\"emergency_missing\\":true\|false/);
 });
 
@@ -282,7 +288,7 @@ test("テスト：生成と照合のプロンプトに、医院としての案�
 
 test("テスト：唇のヒリヒリ・しみる・息苦しい等の問い合わせは、自動送信せずスタッフ確認に回す", () => {
   const { evaluateResponseGrounding } = require("../lib/response-grounding");
-  for (const q of ["テスト：唇がヒリヒリして白くなっています", "テスト：歯がしみます", "テスト：赤くなってかゆい", "テスト：息が苦しいです", "テスト：唇が白くなりました", "テスト：上唇が白く変わって", "テスト：唇が白っぽい"]) {
+  for (const q of ["テスト：唇がヒリヒリして白くなっています", "テスト：歯がしみます", "テスト：赤くなってかゆい", "テスト：息が苦しいです", "テスト：唇が白くなりました", "テスト：上唇が白く変わって", "テスト：唇が白っぽい", "テスト：口が白くなった", "テスト：口内が白く変色", "テスト：全身にじんましんが出ています", "テスト：蕁麻疹が出ました", "テスト：意識がもうろうとします", "テスト：血が止まらないです", "テスト：胸が苦しいです", "テスト：のどが詰まる感じがします", "テスト：飲み込みにくいです", "テスト：顔がむくんでいます", "テスト：めまいがします", "テスト：吐き気があります", "テスト：熱があります"]) {
     const g = evaluateResponseGrounding({ query: q, draft: "テスト：ご連絡ありがとうございます。" });
     assert.equal(g.autoSendAllowed, false, q);
     assert.ok(g.domains.includes("medical"), q);
