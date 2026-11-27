@@ -4672,7 +4672,7 @@ async function reviewDraftChatCandidate(t, p, raw) {
       const submissionReason = /証明|書類|免除|キャンセル料|診断書|受診日/.test(reasonText);
       // 理由文は言い回しで判断しない（肯定・否定の読み違いを避ける）。真偽値の明示だけで判定し、
       // 受診・救急に触れる不合格なのに escalation／emergency_missing の真偽値が欠けている時は「確認できない」として表示しない。
-      const reasonTouchesEscalation = !isTrue(result.pass) && !(submissionReason && p.escalationCheck !== true) && /受診|救急|救命|緊急|119|医療機関|病院/.test(reasonText);
+      const reasonTouchesEscalation = !isTrue(result.pass) && !submissionReason && /受診|救急|救命|緊急|119|医療機関|病院/.test(reasonText);
       const boolsMissing = typeof result.escalation !== "boolean" || typeof result.emergency_missing !== "boolean";
       const reasonMentionsEscalation = p.escalationCheck === true && reasonTouchesEscalation && boolsMissing;
       const emergencyMissing = isTrue(result.emergency_missing);
