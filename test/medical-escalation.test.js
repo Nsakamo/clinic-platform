@@ -102,7 +102,7 @@ test("テスト：受診・救急を足さない文には、店舗ルールの�
   assert.doesNotMatch(source, /下の方針の/);
   assert.match(source, /（ウ）に当たる（患者様の連絡に命に関わる緊急の症状がある）のに救急の案内が無い/);
   assert.match(source, /そのまま書かれていることを理由に不合格にしない（（ウ）に当たるのに救急の案内が無い時を除く/);
-  assert.match(med.MEDICAL_GUIDANCE_POLICY, /受診や救急の案内を足さない（（イ）（ウ）の時を除く）/);
+  assert.match(med.MEDICAL_GUIDANCE_POLICY, /受診や救急の案内を足さない（（ア）〜（ウ）の時を除く）/);
   assert.match(med.STAFF_MEDICAL_INSTRUCTION, /そのまま丁寧な文にする（上の方針の（ウ）の時は、説明を保ったうえで救急の案内を添える）/);
   const regen = source.slice(source.indexOf('app.post("/api/ai-regen"'), source.indexOf('app.post("/api/ai-regen"') + 4000);
   assert.match(regen, /MEDICAL_GUIDANCE_POLICY \+ STAFF_MEDICAL_INSTRUCTION/);
@@ -171,6 +171,17 @@ test("テスト：修正後の案も指示にない受診・救急の案内や�
   // スタッフ指示優先の照合で safety:true・理由が救急案内の欠落なら、emergency_missing:false の明示があっても表示しない
   const hM = reviewer(['{"pass":false,"safety":true,"escalation":false,"emergency_missing":false,"reason":"息苦しさがあるのに救急の案内が無い"}', null]);
   assert.equal((await hM.review({}, consult({ lastQ: "テスト：息苦しいです" }), "テスト：一時的な炎症で大丈夫です。")).text, "");
+  // 「命に関わる症状ではないため救急の案内がないのは適切」は欠落ではない（別の safety の理由で確認ポイント付き表示）
+  const okDraft2 = "テスト：一時的な炎症で、数日〜2週間ほどで落ち着いてまいります。";
+  const hP = reviewer(['{"pass":false,"safety":true,"escalation":false,"emergency_missing":false,"reason":"命に関わる症状ではないため救急の案内がないのは適切ですが、店舗ルールに無い診断名が加わっています"}', okDraft2, '{"pass":false,"safety":true,"escalation":false,"emergency_missing":false,"reason":"命に関わる症状ではないため救急の案内がないのは適切ですが、店舗ルールに無い診断名が加わっています"}']);
+  const rP = await hP.review({}, consult(), okDraft2);
+  assert.equal(rP.text, okDraft2);
+  assert.match(rP.warning, /診断名/);
+  const hQ = reviewer(['{"pass":false,"safety":false,"reason":"119番の案内がないのは適切ですが、お詫びが不足"}', null]);
+  assert.equal((await hQ.review({}, consult(), okDraft2)).error, "");
+  // escalation:false の明示があっても、理由が「指示にない受診案内」なら最初の案は使わない（修正案を表示する）
+  const hR = reviewer(['{"pass":false,"safety":false,"escalation":false,"emergency_missing":false,"reason":"指示にない医療機関への相談の案内"}', "テスト：修正した案です。", '{"pass":false,"safety":false,"escalation":false,"reason":"お詫びが弱い"}']);
+  assert.equal((await hR.review({}, consult(), ADDED)).text, "テスト：修正した案です。");
   // 医療以外の safety（未実施の予約操作の完了表記など）は、従来どおり確認ポイント付きで表示する（最初の案は使わない）
   const h3 = reviewer(['{"pass":false,"safety":true,"escalation":false,"reason":"未実施の予約操作を完了と書いている"}', "テスト：キャンセルについて確認いたします。", '{"pass":false,"safety":true,"escalation":false,"reason":"未実施の予約操作"}']);
   const r3 = await h3.review({}, consult({ latestInstruction: "テスト：キャンセル済みと伝えて" }), "テスト：キャンセルが完了いたしました。");
@@ -294,7 +305,7 @@ test("テスト：唇のヒリヒリ・しみる・息苦しい等の問い合�
     assert.ok(g.domains.includes("medical"), q);
   }
   // ホワイトニングの予約などの問い合わせは、症状語の追加で止めない
-  for (const q of ["テスト：変色した歯でもホワイトニングできますか？", "テスト：前回で歯が白くなったので次の予約をしたいです", "テスト：おかゆは食べてもいいですか", "テスト：口コミで歯が白くなったと見ました", "テスト：施術を楽しみます"]) {
+  for (const q of ["テスト：変色した歯でもホワイトニングできますか？", "テスト：前回で歯が白くなったので次の予約をしたいです", "テスト：おかゆは食べてもいいですか", "テスト：口コミで歯が白くなったと見ました", "テスト：施術を楽しみます", "テスト：美意識が高まりました", "テスト：意識して歯磨きしています", "テスト：入口が白い建物ですか", "テスト：白い口紅でも大丈夫ですか"]) {
     assert.equal(evaluateResponseGrounding({ query: q, draft: "" }).domains.includes("medical"), false, q);
   }
 });
